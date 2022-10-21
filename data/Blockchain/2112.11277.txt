@@ -1,0 +1,1038 @@
+Porting a benchmark with a classic workload to blockchain:
+TPC-C on Hyperledger Fabric
+
+Attila Klenik∗
+Department of Measurement and Information Systems
+Budapest University of Technology and Economics
+Budapest, Hungary
+attila.klenik@vik.bme.hu
+
+Imre Kocsis
+Department of Measurement and Information Systems
+Budapest University of Technology and Economics
+Budapest, Hungary
+kocsis.imre@vik.bme.hu
+
+1
+2
+0
+2
+
+c
+e
+D
+1
+2
+
+]
+F
+P
+.
+s
+c
+[
+
+1
+v
+7
+7
+2
+1
+1
+.
+2
+1
+1
+2
+:
+v
+i
+X
+r
+a
+
+ABSTRACT
+Many cross-organization cooperation applications of blockchain-
+based distributed ledger technologies (DLT) do not aim at innova-
+tion at the cooperation pattern level: essentially the same ”busi-
+ness” is conducted by the parties, but this time without a central
+party to be trusted with bookkeeping. The migration to DLT is
+expected to have a negative performance impact, but some DLTs,
+such as Hyperledger Fabric, are accepted to be much better suited
+performance-wise to such use cases than others. However, with
+the somewhat surprising, but ongoing absence of application-level
+performance benchmarks for DLTs, cross-DLT comparison for ”clas-
+sic” workloads and the evaluation of the performance impact of
+”blockchainification” is still ill-supported. We present the design
+and Hyperledger Caliper-based open implementation of a full port
+of the classic TPC-C benchmark to Hyperledger Fabric, complete
+with a structured approach for transforming the original database
+schema to a smart contract data model. Initial measurements about
+the workload characteristics that will affect the design of large-scale
+performance evaluations are also included.
+
+CCS CONCEPTS
+• Software and its engineering → Software performance; •
+Computer systems organization → Peer-to-peer architectures; •
+Theory of computation → Distributed computing models;
+
+KEYWORDS
+blockchain, DLT, benchmarking, TPC-C, Hyperledger Fabric
+
+ACM Reference Format:
+Attila Klenik and Imre Kocsis. 2022. Porting a benchmark with a classic
+workload to blockchain: TPC-C on Hyperledger Fabric. In Proceedings of
+ACM SAC Conference (SAC’22). ACM, New York, NY, USA, Article 4, 9 pages.
+https://doi.org/xx.xxx/xxx_x
+
+∗Corresponding author
+
+Permission to make digital or hard copies of all or part of this work for personal or
+classroom use is granted without fee provided that copies are not made or distributed
+for profit or commercial advantage and that copies bear this notice and the full citation
+on the first page. Copyrights for components of this work owned by others than ACM
+must be honored. Abstracting with credit is permitted. To copy otherwise, or republish,
+to post on servers or to redistribute to lists, requires prior specific permission and/or a
+fee. Request permissions from permissions@acm.org.
+SAC’22, April 25 –April 29, 2022, Brno, Czech Republic
+© 2022 Association for Computing Machinery.
+ACM ISBN 978-1-4503-8713-2/22/04. . . $15.00
+https://doi.org/xx.xxx/xxx_x
+
+1 INTRODUCTION
+Distributed ledgers, predominantly implemented today with block-
+chain technologies, are able to introduce significant business value
+to a very wide range of established cross-organizational coopera-
+tions [29]. Distributed, fault- and attack-tolerant consensus over
+the contents of the ledger necessarily introduces performance in-
+efficiencies in contrast to centralized databases and distributed
+ones operating under more benign fault assumptions (e.g., only
+non-malicious, independent, fail-silent node failures).
+
+However, while unpermissioned cryptocurrency networks be-
+gan to significantly improve only lately on their historically very
+low throughput and high latency baseline, consortial networks –
+bespoke, permissioned, closed networks supporting the business
+cooperation of a relatively small set of organizations – have always
+had the selling point of having tunable and designable performance.
+Hyperledger Fabric, one of the leading consortial blockchain frame-
+works, has been reported to be able to achieve thousands of trans-
+actions per second [1] for bitcoin-like asset accounting workloads.
+While a growing body of literature documents the various micro-
+level performance mechanisms in Fabric and tooling is available for
+running quasi-microbenchmarks, there’s almost a complete lack of
+full-fledged macrobenchmarks; neither ones focusing on ”blockchain-
+native” functionality (as UTXO-style cryptoasset handling) nor full
+ports of classic workloads are available.
+
+This paper improves on this second aspect of the state of the
+art by introducing an open implementation of the TPC-C OLTP
+benchmark12. In addition to still being a widely used database
+performance benchmark, for Hyperledger Fabric, TPC-C is espe-
+cially relevant due to its (physical) warehouse data model and order
+management transactions – both reflective of such use cases as
+blockchain-assisted supply chain management and cooperative
+digital manufacturing.
+
+At the same time, our port showcases a structured approach
+towards translating classic, SQL-based data models and their trans-
+actions to Fabric. We show that, as expected, moving to Hyperledger
+Fabric transforms database locking induced delays to retry-induced
+delays. More importantly, as the standard workload includes a high
+ratio of logically necessary read-write overlaps between the trans-
+actions, it highly depends on the workload magnitude, block size
+and block time that whether such a structured translation leads to
+an acceptable performance result.
+
+But the broader point of our contribution – beyond creating
+missing tooling and presenting some methodological advances –
+
+1https://drive.google.com/drive/folders/1X-3X59Lzru8do29pqmOUB292ZrgI-9Wt?
+usp=sharing (Accessed: December 22, 2021)
+2Permission to disclose the link granted by the track co-chairs
+
+ 
+ 
+ 
+ 
+ 
+ 
+SAC’22, April 25 –April 29, 2022, Brno, Czech Republic
+
+Attila Klenik and Imre Kocsis
+
+Consensus in Fabric can be outlined as follows (see Fig. 1):
+
+(1) A client sends a transaction proposal to one or more peers,
+operated by one or more organizations (determined by a
+policy) for so-called endorsement.
+
+(2) The peers execute the corresponding chaincode based on
+their current blockchain-backed world-state, collecting a ver-
+sioned set of keys read and to be written as an execution
+side-effect. This results in a transaction read-write set. Writes
+are not persisted at this point yet. Peers sign and send the ex-
+ecution results (”endorsements”) back to the client, including
+the read-write set.
+
+(3) Once the client collected enough endorsements, it packs
+them into an endorsed transaction and sends it to the order-
+ing service for inclusion in a block.
+
+(4) The orderer service cuts a new block as soon as one of several
+pre-configured criteria are met, then broadcasts the block to
+every peer for validation and commit.
+
+(5) If a transaction passes the initial syntax and policy checks,
+then its read-write set is validated against the current ledger
+state. As a form of Multiversion Concurrency Control (MVCC),
+the write values of a transaction are committed if and only
+if the versions of its read keys are still unchanged in the
+world-state (including the effects of earlier transactions in
+the same block). Finally, peers can send notifications about
+the commit event to subscribed clients.
+
+For a detailed description, please refer to [1].
+
+2.2 Fabric performance: state of the art
+Fabric performance is a complex subject, with the existing body of
+research being dividable into three broad categories.
+
+• Evaluating and characterizing the performance of Fabric
+[2–4, 7, 9–11, 14, 17–22, 25–28]. Focus falls mainly on the
+analysis of performance sensitivity to different setups, con-
+figurations and workload characteristics. Bottleneck identifi-
+cation and robustness evaluation are also topics of interest.
+• Performance improvement via various optimization tech-
+niques [8, 12, 16, 26]. The proposed improvements target
+either the steps of the consensus process or the architecture
+itself.
+
+• Formal models of the consensus process [13, 23, 24, 30, 31].
+Model parameter identification is usually based on an ini-
+tial empirical evaluation of the system. Then, subsequent
+sensitivity analyses with varying configurations are only
+performed on the model level, reducing the cost of analysis.
+
+Regardless of the aim of the research, designing empirical per-
+formance evaluations and reporting their results is a common
+theme. The Hyperledger Performance and Scalability Working
+Group (PSWG) released a whitepaper3 about consistently reporting
+the different aspects of blockchain performance evaluations.
+
+To assess repeatability, we evaluated the level of disclosure of the
+available results along six dimensions: (i) hardware environment
+(HE); (ii) software environment (SE); (iii) network setup and config-
+uration (NS); (iv) test harness setup (TH), i.e., workload generators
+
+3https://www.hyperledger.org/learn/publications/blockchain-performance-metrics
+(Accessed: December 22, 2021)
+
+Figure 1: Main steps of the Fabric consensus protocol (1-3:
+transaction-level operations, 4-5: block-level operations)
+
+lies on the positive side of this statement: such a conservative trans-
+formation can be sufficient. Performance-enhancing techniques are
+known for creating Hyperledger Fabric data models broadly based
+on bitcoin-style UTXOs; but methodologically applying these for
+existing applications is not mature yet and presents a much greater
+challenge.
+
+2 ASSESSMENT OF FABRIC PERFORMANCE
+We give a brief introduction to Fabric and briefly survey its per-
+formance evaluation literature. This motivates our primary contri-
+bution: an open-source, representative, and widely known macro-
+benchmark implementation for Fabric.
+
+2.1 Hyperledger Fabric concepts
+Hyperledger Fabric [1] is a consortial, permissioned DLT. A Fabric
+network is operated by organizations that each contributes com-
+puting resources (nodes) to the network. Fabric client applications
+(clients for short) submit transactions to the nodes, but are not
+strictly part of the network. Nodes can take the roles of peers or
+orderers.
+
+Peers execute, validate and commit transactions, i.e., maintain
+the ledger and its corresponding versioned, key-value model world-
+state. Peers can only execute (endorse – see below) transactions
+if the corresponding smart contract (called chaincode in Fabric) is
+deployed on the peer. If not, the peer only validates and commits
+the transaction effects (i.e., all peers validate and commit).
+
+Orderers form the ordering service of the network, responsible for
+determining a unique and global order for transactions. Orderers
+perform the batching of transactions into blocks; the ordering ap-
+proach is ”pluggable” and can range from a single central machine
+to true, distributed, byzantine fault tolerance implementations.
+
+A given network of nodes does not equal a single ledger. Fabric
+employs a so-called channel mechanism to allow a subset of nodes
+(and organizations) to form and maintain a ledger isolated from
+the rest of the network for privacy. Every operation in the Fabric
+network happens in the scope of a channel. The rest of the paper
+ignores channels for the sake of readability and assumes a single
+channel containing every network node.
+
+Org#1Client #1Org#2Client #2Org#1 Peer#1Org#2 Peer#1Ordering serviceOrg#1 Peer#2Org#2 Peer#2114444331225555TPC-C on Hyperledger Fabric
+
+SAC’22, April 25 –April 29, 2022, Brno, Czech Republic
+
+References
+[1, 3, 6, 9, 22, 24, 26]
+[4, 7, 12, 14, 16, 18]
+[2, 11]
+[8, 10, 17, 20, 25, 28]
+[21]
+[19, 27, 30, 31]
+[23]
+
+HE SE NS TH SC WL
+
+✓
+
+✓
+✓
+
+X
+✓
+✓
+
+✓
+
+✓
+✓
+
+X
+✓
+✓
+
+✓
+
+✓
+✓
+✓
+✓
+✓
+
+✓
+
+✓
+✓
+
+X
+✓
+✓
+
+✓
+
+!
+✓
+✓
+
+X
+✓
+
+✓
+
+✓
+!
+!
+!
+X
+
+Table 1: Repeatability evaluation of Fabric performance ex-
+periments (X: missing; !: insufficient; ✓: sufficient)
+
+and data collection; (v) smart contract specification (SC); (vi) and
+workload specification (WL). The evaluation was permissive; we
+did not require the disclosure of exact artifacts (e.g., source code of
+contracts). Even providing a detailed enough description to repro-
+duce the results was deemed sufficient (even if reproduction would
+require a partial reimplementation of the artifacts).
+
+Table 1 summarizes our evaluation. Reporting of aspects (i)–
+(iii) and (v) were almost consistently well-covered. However, the
+specifics of workloads (and, to some extent, smart contracts) show
+a different picture.
+
+When the workload consists of openly available micro- or macro-
+benchmarks (e.g., provided by BlockBench [6]), then all attributes
+of the workload are certainly unambiguous. Otherwise, a detailed
+specification of the applied transaction types and the workload(s)
+composed from them is necessary. The first aspect is largely well-
+covered; however, at least in the papers using macrobenchmark
+or macrobenchmark-like workloads, the rate and transaction type
+composition of workloads did not receive proper attention.
+
+There are two key issues with this state of the art. First, these
+specifics are vital not only to reproduce results, but also for mean-
+ingful comparisons across different studies. Second, the maturation
+of DLT has reached the point where the comparison of DLT capa-
+bilities with such macro-benchmarks as, e.g., the ones specified by
+the Transaction Processing Council (TPC) is not only meaningful,
+but even sorely missing for gauging the technological design space
+for new DLT projects.
+
+TPC-C, a widely accepted and used OLTP benchmark, is a good
+initial target to address this shortcoming, with a clearly defined
+workload and a single workload scaling parameter. It is not DLT
+specific – what can actually be an advantage when such scenarios
+are considered where existing business cooperations are migrated
+to a DLT.
+
+To the best of our best knowledge, an open TPC-C implementa-
+tion that targets Fabric does not exist. Even though the workload
+generator part of the standard is implemented by multiple frame-
+works (OLTP-Bench [5], TPCC-UVa [15], HammerDB4, Benchmark-
+SQL5, Emerald Test6), they all target specific databases (or database
+connector frameworks), relying on SQL support. Accordingly, their
+transaction profile implementations are not compatible with Fabric;
+thus, a specific chaincode-based implementation is needed.
+
+4https://www.hammerdb.com/ (Accessed: December 22, 2021)
+5https://github.com/pgsql-io/benchmarksql (Accessed: December 22, 2021)
+6https://gitlab.com/emerald-platform/emerald (Accessed: December 22, 2021)
+
+3 TPC-C
+TPC benchmarks specify a detailed set of measurement and exper-
+imental requirements and tend to include software artifacts only
+very conservatively; they follow the principle that vendors should
+be able to implement the ”system under test” without major re-
+strictions (which could artificially hamstring their technology). The
+TPC-C performance benchmark specifies7 an online transaction
+processing (OLTP) workload that simulates the typical activity of
+a wholesale supplier. The benchmark was approved in 1992 to en-
+able a more complex evaluation than was possible by previous
+benchmarks, regarding both its database design and transaction
+specification. The specification describes a mix of read-only and
+read-write operations (also referred to as transaction profiles) that
+mimic the complexity and performance characteristics of similar
+real-life applications. Furthermore, a scalable logical database de-
+sign details the participating entities, their relationships, and their
+attributes.
+
+3.1 Database design and scale
+The core entities are warehouses, each having ten sales districts.
+Warehouses maintain stock information about the 100k items sold by
+the company. Each district serves 3k customers by maintaining order,
+new order, order item, and history information for all customers.
+
+A single warehouse and its corresponding data comprise roughly
+500k database entries (in a classic, relational implementation). The
+specification also states that each warehouse has ten associated
+remote terminals which emit requests on customer activity – i.e., the
+workload. Correspondingly, increasing the number of warehouses,
+the single scaling parameter of TPC-C, scales not only the size of
+the database, but also the arrival rate of the workload.
+
+3.2 Transaction profiles
+The standard specifies multiple types of requests (i.e., transaction
+profiles) to mimic typical wholesale supplier operations. Different
+profiles exhibit different characteristics regarding their data access
+pattern, execution frequency, and timing constraints. TPC-C defines
+the following transaction profiles:
+New Order transactions are mid-weight, read-write, and high-
+frequency requests that enter a complete customer order
+atomically in a single transaction.
+
+Payment transactions are light-weight, read-write, and high-frequency
+requests that update a customer’s balance and corresponding
+sales statistics.
+
+Order Status transactions are mid-weight, read-only, and low-
+frequency queries that retrieve information about a cus-
+tomer’s last order.
+
+Delivery transactions are mid-weight, read-write, and low-frequency
+
+requests that process/deliver the ten oldest, not yet delivered
+orders for a warehouse. Terminals submit delivery requests
+in a deferred/asynchronous mode, i.e., not waiting for their
+completion before submitting the next request.
+
+Stock Level transactions are heavy, read-only, and low-frequency
+queries that gather the recently sold items with unsatisfac-
+tory stock levels.
+
+7http://tpc.org/tpc_documents_current_versions/pdf/tpc-c_v5.11.0.pdf (Accessed: De-
+cember 22, 2021)
+
+SAC’22, April 25 –April 29, 2022, Brno, Czech Republic
+
+Attila Klenik and Imre Kocsis
+
+function targeted by the client. The foremost concern of the layer
+is to transform data between the raw string format (required by
+the chaincode API) and the ”strongly typed” representations of the
+business logic layer.
+
+Furthermore, the layer also contains domain-independent instru-
+mentation to aid transaction traceability (e.g., logging the beginning
+and end of transactions), and general error handling mechanisms.
+
+4.1.2 Business logic layer. The second layer contains the verbatim
+implementations of the TPC-C transaction profile specifications.
+The business logic layer relies only on the CRUD-like (Create, Read,
+Update, Delete) operations of the registry layer. This design pat-
+tern lends an almost pseudo-code-like form to the implementation,
+substantially simplifying specification conformance checks and
+requirement traceability. The layer also serves as an instrumen-
+tation point for gathering domain-specific metadata, facilitating
+the identification of workload- and state-dependent performance
+characteristics.
+
+4.1.3 Asset registry layer. The third layer plays the role of a sim-
+ple object-relational mapping (ORM) framework, hiding the pecu-
+liarities of the (ledger-specific) storage implementation. The layer
+provides CRUD-like operations for each asset type in the form of
+separate registries (similarly to the now deprecated Hyperledger
+Composer tool9), while using the domain-agnostic CRUD opera-
+tions of the ledger access layer.
+
+Fabric employs a key-value store abstraction for persisting the
+world-state, where keys are arbitrary strings, and values are arbi-
+trary byte blobs. The registries transparently manage the structure
+of the key space, without affecting the corresponding states (i.e.,
+values) of domain objects. Moreover, the layer also encapsulates
+complex queries for the business logic layer, e.g., retrieving a cus-
+tomer either by their unique ID or by their last name (depending
+on the available inputs).
+
+Correspondingly, the registry layer encapsulates the storage
+access-related design decisions of the implementation, constraining
+the potential modifications to a single layer when experimenting
+with other designs and configurations (as expected from a layered
+service).
+
+4.1.4 Ledger access layer. The fourth and last layer encapsulates
+the API of the chaincode SDK by providing simple CRUD operations
+on a higher abstraction level than byte blobs.
+
+More importantly, this layer gives place to the low-level, domain-
+agnostic instrumentation that tracks the data access statistics of
+transactions, e.g., the number of read/write operations and the size
+of values read/written from/to the ledger. Such statistics play a
+crucial part in understanding the performance characteristics of
+the Fabric consensus phases.
+
+4.2 TPC-C chaincode data model
+The standard specifies a relational data model for the entities that
+needs to be mapped to Fabric’s key-value store abstraction. While
+the mapping is mostly straightforward, special care must be taken
+in some cases due to the key-value store characteristics and API.
+
+9https://www.hyperledger.org/use/composer (Accessed: December 22, 2021)
+
+Figure 2: TPC-C chaincode layers
+
+Despite the multiple transaction types of the workload, TPC-C
+focuses only on a ”business metric”, namely the number of orders
+processed per minute, denoted as tpmC.
+
+3.3 Terminals
+Each warehouse has ten corresponding terminals that generate
+transactions according to a weighted distribution of the transaction
+profiles. Each terminal submits requests sequentially, i.e., in a syn-
+chronous manner (except for deferred delivery requests), following
+a simple customer behavior model graph (CBMG).
+
+Requests are generated by the following simple cycle: (i) waiting
+for input screen display (menu response time); (ii) waiting for user
+input (keying time); (iii) waiting for transaction output (transaction
+response time); (iv) and selecting the next transaction type (think
+time).
+
+The cumulative requests of the independent terminals comprise
+the overall workload of the System Under Test (SUT): the system
+handling the terminal requests.
+
+4 A TPC-C PORT FOR FABRIC
+This section presents the design decisions behind the two main
+components of the open-sourced artifacts: the SUT-side TPC-C
+chaincode, and the client-side TPC-C workload generator.
+
+4.1 TPC-C chaincode design
+Our TPC-C chaincode follows a layered design (Fig. 2), separating
+concerns along different abstraction levels. Correspondingly, each
+layer is responsible for a specific set of operations, utilizing only
+the services of the next layer (as detailed in the next sections).
+
+Even though the chaincode was implemented using Node.JS and
+the recommended contract design pattern,8 the loosely coupled,
+layered design facilitates porting the chaincode to other supported
+languages, whether the contract pattern is supported (e.g., for Java
+chaincodes) or not (e.g., for Golang chaincodes).
+
+Smart contract API layer. The first layer is the entry point
+4.1.1
+of the chaincode, receiving control in the appropriate chaincode
+
+8https://hyperledger.github.io/fabric-chaincode-node/release-1.4/api/
+tutorial-using-contractinterface.html (Accessed: December 22, 2021)
+
+Asset Registry LayerSmart Contract API LayerBusiness Logic LayerNew Order RegistryCustomer RegistryWarehouse Registry...Ledger Access LayerControl flow1234TPC-C on Hyperledger Fabric
+
+SAC’22, April 25 –April 29, 2022, Brno, Czech Republic
+
+In general, the key space is sharded along the ”database tables”,
+distinguishing entity types using the database table names as pre-
+fixes. Furthermore, the key of each entity is constructed from the
+concatenation of their primary keys. For example, a warehouse key
+conforms to the following format: 𝑐𝑜𝑛𝑐𝑎𝑡 (′′𝑊 𝐴𝑅𝐸𝐻𝑂𝑈 𝑆𝐸 ′′, 𝑤_𝑖𝑑),
+where 𝑤_𝑖𝑑 is the sole primary key for warehouse entities, and
+𝑐𝑜𝑛𝑐𝑎𝑡 denotes a function of the chaincode API that can construct
+composite keys amenable to partial lookups.
+
+However, the presented mapping had to be enhanced because:
+(i) the chaincode API provides key iterations only in lexicographic
+order; (ii) and insertion order-based (e.g., oldest, newest entry) key
+access is necessary for some profiles.
+
+The key order constraint prompted the following modifications
+of the key space (transparently handled by the asset registry layer):
+
+(1) Numeric primary keys are left-padded with zero characters
+to a fixed length, so that the resulting key 𝐸𝑁𝑇 𝐼𝑇𝑌 _02 pre-
+cedes the key 𝐸𝑁𝑇 𝐼𝑇𝑌 _11 in iteration order (making simpler
+lookups more efficient).
+
+(2) Customer entries are also stored by a secondary, utility key
+that contains their last names. This enables efficient cus-
+tomer lookups by their last name, as required by payment
+transactions. Note, that payment transactions are read-write
+requests, thus CouchDB-based rich queries are not appli-
+cable (CouchDB is a backend option for Fabric). Moreover,
+greedily enumerating every customer to find matches would
+quickly explode the read-set of the transaction, increasing
+the number of invalid transactions due to concurrent data
+access conflicts.
+
+(3) The customer-scoped history entries do not have a primary
+key specified in the standard, so a client-side timestamp is
+utilized to create a unique key to avoid overwriting previ-
+ous history entries. Utilizing client-side timestamp, in gen-
+eral, can open up the chaincode to replay attacks. However,
+the used timestamp (combined with the client identity) also
+contributes to the transaction ID, delegating replay attack
+detection to higher-level Fabric layers.
+
+(4) The key (and only the key) of order entries contains a flipped
+order ID, meaning that a monotonically decreasing counter
+is used instead of an increasing one. This ensures that the
+last inserted order is iterated first, enhancing the efficiency
+of order lookup in the order status queries.
+
+Currently, the implementation is tailored to the common key-
+value store API of Fabric. Creating a variant that utilizes CouchDB-
+specific rich queries is left for future work.
+
+4.3 TPC-C workload generator design
+This section presents the design of the TPC-C workload generator
+and its integration with Hyperledger Caliper.10
+
+4.3.1 Hyperledger Caliper. Caliper is the official benchmarking
+tool of the Hyperledger project umbrella. Its modular and scalable
+design11 enables generating custom workloads towards large-scale
+systems.
+
+10https://www.hyperledger.org/use/caliper (Accessed: December 22, 2021)
+11https://hyperledger.github.io/caliper/vNext/architecture/ (Accessed: December 22,
+2021)
+
+Caliper utilizes two types of (micro-)services during benchmark-
+ing. An arbitrary number of worker services independently gener-
+ate the workload, while a single manager service orchestrates the
+workers throughout the different rounds of a benchmark.
+
+Worker services are configured with a custom workload mod-
+ule and rate controller for each round. The rate controller deter-
+mines the sending rate of transactions, while the user-implemented
+workload module dictates the content of each transaction. The rate
+and content aspects of a workload are usually independent for
+micro-benchmarks (and for many macro-benchmarks), facilitating
+sensitivity analyses for variances in the workload.
+
+However, TPC-C specifies the scheduling of the workload in
+detail, not just its content. Accordingly, the presented implementa-
+tion acts both as a rate controller and workload module (Sec. 4.3.3),
+resulting in a closed-loop workload generator.
+
+4.3.2 Extending Caliper. TPC-C is a complex performance bench-
+mark with a detailed specification and strict constraints. While
+Caliper provides many customization opportunities, the authors
+had to extend its feature set to fulfill the requirements of a full-
+fledged macro-bechmark, like TPC-C:
+
+(1) The benchmark configuration schema was extended to indi-
+cate the required number of workers for each round, allowing
+using a single worker to load the database, then performing
+the workload generation with multiple workers, both in the
+same Caliper run.
+
+(2) The workload module interface was extended with an addi-
+tional prepare step, orchestrated by the manager service. The
+new step allows the workload modules of different rounds
+to construct arbitrary states, which later will be shared with
+every worker utilizing the messaging service of Caliper. The
+extension allows the dissemination of shared random seeds,
+as required by the benchmark.
+
+(3) A transaction number- and time-independent, third driving
+mode was implemented where the workload module can
+explicitly signal the worker when it deems the round finished,
+i.e., when it inserted every required entity. Such a driving
+mode can account for the random number of entries, not
+conforming to fix transaction numbers or execution time.
+
+4.3.3 The workload module. The workload module for the execu-
+tion phase (Fig. 3) follows a layered design (the module for the
+initial database load phase follows a simpler, one-terminal design,
+thus its description is omitted). Each layer augments the raw TPC-C
+input data until it becomes a fully configured Fabric transaction.
+
+The first layer is responsible for generating the raw arguments
+and the timing constraints for the transaction profiles. The genera-
+tors are stateless and operate independently upon requests from
+the terminal layer. The entry and argument generators are based
+on the implementation of the py-tpcc12 tool (which is ignoring the
+timing constraints).
+
+The second layer impersonates multiple terminals, each with its
+own dedicated generators. The terminals implement the sequen-
+tial behavior, i.e., that new requests are only generated when the
+previous one is finished (except for deferred delivery requests). Ter-
+minals also calculate the scheduling of the next request based on
+
+12https://github.com/apavlo/py-tpcc (Accessed: December 22, 2021)
+
+SAC’22, April 25 –April 29, 2022, Brno, Czech Republic
+
+Attila Klenik and Imre Kocsis
+
+Figure 4: Measurement environment setup
+
+aspects of measurement campaigns performed with our TPC-C
+implementation.
+
+5.1 Measurement setup
+Each measurement was performed in a private cloud infrastructure
+(Fig. 4) on five virtual machines (VM). Each VM was equipped with 4
+vCPUs, 8GB memory, and a 40GB HDD, running the Ubuntu 18.04
+LTS operating system. The measurement utilized containerized
+services deployed on a Docker Swarm cluster across the VMs.
+
+The Fabric network consisted of a single peer and orderer node,
+both of version 1.4.11. The peer node used GoLevelDB as world-
+state database, while the orderer cuts new blocks every 100ms
+(the latest). Other Fabric node configurations retained their default
+values.
+
+A Caliper manager service orchestrated a single Caliper worker
+service, performing both the load and execution round of TPC-C.
+Each measurement used a scale of one warehouse, but the number
+of terminals was increased between measurements (from 10 to 100,
+in steps of ten; and from 100 to 400, in steps of 50). Note, how the
+workload is completely specified by only two parameters. Going by
+the standard, the number of warehouses alone would suffice; our
+implementation diverges from that in that we made the warehouse-
+terminal ratio parameterizable, too.
+
+The data collection part of the test harness utilized the open-
+source Elastic stack,13 processing logs from the Fabric nodes and
+the Caliper worker.
+
+5.2 Workload generation rate and precision
+Determining the number of required services for workload gen-
+eration is a crucial step for benchmarking at scale. The timing
+constraints specified by the standard amount to a rate of approxi-
+mately one transaction per second (TPS) for ten terminals, and this
+scales linearly with the number of terminals (Fig. 5). If a TPC-C
+measurement would like to hit a certain tpmC throughput, then
+the required scale (number of warehouses) of the benchmark must
+be set according to the workload generation capabilities of the ter-
+minals. Note, that new order transactions are only approximately
+45% of the total workload.
+
+Once the number of required terminals is determined, the next
+step is to split the terminals among different services (Caliper work-
+ers, in this case). The implementation for Caliper workers utilizes a
+
+13https://www.elastic.co/elastic-stack/ (Accessed: December 22, 2021)
+
+Figure 3: Caliper TPC-C workload module components
+
+the timing constraints (think time, menu selection time, and keying
+time) of the previous and next requests. Finally, the terminals push
+the next request to the next layer.
+
+The third layer ensures that the requests of multiple terminals are
+scheduled and submitted in order (as calculated by the terminals).
+Moreover, this multiplexer layer plays the part of a Caliper rate
+controller. The multiplexer maintains a sorted list of requests, and
+when Caliper instructs it to ”halt” until the next transaction submit
+time, it pops the first/next request and waits until it is time for
+sending it.
+
+As a naive approach, a Caliper worker service could emulate only
+a single terminal, greatly simplifying the implementation. However,
+the sending rate of a single terminal is so low (less than a transac-
+tion per second) that the worker service would be underutilized.
+Moreover, large-scale measurements might require thousands or
+millions of terminals, which would mean a significant management
+overhead if each terminal were emulated by a different worker
+service.
+
+Correspondingly, the presented workload module implementa-
+tion (which is instantiated on the Caliper worker level) is capable
+of emulating multiple terminals. Furthermore, the multiplexer layer
+is instrumented to gather data about the ”scheduling precision
+reserve,” i.e., how well can the rate controller keep up with the
+calculated scheduling times. The data can help to properly design
+experiments that result in economical resource utilization while
+ensuring compliance with the specified scheduling constraints.
+
+TPC-C request scheduling was SUT-agnostic up until the fourth
+and last layer, facilitating ports to other SUT types. It is the job of
+the last layer to encapsulate the arguments into a Fabric-specific
+transaction, i.e., specify the target nodes, channel, chaincode, and
+user identity to use. Finally, the assembled transaction is sent using
+Caliper’s Fabric connector.
+
+5 EXPERIMENTAL EVALUATION
+This section presents a preliminary evaluation of the workload
+generator and smart contract implementation. The evaluation aims
+at facilitating the design of the scaling and sensitivity analysis
+
+Terminal #1Terminal #NGenerator #1Generator #NTerminal Multiplexer & Scheduler...Fabric Transaction AssemblerFabric TPC-C Transaction1234Private cloud infrastructureVM5Docker Swarm clusterLogspoutLogstashElasticsearchCaliper managerCaliper workerFabric peerFabric ordererVM1VM2VM3VM4TPC-C on Hyperledger Fabric
+
+SAC’22, April 25 –April 29, 2022, Brno, Czech Republic
+
+Figure 5: Aggregate workload rates of terminals
+
+Figure 7: Changes in the error profile
+
+Increasing the number of terminals emulated by a worker has a
+negative impact on scheduling precision (Fig. 6). The scheduling
+precision can drop below zero in the case of hundreds of terminals.
+However, even for 400 terminals, the delay/violation of transaction
+submission never exceeds half a second. Such delay might be accept-
+able, considering that the timing constraints of TPC-C transactions
+are in the order of magnitude of seconds.
+
+5.3 Error profile of workload scaling
+In TPC-C, the fixed ratio of terminals to warehouses keeps the
+concurrent data access situations at a desired level. Traditional
+databases can resolve such race conditions with locking. For Fabric,
+concurrent update attempts manifest as MVCC conflicts between
+two transactions, and the latter one is invalidated, i.e. the client has
+to submit the request again.
+
+As the number of terminals increase (keeping the number of
+warehouses fixed), the number of MVCC conflicts increase corre-
+spondingly (Fig. 7). Around half of the transactions are invalidated
+due to MVCC conflicts when the number of terminals is increased
+to 100. At even higher terminal numbers, commit timeouts and
+endorsement timeouts reduce the goodput to effectively zero. The
+ramifications of these phenomena are twofold.
+
+First, scaling experiments by the benchmark definition (10 ter-
+minals per warehouse, no data dependencies across warehouses)
+will keep the ratio of MVCC conflicts below 10%, what still can be
+
+Figure 6: Scheduling precision boxplots for one worker
+
+single-threaded multiplexer for emulating multiple terminals. How-
+ever, care must be taken not to allocate too many terminals to a
+single worker to uphold the precision of scheduling.
+
+The scheduling precision is defined as the difference between
+the time when a transaction is picked as next, and the time when
+it needs to be actually submitted. For example, the multiplexer
+pops the next transactions from its queue at time 𝑡1, inspects its
+scheduling data to determine the submission time 𝑡2. If the dif-
+ference 𝑑 = 𝑡2 − 𝑡1 is negative, then the timing constraint of the
+corresponding terminal is violated.
+
+1002003004000102030ProfileAllNew OrderNumber of terminalsTPS100200300400−101234567Number of terminalsScheduling precision (s)10020030040000.20.40.60.81Error TypeMVCC ConflictPhantom ReadCommit TimeoutEndorsement TimeoutInvalid ItemTerminalsRatio to total number of TXsSAC’22, April 25 –April 29, 2022, Brno, Czech Republic
+
+Attila Klenik and Imre Kocsis
+
+deemed an acceptable negative impact. In this sense, our approach
+to port the TPC-C workload proved to be a practically feasible one.
+However, we also showed that increasing concurrency not only
+slows down processing – as with traditional databases – but actively
+wastes resources; there is a point where other, less straightforward
+approaches become necessary (as making every single purchasable
+asset an individual, ownable item and translating ”give me three
+items” requests to ”give me those three items” ones).
+
+Second, commit timeouts can, and endorsement timeouts do
+represent resource overload situations (predominantly CPU) – and
+these happen at relatively low overall load, even for the modest
+resources we used for error profiling. This does not limit using our
+smart contracts for either larger-scale benchmarking or configura-
+tion sensitivity analysis (as, e.g., adjusting Fabric block time and
+size), but warrants a further, nuanced analysis of smart contract
+endorsement resource usage versus Fabric platform resource usage.
+
+6 CONCLUSION AND FUTURE WORK
+Consortial blockchain solutions promise increased performance
+compared to the available public networks. The permissioned, closed-
+network nature of such consortial platforms – Hyperledger Fabric
+being one of the most mature ones – enables rigorous capacity plan-
+ning and performance tuning. However, the performance character-
+ization of the complex Fabric consensus process is still a challenging
+task. The research related to the performance of Fabric is diverse in
+its results, and comparisons are difficult to make – mainly due to the
+diversity and limited disclosure of the workloads applied. On the in-
+dustrial side, there are still no practical solutions for benchmarking
+either Hyperledger Fabric, or its contender technologies.
+
+We presented an open implementation of the TPC-C perfor-
+mance benchmark for Fabric. Our artifacts include both a chaincode
+implementation and the corresponding workload generator. The
+implementation was evaluated from a perspective that facilitates
+the design of performance evaluations at scale. As part of our on-
+going research, we plan to perform and evaluate such larger-scale
+experiments and to propose modifications to TPC-C, which incorpo-
+rate DLT aspects to the benchmark. One straightforward possibility
+here is transforming the single warehousing organization TPC-C
+model to a market of suppliers. We also plan to apply the same
+methodology for porting the IoT-focused benchmark TPCx-IoT to
+Fabric.
+
+REFERENCES
+[1] Elli Androulaki et al. 2018. Hyperledger Fabric: A Distributed Operating System
+for Permissioned Blockchains. In Proc. of the Thirteenth EuroSys Conf. (EuroSys
+’18). ACM, New York, NY, USA, 30:1–30:15.
+
+[2] Elli Androulaki, Angelo De Caro, Matthias Neugschwandtner, and Alessandro
+Sorniotti. 2019. Endorsement in Hyperledger Fabric. In Proceedings - 2nd IEEE
+Int. Conf. on Blockchain. IEEE, Piscataway, NJ, USA, 510–519.
+
+[3] Arati Baliga et al. 2018. Performance characterization of Hyperledger Fabric. In
+Crypto Valley Conf. on Blockchain Technology. IEEE, Piscataway, NJ, USA, 65–74.
+[4] Sara Bergman, Mikael Asplund, and Simin Nadjm-Tehrani. 2020. Permissioned
+blockchains and distributed databases: A performance study. Concurrency and
+Computation: Practice and Experience 32, 12 (2020), e5227.
+
+[5] Djellel Eddine Difallah, Andrew Pavlo, Carlo Curino, and Philippe CudreMauroux.
+2013. OLTP-bench: An extensible testbed for benchmarking relational databases.
+Proceedings of the VLDB Endowment 7, 4 (2013), 277–288.
+
+[6] Tien Tuan Anh Dinh et al. 2017. BLOCKBENCH: A framework for analyzing
+private blockchains. In Proc. of the ACM SIGMOD Int. Conf. on Management of
+Data, Vol. Part F1277. ACM, New York, NY, USA, 1085–1100. https://doi.org/10.
+1145/3035918.3064033
+
+[7] Luca Foschini et al. 2020. Hyperledger Fabric Blockchain: Chaincode Performance
+Analysis. In IEEE Int. Conf. on Communications, Vol. 2020-June. IEEE, Piscataway,
+NJ, USA, 1–6.
+
+[8] Christian Gorenflo et al. 2019. FastFabric: Scaling Hyperledger Fabric to 20,000
+Transactions per Second. In IEEE Int. Conf. on Blockchain and Cryptocurrency.
+IEEE, Piscataway, NJ, USA, 455–463.
+
+[9] Himanshu Gupta et al. 2018. Efficiently processing temporal queries on Hyper-
+ledger Fabric. In Proc. - IEEE 34th Int. Conf. on Data Engineering, ICDE 2018. IEEE,
+Piscataway, NJ, USA, 1435–1440.
+
+[10] Yue Hao, Yi Li, Xinghua Dong, Li Fang, and Ping Chen. 2018. Performance Anal-
+ysis of Consensus Algorithm in Private Blockchain. In IEEE Intelligent Vehicles
+Symposium, Proceedings, Vol. 2018-June. IEEE, Piscataway, NJ, USA, 280–285.
+
+[11] Tatsushi Inagaki, Yohei Ueda, Takuya Nakaike, and Moriyoshi Ohara. 2019.
+Profile-based Detection of Layered Bottlenecks. In ICPE 2019 - Proc. of the 2019
+ACM/SPEC Int. Conf. on Performance Engineering. ACM, New York, NY, USA,
+197–208.
+
+[12] Haris Javaid, Chengchen Hu, and Gordon Brebner. 2019. Optimizing validation
+phase of Hyperledger Fabric. In IEEE Computer Society’s Annual Int. Symp. on
+Modeling, Analysis, and Simulation of Computer and Telecommunications Systems,
+Vol. 2019-Oct. IEEE Computer Society, Piscataway, NJ, USA, 269–275.
+
+[13] Lili Jiang et al. 2020. Performance analysis of Hyperledger Fabric platform: A
+hierarchical model approach. Peer-to-Peer Networking and Applications 13, 3
+(2020), 1014–1025.
+
+[14] Murat Kuzlu et al. 2019. Performance analysis of a Hyperledger Fabric block-
+chain framework: Throughput, latency and scalability. In 2nd IEEE Int. Conf. on
+Blockchain. IEEE, Piscataway, NJ, USA, 536–540.
+
+[15] Diego R. Llanos. 2006. TPCC-UVa: An open-source TPC-C implementation for
+global performance measurement of computer systems. SIGMOD Record 35, 4
+(2006), 6–15.
+
+[16] Takuya Nakaike et al. 2020. Hyperledger Fabric Performance Characterization
+and Optimization Using GoLevelDB Benchmark. In IEEE Int. Conf. on Blockchain
+and Cryptocurrency. IEEE, Piscataway, NJ, USA, 1–9.
+
+[17] Qassim Nasir, Ilham A. Qasse, Manar Abu Talib, and Ali Bou Nassif. 2018. Per-
+formance analysis of hyperledger fabric platforms. Security and Communication
+Networks 2018 (2018), 1–14.
+
+[18] Minh Quang Nguyen, Dumitrel Loghin, Tien Tuan, and Anh Dinh. 2021. Un-
+derstanding the Scalability of Hyperledger Fabric. CoRR abs/2107.09886 (2021),
+10.
+
+[19] Thanh Son Lam Nguyen, Guillaume Jourjon, Maria Potop-Butucaru, and
+Kim Loan Thai. 2019.
+Impact of network delays on Hyperledger Fabric. In
+INFOCOM 2019 - IEEE Conf. on Computer Communications Workshops 2019. IEEE,
+Piscataway, NJ, USA, 222–227.
+
+[20] Suporn Pongnumkul, Chaiyaphum Siripanpornchana, and Suttipong Tha-
+jchayapong. 2017. Performance analysis of private blockchain platforms in
+varying workloads. In 26th Int. Conf. on Computer Communications and Networks.
+IEEE, Piscataway, NJ, USA, 1–6.
+
+[21] Salma Shalaby et al. 2020. Performance Evaluation of Hyperledger Fabric. In
+IEEE Int. Conf. on Informatics, IoT, and Enabling Technologies. IEEE, Piscataway,
+NJ, USA, 608–613.
+
+[22] Ankur Sharma, Felix Martin Schuhknecht, Divya Agrawal, and Jens Dittrich.
+2018. How to Databasify a Blockchain: the Case of Hyperledger Fabric. arxiv.org
+abs/1810.13177 (2018), 28.
+
+[23] Harish Sukhwani et al. 2017. Performance modeling of PBFT consensus process
+for permissioned blockchain network (Hyperledger Fabric). In IEEE Symp. on
+Reliable Distributed Systems, Vol. 2017-Sept. IEEE Computer Society, Piscataway,
+NJ, USA, 253–255.
+
+[24] Harish Sukhwani et al. 2018. Performance modeling of Hyperledger Fabric
+(permissioned blockchain network). In 17th IEEE Int. Symp. on Network Computing
+and Applications. IEEE, Piscataway, NJ, USA, 1–8.
+
+[25] Miyamae Takeshi et al. 2018. Performance improvement of the consortium
+blockchain for financial business applications. Journal of Digital Banking 2, 4
+(2018), 369–378.
+
+[26] Parth Thakkar, Senthil Nathan, and Balaji Viswanathan. 2018. Performance
+benchmarking and optimizing Hyperledger Fabric blockchain platform. In 26th
+IEEE Int. Symp. on Modeling, Analysis and Simulation of Computer and Telecom-
+munication Systems. IEEE Computer Society, Piscataway, NJ, USA, 264–276.
+[27] Canhui Wang and Xiaowen Chu. 2020. Performance characterization and bot-
+tleneck analysis of Hyperledger Fabric. In Int. Conf. on Distributed Computing
+Systems, Vol. 2020-Nov. IEEE, Piscataway, NJ, USA, 1281–1286.
+
+[28] Shuo Wang. 2019. Performance Evaluation of Hyperledger Fabric with Malicious
+Behavior. In Lecture Notes in Computer Science, Vol. 11521. Springer, Cham, 211–
+219.
+
+[29] World Economic Forum. 2019. Building Value with Blockchain Technology:
+How to Evaluate Blockchain’s Benefits. https://www3.weforum.org/docs/WEF_
+Building_Value_with_Blockchain.pdf
+
+[30] Xiaoqiong Xu et al. 2021. Latency performance modeling and analysis for Hy-
+perledger Fabric blockchain network. Information Processing & Management 58,
+1 (2021), 102436.
+
+TPC-C on Hyperledger Fabric
+
+SAC’22, April 25 –April 29, 2022, Brno, Czech Republic
+
+[31] Pu Yuan, Kan Zheng, Xiong Xiong, Kuan Zhang, and Lei Lei. 2020. Performance
+modeling and analysis of a Hyperledger-based system using GSPN. Computer
+Communications 153 (2020), 117–124.
+
+

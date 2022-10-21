@@ -1,0 +1,1700 @@
+Coded Transaction Broadcasting for High-throughput Blockchains
+
+Lei Yang
+MIT CSAIL
+
+Yossi Gilad
+Hebrew University of Jerusalem
+
+Mohammad Alizadeh
+MIT CSAIL
+
+2
+2
+0
+2
+
+y
+a
+M
+3
+
+]
+I
+
+N
+.
+s
+c
+[
+
+1
+v
+7
+9
+7
+1
+0
+.
+5
+0
+2
+2
+:
+v
+i
+X
+r
+a
+
+Abstract
+
+High-throughput blockchains require efﬁcient transaction
+broadcast mechanisms that can deliver transactions to most
+network nodes with low bandwidth overhead and latency. Ex-
+isting schemes coordinate transmissions across peers to avoid
+sending redundant data, but they either incur a high latency or
+are not robust against adversarial network nodes. We present
+Strokkur, a new transaction broadcasting mechanism that pro-
+vides both low bandwidth overhead and low latency. The core
+idea behind Strokkur is to avoid explicit coordination through
+randomized transaction coding. Rather than forward individual
+transactions. Strokkur nodes send out codewords—XOR sums
+of multiple transactions selected at random. Since almost every
+codeword is useful for the receiver to decode new transactions,
+Strokkur nodes do not require coordination, for example, to de-
+termine which transactions the receiver is missing. Strokkur’s
+coding strategy builds on LT codes, a popular class of rateless
+erasure codes, and extends them to support multiple uncoordi-
+nated senders with partially-overlapping continual streams of
+transaction data. Strokkur introduces mechanisms to cope with
+adversarial senders that may send corrupt codewords, and a
+simple rate control algorithm that enables each node to indepen-
+dently determine an appropriate sending rate of codewords for
+each peer. Our implementation of Strokkur in Golang supports
+647k transactions per second using only one CPU core. Our
+evaluation across a 19-node Internet deployment and large-
+scale simulation show that Strokkur consumes 2–7.6× less
+bandwidth than the existing scheme in Bitcoin, and 9× lower
+latency that Shrec when only 4% of nodes are adversarial.
+
+1 Introduction
+Blockchains have risen in popularity in recent years with
+the emergence of decentralized applications such as cryp-
+tocurrencies, smart contracts, non-fungible tokens (NFTs),
+decentralized ﬁnance, and more. At its core, a blockchain
+network consists of thousands of geodistributed nodes that
+collectively implement a replicated state machine. The nodes
+establish a peer-to-peer network and participate in a consensus
+algorithm to agree on the ordering of transactions (e.g.,
+money transfers) that apply updates to the state machine.
+To perform a transaction, a client sends it to one or more
+nodes in a blockchain network, which then broadcast
+the transaction throughout the network. Most blockchain
+consensus protocols periodically selects a node to propose an
+
+ordered batch of transactions (called a block) to be executed
+next. Block proposers can be chosen in many ways (e.g., via
+proof-of-work [31], veriﬁable random functions [11], etc.), but
+crucially, the identity of the proposer is not known beforehand
+to prevent targeted attacks. Therefore, it is important to
+broadcast new transactions to reach most network nodes with
+low latency so they can be executed in a timely manner.
+
+Most existing blockchain networks rely on simple trans-
+action broadcasting mechanisms. For example, an Ethereum
+node simply ﬂoods new transactions to all peers [24]. Although
+obviously inefﬁcient — ﬂooding delivers a transaction up
+to 50 times per node since a node by default connects to 50
+peers in the Ethereum network [24] — the throughput of most
+blockchains is quite low. The Ethereum network, for example,
+has a throughput of 20 transactions per second (tps), or tens
+of Kbps, so even a 50× bandwidth overhead is a small-cost.
+
+Several high-throughput blockchains have
+
+recently
+emerged, capable of processing 10s or even 100s of thousands
+of tps [16, 27, 41], or 10–200 Mbps of transaction data. At such
+transaction rates, inefﬁcient transaction broadcast mechanisms
+like ﬂooding become problematic. Simply in terms of cost,
+wasted data transfers could cost a node-operator tens of
+thousands of dollars per year.1 Moreover, excessive bandwidth
+requirements limit the type of nodes that can participate in a
+blockchain network, hurting decentralization and security.
+
+A few blockchains have started adopting more efﬁcient
+broadcasting strategies to address this challenge. A basic
+approach is to ﬂood hashes of the transactions, rather than
+the actual transactions, and have the nodes request only the
+transactions they are missing from their peers. However, as we
+discuss in §2.1, it is difﬁcult to ensure both low communication
+overhead and low latency with such approaches. A node may
+receive the same hash from multiple peers concurrently and
+must decide which peers to request the transaction from and
+how long to wait for a response. For example, to reduce redun-
+dant transmissions, Shrec [20] proposes that a node sends only
+one request for each transaction (hash) and retry the request
+with a different peer upon a timeout. Unfortunately, there is no
+good way to set these timeouts in an adversarial environment.
+A malicious peer can subvert any attempt to tune the timeouts
+based on delay measurements by arbitrarily injecting jitter to
+
+1For example, a node running in AWS sending 100 Mbps of wasted data
+
+at $0.05/GB [1] would incur $19,710 of extra data transfer cost per year.
+
+1
+
+ 
+ 
+ 
+ 
+ 
+ 
+their responses. As a result, practical realization of this idea
+rely on coarse timeouts (e.g., Conﬂux uses a 30-second time-
+out [12]), which can lead to high broadcast latency even with
+a small fraction of adversarial nodes. Moreover, hash-based
+ﬂooding is not effective for small transactions (a common case)
+where hashes are comparable in size to the actual transactions.
+In this paper, we present Strokkur, a new approach to
+transaction broadcasting that achieves both low bandwidth
+overhead and low latency. We observe that the central issue
+in existing approaches is that they require coordination among
+peers to decide whether to forward individual transaction.
+For example, hash-based schemes communicate hashes to try
+to prevent redundant transmissions, but as discussed above
+performing such coordination efﬁciently (with low latency)
+is hard in an uncertain, adversarial setting. An interesting
+alternative, which we adopt in Strokkur, is to use coding. At
+a high level, nodes can encode transactions they’ve received
+into codewords that they send to their peers, and once a node
+receives enough codewords “covering” a set of transactions, it
+is able to decode them. Since it does not matter which speciﬁc
+codewords arrive at a node, this approach does not require any
+coordination, including timeout and retry mechanisms.
+
+Network coding techniques have been used in variety of
+contexts for efﬁcient data delivery, including in wireless net-
+works [23], content distribution networks [19], peer-to-peer net-
+works [17,42], multimedia streaming [30], and inter-datacenter
+transfers [38] (see [15] for a review). However. the use of coded
+transmission raises unique challenges in adversarial block-
+chain networks. For example, standard techniques such as ran-
+dom linear network coding (RLNC) [11, 22] are susceptible to
+pollution attacks where a malicious node can send invalid code-
+words that cause decoding to fail, or worse, propagate through
+the network corrupting codewords sent by honest nodes [18].
+Strokkur’s design address two key challenges. First, to
+safeguard against malicious nodes, we design the encoding
+and decoding procedures such that a node can efﬁciently
+identify and discard invalid codewords during decoding. The
+key observation is that a certain decoding procedure known
+as the “peeling decoder” enables a node to check the validity
+of a codeword before using it to decode other codewords.
+Speciﬁcally, Strokkur uses LT codes [29], a popular rateless
+erasure code. LT codes generate codewords by XORing a
+random subset of transactions. The peeling decoder iteratively
+removes (“peels off”) previously decoded transactions from
+received codewords until there’s only one transaction left
+in the codeword. At this time that transaction has been
+decoded, but before using it to decode other transactions, we
+can check its validity (see §4 for details). Unlike methods
+that simultaneously decode many codewords together (e.g.,
+solving a system of linear equations to decode RLNCs), an
+invalid codeword has no effect on decoding other codewords in
+Strokkur (other than a small amount of wasted computation).
+The second challenge is to enable multiple nodes with
+potentially overlapping transactions to send codewords to a
+
+common peer such that they can be jointly decoded efﬁciently.
+A key question here is at what rate should a node send
+codewords to each peer? The optimal rate depends on the rate
+at which the other neighbors of that peer send it codewords,
+and the amount of overlap with the set transactions covered
+by codewords sent by those peers. For example, if multiple
+senders have entirely overlapping set of transactions, they can
+each send fewer codewords per transactions than if they must
+each communicate a distinct set of transactions. Coordinating
+the sending rates of multiple nodes by explicitly sharing
+information about their set of transactions isn’t possible – we’d
+be back to where we started without coding!
+
+Our main insight is that explicit coordination isn’t necessary
+for making rate control decisions. Each peer can independently
+set a codeword rate for each peer to using a simple invariant:
+send at a rate that achieves a small target loss rate (e.g., 2%),
+where loss refers codewords that the peer is unable to decode
+within a certain time period. This invariant ensures that nodes
+automatically adjust their rates based on how crucial their code-
+words are to successful decoding at their peers. By targeting a
+small loss rate, nodes will not send excessively more codewords
+than needed but send enough to ensure that most codewords
+can be decoded. As the overlap among the transaction sets of
+multiple nodes sending to a common peer increases, each will
+independently reduce its sending rate to maintain the target
+loss rate, ensuring that redundant transmissions remain low.
+Strokkur uses a simple multiplicative-increase multiplicative-
+decrease (MIMD) rate control algorithm operating between
+each pair of peers to continually track the target loss rate.
+
+We evaluate Strokkur in both real-world experiment and
+
+extensive realistic simulations. Our main ﬁndings are:
+• Coding signiﬁcantly reduces the communication cost and
+the latency of transaction broadcasting. Strokkur consumes
+up to 6.38× less bandwidth while achieving 34% lower
+latency than Bitcoin’s scheme.
+
+• Strokkur is resilient to attacks from strong adversaries. An
+attacker with zero-delay connections to every node in the
+network can censor a transaction with only 2% success
+probability, and increase the latency by 0.1s. In comparison,
+the latency of Conﬂux’s scheme increases by 15× when
+only 4% of nodes become adversarial.
+
+• Strokkur scales gracefully to large topologies. As the
+network grows from 250 nodes to 4000 nodes while main-
+taining the same degree, the latency of Strokkur increases
+by 0.5s, while the communication cost increases by 4%.
+• Strokkur is computationally efﬁcient. Our implementation
+can encode or decode 647k transactions per second using
+one CPU core.
+
+2 Background and Related Work
+A blockchain network consists of many nodes. Each node con-
+nects to one or more other nodes (peers) to form a connected
+graph. Each node may create new transactions (byte strings)
+that it wishes to write to the blockchain.The nodes use a
+
+2
+
+transaction broadcast mechanism to spread their transactions
+throughout the network. The goal of transaction broadcasting
+is to deliver new transactions to most nodes in the network with
+low latency and low communication overhead. Here, latency
+refers to the time span from when the ﬁrst node sends this
+transaction to the time that a large fraction (e.g., 95%) of nodes
+have received that transaction. The communication overhead
+is the average amount of data that each node downloads
+relative to the transactions it receives. (We will deﬁne these
+performance metrics more precisely for evaluation, in §5.)
+A crucial aspect of a blockchain’s peer to peer network is
+resisting adversarial nodes. Such nodes may deviate from
+the speciﬁed communication protocol arbitrarily to disrupt
+transaction broadcasting (e.g., to censor or delay transactions).
+
+2.1 Existing mechanisms
+
+Transaction ﬂooding. The simplest broadcast mechanism is
+transaction ﬂooding, where nodes forward new transactions to
+all peers (except the sender) as soon as they receive a new trans-
+action. Transaction ﬂooding incurs a high overhead, because
+a node will receive every new transaction as many times as the
+number of peers it has, since each peer will forward the trans-
+action upon receiving it. On the other hand, new transactions
+travel along the shortest path from their creators to every node,
+so the latency is optimal. The scheme is also robust against
+attacks. As long as there is a path between every pair of honest
+(i.e., non-adversarial) nodes that does not contain any adversar-
+ial node, new transactions can be delivered to all honest nodes.
+A generalization of ﬂooding is to have each node forward trans-
+actions only to a random subset of peers. This reduces the
+overhead but increases the latency (transactions may not travel
+along the shortest paths) and makes the system more vulner-
+able to attacks (nodes may accidentally forward a transaction
+to only adversarial nodes). Ethereum uses this method [24].
+
+Hash ﬂooding. Instead of ﬂooding the actual transactions,
+an alternative is to only ﬂood their hashes. Upon receiving
+a hash from a peer, a node checks if it has already obtained
+the corresponding transaction (i.e., the preimage). If not, it
+requests for the preimage from the peer. After receiving the
+preimage, the node forwards the hash to all peers. This scheme
+reduces the communication overhead at the cost of an extra
+round-trip of latency at each forwarding hop.
+
+Hash ﬂooding, however, does not eliminate all redundant
+communication. A node may hear about the same transaction
+hash from multiple peers concurrently, and then has to decide
+which peers to request the transaction from. One option is to
+request it from all peers that forward the hash but this approach
+incurs a high communication overhead. Shrec [20] proposes
+to mitigate this issue by ensuring that a node only sends one
+request for each transaction (hash), so that at most one peer
+will reply with the preimage. However, this modiﬁcation is
+not robust to attacks. If a request goes to an adversarial peer, it
+may not respond with the preimage, or may deliberately delay
+the response. Shrec does not specify a solution, and nodes in
+
+actual deployments rely on heuristics (such as waiting for a
+long time that bounds the network latency) to decide whether
+to keep waiting or retry requests with another peer [12]. These
+heuristics can lead to high latency in the presence of a small
+fraction of adversarial nodes (as we show later in experiments).
+Another mitigation proposed by Bitcoin is to require each
+node to inject a random jitter before forwarding a hash to
+peers, so that nodes are less likely to receive the same hash
+from multiple peers within a short time window. However, this
+mitigation is only effective when the jitter is sufﬁciently long,
+and forces a trade off between latency and communication
+overhead (as we show later through experiments as well).
+
+Although hashes are shorter than the actual transactions, the
+cost to ﬂood them is still signiﬁcant due to the high overhead
+of ﬂooding. For example, hash ﬂooding accounts for 30–50%
+of all the network trafﬁc of a Bitcoin node [32]. Simply
+reducing the length of the hashes allows adversarial nodes
+to produce hash collisions and disrupt the system. (Recall
+that nodes will not request a transaction if they have already
+received another one with a colliding hash.) Bitcoin [8] and
+Shrec [20] propose an elegant solution by using a keyed hash,
+such as SipHash [5]. Each pair of connected nodes use a local
+secret key when computing hashes. Adversarial nodes cannot
+produce hash collisions without knowing the secret key. Other
+works such as Graphene [33] and Erlay [32] propagate hashes
+using set reconciliation [14], a primitive that allows two
+nodes to exchange hashes with optimal overhead. However,
+it only changes how nodes propagate hashes. They still need to
+decide whether to request for a transaction from a peer after it
+receives a hash through set reconciliation, so they suffer from
+the same issue as in the hash ﬂooding schemes. Moreover,
+experiments in a recent work [20] show that set reconciliation
+is impractical for high-throughput blockchains due to high
+computational cost and high sensitivity to parameter choices,
+facing a computational bottleneck at 826 tps on a 4-core server.
+
+Structured propagation. The peer-to-peer networking
+literature has proposed a variety of efﬁcient broadcast
+mechanisms [7, 13, 34] that forward requests on a structured
+topology (e.g., a broadcast tree). These methods were not
+adopted by blockchain systems largely because they are not
+tolerant to Byzantine nodes. For example, adversarial nodes
+at higher levels of a broadcast tree can disconnect it and thwart
+the progress of the broadcast [28].
+
+3 The Case for Coding and its Challenges
+Nodes in existing transaction broadcasting mechanisms store
+and forward individual transactions. This design creates
+a common challenge: how to avoid forwarding redundant
+transactions to peers? To see why it is difﬁcult, let us consider
+a node A with two peers P1, P2. Suppose that at some point,
+P1 receives a new transaction t from the rest of the network
+and needs to decide whether to forward it to A. Speciﬁcally,
+P1 needs to know whether A has already obtained t from P2 in
+order to avoid forwarding redundant data. The previous section
+
+3
+
+described a few strategies current systems have proposed to
+obtain this information (e.g., hash ﬂooding and explicit trans-
+action requests). However, as we described, uncertainty about
+network delays and the adversarial nodes makes it difﬁcult, if
+not impossible, for P1 to consistently make an optimal decision
+on whether to forward t or not using such strategies. When P1
+makes a mistake, it either increases the overhead (forwarding
+a redundant transaction), or increases the latency (not
+forwarding a transaction that A does not have). To make the
+matter worse, nodes in blockchain networks connect to many
+peers in order to minimize the risk of being disconnected [21].
+In reality, A would have much more than two peers, e.g., 8–133
+in Bitcoin [32] or 25–50 in Ethereum [24]. Each of the peers is
+prone to making such a mistake and increasing the overhead or
+the latency, and the impact from each peer accumulates. This
+happens for every new transaction in the system.
+
+3.1 Strokkur: coded transaction broadcast
+
+Communication theory suggests that we can solve the above
+problem with network coding [2]. Instead of forwarding
+individual transactions, nodes compute and forward linear
+combinations of multiple transactions (treating them as
+elements of a ﬁnite ﬁeld), along with the coefﬁcients for
+computing them. We call each linear combination and the
+corresponding coefﬁcients a codeword. The node receiving a
+codeword treats it as a linear equation, where the transactions
+are the unknowns. By collecting enough linearly independent
+equations (codewords), the node can solve the system of
+equations and recover the transactions.
+
+The key beneﬁt of coding is that it eliminates the need for
+nodes to make optimal decisions on whether to forward each
+individual transaction, which we have shown to be error-prone.
+For example, suppose that P1 receives two new transactions
+t1, t2, but A has already obtained t1. Plain store-and-forward
+would have required P1 to decide whether to forward t1 and
+t2 respectively, each prone to incurring overhead or latency.
+Instead, P1 in network coding may compute t1 +t2 and send
+the resulting codeword to A.2 A can recover t1 by computing
+(t1 + t2) − t2. Notice that P1 does not need to decide which
+transaction to forward, because the codeword t1 +t2 is useful
+to A no matter which one of t1 and t2 it is missing. Instead,
+P1 only needs to decide how many codewords to send (in this
+simple case, one). This task is much easier, because P1 does
+not need precise information about which transactions A has
+already received from other peers.
+
+Coding in an adversarial network. While network coding
+holds great promise, it is difﬁcult to implement in networks
+with adversarial nodes. Recall that a codeword is a linear com-
+bination of multiple transactions along with the corresopnding
+coefﬁcients. The main challenge is to defend against invalid
+codewords, where the linear combinations are inconsistent
+
+2In reality, P1 should randomize the coefﬁcients so that the resulting code-
+word is highly likely to be linearly independent to other linear combinations
+of t1 and t2 [22]. We omit this step to simplify the example.
+
+with the stated coefﬁcients. When a node puts an invalid
+codeword into a linear system and tries to solve it, it either
+obtains corrupt solutions (transactions), or the linear system
+is inconsistent and unsolvable. The node cannot tell which
+equations are invalid before solving the linear system, because
+it must obtain all the involved transactions and recompute
+the linear combinations locally. As a result, the node has to
+enumerate all subsets of possible equations (codewords) to
+include in the linear system until it ﬁnds one that is consistent,
+which is costly since there are exponentially many subsets of
+codewords to consider Furthermore, standard network coding
+allows nodes to produce new codewords by recombining
+existing ones [2]. This can amplify the impact of invalid
+codewords since honest nodes may unknowingly use them
+when producing new codewords, which will in turn become
+invalid and impact other honest nodes in the same way.
+
+To enable coding in an adversarial setting, we need a way
+to identify invalid codewords and limit their impact on the
+decoding process. Our main insight is that codes that can be
+decoded via a “peeling decoder” are suitable for this purpose.
+The peeling decoder decodes a transaction from a codeword
+only using transactions it has already decoded. This allows
+the decoder to check the validity of each transaction it decodes
+before using it in the decoding process, thus preventing any
+corrupt codeword from interfering with other transactions.
+
+Speciﬁcally, Strokkur builds on LT codes [29], a popular
+rateless erasure code in our construction. LT codes generate
+codewords by XORing a number of randomly-chosen trans-
+actions. The number of transactions varies from codeword
+to codeword, and is itself chosen at random according to a
+carefully-chosen degree distribution. During decoding, LT
+codes iteratively “peel off” previously decoded transactions
+from codewords in which they appear. For example, suppose
+codeword C = T1 ⊕ T3 ⊕ T7 is the XOR-sum of three transac-
+tions. When the decoder decodes transaction T1, it removes it
+from C by computing C⊕T1 = T3 ⊕T7. Whenever a codeword
+is left with only one transaction after a peeling step, that trans-
+action has been decoded. However, before using it to decode
+any other codewords, the decoder can check its validity. §4.3
+describes how Strokkur performs this validity check by includ-
+ing a short hash of the transactions in each codeword, which
+also serve as transaction IDs needed by the peeling decoder.
+Rate control. A second key challenge for coded broadcast is
+for nodes to decide the rate to send codewords to each peer.
+The crux of the issue is that the neighbors of a speciﬁc node
+may have partially overlapping sets of transactions that must
+be delivered to their common peer. To minimize overhead, the
+nodes should send fewer codewords per transaction when their
+transaction sets overlap signiﬁcantly and more codewords
+when their sets are distinct (note that the receiver decodes
+codewords received from all peers jointly). But the nodes don’t
+know how much overlap exists between their transactions
+or how other nodes will behave. Strokkur uses a dynamic
+rate control algorithm running between every pair of peers
+
+4
+
+(§4.2) to automatically adapt the sending rates and discover
+an efﬁcient operating point. Strokkur’s rate control is robust
+to adversarial nodes, since each node independently makes
+its own rate control decisions. A malicious node deviating
+from the rate control protocol can waste bandwidth locally
+but cannot prevent the progress of decoding at honest nodes.3
+
+4 Design
+Strokkur runs on a peer-to-peer network, where each node
+connects to several peers to form a connected graph. Nodes can
+create new transactions, produce codewords from transactions
+they create or receive from other nodes, and learn of new
+transactions by decoding codewords they receive from their
+peers. In this section, we explain the design of Strokkur in
+four steps. §4.1 describes the basics of how nodes encode and
+decode codewords. Here, we make a simplifying assumption
+that all transactions have equal length, which we will remove
+later. §4.2 describes how nodes control the rate for sending
+codewords to their peers. §4.3 discusses how Strokkur defends
+against adversarial nodes by making codewords self-validating.
+§4.4 removes the prior assumption on ﬁxed transaction length
+and adds support for variable-sized transactions.
+
+4.1 Windowed LT codes
+
+Strokkur uses a modiﬁed version of LT codes [29] to encode
+transactions, where each codeword consists of the bit-wise
+XOR sum of one or multiple transactions and the list of
+their identiﬁers. Standard LT codes are designed to encode
+a ﬁnite ﬁxed block of data symbols. In comparison, nodes
+in Strokkur receive and create transactions continuously, and
+hence have to encode an inﬁnite stream of transactions. While
+it is possible for nodes to buffer and partition the streams
+into ﬁnite, disjoint segments of transactions, and encode each
+segment independently using conventional LT codes, this
+process incurs undesired latency since the encoder will need
+to accumulate enough transactions to ﬁll its buffer before
+issuing codewords. Instead, we modify LT codes to encode
+streams of transactions directly. Our approach, which we refer
+to as windowed LT codes, is to pass the stream of transactions
+through a ﬁrst-in-ﬁrst-out (FIFO) coding window, and encode
+the transactions in the window using an LT code.
+
+Encoding. Each node maintains a FIFO coding window
+which contains the k most-recent transactions it receives
+or creates. The process for generating a codeword is the
+same as in conventional LT codes, except that the node only
+considers the transactions inside the window. Speciﬁcally,
+the node randomly samples a number d ∈ {1,...,k} from a
+discrete probability distribution ρ. We call d the degree of the
+codeword, and ρ the degree distribution of the code. It then
+uniformly samples d transactions from the coding window as
+the source transactions for the codeword. The resulting code-
+word contains a list of identiﬁers for the source transactions
+
+3An adversarial node sending excessive amounts of trafﬁc can be identiﬁed
+
+and disconnected using standard techniques.
+
+in the codeword and their bit-wise XOR sum. We call them
+the header and the payload of the codeword, respectively.
+The identiﬁers in the header let the decoding node determine
+the set of source transactions (§4.3 describes the identﬁers in
+detail). For now, we assume that all transactions have the same
+length, so that the bit-wise XOR operation is well deﬁned.
+
+Decoding. To decode codewords, nodes run an iterative
+peeling algorithm as in conventional LT codes. Each node
+maintains a bipartite graph of undecoded codewords and
+transactions. Speciﬁcally, there is an edge between a codeword
+and a transaction in the bipartite graph if and only if the latter is
+a source transaction of the former. (The node determines such
+relationships by reading the identiﬁers in codeword headers.)
+When a codeword has only one neighbor, the payload of that
+codeword must be the XOR sum of one transaction, i.e., the
+neighbor transaction itself. The node can therefore decode
+such “degree-one” codewords immediately. Having decoded
+a transaction, the node “peels” it from its other neighboring
+codewords by XORing it into their payloads, and then deletes
+the transaction and the codeword from the graph. Upon
+receiving a new codeword, the node checks for any source
+transactions it has already decoded, and peels them before
+inserting the codeword and its remaining (undecoded) source
+transaction into the graph.
+
+√
+
+We would like to minimize the overhead, i.e., the average
+number of codewords that the decoder must receive to decode
+a transaction. Therefore, ideally, removing a newly-decoded
+transaction from the bipartite graph should cause more
+codewords to become decodable (i.e., have exactly one
+neighbor), so that the decoding process can continue without
+receiving more codewords. Prior work shows that one can
+design the codeword degree distribution ρ such that the peeling
+algorithm can recover a block of k data symbols from any
+kln2(k/δ)) codewords with high probability (at least
+k+O(
+1−δ) [29]. The Robust Soliton distribution [29] is one such
+degree distribution that prior work [29, 37] shows can (asymp-
+totically) achieve the optimal overhead in the setting where all
+codewords are created from the same ﬁxed set of data symbols.
+A windowed LT code applies an LT code on a moving win-
+dow of transactions, so different codewords may correspond
+to different sets of transactions as the content of the window
+changes. However, as shown in Figure 1, windowing has
+negligible effect on the overhead of the code. The ﬁgure shows
+the overhead for a conventional LT code transmitting a ﬁxed
+block of k transactions and a windowed LT code with window
+size k when using the same degree distribution. Intuitively, at
+any given time, the peeling process for a windowed LT code
+with window size k is similar to the peeling process for a ﬁxed
+set of k transactions. Hence, the number of codewords required
+to successfully decode a window’s worth of transactions in
+a windowed LT code is, on average, the same as the number
+of codewords necessary in a conventional LT code for k (ﬁxed)
+transactions. Though we leave a formal analysis to future
+work, the decoding process of windowed LT codes can be
+
+5
+
+analyzed rigorously using the spatial-coupling technique [25]
+in coding theory. Speciﬁcally, windowed LT codes are the
+limit of spatially-coupled LT codes [4] as the length of the
+encoded data goes to inﬁnity. Theoretical and empirical
+results [4, 25, 26] show that spatially-coupled codes achieve
+equal or lower overhead than their uncoupled counterparts,
+and the results hold for LT codes [4].
+
+4.2 Codeword rate controller
+
+As described in §4.1, nodes do not need to decide which
+transactions to include in a codeword. However, they still
+need to determine how fast they should send codewords to
+each peer. This is critical to the reliability and the efﬁciency
+of the system. The rate should be high enough to ensure quick
+decoding of most transactions, while as low as possible to
+minimize the communication cost.
+
+In Strokkur, nodes target a constant loss rate for the
+codewords they send to each peer. Speciﬁcally, a node tries
+to maintain that each peer decodes (1 − γ)-fraction of its
+codewords within time τ of receiving each codeword. We say
+a loss event occurs when the peer fails to decode a codeword
+in time. We call τ the decoding timeout, and γ the target loss
+rate (0 < γ < 1). Nodes do not target a zero loss rate; trying
+to do so would require sending many redundant codewords
+to guarantee absolutely all transactions can be decoded [37].
+Instead, nodes target a small but non-zero loss rate, and there
+are two reasons. First, sparse loss events are useful signals that
+indicate a node is sending just enough codewords for a peer to
+successfully decode. Second, a low loss rate has only minimal
+impact on a node’s ability to receive transactions (since the
+transactions covered in those codewords are also likely to be
+covered in other codewords). In our implementation (§5), we
+target a loss rate of 2%, and every node consistently receives
+more than 95% of transactions.
+
+To maintain the target loss rate γ, nodes run a multiplicative-
+increase multiplicative-decrease (MIMD) algorithm to control
+the rate they send codewords to each peer. Besides γ and τ, the
+algorithm has a parameter α that controls its aggressiveness.
+Let r be the current rate that a node sends codewords to a
+peer. Every time the node sends a new codeword to the peer,
+it decreases the rate by rαγ. Every time the peer reports a loss
+event (with respect to timeout τ), it increases the rate by rα.
+To see the behavior of this algorithm, consider a short time
+span ∆. The node sends r∆ codewords to the peer, causing the
+controller to decrease the rate by r∆αγ. Meanwhile, let Ploss be
+the current loss rate. During the same period, there are r∆Ploss
+loss events, causing the controller to increase the codeword rate
+by r∆Plossα. After the time span ∆, the codeword rate becomes
+r[1 + ∆α(Ploss − γ)], a multiplicative increase/decrease of
+factor 1+∆α(Ploss −γ). When Ploss > γ, the algorithm causes
+the node to increase the codeword sending rate, making it
+easier for the peer to decode (because it will receive more
+codewords) and thus reducing Ploss. The opposite happens
+when Ploss < γ. Either way, the algorithm drives Ploss to γ, which
+
+is a steady state where the codeword rate changes by a factor
+of 1, i.e., no change. When α is sufﬁciently small (e.g., 0.1 in
+our implementation), the algorithm converges to Ploss = γ.
+
+The MIMD algorithm enforces the target loss rate γ for every
+pair of peers when decoding each other’s codewords. This key
+invariant ensures that nodes send codewords at an appropriate
+rate to each peer regardless of the topology or the transaction
+pattern at different nodes. Intuitively, nodes that receive more
+novel transactions (which peers do not have) will send code-
+words at a higher rate to their peers in order to maintain the
+target loss rate, and the opposite goes for nodes with fewer
+novel transactions. To demonstrate this behavior, let us walk
+through a simple example, where two nodes A, B connect to
+a common peer. A receives unique transactions (from the out-
+side) at 600 tps, and B receives unique transactions at 100 tps.
+In addition, both nodes receive a common ﬂow of transactions
+at 400 tps. A and B both send codewords to the common peer.
+Figure 2 shows the time series of the codeword rates from A, B
+as the control algorithm adjusts them, and the loss rates of their
+respective codewords at the peer. Notice that after the controller
+converges, A sends codewords at a higher rate than B, because
+it has more novel transactions. The loss rates of the codewords
+from both nodes stabilize at 0.02, which is our control target γ.
+Figure 3 shows the transition of the codewords rates as we re-
+run the example with three different initial rate conﬁgurations
+for A and B. Regardless of the initial state, their codeword rates
+converge to the same point. In the same ﬁgure, we plot the infea-
+sible region, which are codeword rates that will cause a higher
+loss rate than γ (for codewords from either A or B). Notice that
+the controller converges right on boundary of the infeasible
+region, indicating that it accurately achieves the target loss rate
+γ. Moreover, it converges at the exact point on the boundary
+where the sum of the codeword rates from A and B is minimized,
+which means the total communication overhead is optimal.
+
+Note that nothing prevents an adversarial node from
+deviating the control algorithm. Speciﬁcally, it may ignore the
+feedback and send at an excessively low or high rate. A low
+rate would not have much affect, since the other (honest) peers
+would compensate by increasing their rates. A high rate can
+waste the peer’s bandwidth. Similar to any denial of service
+attack, we could use standard mechanisms to identify and
+disconnect from such nodes. In fact, the receiver can predict
+the expected sending rate based on its feedback, so it is easy to
+detect outliers. Finally, a malicious node could lie about loss
+events to its peers, causing them to increase their rates. How-
+ever, the effect is bounded, since a node can easily determine
+an upper limit on the codeword rate necessary to decode its
+transactions, assuming the peer only receives from this node.
+
+4.3 Transaction identiﬁers
+
+As mentioned in §4.1, codewords include the identiﬁers of the
+source transactions, so that the peeling algorithm can decide
+whether to peel a transaction off a codeword. Nodes in Strokkur
+use codewords they receive from all their peers to decode
+
+6
+
+Figure 1: Overhead of conventional and
+windowed LT codes for different k. The LT
+encoder uses the Robust Soliton distribution
+with c = 0.03, δ = 0.5. See [29] for deﬁnitions
+of c and δ.
+
+Figure 2: Time series of the codewords rates
+and the loss rates of two nodes A, B sending
+to a common peer. The dashed line shows
+the target loss rate γ = 0.02. The set up is
+described in §4.2.
+
+Figure 3: Transition of the codeword rates
+of two nodes A, B sending to a common
+peer. Each curve corresponds to a different
+initialization of codeword rates. The set up
+is described in §4.2.
+
+transactions. This reduces the communication overhead since
+the decoder can consider information received from all peers
+collectively. However, it requires a consistent way to identify
+transactions across peers, so that a transaction decoded from
+one peer’s codeword can be used to decode a codeword from
+another peer. Speciﬁcally, the decoder needs to compute
+the identiﬁer of a transaction based on the transaction’s data
+(which is consistent across all peers). A crucial challenge
+induced by this approach is that blockchain transactions are
+often rather short (e.g., the smallest Ethereum transaction is
+only 109 bytes, which is also the most prominent size [10]).
+Therefore, using long hashes that ensure collision-free IDs
+(e.g., 32B long for SHA256) incurs relatively high overhead.
+Instead, Strokkur uses a short hash to identify transactions in
+codewords and its decoder handles collisions that may occur.
+Detecting hash collisions. Hash collision affects the decoding
+process by causing the decoder to incorrectly peel a transaction
+off a codeword. Consider three different transactions T1,T2,T3.
+There is a hash collision between T1 and T2, i.e., H(T1) = H(T2).
+Suppose the decoder has previously decoded T1, and now
+receives a new codeword whose source transactions are T2 and
+T3. The decoder sees that H(T1) appears in the header (which
+is actually H(T2), but they are equal), and mistakenly peels
+T1 off the codeword. The header becomes {H(T3)}, so the
+decoder believes that the codeword is now degree-1, and treats
+the payload as a newly-decoded transaction. However, the
+payload is actually T1 +T2 +T3, and is not a valid transaction.
+The example above already hints at a solution: it is highly
+likely that H(T1 +T2 +T3) (cid:54)= H(T3). Before taking the payload
+from a degree-1 codeword, the decoder should compute
+its hash and compare it with the hash in the header. If the
+hashes do not match, the decoder knows that the codeword
+is corrupted, and throws it away. Although a corrupted
+codeword might still pass the check by chance, e.g., when
+H(T1 + T2 + T3) = H(T3), it is simply another case of hash
+collision, and can be handled in the same way. Also, the
+possibility that the resulting invalid transaction causes further
+hash collisions decays exponentially (and can be handled in
+
+the same way as we just described if it does happen).
+
+Minimizing hash collisions. We now have a mechanism
+to detect hash collisions. The decoder discards the affected
+codewords and recovers from collisions at the cost of some
+bandwidth waste. However, hash collisions become more
+frequent as the system runs, because there are more decoded
+transactions to collide with the source transactions in a new
+codeword. As an extreme example, after sufﬁciently long time,
+the decoder will have decoded a transaction for every possible
+hash value. At that point, every new codeword will experience
+hash collision, and the decoder may stall.
+
+Strokkur addresses this problem by having nodes to only use
+the last m transactions they receive to decode the current code-
+word. We call m the size of the peeling window. m controls the
+probability of hash collisions. Speciﬁcally, let h be the length
+of the hashes in bits. Assuming that hashes are uniformly
+distributed, the probability that a new transaction collides with
+an existing transaction in the peeling window is m/2h. Because
+the maximum degree of a codeword is k, the probability
+that a codeword is corrupted due to hash collision is at most
+k·m/2h by union bound. For example, using m = 100000 and
+h = 4 bytes, the upper bound on the corruption probability
+is 0.0023%. Recall that the codeword rate controller already
+targets a non-zero loss rate, e.g., 2% in our implementation.
+The extra loss from corrupted codewords is negligible.
+
+Adversarial hash collisions. We have discussed how the
+decoder mitigates hash collisions when they appear at random,
+i.e., not deliberately introduced by an adversary. However,
+when the hashes are short, an adversarial peer can generate
+collisions. Given a transaction ID (hash image), the attacker
+can enumerate transactions until ﬁnding one that hashes to
+the same ID. Such an adversary could disrupt communication
+in the peer to peer network by broadcasting transactions
+with colliding IDs to legitimate transactions. For example,
+the attacker may attempt to create collisions with Alice’s
+transaction in order to censor it.
+
+The solution is to prevent the adversary from computing the
+
+7
+
+ 1 1.2 1.4 1.6 1.8 2 2.2 0 50 100 150 200 250OverheadkConventionalWindowed 0 500 1000 1500 2000 0 200 400 600 800 10000γ=0.020.10.2Codeword rate (s-1)Loss rateTime (s)Node A CodewordNode B CodewordNode A LossNode B LossNode B codeword rate (s-1)Node A codeword rate (s-1)0100020000100020003000InfeasibleInfeasibleSteady stateSteady statehash function that a node uses, so that it cannot forge hash col-
+lisions to affect the node. Strokkur achieves this by leveraging
+a keyed hash function to set the transaction ID, which depends
+on both the transaction data and a secret key. This design is
+inspired by Short Transaction ID in Bitcoin [8]. A node sends a
+fresh secret key to each of its peers. That peer will then use this
+secret key to compute the transaction IDs in the codewords it
+sends to the node. Whenever the node wants to use a transaction
+it recovers from one peer to decode a codeword from another
+peer, it re-hashes this transaction using the second peer’s key to
+obtain its ID relative to that peer. This technique is also enabled
+by the peeling algorithm, which relies on transactions that are
+already decoded to decode new transactions from codewords.
+Using a keyed hash, the attacker cannot create a transaction
+with a hash ID that collides with another speciﬁc transaction,
+since such collisions are peer-dependent. This prevents the
+adversary from, e.g., censoring a transaction from Alice. It
+ensures that a node that connects to good peers will be able to
+decode that transaction despite being also connected to rogue
+peers.
+
+4.4 Variable-sized transactions
+
+Strokkur nodes generate codewords by computing the bit-wise
+XOR sum of the source transactions. So far, we have assumed
+that transactions are of the same size, so that the sum has the
+same length as each source transaction (operand). However,
+when some transactions are longer than others, the resulting
+bit-wise XOR sum is as long as the largest operand. This
+causes inefﬁciency, because the size of a codeword’s payload
+needs to accommodate the largest source transaction, while
+the codeword may encode many smaller transactions.
+
+Instead, Strokkur fragments large transactions. The key
+challenge is that an adversary may attack the reassembly
+process by sending conﬂicting fragments. To see the potential
+problem, consider a straw man solution where each fragment
+contains a sequence number and an identiﬁer (e.g., hash) of the
+transaction it belongs to. It is impossible for a node to validate
+these two ﬁelds, unless it has received the whole transaction,
+in which case it does not need the fragment anymore. As a
+result, an adversary can create fake fragments for a transaction.
+Although transactions usually contain signatures so their
+integrity is never at risk, fake fragments greatly increase the
+computational cost for reassembling a transaction, because
+nodes must enumerate an exponential number of combinations
+of (authentic and fake) fragments to correctly reassemble it.
+
+In Strokkur, nodes fragment long transactions to ﬁxed-size
+fragments of (cid:96) bytes. To defend against conﬂicting fragments
+from the adversary, each fragment contains the cryptographic
+hash of the previous fragment of the same transaction. The
+hash ensures that there is only one unique preﬁx (ending with
+the fragment identiﬁed by the hash) that this fragment should
+attach to, so that there is no ambiguity during reassembly.
+Each fragment also contains two marker bits that indicate
+whether it is the ﬁrst or the last fragment in the transaction.
+
+Sym. Name
+
+ρ Degree distribution
+
+Coding window size
+
+k
+τ Decoding timeout
+Target loss rate
+γ
+α Aggressiveness
+(cid:96)
+
+Fragment size
+
+In evaluation
+
+Robust Soliton,
+δ = 0.5, c = 0.03
+50
+0.5 ms
+0.02
+0.1
+128 bytes
+
+Def.
+
+§4.1
+
+§4.2
+
+§4.4
+
+Table 1: Main parameters of Strokkur and the values used in the
+evaluation.
+
+The remainder of the (cid:96) bytes include data from the transaction.
+Fragments are broadcast in the system in the same way as
+ﬁxed-size transactions. When a node receives the last fragment
+of a transaction (it can tell by examining the marker bits), it
+starts reassembling by tracing the the hash chain until it ﬁnds
+the ﬁrst fragment (also by examining the marker bits). It then
+concatenates the data in each fragment to form the transaction.
+Here, the fragment size (cid:96) decides the maximum transaction
+size that the system can support without fragmentation, and the
+relative overhead of the hashes (because every (cid:96)-byte fragment
+contains a hash). Finding the optimal (cid:96) given a distribution of
+the transaction size is a simple optimization process, because
+the total size of all fragments of a transaction is determined by (cid:96)
+and the size of the transaction. We expect fragmentation to only
+introduce minimal overhead, because the size of blockchain
+transactions is highly concentrated around one or a few values
+(usually corresponding to the size of simple payments) [9, 10].
+For example, we analyzed historic Bitcoin transaction data [9]
+from Jan 2019 to Feb 2022. In the optimal setting ((cid:96) = 258
+bytes), the fragmentation overhead is only 1.23×, much lower
+compared to the overhead of the base system (1.7× to 2.2×).
+
+5 Evaluation
+Our evaluation will demonstrate:
+• Strokkur achieves a better trade off among latency, overhead,
+
+and robustness than the state of the art. (§5.3)
+
+• Strokkur is resilient to censorship from a strong adver-
+
+sary. (§5.4)
+
+• Strokkur can scale to a large number of nodes while
+
+maintaining its performance. (§5.5)
+
+• The control algorithm in Strokkur adapts to changing
+
+transaction load, and converges quickly. (§5.6)
+
+• Encoding and decoding are computationally efﬁcient, and
+scales to a throughput on the order of 105 tps on commodity
+computers. (§5.7)
+
+5.1 Experimental setup
+
+Implementation and internet testbed. We implement
+Strokkur in 1300 lines of Go. To evaluate its performance
+when running across the internet, we set up a real-world
+testbed on Vultr4 consisting of 19 virtual machines in 19
+different cities around the world. Each virtual machine has 4
+CPU cores and 8GB of RAM, and hosts one node. Each node
+
+4https://www.vultr.com
+
+8
+
+connects to 4 random peers, forming a random regular graph
+of degree 4 and diameter 4.
+Simulator and topologies. Two factors limit the size of our in-
+ternet testbed: (i) the number of datacenter locations that cloud
+vendors offer; (ii) the high cost to operate a large test deploy-
+ment across the internet. To experiment with larger topologies,
+we implement Strokkur as a module for the OMNET++ [39]
+discrete-event simulator in 900 lines of C++. The simulator
+models the network propagation latency between each pair
+of nodes. We experiment with three classes of topologies: (i)
+a replica of the aforementioned testbed, parameterized with
+latency measurements from the real world; (ii) a degree-16
+random regular graph of 250 nodes at 250 cities around the
+world, parameterized with a public data set [36] of latency mea-
+surements across these cities; (iii) graphs of up to 4000 nodes
+with pair-wise latency sampled from a log-normal distribution
+(more details in §5.5). In §5.2, we compare the results from the
+real-world testbed with the simulator using the same topology,
+and demonstrate that the simulator is highly accurate.
+Parameters. See Table 1.
+Workload. To generate workload, nodes create new trans-
+actions in Poisson processes with adjustable rates. Strokkur
+serves as the networking layer for blockchains, orthogonal
+to the blockchain applications running on top. So, we let
+each transaction be a random 128B string to match standard
+blockchain applications [10, 35]. Transactions do not have
+blockchain-speciﬁc semantics such as payments, smart
+contracts, signatures, etc.
+Metrics. For each node in the system, we measure the
+following three metrics:
+• Latency. The average latency of all transactions that the
+node receives. The latency of a transaction is the time from
+its creation to its reception at the node.
+
+• Delivery rate. The number of transactions that the node
+receives, divided by the number of all transactions created
+in the system. It measures how reliably the node can receive
+transactions.
+
+• Overhead. The amount of codeword data that the node
+downloads, divided by the amount of transaction data it
+decodes. It is the relative cost compared to a perfect delivery
+protocol where each bit a node receives translates to a new
+bit of useful transaction data (1 is perfect in this metric).
+A public blockchain usually involves many operators
+(individuals or companies), each operating one or a few
+nodes. In order to beneﬁt all the operators, the transaction
+broadcasting scheme should provide good performance even
+for nodes at the tail. As a result, unless otherwise mentioned,
+we report the 95th-percentile across all nodes for each metric.
+For each datapoint, we collect data over a duration of at least
+100 seconds in simulation or real time.
+5.2 Real-world experiments
+
+We ﬁrst evaluate Strokkur on the real-world testbed. Figure 4
+shows the performance metrics as we vary the arrival rate of
+
+Figure 4: Latency, overhead, and delivery rate when running our
+implementation on the real-world testbed, compared to simulation
+of the same topology. Notice that the curves overlap. Points show the
+average, and error bars show the 5th and the 95th-percentiles across
+all nodes.
+
+Figure 5: The rate that nodes send codewords between each pair of
+peers when running our implementation on the real-world testbed,
+compared to simulation of the same topology. Notice that the curves
+overlap. Bars in the background show the relative difference of the
+simulation compared to the real world.
+
+new transactions from 370 tps to 3500 tps. In all scenarios,
+Strokkur consistently achieves a delivery rate of 95%, a
+latency of 0.5s, and an overhead of 1.8× for every node. (We
+compare with other schemes in §5.3.)
+
+We need simulations to evaluate Strokkur in larger topolo-
+gies. To verify the accuracy of the simulator, we run it with the
+same topology as the testbed, and compare the results with the
+aforementioned real-world experiments. Figure 4 shows that
+for all datapoints, results from simulations are within 1.5% of
+that from the real-world testbed. To further demonstrate the
+accuracy of the simulator, Figure 5 shows a comparison of the
+rates that each node sends codewords to peers in the simulation
+and on the testbed. These rates are determined by the control
+algorithm (§4.2), and reﬂect the operating state of each indi-
+vidual node in detail. For almost all pairs of peers (one sending
+codewords and the other receiving), the codeword rate in the
+simulation is within 3% of that in the real-world experiment.
+These comparison show that the simulator provides reliable
+results by accurately modelling the operation of each individ-
+ual node. From now on, we move to the simulator to explore
+larger topologies. We will come back to the real-world imple-
+mentation in §5.7 to evaluate its computational efﬁciency.
+
+5.3 Performance comparison
+
+In this experiment, we compare the latency and the overhead
+of Strokkur with other schemes. We use the 250-city topology.
+Each node generates transactions at 10 tps, resulting in a total
+throughput of 2500 tps.
+
+Schemes compared. We compare Strokkur with three
+
+9
+
+ 0 1 2020004000Latency (s)Transaction rate (s-1) 0 1 2020004000OverheadTransaction rate (s-1)Real-worldSimulation 0 0.5 1020004000Delivery rateTransaction rate (s-1) 400 600 800 1000-1-0.5 0 0.5 1Codeword rate (s-1)Rel. differencePair of peersRel. diff.Real-worldSimulationtechnique works well when all nodes are honest and follow the
+protocol. Shrec achieves a latency of 0.47 seconds and an over-
+head of 1.25 in this scenario, using 27% less bandwidth than
+Strokkur. However, its performance relies on correct behavior
+of all nodes while blockchains networks with adversarial
+nodes. A malicious or malfunctioning node may not respond
+to transaction requests preventing them from concluding.
+
+Shrec does not specify a solution, and applications rely on
+heuristics to mitigate this issue. In its real-world deployment in
+the Conﬂux [27] blockchain, there is a timeout for transaction
+requests [12]. If a request does not ﬁnish within the timeout, the
+requesting node retries with another neighbor. This timeout re-
+quires careful tuning. If set too high, a failed request can signiﬁ-
+cantly delay a transaction. If set too low, a node may spuriously
+retry a request and receive duplicated responses, increasing
+the overhead. In Figure 7, we compare Strokkur and Shrec
+when a fraction of nodes are adversarial. Adversarial nodes
+do not send any codewords in Strokkur, and do not respond to
+any requests in Shrec. We try two timeout settings for Shrec: a
+value ﬁne-tuned for our topology, and the value used in produc-
+tion [12]. For the ﬁne-tuned setting, we use the smallest timeout
+that ensures no node receives spurious transactions. This is an
+ideal setting that minimizes the latency. As the fraction of ad-
+versarial nodes increases, Shrec experiences higher latency, up
+to 3 seconds when 50% of nodes are adversarial. We point out
+that such ﬁne tuning is only possible in our experiments where
+the delay on each link is ﬁxed, and the adversary does not try to
+attack the tuning process itself. In a real-world deployment, tun-
+ing is less practical. In practice, Conﬂux sets the timeout to 30
+seconds [12]. Under this setting, the latency of Shrec increases
+to 7 seconds at only 4% of adversarial nodes, and goes up to 136
+seconds at 50% adversarial nodes. In comparison, the latency
+of Strokkur stays stable at 0.76 seconds across all scenarios.
+
+Pull vs. push-based mechanisms. At a high level, we
+evaluated two types of schemes in this subsection: pull-based,
+and push-based. In a pull-based scheme such as Bitcoin and
+Shrec, nodes ﬁrst receive the hashes of transactions, and need
+to explicitly request for full transactions. It takes at least
+three single trips for a transaction to travel across a link. The
+vertical dashed line in Figure 6 illustrates this lower bound
+for the latency for such pull-based schemes. Bitcoin achieves
+it when the max jitter is set to 0, but incurs a high overhead
+of 12.59. Shrec achieves it only when all nodes are honest. In
+comparison, push-based schemes such as transaction ﬂooding
+and Strokkur achieve a lower latency, because nodes receive
+transaction data without sending any request.
+
+5.4 Censorship resilience
+
+In this experiment, we consider adversarial censoring of
+transactions. The topology and the workload is the same as the
+previous experiment. However, an adversary controls some
+nodes in the network, and attempts to prevent honest nodes
+from receiving certain transactions by not including them in
+the codewords they send. To determine how resilient Strokkur
+
+Figure 6: Latency and overhead when all node are honest. Curves for
+Strokkur and Bitcoin show possible trade-offs. For Strokkur, we ad-
+just the coding window size k and the decoding timeout τ. For Bitcoin,
+we adjust the max random jitter that nodes inject before forwarding
+the hash of a new transaction to peers. Dashed line shows the lowest
+latency that pull-based mechanisms (Bitcoin, Shrec) can achieve.
+
+schemes: Bitcoin, Shrec, and transaction ﬂooding. Transaction
+ﬂooding is a simple scheme where nodes forward each new
+transaction to all peers. Bitcoin and Shrec are based on hash
+ﬂooding, where nodes forward the hashes of newly-received
+transaction to peers, and explicitly request for unknown
+transactions from peers. Speciﬁcally, Bitcoin nodes inject a
+random jitter before forwarding the hash of a new transaction.
+Shrec, the state of the art scheme, enforces that each node only
+sends one request for each unknown transaction (hash). We
+describe these schemes in more detail in §2.1.
+
+Transaction ﬂooding. Transaction ﬂooding is a simple
+scheme where nodes forward transactions it receives for the
+ﬁrst time to all neighbors. It achieves the lowest-possible
+latency among all schemes, because every transaction propa-
+gates as in a breadth-ﬁrst search, and reaches each node along
+the shortest path possible. However, it incurs a high overhead
+of 16.0 because it makes no effort to avoid sending duplicated
+transactions. In comparison, Strokkur can achieve 2× latency
+while consuming 7× less bandwidth, as shown in Figure 6.
+
+Bitcoin. Both Strokkur and Bitcoin provide a trade off between
+overhead and latency. For Strokkur, we adjust the max code-
+word degree of the LT code between 10 and 100. A larger max
+degree reduces the overhead of the LT code [6], but incurs a
+higher coding delay because transactions have to wait longer in
+the coding window before being selected into a codeword. For
+Bitcoin, we adjust the max random jitter before a node forwards
+the hash of a transaction to its neighbors. A larger max jitter
+spreads the hashes of a transaction across a wider timespan, so
+that a node is less likely to send duplicated requests for the same
+transaction, but it increases the latency. As Figure 6 shows,
+Strokkur consumes 2× less bandwidth than Bitcoin when both
+schemes achieve a latency of 1.5 seconds. As we push for a
+lower latency, the gap of the overhead between Bitcoin and
+Strokkur increases, up to 7.6× at a latency of 0.47 seconds.
+
+Shrec. Shrec nodes track the set of in-ﬂight requests, and avoid
+sending duplicated requests for the same transaction. This
+
+10
+
+ 0 2 4 6 8 10 12 14 16 18 0 0.5 1 1.5 2 2.5Latency lower bound forpull-based mechanismsOverheadLatency (s)StrokkurBitcoinShrecFloodingFigure 7: Latency of Strokkur and Shrec when a variable fraction
+of nodes are adversarial. Shrec (ideal) uses parameters tuned for the
+particular topology in this experiment. Such tuning is not practical
+for a real-world deployment. Shrec (production) uses the same
+parameters [12] as in the Conﬂux [27] blockchain.
+
+Figure 8: Delivery rate and latency of censored transactions, when
+the adversary controls a fraction of nodes and censors a variable
+fraction of transactions.
+
+Figure 9: Delivery rate and latency of censored transactions, when the
+adversary sets up attacker nodes with zero-delay connections to each
+of the honest nodes, and censors a variable fraction of transactions.
+
+is against such attacks, we measure the latency and the delivery
+rate of the censored transactions, i.e. the probability that an
+honest node can receive a censored transaction. We consider
+two types of adversaries, positioning their adversarial nodes
+differently relative to the honest nodes.
+
+A distributed adversary controls a random subset of nodes
+in the network. Figure 8 shows the results of censorship for
+different portions of adversarial nodes in the network. When
+the adversary controls 20% of the nodes, censored transactions
+have a delivery rate of 95% and a latency of 0.83 second.
+Even a powerful adversary that controls 50% of the nodes
+can only reduce the delivery rate to 83.7%. Furthermore, the
+effectiveness of the attack depends on how many transactions
+the adversary tries to censor. To achieve the effectiveness we
+just described, the adversary cannot censor more than 0.1%
+of the transactions. As this fraction increases, the effectiveness
+
+11
+
+Figure 10: Latency, overhead, and delivery rate in synthetic random
+regular topologies of degrees 16 and 32, and up to 4000 nodes.
+
+goes down. This is because the codeword rate controller on
+each honest node will (independently) notice that adversarial
+codewords have a lower loss rate (because they do not contain
+as many novel transactions—some of them are censored), and
+thus decrease their sending rates. Meanwhile, it will detect
+that the loss rate of honest codewords are higher (because they
+contain censored transactions), and increase the sending rates
+accordingly. For example, a 20% adversary censoring 20%
+of transactions succeeds with a probability of only 1.3%, and
+increases the latency by only 0.02 seconds.
+
+Next, we consider an even more powerful type of adversary,
+that sets up attacker nodes that connect to all honest nodes
+with zero latency. Such an adversary does not exist in the real
+world unless all honest nodes are co-located, but it serves as a
+worst-case scenario for evaluation. Figure 9 shows the delivery
+rate under such an attack. When there is one attacker node that
+connects to all honest nodes, censored transactions have a de-
+livery rate of 95% and a latency of 0.90 seconds. An adversary
+controlling three attacker nodes can reduce the delivery rate
+to 90%. Similar to the previous type of adversary, this attack
+becomes less effective as the adversary tries to censor more
+transactions. In conclusion, both types of adversary cannot
+signiﬁcantly affect the delivery rate and the latency of censored
+transactions, proving that Strokkur is resilient to censorship.
+
+5.5 Scalability
+
+To demonstrate that Strokkur retains its performance and
+efﬁciency in larger networks, we generate random regular
+graphs of 250, 1000, 4000 nodes with degrees 16 and 32. We
+sample the propagation delay (in milliseconds) of each link
+from a log-normal distribution with parameters µ = ln(70) and
+σ = 0.5. This distribution has a median of 70 and a standard
+deviation of 42.27, closely matching the median latency of
+69.98 ms and the standard deviation of 45.56 ms of the 250-city
+data set that we use for the other experiments. To ensure the
+simulations ﬁnish in reasonable time, we reduce the total trans-
+action generation rate to 400 tps, and set the codeword timeout
+to 1 second. To show Strokkur scales gracefully without any
+tuning, we ﬁx all system parameters as we change topologies.
+Figure 10 shows the results. As we increase the number of
+nodes from 250 to 4000, the latency goes up by 0.5s, because
+transactions have to travel across more links, experiencing
+more propagation delay and coding delay. The increased
+latency implies that nodes have to wait longer to receive
+
+01234 0 0.1 0.2 0.3 0.4 0.5Latency (s)Aversarial fractionStrokkurShrec (ideal)050100150 0 0.1 0.2 0.3 0.4 0.5Aversarial fractionShrec (production) 0 0.2 0.4 0.6 0.8 1 0 0.2 0.4 0.6 0.8 1Delivery rateof censoredFraction censored20% Adversarial50% Adversarial 0 0.5 1 1.5 2 0 0.2 0.4 0.6 0.8 1Latency (s)of censoredFraction censoredNo censorship 0 0.2 0.4 0.6 0.8 1 0 0.2 0.4 0.6 0.8 1Delivery rateof censoredFraction censored1 Attacker3 Attackers 0 0.5 1 1.5 2 0 0.2 0.4 0.6 0.8 1Latency (s)of censoredFraction censoredNo censorship 0 1 2 325010004000Latency (s)Nodes 0 1 225010004000OverheadNodesDegree=16Degree=32 0 0.5 125010004000Delivery rateNodesof 97%, an overhead of 1.37, and a latency of 0.75 seconds,
+similar to the performance when the load stays constant.
+
+5.7 Computational cost
+
+Finally, we benchmark our implementation to show that
+encoding and decoding are computationally efﬁcient, and can
+support high transaction throughputs. We use a 2018-model
+MacBook Pro with an Intel Core i7-8559U CPU and 16 GB of
+RAM. We set the coding window size k to 50, and use the same
+settings for the other parameters as in previous experiments.
+We limit the node to only use one CPU core in the benchmarks.
+
+Encoding. We create and insert 50 random transactions into
+the coding window of a node, and measure the time for it to gen-
+erate 800,000 codewords. The node can generate codewords
+at a throughput of 786.16 Mbps using only one CPU core.
+
+Decoding. We generate 800,000 random transactions, and
+encode them using the windowed LT code to obtain a stream
+of 1,080,000 codewords (1.35 codewords per transaction on
+average). We then feed the steam of codewords into a node,
+and measure the time for it to decode the codewords. The node
+can decode codewords at 895.2 Mbps, recovering transactions
+at 663.28 Mbps or 647,668 tps.
+
+These results show that Strokkur is computationally
+efﬁcient, and can support a throughput on the order of 105 tps
+using only one CPU core. In comparison, future blockchains
+are likely to experience other bottlenecks such as verifying
+cryptographic signatures over transactions and executing
+transactions before Strokkur’s computational cost becomes
+the bottleneck. For example, a deployed implementation of
+the Ethereum transaction logic is computationally-bounded
+at 10,000 tps when executing simple payments [40]; a highly-
+optimized implementation of the Bitcoin transaction logic
+is IO-bounded at 80,000 tps [41]. As we have demonstrated,
+Strokkur can support such a throughput using less than one
+CPU core on a commodity laptop.
+
+6 Conclusion
+
+We presented Strokkur, a new approach for broadcasting trans-
+actions in a blockchain’s peer to peer network based on coding.
+We realize coding in an adversarial network by extending the
+LT code to support a continuous stream of transactions. We
+designed an effective control algorithm that allows nodes to
+exchange codewords at the optimal rate that minimizes the
+communication cost and maintains a low latency. Through
+evaluation on a prototype implementation and simulations, we
+showed that Strokkur quickly adapts codeword transmission
+rates across peers to the transaction rates to minimize loss,
+resists adversarial nodes trying to degrade performance or
+censor transactions, scales well to large networks, and has low
+computational costs. These properties make Strokkur suitable
+for high performance blockchain networks. The design is
+useful as a generic scheme to broadcast short messages in an
+adversarial network with low overhead and low latency.
+
+Figure 11: Time series of transaction and codeword reception at a
+node, and transaction generation of the entire network.
+
+enough transactions and decode a codeword. Meanwhile,
+recall that we do not attempt to tune the codeword timeout in
+this experiment, so more codewords fail to meet the decoding
+timeout, and cause the peers to increase the codeword rate.
+As a result, the overhead stays stable at 1.54 with 250 and
+1000 nodes, then slightly increases to 1.58 with 4000 nodes.
+Increasing the codeword timeout to 2 seconds brings the
+overhead down to 1.55, but we do not think such ﬁne tuning is
+worthwhile in most use cases. Finally, the transaction delivery
+rate stays stable at 98% across all topologies.
+
+Increasing the degree of the topology has long been pro-
+posed in the literature [3, 32] to mitigate the eclipse attack [21],
+where the adversary controls all neighbors of a node to cut it
+from the network. On the other hand, it is known to cause higher
+overhead for many schemes since there are more potential
+neighbors to send duplicated transactions to a node. Strokkur
+does not suffer from this issue. Results show that increasing the
+degree from 16 to 32 does not affect the overhead or the deliv-
+ery rate, and reduces the latency because of the smaller network
+diameter. This is because the codeword rate controller ensures
+that nodes send codewords to each peer at the lowest rate that
+achieves the target loss rate, so that the system can always
+achieve the overhead of the underlying windowed LT code.
+
+5.6 Convergence
+
+In this experiment, we show that the control algorithm in
+Strokkur quickly converges when the load changes. We start
+the system with a transaction throughput of 1250 tps, increase
+the throughput to 2000 tps in three equal steps, and then reduce
+the throughput to 1250 tps in three steps. Figure 11 shows
+the trace of the experiment. When the throughput suddenly
+increases, more codewords begin to time out because there are
+not enough of them to accommodate the higher throughput.
+The timeout events trigger the controller to quickly ramp up
+the codeword sending rate, and the system converges within 10
+seconds. When the throughput decreases, there are more code-
+words than needed for successful decoding. The controller sees
+fewer codeword timeouts than targeted, and reduces the code-
+word sending rate. Ramping down is slower than ramping up,
+because the controller decreases the codeword rate less aggres-
+sively than it does increase to avoid a catastrophic overshoot.
+Still, it takes only 100s for the network of 250 nodes to converge.
+Over the entire experiment, the system achieves a delivery rate
+
+12
+
+ 1000 1500 2000 2500 3000 0 100 200 300 400 500 600 700Rate (s-1)Time (s)Transaction generatedTransaction receivedCodeword receivedReferences
+[1] Amazon
+
+ec2
+
+on-demand
+https://aws.amazon.com/ec2/pricing/on-
+demand/#DataTransfer. Accessed: 2022-04-20.
+
+pricing.
+
+[11] Supratim Deb, Muriel Médard, and Clifford Choute.
+Algebraic gossip: a network coding approach to optimal
+multiple rumor mongering. IEEE Trans. Inf. Theory,
+52(6):2486–2507, 2006.
+
+[2] Rudolf Ahlswede, Ning Cai, Shuo-Yen Robert Li, and
+Raymond W. Yeung. Network information ﬂow. IEEE
+Trans. Inf. Theory, 46(4):1204–1216, 2000.
+
+[3] Maria Apostolaki, Aviv Zohar, and Laurent Vanbever.
+Hijacking bitcoin: Routing attacks on cryptocurrencies.
+In 2017 IEEE Symposium on Security and Privacy,
+SP 2017, San Jose, CA, USA, May 22-26, 2017, pages
+375–392. IEEE Computer Society, 2017.
+
+[4] Vahid Aref and Rüdiger L. Urbanke. Universal rateless
+codes from coupled LT codes. In 2011 IEEE Information
+Theory Workshop, ITW 2011, Paraty, Brazil, October
+16-20, 2011, pages 277–281, 2011.
+
+[5] Jean-Philippe Aumasson and Daniel J. Bernstein.
+Siphash: A fast short-input PRF. In Progress in Cryptol-
+ogy - INDOCRYPT 2012, 13th International Conference
+on Cryptology in India, Kolkata, India, December 9-12,
+2012. Proceedings, volume 7668 of Lecture Notes in
+Computer Science, pages 489–508. Springer, 2012.
+
+[6] Elizabeth A. Bodine and Michael K. Cheng. Charac-
+terization of luby transform codes with small message
+size for low-latency decoding. In Proceedings of IEEE
+International Conference on Communications, ICC
+2008, Beijing, China, 19-23 May 2008, pages 1195–1199.
+IEEE, 2008.
+
+[7] Miguel Castro, Peter Druschel, Anne-Marie Kermarrec,
+Animesh Nandi, Antony I. T. Rowstron, and Atul Singh.
+Splitstream: high-bandwidth multicast in cooperative
+environments. In Michael L. Scott and Larry L. Peterson,
+editors, Proceedings of the 19th ACM Symposium on
+Operating Systems Principles 2003, SOSP 2003, Bolton
+Landing, NY, USA, October 19-22, 2003, pages 298–313.
+ACM, 2003.
+
+[8] Matt Corallo.
+
+Compact
+
+block
+
+relay.
+
+https://github.com/bitcoin/bips/blob/master/bip-
+0152.mediawiki, 2016. Accessed: 2022-01-17.
+
+[9] Allen Day and Colin Bookman.
+
+Bitcoin in
+BigQuery: blockchain analytics on public data.
+https://cloud.google.com/blog/topics/public-
+datasets/bitcoin-in-bigquery-blockchain-analytics-
+on-public-data, 2018. Accessed: 2022-04-20.
+
+[10] Allen Day and Evgeny Medvedev.
+
+Ethereum
+in BigQuery: a public dataset for smart contract
+analytics. https://cloud.google.com/blog/products/data-
+analytics/ethereum-bigquery-public-dataset-smart-
+contract-analytics, 2018. Accessed: 2022-04-20.
+
+[12] Conﬂux
+
+Developer.
+
+conﬂux-rust.
+
+https://github.com/Conﬂux-Chain/conﬂux-
+rust/blob/master/run/hydra.toml, 2022.
+2022-04-20.
+
+Accessed:
+
+[13] Sameh El-Ansary, Luc Onana Alima, Per Brand, and Seif
+Haridi. Efﬁcient broadcast in structured P2P networks. In
+Peer-to-Peer Systems II, Second International Workshop,
+IPTPS 2003, Berkeley, CA, USA, February 21-22,2003,
+Revised Papers, volume 2735 of Lecture Notes in
+Computer Science, pages 304–314. Springer, 2003.
+
+[14] David Eppstein, Michael T. Goodrich, Frank C. Uyeda,
+and George Varghese. What’s the difference?: efﬁcient
+set reconciliation without prior context. In Proceedings
+of the ACM SIGCOMM 2011 Conference on Appli-
+cations, Technologies, Architectures, and Protocols
+for Computer Communications, Toronto, ON, Canada,
+August 15-19, 2011, pages 218–229. ACM, 2011.
+
+[15] Christina Fragouli, Jean-Yves Le Boudec, and Jörg
+Widmer. Network coding: an instant primer. ACM SIG-
+COMM Computer Communication Review, 36(1):63–68,
+2006.
+
+[16] Yossi Gilad, Rotem Hemo, Silvio Micali, Georgios
+Vlachos, and Nickolai Zeldovich. Algorand: Scaling
+In Pro-
+byzantine agreements for cryptocurrencies.
+ceedings of the 26th Symposium on Operating Systems
+Principles, Shanghai, China, October 28-31, 2017,
+pages 51–68. ACM, 2017.
+
+[17] Christos Gkantsidis, John Miller, and Pablo Rodriguez.
+Comprehensive view of a live network coding p2p system.
+In Proceedings of the 6th ACM SIGCOMM conference
+on Internet measurement, pages 177–188, 2006.
+
+[18] Christos Gkantsidis and Pablo Rodriguez. Cooperative
+security for network coding ﬁle distribution.
+In
+INFOCOM 2006. 25th IEEE International Conference
+on Computer Communications, Joint Conference of the
+IEEE Computer and Communications Societies, 23-29
+April 2006, Barcelona, Catalunya, Spain. IEEE, 2006.
+
+[19] Christos Gkantsidis and Pablo Rodriguez Rodriguez.
+Network coding for large scale content distribution. In
+Proceedings IEEE 24th Annual Joint Conference of
+the IEEE Computer and Communications Societies.,
+volume 4, pages 2235–2245. IEEE, 2005.
+
+[20] Yilin Han, Chenxing Li, Peilun Li, Ming Wu, Dong Zhou,
+and Fan Long. Shrec: bandwidth-efﬁcient transaction
+
+13
+
+relay in high-throughput blockchain systems. In SoCC
+’20: ACM Symposium on Cloud Computing, Virtual Event,
+USA, October 19-21, 2020, pages 238–252. ACM, 2020.
+
+[21] Ethan Heilman, Alison Kendler, Aviv Zohar, and Sharon
+Goldberg. Eclipse attacks on bitcoin’s peer-to-peer
+network. In 24th USENIX Security Symposium, USENIX
+Security 15, Washington, D.C., USA, August 12-14, 2015,
+pages 129–144. USENIX Association, 2015.
+
+[22] Tracey Ho, Muriel Médard, Ralf Koetter, David R.
+Karger, Michelle Effros, Jun Shi, and Ben Leong. A
+random linear network coding approach to multicast.
+IEEE Trans. Inf. Theory, 52(10):4413–4430, 2006.
+
+[23] Sachin Katti, Hariharan Rahul, Wenjun Hu, Dina Katabi,
+Muriel Médard, and Jon Crowcroft. Xors in the air:
+Practical wireless network coding. In Proceedings of the
+2006 conference on Applications, technologies, archi-
+tectures, and protocols for computer communications,
+pages 243–254, 2006.
+
+[24] Seoung Kyun Kim, Zane Ma, Siddharth Murali, Joshua
+Mason, Andrew Miller, and Michael Bailey. Measuring
+ethereum network peers. In Proceedings of the Internet
+Measurement Conference 2018, IMC 2018, Boston, MA,
+USA, October 31 - November 02, 2018, pages 91–104.
+ACM, 2018.
+
+[25] Shrinivas Kudekar, Thomas J. Richardson, and Rüdiger L.
+Urbanke. Threshold saturation via spatial coupling: Why
+convolutional LDPC ensembles perform so well over the
+BEC. IEEE Trans. Inf. Theory, 57(2):803–834, 2011.
+
+[26] Shrinivas Kudekar, Tom Richardson, and Rüdiger L.
+Spatially coupled ensembles universally
+Urbanke.
+achieve capacity under belief propagation. IEEE Trans.
+Inf. Theory, 59(12):7761–7813, 2013.
+
+[27] Chenxing Li, Peilun Li, Dong Zhou, Zhe Yang, Ming Wu,
+Guang Yang, Wei Xu, Fan Long, and Andrew Chi-Chih
+Yao. A decentralized blockchain with high throughput
+In 2020 USENIX Annual
+and fast conﬁrmation.
+Technical Conference, USENIX ATC 2020, July 15-17,
+2020, pages 515–528. USENIX Association, 2020.
+
+[28] Thomas Locher, David Mysicka, Stefan Schmid, and
+Roger Wattenhofer. Poisoning the kad network. In Dis-
+tributed Computing and Networking, 11th International
+Conference, ICDCN 2010, Kolkata, India, January 3-6,
+2010. Proceedings, volume 5935 of Lecture Notes in
+Computer Science, pages 195–206. Springer, 2010.
+
+[29] Michael Luby. LT codes.
+
+In 43rd Symposium on
+Foundations of Computer Science (FOCS 2002), 16-19
+November 2002, Vancouver, BC, Canada, Proceedings,
+page 271. IEEE Computer Society, 2002.
+
+[30] Enrico Magli, Mea Wang, Pascal Frossard, and Athina
+Network coding meets multime-
+IEEE Transactions on Multimedia,
+
+Markopoulou.
+dia: A review.
+15(5):1195–1212, 2013.
+
+[31] Satoshi Nakamoto. Bitcoin: A peer-to-peer electronic
+https://bitcoin.org/bitcoin.pdf, 2008.
+
+cash system.
+Accessed: 2022-04-20.
+
+[32] Gleb Naumenko, Gregory Maxwell, Pieter Wuille,
+Alexandra Fedorova, and Ivan Beschastnikh. Erlay:
+Efﬁcient transaction relay for bitcoin. In Proceedings
+of the 2019 ACM SIGSAC Conference on Computer
+and Communications Security, CCS 2019, London, UK,
+November 11-15, 2019, pages 817–831. ACM, 2019.
+
+[33] A. Pinar Ozisik, Gavin Andresen, Brian Neil Levine,
+Darren Tapp, George Bissias, and Sunny Katkuri.
+Graphene: efﬁcient interactive set reconciliation applied
+In Proceedings of the
+to blockchain propagation.
+ACM Special Interest Group on Data Communication,
+SIGCOMM 2019, Beijing, China, August 19-23, 2019,
+pages 303–317. ACM, 2019.
+
+[34] Venkata N. Padmanabhan and Kunwadee Sripanid-
+kulchai. The case for cooperative networking. In Peter
+Druschel, M. Frans Kaashoek, and Antony I. T. Row-
+stron, editors, Peer-to-Peer Systems, First International
+Workshop, IPTPS 2002, Cambridge, MA, USA, March
+7-8, 2002, Revised Papers, volume 2429 of Lecture Notes
+in Computer Science, pages 178–190. Springer, 2002.
+
+[35] Algorand Developer Portal.
+
+Transaction refer-
+ence.
+https://developer.algorand.org/docs/get-
+details/transactions/transactions/#payment-transaction,
+2022. Accessed: 2022-02-01.
+
+[36] Paul Reinheimer. A day in the life of the Internet.
+https://wonderproxy.com/blog/a-day-in-the-life-of-the-
+internet/, 2020. Accessed: 2022-01-26.
+
+[37] Amin Shokrollahi. Raptor codes.
+Theory, 52(6):2551–2567, 2006.
+
+IEEE Trans. Inf.
+
+[38] Shih-Hao Tseng, Saksham Agarwal, Rachit Agarwal,
+{CodedBulk}:{Inter-
+Hitesh Ballani, and Ao Tang.
+Datacenter} bulk transfers using network coding.
+In
+18th USENIX Symposium on Networked Systems Design
+and Implementation (NSDI 21), pages 15–28, 2021.
+
+[39] András Varga. Omnet++.
+
+In Klaus Wehrle, Mesut
+Günes, and James Gross, editors, Modeling and Tools
+for Network Simulation, pages 35–59. Springer, 2010.
+
+[40] Gerui Wang, Shuo Wang, Vivek Kumar Bagaria, David
+Tse, and Pramod Viswanath. Prism removes consensus
+bottleneck for smart contracts. In Crypto Valley Confer-
+ence on Blockchain Technology, CVCBT 2020, Rotkreuz,
+Switzerland, June 11-12, 2020, pages 68–77. IEEE, 2020.
+
+14
+
+[41] Lei Yang, Vivek Kumar Bagaria, Gerui Wang, Moham-
+mad Alizadeh, David Tse, Giulia C. Fanti, and Pramod
+Viswanath. Prism: Scaling bitcoin by 10, 000x. CoRR,
+abs/1909.11261, 2019.
+
+[42] Min Yang and Yuanyuan Yang. Peer-to-peer ﬁle sharing
+based on network coding. In 2008 The 28th International
+Conference on Distributed Computing Systems, pages
+168–175. IEEE, 2008.
+
+15
+
+
