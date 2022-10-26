@@ -1,0 +1,1584 @@
+7
+1
+0
+2
+
+n
+u
+J
+
+1
+1
+
+]
+
+G
+L
+.
+s
+c
+[
+
+1
+v
+2
+9
+2
+3
+0
+.
+6
+0
+7
+1
+:
+v
+i
+X
+r
+a
+
+Poseidon: An Efﬁcient Communication Architecture for Distributed Deep
+Learning on GPU Clusters
+
+Hao Zhang1,2, Zeyu Zheng2, Shizhen Xu1, Wei Dai1,2, Qirong Ho2, Xiaodan Liang1,
+Zhiting Hu1,2, Jinliang Wei1, Pengtao Xie1,2, Eric P. Xing2
+Carnegie Mellon University1, Petuum Inc.2
+
+Abstract
+
+Deep learning models can take weeks to train on a single
+GPU-equipped machine, necessitating scaling out DL
+training to a GPU-cluster. However, current distributed
+DL implementations can scale poorly due to substantial
+parameter synchronization over the network, because the
+high throughput of GPUs allows more data batches to be
+processed per unit time than CPUs, leading to more fre-
+quent network synchronization. We present Poseidon, an
+efﬁcient communication architecture for distributed DL
+on GPUs. Poseidon exploits the layered model structures
+in DL programs to overlap communication and compu-
+tation, reducing bursty network communication. More-
+over, Poseidon uses a hybrid communication scheme that
+optimizes the number of bytes required to synchronize
+each layer, according to layer properties and the num-
+ber of machines. We show that Poseidon is applicable
+to different DL frameworks by plugging Poseidon into
+Caffe and TensorFlow. We show that Poseidon enables
+Caffe and TensorFlow to achieve 15.5x speed-up on
+16 single-GPU machines, even with limited bandwidth
+(10GbE) and the challenging VGG19-22K network for
+image classiﬁcation. Moreover, Poseidon-enabled Ten-
+sorFlow achieves 31.5x speed-up with 32 single-GPU
+machines on Inception-V3, a 50% improvement over the
+open-source TensorFlow (20x speed-up).
+
+1
+
+Introduction
+
+Deep learning (DL) is a class of machine learning (ML)
+approaches that has achieved notable success across
+including speech recogni-
+a wide spectrum of tasks,
+tion [10], visual recognition [34, 35] and language un-
+derstanding [21, 20]. These DL models exhibit a high
+degree of model complexity, with many parameters in
+deeply layered structures that usually take days to weeks
+to train on a GPU-equipped machine. The high compu-
+tational cost of DL programs on large-scale data neces-
+sitates the training on distributed GPU cluster in order to
+
+keep the training time acceptable.
+
+DL software such as TensorFlow [1] and Caffe [14]
+allow practitioners to easily experiment with DL models
+on a single machine. However, their distributed imple-
+mentations can scale poorly for larger models. For exam-
+ple, we ﬁnd that on the VGG19-22K network (229M pa-
+rameters), open-source TensorFlow on 32 machines can
+be slower than single machine (Section 5.1). This obser-
+vation underlines the challenge of scaling DL on GPU
+clusters: the high computational throughput of GPUs al-
+lows more data batches to be processed per minute (than
+CPUs), leading to more frequent network synchroniza-
+tion that grows with the number of machines. Exist-
+ing communication strategies, such as parameter servers
+(PS) for ML [31, 19], can be overwhelmed by the high
+volume of communication [7]. Moreover, despite the
+increasing availability of faster network interfaces such
+as Inﬁniband or 40GbE Ethernet, GPUs have continued
+to grow rapidly in computational power, and continued
+to produce parameter updates faster than can be naively
+synchronized over the network. For instance, on a 16-
+machine cluster with 40GbE Ethernet and one Titan X
+GPU per machine, updates from the VGG19-22K model
+will bottleneck the network, so that only an 8x speedup
+over a single machine is achieved (Section 5.1).
+
+These scalability limitations in distributed DL stem
+from at least two causes:
+(1) the gradient updates to
+be communicated are very large matrices, which quickly
+saturate network bandwidth; (2) the iterative nature of
+DL algorithms causes the updates to be transmitted in
+bursts (at the end of an iteration or batch of data), with
+signiﬁcant periods of low network usage in between. We
+propose that a solution to these two problems should ex-
+ploit the structure of DL algorithms on two levels: on one
+hand, it should identify ways in which the matrix updates
+can be separated from each other, and then schedule them
+in a way that avoids bursty network trafﬁc. On the other
+hand, the solution should also exploit the structure of the
+matrix updates themselves, and wherever possible, re-
+
+ 
+ 
+ 
+ 
+ 
+ 
+duce their size and thus the overall load on the network.
+For such a solution to be relevant to practitioners (who
+may have strong preferences for particular frameworks),
+we would prefer not to exploit speciﬁc traits of Tensor-
+Flow’s or Caffe’s design, but should strive to be relevant
+to as many existing frameworks as possible.
+
+With this motivation, we design Poseidon, an efﬁ-
+cient communication architecture for data-parallel DL
+on distributed GPUs. Poseidon exploits the sequential
+layer-by-layer structure in DL programs, ﬁnding inde-
+pendent GPU computation operations and network com-
+munication operations in the training algorithm, so that
+they can be scheduled together to reduce bursty network
+communication. Moreover, Poseidon implements a hy-
+brid communication scheme that accounts for each DL
+program layer’s mathematical properties as well as the
+cluster conﬁguration, in order to compute the network
+cost of different communication methods, and select the
+cheapest one – currently, Poseidon implements and sup-
+ports a parameter server scheme [31] that is well-suited
+to small matrices, and a sufﬁcient factor broadcasting
+scheme [32] that performs well on large matrices. We
+focus on synchronous parallel training which is shown
+to yield faster convergence compared with asynchronous
+training in distributed DL (as measured by wall clock
+time) on GPUs [7, 2]. Unless otherwise speciﬁed, our
+discussion in this paper assumes synchronous replica-
+tion of model parameters in each training iteration, al-
+though we note that Poseidon’s design can easily be ap-
+plied to asynchronous or bounded-asynchronous consis-
+tency models [12, 8].
+
+To demonstrate Poseidon’s applicability to multiple
+DL frameworks, we implement it into two different
+DL frameworks: Caffe and TensorFlow, and show that
+Poseidon allows them to scale almost-linearly in algo-
+rithm throughput with additional machines, while incur-
+ring little additional overhead even in the single ma-
+chine setting. For distributed execution, with 40GbE
+network bandwidth available, Poseidon consistently de-
+livers near-linear increases in throughput across vari-
+ous models and engines: 31.5x speedup on training
+the Inception-V3 network using TensorFlow engine on
+32 nodes, which improves 50% upon the original Ten-
+sorFlow (20x); when training a 229M parameter net-
+work (VGG19-22K), Poseidon still achieves near-linear
+speedup (30x on 32 nodes) using both Caffe and Ten-
+sorFlow engines, while distributed TensorFlow some-
+times experiences negative [37] scaling with additional
+machines. Our experiments also conﬁrm that Poseidon
+successfully alleviates network communication bottle-
+necks, by reducing the required bandwidth for paralleliz-
+ing large models. For example, when training VGG19-
+22K under limited bandwidth (10GbE), in contrast to a
+PS-based parallelization which only achieves 4x speedup
+
+with 16 machines, Poseidon effectively reduces the com-
+munication overheads by automatically specializing the
+best communication method for each layer, and is able
+to keep linearly scaling with throughput. Compared to
+other communication reduction methods [4, 36], Posei-
+don demonstrates either systems advantages (increased
+algorithm throughput) or statistical advantages (fewer al-
+gorithm steps or iterations to reach a ﬁxed termination
+criteria). Poseidon does not suffer much from imbal-
+anced communication loads, which we found to be the
+case when using the sufﬁcient factor strategy used in
+Project Adam [4]. Poseidon also guarantees that the
+number of algorithm steps to reach termination remains
+unchanged, unlike the 1-bit quantization strategy used in
+CNTK [36] which is approximate and can hurt statistical
+performance in some applications.
+
+The rest of the paper is organized as follows. Sec-
+tion 2 motivates Poseidon with introduction on large-
+scale DL, parameter servers and sufﬁcient factor broad-
+casting. Section 3 and section 4 elaborates Poseidon’s
+design and implementation, respectively. Section 5 eval-
+uates Poseidon by training different models over multiple
+datasets, including comparisons to state-of-the-art GPU-
+based distributed DL systems. Section 6 discusses re-
+lated works and section 7 concludes.
+2 Large-scale Deep Learning
+In this section, we formulate the DL training as an
+iterative-convergent algorithm, and describe parameter
+server (PS) and sufﬁcient factor broadcasting (SFB) for
+parallelizing such computation on clusters.
+
+2.1 Distributed Deep Learning
+DL programs are distinguished from other ML programs
+mainly by their use of neural networks (NNs), a family of
+hierarchical models containing many layers, from as few
+as 5-10 [16] to as many as 100s [11]. Figure 1 illustrates
+a neural network with 6 layers. The ﬁrst layer (green) is
+an input layer that reads data in application-speciﬁc for-
+mats, e.g., raw pixels if it is trained to classify images.
+The input layer is connected to a sequence of interme-
+diate layers (cyan, orange), each of which consists of a
+few neurons, where each neuron applies a function trans-
+formation f on its input and produces an output. A vec-
+tor output is obtained by concatenating the output of all
+neurons from a layer. By stacking multiple intermediate
+layers, the NN can transform raw input data one layer at
+a time, ﬁrst into a series of intermediate representations,
+and ﬁnally into the desired output or prediction (red). DL
+programmers usually need to specify the computation of
+a layer by deﬁning two properties of its neurons. The ﬁrst
+is the transformation function f (W, x), where x is the in-
+put to the neuron, and W is an optional trainable param-
+eter. The other is the connectivity that determines how
+the neuron should be connected to its adjacent layer. For
+
+(2)
+
+∇L(θ (t), D(t)
+p )
+
+θ (t+1) = θ (t) + ε
+
+allelism, a parallelization strategy that partitions the data
+D and distributes to a cluster of computational worker
+machines (indexed by p = 1, · · · , P), as illustrated in Fig-
+ure 2. At each iteration t, every worker fetches a batch
+D(t)
+from its data partition and computes the gradients
+p
+∇L(θ (t), D(t)
+p ). Gradients from all workers are then ag-
+gregated and applied to update θ (t) to θ (t+1) following
+P
+∑
+p=1
+Data-parallelism allows data to be locally partitioned to
+each worker, which is advantageous for large datasets.
+It however requires every worker to have read and
+write access to the shared model parameters θ , which
+causes communication among workers; this shared ac-
+cess can be provided by a parameter server architec-
+ture [31, 4] (Figure 2a) or a peer-to-peer broadcast-
+ing architecture [32] (Figure 2b), both are designed for
+general-purpose data-parallel ML programs on CPUs.
+Parameter Server. A parameter server (PS) is a
+distributed shared memory system that provides sys-
+tematic abstraction of iterative-convergent algorithms
+in data-parallel distributed ML. Typically, PS enables
+each worker to access the global model parameters θ
+via network communications following the client-server
+scheme. DL can be trivially parallelized over distributed
+workers using PS with the following 3 steps: (1) Each
+worker computes the gradients (∇L) on their own data
+partition and send them to remote servers; (2) servers re-
+ceive the updates and apply (+) them on globally shared
+parameters; (3) a consistency scheme coordinates the
+synchronization among servers and workers (Figure 2a).
+Sufﬁcient Factor Broadcasting. Many ML models rep-
+resent their parameters θ as matrices. For example, fully-
+connected NNs, when trained using SGD, their gradi-
+ent ∇θ over a training sample is a rank-1 matrix, which
+can be cast as the outer product of two vectors u, v:
+∇θ = uv(cid:62), where u and v are called sufﬁcient factors
+(SFs). Sufﬁcient factor broadcasting (SFB) [32] is de-
+signed to parallelize these models by broadcasting SFs
+among workers and then reconstructing the gradient ma-
+trices ∇θ using u, v locally. SFB presents three key dif-
+ferences from PS: (1) SFB uses a P2P communication
+strategy that transmits SFs instead of full matrices. (2)
+Unlike gradients, SFs are not additive over training sam-
+ples, i.e., the number of SFs needed to be transmitted
+grows linearly with the number of data samples (not data
+batches); (3) the overall communication overheads of
+SFB increase quadratically with the number of workers.
+
+2.2 Parallel DL on Distributed GPUs
+Modern DL models are mostly trained using NVIDIA
+GPUs, because the primary computational steps (e.g.,
+matrix-matrix multiplications) in DL match the SIMD
+operation that could be efﬁciently performed by GPUs.
+
+Figure 1: A convolutional neural network with 6 layers.
+
+Figure 2: An illustration of (a) the parameter server and (b)
+sufﬁcient factor broadcasting for distributed ML.
+
+instance, a convolutional neural network has two types
+of neuron: convolutional (CONV) neuron (cyan) that are
+only locally connected to a subset of neurons in its pre-
+vious layer, and fully-connected (FC) neurons (orange).
+Most NNs need to be trained with data to give accu-
+rate predictions. Stochastic gradient descent (SGD) and
+backpropagation are commonly employed to train NNs
+iteratively – each iteration performs a feed forward (FF)
+pass followed with a backpropagation (BP) pass. In the
+FF pass, the network takes a training sample as input,
+forwards from its input layer to output layer to produce
+a prediction. A loss function is deﬁned to evaluate the
+prediction error, which is then backpropagated through
+the network in reverse, during which the network param-
+eters are updated by their gradients towards where the
+error would decrease. After repeating a sufﬁcient num-
+ber of passes, the network will usually converge to some
+state where the loss is close to a minima, and the training
+is then terminated. In a mathematical form, given data D
+and a loss function L, ﬁtting the parameters θ of a NN
+can be formulated as an iterative-convergent algorithm
+that repeatedly executing the update equation
+
+(1)
+
+θ (t) = θ (t−1) + ε · ∇L(θ (t−1), D(t))
+until θ reaches some stopping criteria, where t denotes
+the iteration. The update function ∇L calculates the gra-
+dients of L over current data Di(Di ∈ D). The gradi-
+ents are then scaled by a learning rate ε and applied on
+θ as updates. As the gradients are additive over data
+samples i, i.e., θ (t) = θ (t−1) + ε · ∑i ∇L(θ (t−1), Di), for
+efﬁciency, we usually feed a batch of training samples
+D(t)(D(t) ⊂ D) at each training iteration t, as in Eq.1.
+
+In large-scale deep learning, data D are usually too
+large to process on a single machine in acceptable time.
+To speedup the training, we usually resort to data par-
+
+Conv	layersFC	layersWorker	1Worker	2Worker	3Worker	4PS𝛻𝜃"𝛻𝜃#𝛻𝜃$𝛻𝜃+𝜃𝜃𝜃𝜃Worker	1Worker	2Worker	3Worker	4𝑢",𝑣"𝑢#,𝑣#𝑢",𝑣"𝑢$,𝑣$𝑢$,𝑣$𝑢+,𝑣+𝑢#,𝑣#𝑢+,𝑣+𝑢",𝑣"𝑢+,𝑣+𝑢$,𝑣$𝑢#,𝑣#(a)(b)In practice, DL practitioners often use single-node soft-
+ware frameworks, such as Caffe [14] and Torch [6],
+which mathematically derive the correct training algo-
+rithm and execute it on GPU by calling GPU-based ac-
+celeration libraries, such as CUBLAS and cuDNN. It is
+thus straightforward to parallelize these programs across
+distributed GPUs using either PS or SFB, by moving the
+computation from CPU to GPU, and performing memory
+copy operations (between DRAM and GPUs) or com-
+munication (among multiple nodes) whenever needed.
+However, we argue below and show empirically in Sec-
+tion 5 that these usually lead to suboptimal performance.
+The inefﬁciency is mainly caused by parameter syn-
+chronization via the network. Compared to CPUs, GPUs
+are an order of magnitude more efﬁcient in matrix com-
+putations; the production of gradients on GPUs is much
+faster than they can be naively synchronized over the net-
+work. As a result, the training computations are usually
+bottlenecked by communications. For example, when
+training AlexNet [16] (61.5M parameters) on Titan X
+with a standard batch size 256, 240 million gradients will
+be generated per second on each GPU (0.25s/batch). If
+we parallelize the training on 8 nodes using a PS, with
+every node also holding 1/8 of parameters as a PS shard;
+then, every node needs to transfer 240M×7/8 × 4 =
+840M ﬂoat parameters in one second to make sure the
+next iteration of computation not being blocked. Ap-
+parently, the demanded throughput (>26Gbps) exceeds
+the bandwidth that commodity Ethernet (i.e., 1GbE and
+10GbE Ethernet) provides; the GPUs distributed across
+clusters cannot be fully utilized. Practically, it is usually
+difﬁcult to partition the parameters completely equally,
+which will result in more severe bandwidth demands, or
+bursty communication trafﬁc on several server nodes (as
+we will show in Section 5.3), which prevents the trivial
+realization of efﬁcient DL on distributed GPUs 1. We
+next describe our strategies and system design to over-
+come the aforementioned obstacles.
+3 Poseidon Design
+In this section, we ﬁrst analyze the DL program in both
+a single-node and distributed environment by decompos-
+ing the program into a sequence of operations. Based on
+it, we introduce two strategies to address the issues.
+The Structure of DL Programs. At the core of the
+DL program is the BP algorithm that performs forward-
+backward pass through the network repeatedly.
+If we
+deﬁne a forward and a backward pass through the lth
+t and bl
+layer of a network as f l
+then
+a Computation step at iteration t
+is notated as Ct =
+t , · · · , b1
+[ f 1
+t ], as illustrated in Fig. 3(a). When
+
+t , respectively,
+
+t , · · · , f L
+
+t , bL
+
+1Frequent memory copy operations between DRAM and GPU
+memory can also cause extra overheads, which is minor compared to
+the network communication according to our empirical results. How-
+ever, our strategies in this paper can also alleviate this overhead.
+
+Figure 3:
+backpropagation on distributed environment.
+
+(a) Traditional backpropagation and (b) wait-free
+
+executing on distributed GPUs, inter-machine communi-
+cations are required after each C step to guarantee the
+synchronized replication of model parameters. We sim-
+ilarly deﬁne the Synchronization step St as the process
+that a worker sends out locally generated updates and
+then receives updated parameters from remote workers at
+iteration t. Therefore, a naive parallelization of DL train-
+ing over distributed GPUs using either PS or SFB can
+be expressed as alternating Ct and St deﬁned above. We
+note that DL training is highly sequential; the commu-
+nication and computation perform sequentially, waiting
+each other to ﬁnish (Fig. 3a).
+
+t , il
+
+t , iL
+
+t , bL
+
+t , · · · , i1
+
+t , · · · , sL
+
+t , · · · , b1
+
+t ), by deﬁning sl
+
+t ), we can rewrite a training iteration as:
+t , oL
+t , · · · , f L
+
+Fortunately, we also note that as every layer of a NN
+contains an independent set of parameters, St can be de-
+coupled as St = (s1
+t as the syn-
+chronization of parameters of layer l. If we further de-
+compose sl
+t = [ol
+t ] as ﬁrst sending out local updates of
+layer l (ol
+t ) and reads in the updated parameters remotely
+(il
+[Ct , St ] =
+t , · · · , o1
+[ f 1
+t ]. The sequen-
+tial nature of the BP algorithm presents us an opportunity
+to overlap the computations and communications. Our
+ﬁrst strategy, wait-free backpropagation, overlaps Ct and
+St by partially rescheduling those bt and st that are in-
+dependent. Our second strategy, hybrid communication,
+utilizes the independency among st , and tries to reduce
+the communication overheads by specializing different
+communication methods for different st .
+3.1 Wait-free Backpropagation
+The wait-free backpropagation (WFBP) is designed to
+overlap communication overheads with the computation
+based on two key independencies in the program: (1) the
+send-out operation ol
+t is independent of backward oper-
+ations bi
+t (i < l), so they could be executed concurrently
+without blocking each other; (2) the read-in operation il
+t
+could update the layer parameters as long as bl
+t was ﬁn-
+ished, without blocking the subsequent backward opera-
+tions bi
+t (i < l). Therefore, we can enforce each layer l to
+start its communication once its gradients are generated
+after bl
+t , so that the time spent on operation sl
+t could be
+overlapped with those of bi
+t (i < l), as shown in Fig. 3b.
+
+	𝐶4	𝑂4𝐼4𝐶47"	𝐼47"⋯𝐶4𝑂4𝐼4(a)𝑂47"𝑏>𝑏#𝑏"𝑜CCD">𝑖CCD">⋯𝑏>𝑏#𝑏"𝑜>𝑜$𝑜#𝑜"𝑖>𝑖$𝑖#𝑖"𝐶47"𝑂47"𝐼47"𝐶47#𝑂47#𝐼47#𝐶47$𝑂47$𝐼47$(b)WFBP is most beneﬁcial for training DL models that
+have their parameters concentrating at upper layers (FC
+layers) but computation concentrating at lower layers
+(CONV layers)2, e.g., VGG [26] and AdamNet [4, 7]),
+because it overlaps the communication of top layers
+(90% of communication time) with the computation of
+bottom layers (90% of computation time) [37, 7]. Be-
+sides chain-like NNs, WFBP is generally applicable to
+other non-chain like structures (e.g., tree-like structures),
+as the parameter optimization for deep neural networks
+depends on adjacent layers (and not the whole network),
+there is always an opportunity for parameter optimiza-
+tion (i.e., computation) and communication from differ-
+ent layers to be performed concurrently.
+
+Some DL frameworks, such as TensorFlow, represent
+the data dependencies of DL programs using graphs,
+therefore implicitly enable auto-parallelization. How-
+ever, they fail on exploring the potential opportunities
+of parallelization between iterations. For example, Ten-
+sorFlow needs to fetch the updated parameters from the
+remote storage at the beginning of each iteration, while
+it is possible to overlap this communication procedure
+with the computation procedure of the previous iteration.
+In comparison, WFBP enforces this overlapping by ex-
+plicitly pipelining compute, send and receive procedures.
+We describe our implementation of WFBP in Section 4
+and empirically show its effectiveness in Section 5.1.
+
+3.2 Hybrid Communication
+While WFBP overlaps communication and computation,
+it does not reduce the communication overhead. In sit-
+uations where the network bandwidth is limited (e.g.,
+commodity Ethernet or the Ethernet is shared with other
+communication-heavy applications), the communication
+would still be unacceptably slow. To address the issue,
+we introduce a hybrid communication (HybComm) strat-
+egy that combines the best of PS and SFB by being aware
+of both the mathematical property of DL models and the
+structure of computing clusters. Our idea comes from
+two observations: ﬁrst, as presented in Section 3, the syn-
+t }L
+chronization operations {Sl
+l=1 are independent of each
+other, meaning that we can use different communication
+methods for different Sl
+t accord-
+ing to the two methods described in Figure 2; second, a
+NN structure is usually predeﬁned and ﬁxed throughout
+the training – by measuring the number of parameters
+needed to transferred, we are able to estimate the com-
+munication overhead, so that we can always choose the
+optimal method even before the communication happens.
+the over-
+heads of Sl
+t could be estimated as follows (Table 1):
+assume the batch size K = 32, the number of work-
+
+Consider training VGG19 network [26],
+
+t by specializing ol
+
+t and il
+
+2Most classiﬁcation models will fall into this family if the number
+
+of classes to be classiﬁed is large.
+
+Method
+
+Server
+
+PS
+
+2P1MN/P2
+
+SFB
+
+Adam
+(max)
+
+N/A
+
+P1MN +
+P1K(M + N)
+
+Worker
+
+2MN
+
+2K(P1 −
+1)(M + N)
+K(M + N) +
+MN
+
+Server & Worker
+2MN(P1 + P2 −
+2)/P2
+
+N/A
+
+(P1 − 1)(MN +
+KM + KN)
+
+Table 1: Estimated communication cost of PS, SFB and Adam
+for synchrnizing the parameters of a M × N FC layer on a clus-
+ter with P1 workers and P2 servers, when batchsize is K.
+ers and server nodes P1 = P2 = 8 (assume parameters
+are equally partitioned over all server shards), respec-
+tively. On one hand, if l is an FC layer (with shape
+4096 × 4096, M = N = 4096), synchronizing its param-
+eters via PS will transfer 2MN ≈ 34 million parameters
+for a worker node, 2P1MN/P2 ≈ 34 million for a server
+node, and 2MN(P1 + P2 − 2)/P2 ≈ 58.7 million for a
+node that is both a server and a worker, compared to
+2K(M + N)(P1 − 1) ≈ 3.7 million for a single node using
+SFB. On the other hand, if l is a CONV layer, the updates
+are indecomposable and sparse, so we can directly resort
+to PS. Therefore, the synchronization overheads depend
+not only on the model (type, shape, size of the layer), but
+also the size of the clusters. The optimal solution usu-
+ally changes with M, N, K, P1, P2. HybComm takes into
+account these factors and allows to dynamically adjust
+the communication method for different parts of a model
+– it always chooses the best method from available ones
+whenever it results in fewer communication overheads.
+
+Microsoft Adam [4] employs a different communica-
+tion strategy from those in Figure 2. Instead of broad-
+casting SFs across workers, they ﬁrst send SFs to a pa-
+rameter server shard, then pull back the whole updated
+parameter matrices. This seems to reduce the total num-
+ber of parameters needed to be communicated, but usu-
+ally leads to load imbalance; the server node that holds
+the corresponding parameter shard overloads because it
+has to broadcast the parameter matrices to all work-
+ers (P1MN + P1K(M + N) messages need to be broad-
+casted), which easily causes communication bottleneck
+(Section 5.3). It is noticeable that reconstructing gradi-
+ents from SFs may cause extra computation cost, which
+however is often negligible compared to communication.
+We describe our implementation of HybComm in the
+next section, and assess its effectiveness in Section 5.
+4
+This section ﬁrst elaborates Poseidon’s system architec-
+ture and APIs, and then describes how to modify a frame-
+work using Poseidon to enable distributed execution.
+
+Implementation
+
+4.1 System Implementation and APIs
+Figure 4 illustrates the architecture of Poseidon: a C++
+communication library that manages parameter commu-
+nication for DL programs running on distributed GPUs.
+It has three main components: coordinator, that main-
+
+Owner
+
+Arguments
+
+Method
+BestScheme Coordinator A layer name or index
+Query
+Send
+Receive
+Move
+
+Coordinator A list of property names
+Syncer
+Syncer
+Syncer
+
+None
+None
+A GPU stream and an indicator
+of move direction
+updated parameters
+parameter buffer of KV stores
+
+Send
+Receive
+
+KV store
+KV store
+
+Description
+
+Get the best communication scheme of a layer
+Query information from coordinators’ information book
+Send out the parameter updates of the corresponding layer
+Receive parameter updates from either parameter server or peer workers
+Move contents between GPU and CPU, do transformations and
+application of updates if needed
+Send out the updated parameters
+Receive gradient updates from workers
+
+Table 2: Poseidon APIs for parameter synchronization.
+
+Algorithm 1 Get the best comm method of layer l
+
+layer property = Query(l.name)
+P1, P2, K = Query(‘n worker’, ‘n server’, ‘batchsize’)
+if layer property.type == ‘FC’ then
+
+1: function BESTSCHEME(l)
+2:
+3:
+4:
+5:
+6:
+
+M = layer property.width
+N = layer property.height
+if 2K(P1 − 1)(M + N) ≤ 2MN(P1+P2−2)
+
+P2
+
+then
+
+return ‘SFB’
+
+7:
+8:
+9:
+10:
+11:
+12: end function
+
+end if
+return ‘PS’
+
+end if
+
+Figure 4: An overview of the architecture of Poseidon.
+
+tains the model and the cluster conﬁguration; KV store, a
+shared memory key-value store that provides support for
+parameter server based communication; client library,
+which is plugged into DL programs to handle parame-
+ter communication. Their APIs are listed in Table 2.
+Coordinator. To setup distributed training, the client
+program (e.g., Caffe) ﬁrst instantiates Poseidon by cre-
+ating a coordinator within its process. Coordinators will
+ﬁrst collect necessary information, including the clus-
+ter information (e.g., the number of workers and server
+nodes, their IP addresses) and the model architecture
+(e.g., the number of layers, layer types, number of neu-
+rons and how they are connected, etc.). With the in-
+formation, the coordinator will initialize the KV stores
+and the client library with two steps: (1) allocate proper
+communication ports for each PS shard and peer worker;
+(2) determine what parameters should be transmitted via
+the KV store and what by SFB, and hash the parame-
+ters equally to each KV store if necessary, and save the
+mapping in the information book, which, throughout the
+whole training, is maintained and synchronized across
+
+nodes, and could be accessed elsewhere through coor-
+dinator’s Query API. Besides, the coordinator provides
+another API BestScheme that takes in a layer and re-
+turns the optimal communication scheme for it according
+to the strategy described in Section 3.2 (Algorithm 1).
+KV Store. The KV store is implemented based on a bulk
+synchronous parameter server [31, 7], and instantiated
+by coordinators on a list of user-speciﬁed “server” ma-
+chines. Each instance of the KV store holds one shard
+of the globally shared model parameters in the form of
+a set of KV pairs, of which each KV pair is stored on
+a chunk of DRAM. Poseidon sets the size of a KV pair
+to a ﬁxed small size (e.g., 2MB), so as to partition and
+distribute model parameters to server nodes as equally as
+possible, reducing the risk of Ethernet bottleneck. Each
+KV store instance manages a parameter buffer on RAM,
+and provides PS-like APIs, such as Receive and Send,
+for receiving and applying updates from client libraries,
+or sending out parameters. It will regularly checkpoint
+current parameter states for fault tolerance.
+Client Library. Poseidon coordinates with DL pro-
+grams via its client library. Particularly, users plug the
+client library into their training program, and the client
+library will create a syncer for each NN layer during net-
+work assembling (so that each layer one-to-one maps to
+one syncer), accounting for its parameter synchroniza-
+tion. Each sycner is then initialized, for example, set-
+ting up connections to its corresponding PS shards or
+(remote) peer syncers according to the coordinator’s in-
+formation book, and allocating a small memory buffer
+for receiving remote parameter matrices or SFs, etc.
+
+The client library manages a CPU thread pool and a
+GPU stream pool on the worker machine, which can
+be allocated by the syncer APIs when there is a syncer
+job created. The syncer has three main APIs, Send,
+Receive and Move, to be used in client programs. The
+Move API takes care of the memory movement between
+RAM and GPU memory, and performs necessary com-
+putation, e.g., the transformation between SFs and gradi-
+ents, and the application of updates. It is multi-threaded
+using the CUDA asynchronous APIs, and will trigger an
+allocation from the client library’s thread/stream pools
+when a syncer job starts (see L14 of Algorithm 2). The
+Send and Receive are communication APIs that syn-
+chronize layer parameters across different model repli-
+
+GPUCPUStream PoolKV StoreSynceriCoordinatorSFBdata flowallocateinstructionKV StoreThread PoolClient Librarycas. The Send API is nonblocking; it sends out param-
+eter updates during backpropagation once they are gen-
+erated, following the protocol returned by coordinator’s
+BestScheme API. The Receive API will be called
+once Send is ﬁnished. It requests either fresh parameter
+matrices from the KV stores or SFs from its peer syncers,
+and will block its current thread until it receives all of
+what it requested. The received messages are put into
+the syncer’s memory buffer for the Move API to fetch.
+Managing Consistency. Poseidon implements the bulk
+synchronous consistency (BSP) model as follows. The
+client library maintains a binary vector C with length the
+number of syncers and values reset to zeros at the start
+of each iteration. A syncer will set its corresponding en-
+try in C as 1 when its job ﬁnishes, and the client starts
+next iteration when all entries are 1. While, the KV store
+maintains a zero-initialized count value for each KV pair
+at the start of each iteration. Every time when there is
+an update being applied on a KV pair, its count value
+is increased by 1. The KV pair will be broadcasted via
+its Send API when its count equals to the number of
+workers. Poseidon handles stragglers by simply drop-
+ping them. Although asynchronous models can alleviate
+the straggler problem in distributed ML [12], Poseidon
+focuses on synchronous parallel training, because syn-
+chronous execution yields the fastest per-iteration im-
+provement in accuracy for distributed DL (as measured
+by wall clock time) on GPUs [7, 2] (see Section 5.1).
+
+Algorithm 2 Parallelize a DL library using Poseidon
+
+end for
+
+for iter = 1 → T do
+sync count = 0
+net.Forward()
+for l = L → 1 do
+
+1: function TRAIN(net)
+2:
+3:
+4:
+5:
+6:
+7:
+8:
+9:
+10:
+11: end function
+12: function SYNC(l)
+13:
+14:
+15:
+16:
+17:
+18:
+19:
+20: end function
+
+net.BackwardThrough(l)
+thread pool.Schedule(sync(l))
+
+end for
+wait until(sync count == net.num layers)
+
+stream = stream pool.Allocate()
+syncers[l].Move(stream, GPU2CPU)
+syncers[l].method = coordinator.BestScheme(l)
+syncers[l].Send()
+syncers[l].Receive()
+syncers[l].Move(stream, CPU2GPU)
+sync count++
+
+Integrate Poseidon with DL Libraries
+
+4.2
+Poseidon could be plugged into most existing DL frame-
+works to enable efﬁcient distributed execution. Algo-
+rithm 2 provides an example. Speciﬁcally, one needs to
+ﬁrst include Poseidon’s client library into the framework,
+
+then ﬁgure out where the backpropagation proceeds (L6),
+and insert Poseidon’s syner APIs in between gradient
+generation and application (L7). We demonstrate in Sec-
+tion 5.1 that with slight modiﬁcations (150 and 250 LoC
+for Caffe and TensorFlow), both Poseidon-enable Caffe
+and TensorFlow deliver linear scalings up to 32 GPU ma-
+chines. Poseidon respects the programming interfaces by
+the native DL library and stores necessary arguments for
+distributed execution as environment variables to allow
+zero changes on the DL application programs.
+5 Evaluation
+In this section, we evaluate Poseidon’s performance on
+scaling up DL with distributed GPUs. We focus on the
+image classiﬁcation task where DL is most successfully
+applied. Our evaluation reveals the following results: (1)
+Poseidon has little overhead when plugged into exist-
+ing frameworks; it achieves near-linear speedups across
+different NNs and frameworks, on up to 32 Titan X-
+equipped machines. (2) Poseidon’s system design effec-
+tively improves GPU and bandwidth utilization. (3) Po-
+seidon’s communication strategy HybComm effectively
+alleviates the communication bottleneck, thus achieves
+better speedups under limited bandwidth; Moreover,
+Poseidon compares favorably to other communication-
+reduction methods, such as the SF strategy in Adam [4],
+and the 1-bit quantization in CNTK [36].
+Cluster Conﬁguration. We conduct our experiments on
+a GPU cluster with each node equipped with a NVIDIA
+GeForce TITAN X GPU card, an Intel 16-core CPU and
+64GB RAM, interconnected via a 40-Gigabit Ethernet
+switch. All cluster nodes have shared access to a NFS
+and read data through the Ethernet interface. We run our
+system on UBUNTU 16.04, with NVIDIA driver version
+361.62, CUDA 8.0 and cuDNN v5.
+Computation Engines. We deploy Poseidon on two DL
+frameworks, Caffe [14] and TensorFlow [1]. For Caffe,
+we use the ofﬁcial version at 2016/06/30 as the single
+node baseline, and modify it using Poseidon’s client li-
+brary API for distributed execution. For TensorFlow,
+we use its open source version r0.10, and parallelize its
+single-node version with Poseidon’s client library, and
+compare to its original distributed version. 3
+Dataset and Models. Our experiments use three well-
+known image classiﬁcation datasets. (1) CIFAR-10 [15],
+which contains 32 × 32 colored images of 10 classes,
+with 50K images for training and 10K for testing; (2)
+ILSVRC12 [23], a subset of ImageNet22K that has 1.28
+million of training images and 50K validation images in
+1,000 categories; (3) ImageNet22K [23], the largest pub-
+lic dataset for image classiﬁcation, including 14,197,087
+
+3Note that as the distributed engine of TensorFlow is highly opti-
+mized (e.g., auto-parallelization of graphs [1]). Poseidon avoids lever-
+aging any build-in optimization of distributed TensorFlow by paral-
+lelizing its single-node version instead.
+
+Model
+
+# Params
+
+Dataset
+
+Batchsize
+
+CIFAR-10 quick
+GoogLeNet
+Inception-V3
+VGG19
+VGG19-22K
+ResNet-152
+
+145.6K
+5M
+27M
+143M
+229M
+60.2M
+
+CIFAR10
+ILSVRC12
+ILSVRC12
+ILSVRC12
+ImageNet22K
+ILSVRC12
+
+100
+128
+32
+32
+32
+32
+
+Table 3: Neural networks for evaluation. Single-node batchsize
+is reported. The batchsize is chosen based on the standards
+reported in literature (usually the maximum batch size that can
+ﬁll in the GPU memory).
+
+labeled images from 21,841 categories.
+
+We test Poseidon’s scalability across different neural
+networks: (1) CIFAR-10 quick: a toy CNN from Caffe
+that converges at 73% accuracy for classifying images
+in CIFAR-10 dataset; (2) GoogLeNet [27]: a 22-layer
+CNN with 5M parameters. (3) Inception-V3 [28]: the
+ImageNet winner, an improved version of GoogLeNet
+from TensorFlow; (4) VGG19: A popular feature extrac-
+tion network in the computer vision community [26] that
+has 16 CONV layers and 3 FC layers, in total 143M pa-
+rameters; (5) VGG19-22K: we modify the VGG19 net-
+work by replacing its 1000-way classiﬁer with a 21841-
+way classiﬁer, to classify images from the ImageNet22K
+dataset. The modiﬁed network has 229M parameters. (6)
+ResNet-152: the ImageNet winner network with 152 lay-
+ers. We list their statistics and conﬁgurations in Table 3.
+Metrics. In this paper, we mainly focus on metrics that
+measure the system performance, such as speedups on
+throughput (number of images scanned per second). Our
+experiments focus on medium-scale distributed cluster
+with up to 32 machines, which distributed DL empiri-
+cally beneﬁts most from. Larger clusters require larger
+batch sizes, which hurt the convergence rate of each iter-
+ation [3, 7]. For completeness, we also report the statis-
+tical performance (time/epoch to converge) on ResNet-
+152. Poseidon uses synchronized replication which en-
+ables many models to converge in fewer steps [1, 7, 3, 2].
+
+5.1 Scalability
+To demonstrate Poseidon’s scalability, we train CNNs
+using Poseidon with different computational engines,
+and compare different systems in terms of their speedups
+on throughput. For Caffe engine, we train GoogLeNet
+VGG19 and VGG19-22K networks; for TensorFlow en-
+gine, we train Inception-V3, VGG-19, VGG19-22K.
+Caffe Engine. Figure 5 shows the throughput vs. num-
+ber of workers when training the three networks using
+Caffe engine, given 40GbE Ethernet bandwidth avail-
+(1) Caffe:
+able. We compare the following systems:
+unmodiﬁed Caffe that executes on a single GPU; (2)
+Caffe+PS: we parallelize Caffe using a vanilla PS, i.e.,
+the parameter synchronization happens sequentially after
+the backpropagation in each iteration; (3) Caffe+WFBP:
+Parallelized Caffe using Poseidon so the communication
+
+and computation are overlapped. However, we disable
+HybComm so that parameters are synchronized only via
+PS; (4) Poseidon: the full version of Poseidon-Caffe.
+
+Poseidon shows little overheads when combined with
+Caffe; running on a single node with no communication
+involved, Poseidon-Caffe can process 257, 35.5 and 34.2
+images per second when training GoogLeNet, VGG19
+and VGG19-22K, respectively, as compared to the origi-
+nal Caffe, which can process 257, 35.5 and 34.6 images,
+and Caffe+PS, which can only process 213.3, 21.3 and
+18.5 images per second, due to the overheads caused
+by memory copy operations between RAM and GPU,
+which have been overlapped by Poseidon with the com-
+putation. In distributed environment, the rescheduling of
+computation and communication signiﬁcantly improves
+the throughput: when training GoogLeNet and VGG19,
+incorporating WFBP achieves almost linear scalings up
+to 32 machines, and for the larger VGG19-22K network,
+Caffe+WFBP achieves 21.5x speedup on 32 machines.
+We conclude that rescheduling and multi-threading the
+communication and computation are key to the perfor-
+mance of distributed DL on GPUs, even when the band-
+width resource is abundant. Poseidon provides an effec-
+tive implementation to overlap these operations for DL
+frameworks, to guarantee better GPU utilization.
+
+When the available bandwidth is sufﬁcient, Poseidon’s
+HybComm strategy shows small improvement on train-
+ing GoogLeNet and VGG19. However, when training
+VGG19-22K which has three FC layers that occupy 91%
+of model parameters, it improves over Caffe-WFBP from
+21.5x to 29.5x on 32 nodes.
+TensorFlow Engine. We also modify TensorFlow using
+Poseidon, and compare the following systems in terms
+of speedup on throughput: (1) TF: TensorFlow with its
+original distributed executions; (2) TF+WFBP: we mod-
+ify TensorFlow using Poseidon’s client library. Specif-
+ically, we change the assign operator in TensorFlow, so
+that instead of being applied, the parameter updates will
+be synchronized via Poseidon’s PS interface with WFBP;
+(3) Poseidon:
+the full version of Poseidon-parallelized
+TensorFlow with HybComm enabled.
+
+We train Inception-V3, VGG19 and VGG19-22K
+models and report the results in Figure 6. Running on a
+single node, Poseidon processes 43.2, 38.2 and 34.5 im-
+ages per second on training Inception-V3, VGG19 and
+VGG19-22K, while original TensorFlow processes 43.2,
+38.5 and 34.8 images per second on these three models,
+respectively – little overhead is introduced by our modi-
+ﬁcation. In distributed execution, Poseidon achieves al-
+most linear speedup on up to 32 machines. Distributed
+TensorFlow, however, demonstrates only 10x speedup on
+training Inception-V3 and even fails to scale on training
+the other two networks in our experiments. To investi-
+gate the problem of TensorFlow and explain how Posei-
+
+Figure 5: Throughput scaling when training GoogLeNet, VGG19 and VGG19-22K using Poseidon-parallelized Caffe and 40GbE
+bandwidth. Single-node Caffe is set as baseline (i.e., speedup = 1).
+
+Figure 6: Throughput scaling when training Inception-V3, VGG19 and VGG19-22K using Poseidon-parallelized TensorFlow and
+40GbE bandwidth. Single-node TensorFlow is set as baseline (i.e., speedup = 1).
+
+Figure 7: Breakdown of GPU computation and stall time when
+training the three networks on 8 nodes using different systems.
+
+don improves upon it, we illustrates in Figure 7 the (aver-
+aged) ratio of busy and stall time of a GPU when training
+the three networks using different systems on 8 nodes.
+Observe that Poseidon keeps GPUs busy in most of the
+time, while TensorFlow wastes much time on waiting
+for parameter synchronization. The inefﬁciency of dis-
+tributed TensorFlow stems from two sources. First, Ten-
+sorFlow partitions model parameters in a coarse-grained
+granularity – each tensor (instead of a KV pair) in the
+model is assigned to a PS shard. A big tensor (such as
+the parameter matrix in VGG19) is highly likely to cre-
+ate communication bottleneck on its located server node.
+Poseidon ﬁxes this problem by partitioning parameters
+among server nodes in a ﬁner-grained granularity us-
+ing KV pairs, so that every node has evenly distributed
+communication load; as an evidence, TF-WFBP demon-
+strates higher computation-to-stall ratio in Figure 7. Sec-
+ond, TensorFlow cannot reduce the communication over-
+heads while Poseidon’s HybComm effectively reduces
+the size of messages. As a result, Poseidon further im-
+proves upon TF-WFBP from 22x to 30x on 32 nodes.
+Multi-GPU Settings. Poseidon’s key strategies can be
+
+directly extended to support distributed multi-GPU en-
+vironment with minor modiﬁcations. Speciﬁcally, when
+there are more than 1 GPU on a worker node, Poseidon
+will ﬁrst collect the gradient updates following WFBP lo-
+cally (either by full matrices or SFs) from multiple GPUs
+to a leader GPU using CudaMemcpy(DeviceToDevice)
+API. If those updates are determined to be communi-
+cated via full matrices, Poseidon will aggregate them lo-
+cally before sending out. Using Caffe engine on a single
+node, Poseidon achieves linear scalings on up to 4 Titan
+X GPUs when training all three networks, outperforming
+Caffe’s multi-GPU version, which shows only 3x and 2x
+speedups when training GooLeNet and VGG19. When
+running on AWS p2.8xlarge instances (8 GPUs each
+node), Poseidon reports 32x and 28x speedups when
+training GoogLeNet and VGG19 with 4 nodes (32 GPUs
+in total), conﬁrming our statement that the overheads
+caused by memory movement between GPUs are usually
+negligible compared to network communication4.
+Statistical Performance.
+For completeness, we re-
+port in Figure 9 the statistical performance for training
+ResNet-152 using Poseidon. Poseidon achieves near-
+linear speedups on both system throughput and statisti-
+cal convergence: Poseidon delivers 31x speedup in terms
+of throughput, and reaches 0.24 reported error with less
+than 90 epochs with both 16 and 32 nodes – thus lin-
+ear scales in terms of time to accuracy, compared to 8
+nodes with batchsize = 32 × 8, which is a standard set-
+
+4The K80 GPUs on p2.8xlarge has less GFLOPS than Titan X used
+
+in our main experiments – the communication burden is less severe.
+
+12481632# of Nodes12481632SpeedupsGoogLeNet (40 GbE)LinearPoseidonCaffe+WFBPCaffe+PS12481632# of Nodes12481632SpeedupsVGG19 (40 GbE)LinearPoseidonCaffe+WFBPCaffe+PS12481632# of Nodes12481632SpeedupsVGG19-22K (40 GbE)LinearPoseidonCaffe+WFBPCaffe+PS12481632# of Nodes12481632SpeedupsInception-V3 (40 GbE)LinearPoseidonTF+WFBPTF12481632# of Nodes12481632SpeedupsVGG19 (40 GbE)LinearPoseidonTF+WFBPTF12481632# of Nodes12481632SpeedupsVGG19-22K (40 GbE)LinearPoseidonTF+WFBPTFInception-v3VGG19VGG19-22k0306090PercentageTFTF+WFBPPSDTFTF+WFBPPSDTFTF+WFBPPSDStall timeComputation timeFigure 8: Throughput scaling when training GoogLeNet, VGG19 and VGG19-22K using Poseidon-parallelized Caffe with varying
+network bandwidth. Single-node Caffe is set as baseline (speedup = 1).
+
+on 16 nodes can only be accelerated by 8x. This observa-
+tion conﬁrms our argument that limited bandwidth would
+result in communication bottleneck when training big
+models on distributed GPUs. Fortunately, Poseidon sig-
+niﬁcantly alleviates this issue. Under limited bandwidth,
+it constantly improves the throughput by directly reduc-
+ing the size of messages needed to be communicated,
+especially when the batch size is small; when training
+VGG19 and VGG19-22K, Poseidon achieves near-linear
+speedup on 16 machines using only 10GbE bandwidth,
+while an optimized PS would otherwise need 30GbE or
+even higher to achieve. Note that Poseidon will never
+underperform a traditional PS scheme because it will re-
+duce to a parameter server whenever it results in less
+communication overheads; for instance, we observe that
+Poseidon reduces to PS when training GoogLeNet on 16
+nodes, because GoogleNet only has one thin FC layer
+(1000×1024) and is trained with a large batch size (128).
+5.3 Comparisons to Other Methods
+In this section, we compare Poseidon against other com-
+munication methods, including Adam [4] and CNTK 1-
+bit quantization [36], and show Poseidon’s advantages.
+Adam. To save bandwidth, Adam [4] synchronizes the
+parameters of a FC layer by ﬁrst pushing SFs generated
+on all workers to a PS node, and then pulling back the
+full parameter matrices thereafter. As direct comparisons
+to Adam [4] are inaccessible, we implement its strategy
+in Poseidon, and compare it (denoted as Adam) to TF-
+WFBP and Poseidon by monitoring the network trafﬁc
+of each machine when training VGG19 on 8 nodes using
+TensorFlow engine. As shown in Figure 10, the com-
+munication workload is highly imbalanced using Adam’s
+strategy. Unlike a traditional PS (TF-WFBP) where the
+parameters are equally distributed over multiple shards,
+Adam cannot partition the parameters of FC layers be-
+cause of their usage of SFs. Although the “push” op-
+eration uses SFs to reduce message size, the “pull” re-
+quires some server nodes to broadcast big matrices to
+each worker node, which creates bursty trafﬁc that re-
+sults in communication bottleneck on them. By contrast,
+Poseidon either partitions parameters equally over multi-
+ple PS shards, or transmits SFs among peer workers, both
+
+Figure 9: (a) Speedup vs. number of nodes and (b) Top-1
+test error vs. epochs for training ResNet-152 using Poseidon-
+TensorFlow and the original TensorFlow.
+
+Figure 10: Averaged communication load when training
+VGG19 using TF-WFBP, Adam and Poseidon with TensorFlow
+engine. Each bar represents the network trafﬁc on a node.
+
+ting as in [11], echoing recent results that synchronous
+training on distributed GPUs yields better performance
+than asynchronous training in terms of time to quality
+for most NNs [7, 2]. For other NNs in Table. 3, Posei-
+don delivers the same quality of accuracies as reported in
+their papers [16, 28, 27, 26] on up to 32 GPUs.
+
+5.2 Bandwidth Experiments
+To further assess Poseidon’s HybComm strategy, we
+simulate the environment where network bandwidth is
+limited. We use Linux trafﬁc control tool tc to lower
+the available bandwidth on each node, and compare
+the training throughput between with and without Hyb-
+Comm. We focus on Caffe engine in this section because
+it is lighter and less optimized than TensorFlow.
+
+Figure 8 plots the speedup on throughput vs. num-
+ber of workers when training GoogLeNet, VGG19
+and VGG19-22K with different maximum bandwidth.
+Clearly,
+limited bandwidth prevents a standard PS-
+based system from linearly scaling with number of
+nodes; for example, given 10GbE bandwidth (which is
+a commonly-deployed Ethernet conﬁguration in most
+cloud computing platforms), training VGG19 using PS
+
+124816# of Nodes124816SpeedupsGoogLeNetLinearPoseidon (2GbE)Poseidon (5GbE)Poseidon (10GbE)Caffe+WFBP (2GbE)Caffe+WFBP (5GbE)Caffe+WFBP (10GbE)124816# of Nodes124816SpeedupsVGG19LinearPoseidon (10GbE)Poseidon (20GbE)Poseidon (30GbE)Caffe+WFBP (10GbE)Caffe+WFBP (20GbE)Caffe+WFBP (30GbE)124816# of Nodes124816SpeedupsVGG19-22KLinearPoseidon (10GbE)Poseidon (20GbE)Poseidon (30GbE)Caffe+WFBP (10GbE)Caffe+WFBP (20GbE)Caffe+WFBP (30GbE)12481632# of Nodes12481632Speedups(a) ThroughputLinearPoseidonTF0306090120Epoch0.200.240.300.400.500.60Top-1 Error (%)(b) Convergence32 nodes16 nodes8 nodesTF-WFBPAdamPoseidon01020Traffic (Gb/iter)are communication load-balanced that avoid bursty com-
+munication situations. Quantitatively, Adam delivers 5x
+speedup with 8 nodes when training VGG19.
+CNTK. We compare Poseidon to the 1-bit quantization
+technique proposed in CNTK [36]. We create a baseline
+Poseidon-1bit which uses the 1-bit strategy to quantize
+the gradients in FC layers, and add the residual to up-
+dates of the next iteration. We then train the CIFAR-10
+quick network, and plot the training loss and test error
+vs.
+iterations for two systems (both have linear scal-
+ing on throughput). As in Figure 11, 1-bit quantization
+yields worse convergence in terms of accuracy – on 4
+GPUs, it achieves 0.5 error after 3K iterations, while Po-
+seidon quickly converges to 0.3 error at iteration 1000.
+We conjecture this is caused by the quantization residual,
+which is equivalent to delayed updates that may hurt the
+convergence performance when training NNs on images,
+conﬁrmed by [7]. We also directly train VGG19 using
+CNTK-1bit system, and report 5.8x, 11x, 20x speedups
+on 8, 16 and 32 nodes, respectively, thus less scale-ups
+than Poseidon, and also compromised statistical perfor-
+mance due to approximated updates.
+
+Figure 11: Training loss and test error vs. iteration when train-
+ing CIFAR-10 quick network using Poseidon and Poseidon-
+1bit on 4GPUs with Caffe engine.
+
+6 Related Work
+PS-based Distributed DL Systems. Based on the pa-
+rameter server [31, 19] architecture, a number of CPU-
+based distributed DL systems have been developed, such
+as [38, 29, 9, 17] and Adam [4]. They are purely PS-
+based systems on CPU-only clusters, whereas we ad-
+dress the more challenging case of GPU clusters.
+
+Scaling up DL on distributed GPUs is an active ﬁeld
+of research. Coates et al. [5] build a GPU-based multi-
+machine system for DL using model parallelism rather
+than data parallelism, and their implementation is rather
+specialized for a ﬁxed model structure while demand-
+ing specialized hardware, such as InﬁBand networking.
+TensorFlow [1] is Google’s distributed ML platform that
+uses a dataﬂow graph to represent DL models, and syn-
+chronizes model parameters via PS. It therefore can-
+not dynamically adjust its communication method de-
+pending on the layer and cluster information as Posei-
+don does. MXNet [3] is another DL system that uses
+PS for distributed execution, and supports TensorFlow-
+like graph representations for DL models. By auto-
+
+parallelizing independent subgraphs, both frameworks
+implicitly overlap the communication and computation.
+By contrast, Poseidon has a more explicit way to over-
+lap them via its client library. Hence, Poseidon can
+be also used to parallelize non-graph-based frameworks.
+Moreover, both MXNet and TensorFlow do not address
+the bottleneck caused by limited network bandwidth,
+which undermines their scalability when training large
+models with dense layers (e.g., big softmax). Besides,
+Cui et al. propose GeePS [7] that manages the limited
+GPU memory and report speedups on distributed GPUs.
+While, GeePS does not address the issue of limited
+network bandwidth. Therefore, Poseidon’s technique
+could be combined with them to enable better training
+speedups. Also of note are several efforts to port Caffe
+onto other distributed platforms, such as SparkNet [22],
+YahooCaffe [33] and FireCaffe [13], the former reports
+a 4-5 times speedup with 10 machines (and hence less
+scalability than our results herein).
+Other distributed ML systems. CNTK [36] is a DL
+framework that supports distributed executions and ad-
+dresses the problem of communication bottleneck via
+the 1-bit quantization technique. CNTK demonstrates
+little negative impact on convergence in speech do-
+mains [25, 24]. However, in some other domains (Sec-
+tion 5.3), the performance is usually compromised by
+noisy gradients [1, 7]. By contrast, Poseidon’s Hyb-
+Comm reduces the communication while always guar-
+anteeing synchronous training. There are also growing
+interest in parallelizing ML applications using peer-to-
+peer communication, such as MALT [18], SFB [32] and
+Ako [30]. Poseidon draws inspiration from these works
+but goes one step further as it is an adaptive best-of-both-
+worlds protocol, which will select client-server commu-
+nication whenever it would result in fewer overheads.
+7 Conclusion
+We present Poseidon, a scalable and efﬁcient commu-
+nication architecture for large-scale DL on distributed
+GPUs. Poseidon’s design is orthogonal to TensorFlow,
+Caffe or other DL frameworks – the techniques present
+in Poseidon could be used to produce a better distributed
+version of them. We empirically show that Poseidon
+constantly delivers linear speedups using up to 32 nodes
+and limited bandwidth on a variety of neural network,
+datasets and computation engines, and compares favor-
+ably to Adam and Microsoft CNTK.
+Acknowledgments
+We thank our shepherd Yu Hua and ATC reviewers for
+their helpful feedback. We thank the CMU Parallel Data
+Laboratory for their machine resources and Henggang
+Cui for insightful discussion. This research is supported
+by NSF Big Data IIS1447676 and NSF XPS Parallel
+CCF1629559.
+
+051015202530Iterations (x100)0.40.81.21.62.02.4Train LossPoseidonPoseidon-1bit051015202530Iterations (x100)0.20.40.60.80.9Test ErrorPoseidonPoseidon-1bitReferences
+
+[1] ABADI, M., BARHAM, P., CHEN, J., CHEN, Z.,
+DAVIS, A., DEAN, J., DEVIN, M., GHEMAWAT,
+S., IRVING, G., ISARD, M., ET AL. Tensorﬂow:
+A system for large-scale machine learning. arXiv
+preprint arXiv:1605.08695 (2016).
+
+[2] CHEN, J., MONGA, R., BENGIO, S., AND JOZE-
+FOWICZ, R. Revisiting distributed synchronous
+sgd. arXiv preprint arXiv:1604.00981 (2016).
+
+[3] CHEN, T., LI, M., LI, Y., LIN, M., WANG, N.,
+WANG, M., XIAO, T., XU, B., ZHANG, C., AND
+ZHANG, Z. Mxnet: A ﬂexible and efﬁcient ma-
+chine learning library for heterogeneous distributed
+systems. arXiv preprint arXiv:1512.01274 (2015).
+
+[4] CHILIMBI, T., APACIBLE, Y. S. J., AND KALYA-
+NARAMAN, K. Project Adam: Building an Efﬁ-
+cient and Scalable Deep Learning Training System.
+In OSDI (2014).
+
+[5] COATES, A., HUVAL, B., WANG, T., WU, D. J.,
+NG, A. Y., AND CATANZARO, B. Deep Learning
+with COTS HPC Systems. In ICML (2013).
+
+[6] COLLOBERT, R., KAVUKCUOGLU, K., AND
+FARABET, C. Torch7: A Matlab-like Environment
+for Machine Learning. In NIPSW (2011).
+
+[7] CUI, H., ZHANG, H., GANGER, G. R., GIB-
+BONS, P. B., AND XING, E. P. Geeps: Scal-
+able deep learning on distributed gpus with a gpu-
+specialized parameter server. In Proceedings of the
+Eleventh European Conference on Computer Sys-
+tems (2016), ACM, p. 4.
+
+[8] DAI, W., KUMAR, A., WEI, J., HO, Q., GIB-
+SON, G., AND XING, E. P. Analysis of high-
+performance distributed ml at scale through param-
+eter server consistency models. In Proceedings of
+the 29th AAAI Conference on Artiﬁcial Intelligence
+(2015).
+
+[9] DEAN, J., CORRADO, G. S., MONGA, R., CHEN,
+K., DEVIN, M., LE, Q. V., MAO, M. Z., RAN-
+ZATO, M., SENIOR, A., TUCKER, P., YANG, K.,
+AND NG, A. Y. Large Scale Distributed Deep Net-
+works. In NIPS (2012).
+
+[10] DENG, L., LI, J., HUANG, J.-T., YAO, K., YU,
+D., SEIDE, F., SELTZER, M. L., ZWEIG, G., HE,
+X., WILLIAMS, J., GONG, Y., AND ACERO, A.
+Recent Advances in Deep Learning for Speech Re-
+search at Microsoft. In ICASSP (2013).
+
+[11] HE, K., ZHANG, X., REN, S., AND SUN, J.
+Deep residual learning for image recognition. arXiv
+preprint arXiv:1512.03385 (2015).
+
+[12] HO, Q., CIPAR, J., CUI, H., KIM, J. K., LEE,
+S., GIBBONS, P. B., GIBSON, G. A., GANGER,
+G. R., AND XING, E. P. More Effective Dis-
+tributed ML via a Stale Synchronous Parallel Pa-
+rameter Server. In NIPS (2013).
+
+[13] IANDOLA, F. N., MOSKEWICZ, M. W., ASHRAF,
+K., AND KEUTZER, K. Firecaffe: near-linear ac-
+celeration of deep neural network training on com-
+pute clusters. In Proceedings of the IEEE Confer-
+ence on Computer Vision and Pattern Recognition
+(2016), pp. 2592–2600.
+
+[14] JIA, Y., SHELHAMER, E., DONAHUE,
+
+J.,
+J., GIRSHICK, R.,
+KARAYEV, S., LONG,
+GUADARRAMA, S., AND DARRELL, T. Caffe:
+Convolutional Architecture for Fast Feature Em-
+bedding. In MM (2014).
+
+[15] KRIZHEVSKY, A. Learning Multiple Layers of
+Features from Tiny Images. Master’s thesis, Uni-
+versity of Toronto, 2009.
+
+[16] KRIZHEVSKY, A., SUTSKEVER, I., AND HIN-
+ImageNet Classiﬁcation with Deep
+
+TON, G. E.
+Convolutional Neural Networks. In NIPS (2012).
+
+[17] LE, Q. V., MONGA, R., DEVIN, M., CHEN, K.,
+CORRADO, G. S., DEAN, J., AND NG, A. Y.
+Building High-level Features Using Large Scale
+Unsupervised Learning. In ICML (2012).
+
+[18] LI, H., KADAV, A., KRUUS, E., AND UNGURE-
+ANU, C. Malt: distributed data-parallelism for
+In Proceedings of the
+existing ml applications.
+Tenth European Conference on Computer Systems
+(2015), ACM, p. 3.
+
+[19] LI, M., ANDERSEN, D. G., PARK, J. W., SMOLA,
+A. J., AHMED, A., JOSIFOVSKI, V., LONG,
+J., SHEKITA, E. J., AND SU, B.-Y.
+Scaling
+distributed machine learning with the parameter
+In 11th USENIX Symposium on Operat-
+server.
+ing Systems Design and Implementation (OSDI 14)
+(2014), pp. 583–598.
+
+[20] LIANG, X., HU, Z., ZHANG, H., GAN, C.,
+AND XING, E. P. Recurrent topic-transition gan
+arXiv preprint
+for visual paragraph generation.
+arXiv:1703.07022 (2017).
+
+[21] MIKOLOV, T., CHEN, K., CORRADO, G., AND
+DEAN, J. Efﬁcient Estimation of Word Represen-
+tations in Vector Space. In ICLRW (2013).
+
+[33] YAHOO.
+
+Caffe
+
+on
+
+spark.
+
+http:
+
+//yahoohadoop.tumblr.com/post/
+129872361846/large-scale-
+distributed-deep-learning-on-
+hadoop.
+
+[34] YAN, Z., ZHANG, H., JAGADEESH, V., DE-
+COSTE, D., DI, W., AND PIRAMUTHU, R. Hd-
+cnn: Hierarchical deep convolutional neural net-
+work for image classiﬁcation. ICCV (2015).
+
+[35] YAN, Z., ZHANG, H., WANG, B., PARIS, S., AND
+YU, Y. Automatic photo adjustment using deep
+neural networks. ACM Transactions on Graphics
+(TOG) 35, 2 (2016), 11.
+
+[36] YU, D., EVERSOLE, A., SELTZER, M., YAO,
+K., HUANG, Z., GUENTER, B., KUCHAIEV, O.,
+ZHANG, Y., SEIDE, F., WANG, H., ET AL. An in-
+troduction to computational networks and the com-
+putational network toolkit. Tech. rep.
+
+[37] ZHANG, H., HU, Z., WEI, J., XIE, P., KIM,
+G., HO, Q., AND XING, E.
+Poseidon: A
+system architecture for efﬁcient gpu-based deep
+arXiv preprint
+learning on multiple machines.
+arXiv:1512.06216 (2015).
+
+[38] ZOU, Y., JIN, X., LI, Y., GUO, Z., WANG, E.,
+AND XIAO, B. Mariana: Tencent Deep Learning
+In VLDB Endow-
+Platform and its Applications.
+ment (2014).
+
+[22] MORITZ, P., NISHIHARA, R., STOICA, I., AND
+JORDAN, M. I. Sparknet: Training deep networks
+in spark. arXiv preprint arXiv:1511.06051 (2015).
+
+[23] RUSSAKOVSKY, O., DENG, J., SU, H., KRAUSE,
+J., SATHEESH, S., MA, S., HUANG, Z., KARPA-
+THY, A., KHOSLA, A., BERNSTEIN, M., BERG,
+A. C., AND FEI-FEI, L.
+ImageNet Large Scale
+Visual Recognition Challenge. IJCV (2015), 1–42.
+
+[24] SEIDE, F., FU, H., DROPPO, J., LI, G., AND YU,
+D. 1-bit stochastic gradient descent and its appli-
+cation to data-parallel distributed training of speech
+dnns. In INTERSPEECH (2014), pp. 1058–1062.
+
+[25] SEIDE, F., FU, H., DROPPO, J., LI, G., AND YU,
+D. On parallelizability of stochastic gradient de-
+scent for speech dnns. In 2014 IEEE International
+Conference on Acoustics, Speech and Signal Pro-
+cessing (ICASSP) (2014), IEEE, pp. 235–239.
+
+[26] SIMONYAN, K., AND ZISSERMAN, A. Very
+Deep Convolutional Networks for Large-Scale Im-
+age Recognition. In ICLR (2015).
+
+[27] SZEGEDY, C., LIU, W., JIA, Y., SERMANET, P.,
+REED, S., ANGUELOV, D., ERHAN, D., VAN-
+HOUCKE, V., AND RABINOVICH, A. Going deeper
+with convolutions. In CVPR (2015).
+
+[28] SZEGEDY, C., VANHOUCKE, V.,
+
+IOFFE, S.,
+SHLENS, J., AND WOJNA, Z. Rethinking the in-
+arXiv
+ception architecture for computer vision.
+preprint arXiv:1512.00567 (2015).
+
+[29] WANG, W., CHEN, G., DINH, T. T. A., GAO, J.,
+OOI, B. C., TAN, K.-L., AND WANG, S. SINGA:
+Putting Deep Learning in the Hands of Multimedia
+Users. In MM (2015).
+
+[30] WATCHARAPICHAT, P., MORALES, V. L., FER-
+NANDEZ, R. C., AND PIETZUCH, P. Ako: De-
+centralised deep learning with partial gradient ex-
+change. In Proceedings of the Seventh ACM Sym-
+posium on Cloud Computing (2016), ACM, pp. 84–
+97.
+
+[31] WEI, J., DAI, W., QIAO, A., HO, Q., CUI,
+H., GANGER, G. R., GIBBONS, P. B., GIBSON,
+G. A., AND XING, E. P. Managed Communica-
+tion and Consistency for Fast Data-parallel Iterative
+Analytics. In SoCC (2015).
+
+[32] XIE, P., KIM, J. K., ZHOU, Y., HO, Q., KU-
+MAR, A., YU, Y., AND XING, E. Distributed Ma-
+chine Learning via Sufﬁcient Factor Broadcasting.
+In arXiv (2015).
+
+

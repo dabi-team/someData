@@ -1,0 +1,5002 @@
+2
+2
+0
+2
+
+t
+c
+O
+9
+
+]
+
+G
+L
+.
+s
+c
+[
+
+2
+v
+8
+4
+0
+1
+1
+.
+5
+0
+2
+2
+:
+v
+i
+X
+r
+a
+
+GBA: A Tuning-free Approach to Switch between
+Synchronous and Asynchronous Training for
+Recommendation Models
+
+Wenbo Su∗, Yuanxing Zhang∗, Yufeng Cai, Kaixu Ren, Pengjie Wang, Huimin Yi,
+Yue Song, Jing Chen1, Hongbo Deng, Jian Xu, Lin Qu1, Bo Zheng†
+Alibaba Group
+{vincent.swb, yuanxing.zyx, baike.cyf, kaixu.rkx,
+pengjie.wpj, huimin.yhm, yue.song, dhb167148,
+xiyu.xj, bozheng}@alibaba-inc.com
+1{gongcheng.cj, xide.ql}@taobao.com
+
+Abstract
+
+High-concurrency asynchronous training upon parameter server (PS) architecture
+and high-performance synchronous training upon all-reduce (AR) architecture
+are the most commonly deployed distributed training modes for recommendation
+models. Although synchronous AR training is designed to have higher training
+efﬁciency, asynchronous PS training would be a better choice for training speed
+when there are stragglers (slow workers) in the shared cluster, especially under
+limited computing resources. An ideal way to take full advantage of these two
+training modes is to switch between them upon the cluster status. However, switch-
+ing training modes often requires tuning hyper-parameters, which is extremely
+time- and resource-consuming. We ﬁnd two obstacles to a tuning-free approach:
+the different distribution of the gradient values and the stale gradients from the
+stragglers. This paper proposes Global Batch gradients Aggregation (GBA) over
+PS, which aggregates and applies gradients with the same global batch size as the
+synchronous training. A token-control process is implemented to assemble the
+gradients and decay the gradients with severe staleness. We provide the conver-
+gence analysis to reveal that GBA has comparable convergence properties with the
+synchronous training, and demonstrate the robustness of GBA the recommenda-
+tion models against the gradient staleness. Experiments on three industrial-scale
+recommendation tasks show that GBA is an effective tuning-free approach for
+switching. Compared to the state-of-the-art derived asynchronous training, GBA
+achieves up to 0.2% improvement on the AUC metric, which is signiﬁcant for the
+recommendation models. Meanwhile, under the strained hardware resource, GBA
+speeds up at least 2.4x compared to synchronous training.
+
+1
+
+Introduction
+
+Nowadays, recommendation models with a large volume of parameters and high computational
+complexity have become the mainstream in the deep learning communities [12]. Accelerating the
+training of these recommendation models is a trending issue, and recently synchronous training upon
+high-performance computing (HPC) has dominated the training speed records [16, 15, 29]. The
+resource requirements of the synchronous training upon AR are more rigorous than the asynchronous
+
+∗∗ These authors contributed equally to this work.
+†† Corresponding author
+
+36th Conference on Neural Information Processing Systems (NeurIPS 2022).
+
+ 
+ 
+ 
+ 
+ 
+ 
+training upon PS [1]. In a shared training cluster with dynamic status [2], the synchronous training
+would be retarded by a few straggling workers. Thus, its training speed may be even much slower
+than the high-concurrency asynchronous training.
+
+Should it be possible to switch the training mode according to the cluster status, we will have
+access to making full use of the limited hardware resources. Switching the training mode for a
+speciﬁc model usually demands tuning of the hyper-parameters for guarantees of accuracy. Re-tuning
+the hyper-parameters is common in the one-shot training workloads (e.g., the general CV or NLP
+workloads) [18]. However, it is not applicable for the continual learning or the lifelong training of
+the recommendation models [9], as tuning would be highly time- and resource-consuming. When
+switching the training mode of representative recommendation models, we confront three main
+challenges from our shared cluster: 1) Model accuracy may suffer from a sudden drop after switching,
+requiring the model to be retrained on a large amount of data to reach the comparable accuracy
+before switching; 2) The distribution of gradient values is different between synchronous training
+and asynchronous training, making the models under two training modes difﬁcult to reach the same
+accuracy by tuning the hyper-parameters;3) The cluster status imposes staleness on the asynchronous
+training, and staleness negatively impacts the aggregation of gradients, especially for the dense
+parameters.
+
+We conduct a systematic investigation of the training workloads of recommendation models to tackle
+the above challenges. It is found that when the global batch size (i.e., the actual batch size of gradient
+aggregation) is the same, the distribution of gradient values of asynchronous training tends to be
+similar to that of synchronous training. Besides, we notice that due to the high sparsity, the embedding
+parameters in recommendation models are less frequently updated than the dense parameters, leading
+to a stronger tolerance for staleness than the general CV or NLP deep learning models. Based on
+these insights, we propose Global Batch gradients Aggregation (GBA), which ensures the model
+keeps the same global batch size when switched between the synchronous and asynchronous training.
+GBA is implemented by a token-control mechanism, which resorts to bounding the staleness and
+making gradient aggregation [11]. The mechanism suppresses the staleness following a staleness
+decay strategy over the token index. The faster nodes would take more tokens without waiting,
+and thereby GBA trains as fast as the asynchronous mode. Furthermore, the convergence analysis
+shows that GBA has comparable convergence properties with the synchronous mode, even under
+high staleness for recommendation models. We conduct an extensive evaluation on three continual
+learning of recommendation tasks. The results reveal that GBA performs well on both accuracy and
+efﬁciency with the same hyper-parameters. Particularly, GBA improves the AUC metric by 0.2%
+on average compared to the state-of-the-art training modes of asynchronous training. Besides, GBA
+presents at least 2.4x speedup over the synchronous AR training in the cluster with strained hardware
+resources.
+
+To the best of our knowledge, this is the ﬁrst work to approach switching between synchronous and
+asynchronous training without tuning the hyper-parameters. GBA has been deployed in our shared
+training cluster. The tuning-free switching enables our users to dynamically change the training
+modes between GBA and the synchronous HPC training for the continual learning tasks. The overall
+training efﬁciency of these training workloads is thereby signiﬁcantly improved, and the hardware
+utilization within the cluster is also raised by a large margin.
+
+2 Related Work
+
+Distributed training mode. PS [19] and AR [16] are two mainstream architectures for the training
+workloads of recommendation models, accompanied by the asynchronous training and synchronous
+training, respectively. Researchers are enthusiastic about the pipeline, communication, and compu-
+tation optimization for the AR architecture of recommender systems [29]. Meanwhile, to improve
+the training efﬁciency of the PS architecture, researchers propose a category of semi-synchronous
+training mode [11]. For example, Hop-BS [22] restricts the gradient updates under the bounded
+staleness, and Hop-BW [22] ignores the gradients from the stragglers with the well-shufﬂed and
+redundancy data. Recently, a category of decentralized training has been proposed in many studies to
+scale out the AR architecture. Local all-reduce [23], local update [24], exponential graph [26], and
+many topology-aware solutions have proven promising in the NLP and CV tasks. However, owing to
+the sparsity in recommendation models, the inconsistent parameters among workers and the dropped
+gradients of the scarce IDs would intolerably degrade the accuracy. Besides, these training modes
+
+2
+
+Figure 1: Normalized QPS of four training
+modes in training YouTubeDNN models in a
+shared cluster, with CPU utilization in a day.
+
+Figure 2: The AUC on the validation set of
+Criteo-4GB and Private by every 5% progress
+during training, switching at 50% progress.
+
+hardly consider the requirements to switch to another training mode according to the cluster status,
+though switching is beneﬁcial to improve the training efﬁciency in the shared training clusters.
+
+Staleness and noisy gradients. The indeterminate or even inferior model accuracy of asynchronous
+training is mainly attributed to the staleness [6] and the noisy gradients [25] caused by the small batch.
+Although prior research has pointed out that the converged giant model is less sensitive to staleness
+[7], staleness is still a negative factor in the accuracy of the continual recommendation training. Many
+efforts have been put into controlling staleness via Taylor expansion [30], weighted penalty [33], etc.
+Recent works present a large-batch training paradigm with specially-designed optimizers to scale the
+gradients before updating [27], and point out that it can reach the best accuracy by merely adjusting
+batch size [10, 28]. There are also attempts to change gradient aggregation strategies during the
+asynchronous training to achieve stable model accuracy [20]. GBA generalizes the staleness control
+paradigm to the recommendation workloads by token-control mechanism, which ﬁnds the balance
+between bounding staleness and ignoring gradients. GBA runs with the same global batch size as the
+synchronous mode, ensuring the effective switching between GBA and synchronous training without
+tuning hyper-parameters.
+
+3 Preliminaries
+
+3.1 Distributed Training of Recommendation Models
+
+Recommendation models usually comprise two modules: the sparse module contains the embedding
+layers with the embedding parameters, mapping the categorical IDs into numerical space; the dense
+module contains the computational blocks with the dense parameters, such as attention and MLP
+[3, 31], to exploit the feature interactions. The main difference between the two kinds of parameters
+is the occurrence ratio in each training batch. Each training batch needs all the dense parameters,
+yet only a tiny amount of embedding parameters are required according to the feature IDs in the
+data shard. The latest development of recommendation models introduces high complexity and a
+large volume of parameters, making distributed training essential to improve training efﬁciency. The
+synchronous HPC training mode usually adopts the AR architecture, where the dense parameters are
+replicated, and the embedding parameters are partitioned on each worker. HPC should be deployed by
+monopolizing a few high-performance workers and making full use of the associated resources, which
+may be retarded by the slow workers [17]. PS architecture is usually coupled with asynchronous high
+concurrency training where the parameters are placed on PSs, and the workers are responsible for the
+computation. On the one hand, the high concurrency mechanism activates the fragmentary resources
+in the training cluster by deploying hundreds of workers. On the other hand, the asynchronous
+training brings in gradient staleness, which occurs when the gradient is calculated based on the
+parameters of an old version and applied to the parameters of a new version.
+
+3.2 Observations and Insights within a Shared Training Cluster
+
+We investigate the training workloads of recommendation models from a shared training cluster to
+observe the obstacles and necessities of switching training modes.
+
+3
+
+0:0012:0023:00Time in a day00.51.0Normalized valueCPU Util.Sync.Async.PragueSwarmAdam0.8043DeepFMYouTubeDNNAUCTraining progressSwitching0.7680Figure 3: The distribution of L2-norm of gra-
+dients from the synchronous training and BSP
+with various size of aggregation.
+
+Figure 4: The skewed distribution of ID occur-
+rences across batches, reﬂecting the frequency
+that an ID gets updated.
+
+Observation 1: Cluster status determines the performance of training modes. Figure 1 illus-
+trates the average CPU utilization within a real shared cluster, and the corresponding samples/queries
+per second (QPS) of a YouTubeDNN [5] model by the synchronous and asynchronous training
+mode. The utilization and QPS are normalized by their maximal value, respectively. When the
+cluster is relatively vacant, models trained in the synchronous mode can fully occupy the hardware
+resources, satisfying HPC conditions and presenting high efﬁciency. When there are plenty of hetero-
+geneous workloads in the cluster, slow workers dominate the training speed, making the asynchronous
+training mode run much faster than the synchronous mode. We also implement two approaches
+of local all-reduce3. Since the status of each device in the cluster is constantly changing, the local
+all-reduce-based mode would not work well when confronting resource shortages.
+
+Observation 2: Directly switching training mode brings sudden drop on accuracy. We run
+DeepFM [21] over Criteo-4GB [14] (few parameters, fast convergence) and YouTubeDNN on Private
+dataset (trillions of parameters, slow convergence) in the shared cluster. We tune the hyper-parameters
+from scratch for the best model accuracy of both asynchronous and synchronous mode, and denote
+the two sets of hyper-parameters as set A and set S, respectively. After training in one training mode,
+we evaluate the tendency of the training AUC after switching to the other training mode with set A
+or set S. Figure 2 illustrates that after switching from the synchronous mode to the asynchronous
+mode, the AUC encounters sudden drop and even decreases to 0.5. The AUC drop also appears in the
+opposite-side switching, indicating that this condition is irrelevant to whether the model had been
+converged. These observations imply that directly switching the training mode requires heavy effort
+in re-tuning the hyper-parameter. Inherently, training modes would lead to different convergence
+or minima owing to the difference in batch size, learning rate and many other factors, which have
+already received in-depth theoretical research [? ? ]. We provide theoretical analysis to explain the
+sudden drop in Appendix D.
+
+We then probe into the insights from asynchronously training recommendation models.
+
+Insight 1: Distribution of the gradient values is related to the aggregated batch size. We attempt
+to investigate the reason for observation 2 from the gradient aspect. We implement asynchronous
+bulk synchronous parallel (BSP) on the YouTubeDNN recommendation task, which asynchronously
+aggregates K gradients from workers before applying the values to the parameters. Here, we set
+K to 100, the same as the number of workers. Besides, we compare the synchronous training
+in 6.4K local batch size (64 workers). Figure 3 plots the distribution of the L2-norm of gradient
+values from the synchronous training and BSP with various local batch sizes. It is evident that the
+batch size determines the mean and variance of the distribution. The distribution of BSP resembles
+synchronous training when the aggregation size is similar (i.e., BSP-4K). The result suggests that the
+same aggregation size could lead to a similar distribution of gradient values. However, there is still a
+gap in model accuracy after equalizing the global batch size between the asynchronous training and
+the synchronous training, mainly induced by gradient staleness.
+
+Insight 2: The gradient staleness imposes different impact on the embedding parameters and
+the dense parameters. Due to the skewed distribution, most IDs would merely appear in a small
+number of batches, as depicted in Fig. 4. It means that in the recommendation models, only a tiny
+portion of IDs would be involved in every single batch, and the embedding parameters are less
+
+3SwarmAdam is a variant of SwarmSGD [24] with Adam optimizer. It is uncommon to use SwarmAdam and
+Prague [23] in recommendation models as they may lead to accuracy loss which is not tolerable in the business.
+
+4
+
+36912L2-norm of Gradients (×10−5)00.120.25ProportionSync.BSP-1KBSP-2KBSP-4KBSP-6K1205080Occurences per 100 batches10−710−410−1ProportionFigure 5: Illustration of the token-control mechanism in GBA: every M gradients would be aggregated
+in the buffer before the PSs apply them to the parameters; workers report gradients to the PSs along
+with a token indicating the degree of data staleness.
+
+frequently updated than the dense parameters. Therefore, the embedding parameters tend to be more
+robust on the gradient staleness than the dense parameters (for example, considering a worker in
+training, there could be ﬁve updates for the dense parameters, yet only two updates for the embedding
+of a speciﬁc ID).
+
+4 Global Batch based Gradients Aggregation
+
+4.1 Training Recommendation Models with GBA
+
+Switching the distributed training mode for recommendation models should get rid of tuning the
+hyper-parameters. We introduce the concept of global batch size, which is deﬁned as the actual batch
+size when gradients are aggregated and applied, and propose GBA for the tuning-free switching. We
+denote the local batch size, i.e., the actual batch size on each worker and the number of workers, as
+Bs and Ns for the synchronous training, Ba and Na for the asynchronous training. Then, the global
+batch size in synchronous training, denoted by Gs, can be calculated as Bs × Ns. Following Insight
+1, GBA remains the global batch size unchanged when we switch the distributed training model
+from synchronous training to asynchronous training. For each step, all the dense parameters would
+be updated, and only a small number of embedding parameters would be updated. Then the dense
+parameters and embedding parameters obtain different gradient staleness during training. Hence,
+we deﬁne the data staleness as the uniﬁed staleness in training recommendation models. The data
+staleness describes the gap between the global step when the worker begins to ingest a data batch
+and the global step when the calculated gradient is applied. Obviously, the data staleness in the
+synchronous training mode is constantly zero. Based on data staleness, we implement GBA by a
+token-control mechanism on the PS architecture to cope with the sparsity and the dynamic cluster
+status.
+
+Figure 5 illustrates the architecture of the proposed token-control mechanism. Over the canonical PS,
+we prepare a queue called data list to arrange the data (addresses) by batches. Given a dataset D,
+suppose we can split it into Q batches of size Ba, denoted by D = (d0, d1, . . . , dQ−1). Meanwhile,
+we establish another queue called token list to yield the token of each individual batch. The token
+list contains Q tokens, denoted by (t0, t1, . . . , tQ−1), each attached to one batch in the data list to
+indicate the global step when this batch is sent to a worker. The token value starts from zero, and
+each token value repeats M times in the token list. Here, M is the number of batches we use to
+aggregate gradients. Under this setting, we can deduce that there will be K = (cid:100) Q
+M (cid:101) gradient updates
+during the training. Then we set ti = (cid:98) i
+K (cid:99), ∀i ∈ {0, 1, . . . , Q − 1} to ensure that the token list yields
+the token value in ascending order. Apart from the two queues, we also employ a gradient buffer to
+receive the gradients calculated by the workers with the corresponding tokens of the gradients. To
+be consistent with the tokens, the capacity of the gradient buffer is set to M , and therefore the PSs
+would aggregate M gradients before applying them to the variables. Note that each PS maintains an
+individual gradient buffer to deal with the gradients of the corresponding partitions of the variables.
+
+5
+
+PSWorker𝟎Worker𝑵𝒂−𝟏Worker𝟐Worker𝟏PS……211…2∇∇∇…∇Gradient Buffer𝑀−10tokengradient(partition)12…211…2∇∇∇…∇Gradient Buffer𝑀−10token12…00…011…122…2…𝐝0𝐝1𝐝2…𝐝𝑄−1Token List (Size 𝑄)Data List (Size 𝑄)worker sends token and gradient to PSdata and token are sent to worker 𝑀gradients in gradient buffer would be aggregatedSize 𝑀Size 𝑀Size 𝑀Dense ParametersStaleness2∇1∇1∇……2∇…Embedding ParametersNon-UpdateUpdategradient(partition)token gradientDuring the training process, a worker would pull the parameters from PS, a batch from the data
+list, and a token from the token list simultaneously before ingesting the data and computing the
+gradient locally. When a worker completes calculating the gradient of a batch, the gradient and the
+corresponding token are sent to the gradient buffer on PS. Then, the worker immediately proceeds
+to work on the next batch. In this way, the fast workers can keep working without waiting for the
+slow ones. When the gradient buffer reaches the capacity of M pairs of gradients and tokens, all
+the gradients are aggregated to apply once, and at the same time, the buffer will be cleared. This is
+what we call ﬁnishing a global step, and thereby the global batch size in GBA can be calculated as
+Ga = Ba × M . According to the design, we aim to keep the global batch size consistent in switching,
+that is, Gs = Ga. Hence, we can set the size of the gradient buffer to be M = Bs×Ns
+. We would use
+M workers in GBA, i.e., Na = M , to avoid the intrinsic gradient staleness led by the inconsistency
+between the number of workers and the number of batches to aggregate.
+
+Ba
+
+At the update of global step k, denote τ (m, k) the m-th token in the gradient buffer. When we
+aggregate the gradients in the gradient buffer, we shall decay the gradients that suffer from severe
+staleness. GBA could employ different staleness decay strategies to mitigate the negative impact
+from the staleness according to the token index, and in this work we deﬁne it as:
+
+f (τ (m, k), k) =
+
+(cid:26)0,
+
+k − τ (m, k) > ι
+1, k − τ (m, k) ≤ ι,
+
+(1)
+
+where ι is the threshold of tolerance. If f (τ (m, k), k) = 0, we exclude the m-th gradient in the buffer
+due to the severe staleness; otherwise, we aggregate the gradient. As we can see, tokens help identify
+whether the corresponding gradients are stale and how many stale steps are behind the current global
+step. In this case, although the token is designed over the data staleness, the negative impact from the
+canonical gradient staleness can also be mitigated.
+
+4.2 Convergence Analysis
+
+We have seen much research on the convergence analysis of the synchronous and asynchronous
+training. Following the assumptions and convergence analysis in Dutta et al. [6], the expectation of
+error after k steps of gradient updates in the synchronous training can be deduced by:
+
+E[F (wk)] − F ∗ ≤
+
+ηLσ2
+2cNsBs
+
++ (1 − ηc)k(F (w0) − F ∗ −
+
+ηLσ2
+2cNsBs
+
+),
+
+(2)
+
+where wk denotes the parameter in step k, η denotes learning rate, L is the Lipschitz constant and σ
+denotes the variance of gradients. F (w) is the empirical risk function that is strongly convex with
+parameter c. E[F (wk)] − F ∗ is the expected gap of the risk function from its optimal value, used as
+the error after k steps. As mentioned in Eqn. (2), The ﬁrst term in the right, i.e.
+2c(NsBs) , would be
+the error ﬂoor, and (1 − ηc) is the decay rate. The proposed GBA is derived upon the asynchronous
+gradient aggregation. We assume that, for some γ ≤ 1,
+
+ηLσ2
+
+γ ≥
+
+ζE[||∇F (wk) − ∇F (wτ (m,k))||2
+2]
+E[||∇F (wk)||2
+2]
+
+.
+
+(3)
+
+Here, γ is a measure of gradients impact induced by the staleness; smaller value of γ indicates that
+staleness makes less accuracy deterioration of the model. Besides, ζ indicates the average probability
+that any parameter in the model would be both updated in step k and step τ (m, k). Intuitively, ζ
+would be far below 1 in the recommendation models due to the strong sparsity. Then, the error of
+GBA after k steps of aggregated updates would become (Appendix A presents the proof):
+
+E[F (wk)] − F ∗ ≤
+
+ηLσ2
+2cγ(cid:48)M Ba
+
++ (1 − ηγ(cid:48)c)k(E[F (w0)] − F ∗ −
+
+ηLσ2
+2cγ(cid:48)M Ba
+
+),
+
+(4)
+
+where γ(cid:48) = 1 − γ + p0
+2 and p0 is a lower bound on the conditional probability that the token equals to
+the global step, i.e., τ (m, k) = k. Equation (4) proves the convergence of GBA. Considering the error
+ﬂoors of Eqn. (2) and Eqn. (4), M × Ba should be set close to Ns × Bs to make GBA tuning-free. It
+is exactly the global batch size we use in GBA, consistent with our main idea of keeping global batch
+size unchanged. Recall that with the embedding parameters, ζ < 1 makes γ lower than the training
+of general CV or NLP models. Consequently, the error ﬂoor remains low in GBA.
+
+6
+
+Figure 6: The AUC tendencies on the test days of the three datasets after inheriting a base model:
+(a-c) from the synchronous training modes and switching to the compared training modes; (d-f) from
+the compared training modes and switching to the synchronous training modes; (g-h) AUC difference
+between GBA and the other training modes after switching from/to synchronous training.
+
+5 Evaluation
+
+5.1 Settings
+
+Table 5.1: Settings of the three continual recommendation tasks by the compared training modes.
+
+Task
+
+Criteo
+(DeepFM)
+
+Alimama
+(DIEN)
+
+Model
+description
+
+Data parts
+
+Sample
+per day
+
+Optimizer
+
+Learning
+rate
+
+# of workers
+
+Local batch
+size
+
+Private
+hyper-param.
+
+19M(x40K) FLOPS
+45B params.
+16 avg. dim.
+
+112M(x3K) FLOPS
+160B params.
+19 avg. dim.
+
+12 days (base)
+11 days (eval)
+
+190M
+
+Adagrad (Async.)
+Adam (Others)
+
+0.006 (Async.)
+0.0011 (Others)
+
+32 (Sync.)
+100 (Others)
+
+5 days (base)
+3 days (eval)
+
+90M
+
+Adagrad (Async.)
+Adam (Others)
+
+0.008 (Async.)
+0.0015 (Others)
+
+32 (Sync.)
+128 (Others)
+
+Private
+(YouTubeDNN)
+
+746M(x6.4K) FLOPS
+1.9T params.
+24 avg. dim.
+
+14 days (base)
+8 days (eval)
+
+2B
+
+Adagrad (Async.)
+Adam (Others)
+
+0.001 (Async.)
+0.0006 (Others)
+
+64 (Sync.)
+400 (Others)
+
+5K (Async.)
+12.8K (GBA)
+40K (Others)
+
+1K (Async.)
+0.75K (GBA)
+3K (Others)
+
+1K (Async.)
+1K (GBA)
+6.4K (Others)
+
+Hop-BS (b1=2)
+BSP (b2=20)
+Hop-BW (b3=20)
+GBA (ι=3)
+Hop-BS (b1=2)
+BSP (b2=20)
+Hop-BW (b3=20)
+GBA (ι=4)
+Hop-BS (b1=2)
+BSP (b2=50)
+Hop-BW (b3=100)
+GBA (ι=4)
+
+We conduct systematical evaluations to examine the performance of GBA and make a ﬁne-grained
+analysis. The evaluations involve three industrial-scale recommendation tasks: 1) On the Criteo-1TB
+dataset [13], we implement DeepFM, where the hyper-parameters on Criteo-4GB (AUC 0.8043)
+are utilized; 2) On the Alimama dataset [8], we implement DIEN [32] and use the recommended
+hyper-parameters in the original design; 3) On the Private dataset, we implement YouTubeDNN, and
+we tune the best hyper-parameters. The models are implemented in DeepRec [4] with the expandable
+HashTables. Detailed information on the dataset and the models are listed in Tab. 5.1. We imitate the
+continual training without changing the hyper-parameters to the models, and ensure a similar cluster
+status for all evaluations. Inheriting from a pre-trained checkpoint, we repeatedly train on the data
+of every day and evaluate the data of the subsequent day. The training cluster is equipped with a
+Tesla-V100S GPU and Skylake CPU. We focus on AUC as the accuracy metric and global/local QPS
+(QPS of all/single workers) as the efﬁciency metric.
+
+We select several state-of-the-art PS-based training modes: Bounded staleness (Hop-BS) restricts
+the maximal differences of gradient version between the fastest and the slowest workers, controlled
+by b1; Bulk synchronous parallel (BSP) aggregates a pre-set number b2 of gradients when applying
+gradients to the parameters, regardless of the gradient version; Backup worker (Hop-BW) ignores
+the pre-set number b3 of gradients from the slowest workers during each gradient aggregation. We
+enumerate the specialized hyper-parameters of each training mode and record the statistics when
+reaching its best AUC.
+
+7
+
+(d) Criteo (to Sync.)(e) Alimama(to Sync.)(f) Private (to Sync.)Test day(a) Criteo (from Sync.)(b) Alimama(from Sync.)(c) Private (from Sync.)Test day0.7850.6440.6530.7770.6530.6360.7701stdayLast dayAverageSync.+0.0011-0.0002+0.0002Hop-BW-0.0012-0.0046-0.0025Hop-BS-0.0015-0.0979-0.0716BSP-0.0017-0.0045-0.0034Async.-0.1513-0.1542-0.15181stdayLast dayAverageSync.+0.0011+0.0001+0.0002Hop-BW-0.0060-0.0021-0.0036Hop-BS-0.0018-0.0005-0.0009BSP-0.0079-0.0021-0.0040Async.-0.0080-0.0980-0.0875(g) Diff. from GBA (from Sync.)(h) Diff. from GBA (to Sync.)Table 5.2: Global QPS of the compared training mode on the three tasks.
+
+Sync.
+
+Async.
+
+Hop-BS
+
+BSP
+
+Hop-BW
+
+GBA
+
+1,436K(±224K) 3,253K(±84K)
+
+Criteo
+Alimama 182K(±52K)
+43K(±21K)
+Private
+
+403K(±33K)
+90K(±15K)
+
+2,227K(±336K) 3,247K(±93K)
+217K(±65K)
+29K(±11K)
+
+403K(±33K)
+88K(±17K)
+
+2,559K(±294K) 3,240K(±97K)
+288K(±48K)
+66K(±24K)
+
+399K(±35K)
+87K(±19K)
+
+Table 5.3: Fine-grained analysis between GBA and the other training modes.
+
+Local QPS
+GBA
+
+Async.
+
+Sync.
+
+78K(±23K) 74K(±25K) 0.7864
+90K(±15K) 87K(±19K) 0.7864
+99K(±12K) 98K(±12K) 0.7864
+
+AUC
+
+GBA
+
+0.7864
+0.7866
+0.7865
+
+# of drop
+
+Avg. grad. staleness (max)
+
+Hop-BW GBA
+
+Hop-BS
+
+GBA
+
+BSP
+
+300K
+300K
+300K
+
+1,454
+898
+786
+
+0.06 (2)
+0.04 (2)
+0.03 (2)
+
+0.21 (11)
+0.15 (11)
+0.12 (9)
+
+2.61 (12)
+1.92 (12)
+1.62 (10)
+
+5.2 Performance of Training Modes
+
+We ﬁrst examine the performance of GBA. Figure 6(a-c) records the AUC tendencies after switching
+from synchronous to the other training modes over the three recommendation tasks. We mainly focus
+on the AUC at the ﬁrst day and the last day, as well as the average AUC scores throughout the datasets.
+Although Hop-BW eliminates staleness, the ignorance of a large volume of data makes it perform
+the worst (also taken as evidence why we tend not to use local all-reduce in training recommender
+systems). The manipulation of global batch size contributes to the best performance on both sides of
+switching. Compared to the best baselines (i.e., Hop-BW), GBA improves AUC by at least 0.2% on
+average over the three datasets, which has the potential to increase by 1% revenue in the real-world
+business. Meanwhile, after switching from synchronous training, GBA obtains immediate good
+accuracy (AUC at the ﬁrst day), while there are explicit re-convergence on the other training modes,
+as depicted in Figure 6(g).
+
+Figure 6(d-f,h) illustrates the AUCs of these training modes after switching to synchronous train-
+ing.We can see that GBA tends to obtain at least equal accuracy to the continuous synchronous
+training without switching. On the contrary, the models inherited from the other baselines require
+consuming more data to reach the desired accuracy of the synchronous training. The tendency of
+the AUC gaps between the synchronous training and the compared training modes reﬂects that the
+parameters trained by GBA are the most compatible with the synchronous training. It veriﬁes that
+switching from GBA to synchronous training is also tuning-free.
+
+We collect metrics of the training efﬁciency during the above experiments, and report their global QPS
+in Tab. 5.2. The results reveal that GBA performs similarly to the asynchronous training. Although
+Hop-BS works better than BSP and Hop-BW in accuracy, it struggles to deal with the slow workers.
+It indicates that when facing a resource shortage in the shared cluster, GBA can provide similar
+accuracy with synchronous training mode, while running as fast as the asynchronous training mode.
+
+5.3 Fine-grained Analysis
+
+We further probe into the performance of GBA. Here, we take the recommendation task on the Private
+dataset (the most complex model) as an example, switching from the synchronous mode to GBA.
+
+We ﬁrst analyze how the cluster status affects the performance of GBA. The experiments are repeated
+in the cluster during different periods of a day. We collect AUC, QPS, average gradient staleness on
+the dense parameters (for fair comparison among the baselines), and the number of excluded batches,
+as shown in Tab. 5.3. From the results, we can infer that GBA properly ﬁnds the balance between
+the staleness and the excluded data (as deﬁned in Eqn. (1)), i.e., excluding fewer data compared
+to Hop-BW and suppressing the staleness to the same level of Hop-BS. GBA also shows strong
+robustness on the dynamic cluster status, obtaining stable performance on AUC.
+
+We then examine the impact of the batch sizes in GBA. Figure 7 depicts the average AUC score and
+the global QPS when we modify the local batch size (the number of workers is thereby changed)
+and keep the global batch size unchanged. Considering the hardware limitation on worker and the
+communication overhead on PS, we vary the number of workers from 100 to 800. We can see a
+steady state of the AUC score (i.e., absolute difference less than 10−4), while the training achieves
+
+8
+
+Figure 7: The average AUC on the 8-day test sets
+and the training efﬁciency via GBA, varying the
+number of workers while maintaining the global
+batch size.
+
+Figure 8: The range of AUC on the 8-
+day test sets via GBA of 400 workers,
+varying the local batch size.
+
+a signiﬁcant efﬁciency boost when using more workers. It can thereby be inferred that GBA has a
+good capability of scaling out. Besides, we ﬁx the number of workers to 400 and change the local
+batch size for each worker, which means that the global batch size would differ. As shown in Fig. 8,
+the inconsistent global batch size with the synchronous training makes the training encounter lower
+AUC scores after switching. Although the larger global batch size may have the potential to achieve
+better accuracy (i.e., owing to the stable and accurate gradient), the experiment indicates the model
+would hardly reach its best accuracy without tuning. These results verify that using the same global
+batch size in GBA as in the synchronous training is necessary to get rid of tuning when switching the
+training mode.
+
+6 Conclusion
+
+A tuning-free switching approach is demanded to take full advantage of the synchronous and
+asynchronous training, which can improve the training efﬁciency in the shared cluster. We raise
+insights from the investigation over the production training workloads that the inconsistent batch size
+and the gradient staleness are two main reasons to fail the switching regarding the model accuracy.
+Then GBA training mode is proposed for asynchronously training recommendation models via
+aggregating gradients by the global batch size. GBA enables switching between synchronous training
+and asynchronous training of the continual learning tasks with the accuracy and efﬁciency guarantees.
+With GBA, users can freely switch the training modes according to the status of the shared training
+clusters, without tuning hyper-parameters. GBA is implemented through a token-control mechanism
+to ensure that the faster worker should contribute more gradients to the aggregation while the gradients
+from the straggling workers would be decayed. Evaluations of three representative continual training
+tasks of recommender systems reveal that GBA achieves similar accuracy with the synchronous
+training, while resembling the efﬁciency of the canonical asynchronous training. Currently, GBA
+requires the users to select the training mode according to their own judgment on the cluster status. In
+the future, we will attempt to make GBA be adaptive to the cluster status. The guidelines of automatic
+switching would be derived from more analyses upon the training trace logs. It could be formulated
+as an optimization problem under many control factors including but not limited to the overall QPS,
+training cost, and task scheduling with priority.
+
+References
+
+[1] B. Acun, M. Murphy, X. Wang, J. Nie, C.-J. Wu, and K. Hazelwood. Understanding training
+efﬁciency of deep learning recommendation models at scale. In 2021 IEEE International
+Symposium on High-Performance Computer Architecture (HPCA), pages 802–814. IEEE, 2021.
+
+[2] Y. Chen, J. Wang, Y. Lu, Y. Han, Z. Lv, X. Min, H. Cai, W. Zhang, H. Fan, C. Li, et al. Fangorn:
+adaptive execution framework for heterogeneous workloads on shared clusters. Proceedings of
+the VLDB Endowment, 14(12):2972–2985, 2021.
+
+[3] H.-T. Cheng, L. Koc, J. Harmsen, T. Shaked, T. Chandra, H. Aradhye, G. Anderson, G. Corrado,
+W. Chai, M. Ispir, et al. Wide & deep learning for recommender systems. In Proceedings of the
+1st workshop on deep learning for recommender systems, pages 7–10, 2016.
+
+[4] D. community. Deeprec. https://github.com/alibaba/DeepRec 2022.5.11.
+
+9
+
+100200400800# of workers0.78650.7866AUC2586152Global QPS / K2505001K2K4KLocal batch size0.780.79AUC[5] P. Covington, J. Adams, and E. Sargin. Deep neural networks for youtube recommendations. In
+Proceedings of the 10th ACM conference on recommender systems, pages 191–198, 2016.
+
+[6] S. Dutta, G. Joshi, S. Ghosh, P. Dube, and P. Nagpurkar. Slow and stale gradients can win the
+race: Error-runtime trade-offs in distributed SGD. In International Conference on Artiﬁcial
+Intelligence and Statistics, pages 803–812. PMLR, 2018.
+
+[7] S. Eliad, I. Hakimi, A. De Jagger, M. Silberstein, and A. Schuster. Fine-tuning giant neural
+networks on commodity hardware with automatic pipeline model parallelism. In 2021 USENIX
+Annual Technical Conference (USENIX ATC 21), pages 381–396, 2021.
+
+[8] A. Group. Ad display/click data on taobao.com. https://tianchi.aliyun.com/dataset/
+dataDetail?dataId=56&lang=en-us under CC BY-NC-SA 4.0, visited on 2022.5.11.
+
+[9] Y. Guo, M. Liu, T. Yang, and T. Rosing. Improved schemes for episodic memory-based lifelong
+
+learning. Advances in Neural Information Processing Systems, 33:1023–1035, 2020.
+
+[10] F. He, T. Liu, and D. Tao. Control batch size and learning rate to generalize well: Theoretical
+and empirical evidence. Advances in Neural Information Processing Systems, 32, 2019.
+
+[11] Q. Ho, J. Cipar, H. Cui, S. Lee, J. K. Kim, P. B. Gibbons, G. A. Gibson, G. Ganger, and E. P.
+Xing. More effective distributed ml via a stale synchronous parallel parameter server. Advances
+in neural information processing systems, 26, 2013.
+
+[12] J. Hron, K. Krauth, M. Jordan, and N. Kilbertus. On component interactions in two-stage
+recommender systems. Advances in Neural Information Processing Systems, 34, 2021.
+
+[13] C.
+
+Inc.
+
+Criteo
+
+1tb
+
+click
+
+logs
+
+dataset.
+
+https://ailab.criteo.com/
+
+download-criteo-1tb-click-logs-dataset/ visited on 2022.5.11, .
+
+[14] C. Inc. Kaggle display advertising challenge dataset. http://labs.criteo.com/2014/02/
+
+kaggle-display-advertising-challenge-dataset/ visited on 2020.1.10, .
+
+[15] Y. Jiang, Y. Zhu, C. Lan, B. Yi, Y. Cui, and C. Guo. A uniﬁed architecture for accelerating
+distributed {DNN} training in heterogeneous {GPU/CPU} clusters. In 14th USENIX Symposium
+on Operating Systems Design and Implementation (OSDI 20), pages 463–479, 2020.
+
+[16] S. Kim, G.-I. Yu, H. Park, S. Cho, E. Jeong, H. Ha, S. Lee, J. S. Jeong, and B.-G. Chun. Parallax:
+Sparsity-aware data parallel training of deep neural networks. In Proceedings of the Fourteenth
+EuroSys Conference 2019, pages 1–15, 2019.
+
+[17] A. Kumar, A. Beutel, Q. Ho, and E. Xing. Fugue: Slow-worker-agnostic distributed learning for
+big models on big data. In Artiﬁcial Intelligence and Statistics, pages 531–539. PMLR, 2014.
+
+[18] L. Li, K. Jamieson, A. Rostamizadeh, E. Gonina, J. Ben-Tzur, M. Hardt, B. Recht, and
+A. Talwalkar. A system for massively parallel hyperparameter tuning. Proceedings of Machine
+Learning and Systems, 2:230–246, 2020.
+
+[19] M. Li, D. G. Andersen, J. W. Park, A. J. Smola, A. Ahmed, V. Josifovski, J. Long, E. J. Shekita,
+and B.-Y. Su. Scaling distributed machine learning with the parameter server. In 11th USENIX
+Symposium on Operating Systems Design and Implementation (OSDI 14), pages 583–598, 2014.
+
+[20] S. Li, O. Mangoubi, L. Xu, and T. Guo. Sync-switch: Hybrid parameter synchronization
+for distributed deep learning. In 2021 IEEE 41st International Conference on Distributed
+Computing Systems (ICDCS), pages 528–538. IEEE, 2021.
+
+[21] J. Lian, X. Zhou, F. Zhang, Z. Chen, X. Xie, and G. Sun. xdeepfm: Combining explicit
+and implicit feature interactions for recommender systems. In Proceedings of the 24th ACM
+SIGKDD International Conference on Knowledge Discovery & Data Mining, pages 1754–1763,
+2018.
+
+[22] Q. Luo, J. Lin, Y. Zhuo, and X. Qian. Hop: Heterogeneity-aware decentralized training.
+In Proceedings of the Twenty-Fourth International Conference on Architectural Support for
+Programming Languages and Operating Systems, pages 893–907, 2019.
+
+10
+
+[23] Q. Luo, J. He, Y. Zhuo, and X. Qian. Prague: High-performance heterogeneity-aware asyn-
+chronous decentralized training. In Proceedings of the Twenty-Fifth International Conference
+on Architectural Support for Programming Languages and Operating Systems, pages 401–416,
+2020.
+
+[24] G. Nadiradze, A. Sabour, P. Davies, S. Li, and D. Alistarh. Asynchronous decentralized sgd
+with quantized and local updates. Advances in Neural Information Processing Systems, 34,
+2021.
+
+[25] J. Wu, W. Hu, H. Xiong, J. Huan, V. Braverman, and Z. Zhu. On the noisy gradient descent
+that generalizes as sgd. In International Conference on Machine Learning, pages 10367–10376.
+PMLR, 2020.
+
+[26] B. Ying, K. Yuan, Y. Chen, H. Hu, P. Pan, and W. Yin. Exponential graph is provably efﬁcient
+for decentralized deep training. Advances in Neural Information Processing Systems, 34, 2021.
+
+[27] Y. You, J. Li, S. Reddi, J. Hseu, S. Kumar, S. Bhojanapalli, X. Song, J. Demmel, K. Keutzer,
+and C.-J. Hsieh. Large batch optimization for deep learning: Training bert in 76 minutes. In
+ICLR, 2020.
+
+[28] H. Yu and R. Jin. On the computation and communication complexity of parallel sgd with
+dynamic batch sizes for stochastic non-convex optimization. In International Conference on
+Machine Learning, pages 7174–7183. PMLR, 2019.
+
+[29] Y. Zhang, L. Chen, S. Yang, M. Yuan, H. Yi, J. Zhang, J. Wang, J. Dong, Y. Xu, Y. Song,
+et al. Picasso: Unleashing the potential of gpu-centric training for wide-and-deep recommender
+systems. In 2022 IEEE International Conference on Data Engineering (ICDE), 2022.
+
+[30] S. Zheng, Q. Meng, T. Wang, W. Chen, N. Yu, Z.-M. Ma, and T.-Y. Liu. Asynchronous
+stochastic gradient descent with delay compensation. In International Conference on Machine
+Learning, pages 4120–4129. PMLR, 2017.
+
+[31] G. Zhou, X. Zhu, C. Song, Y. Fan, H. Zhu, X. Ma, Y. Yan, J. Jin, H. Li, and K. Gai. Deep
+interest network for click-through rate prediction. In Proceedings of the 24th ACM SIGKDD
+international conference on knowledge discovery & data mining, pages 1059–1068, 2018.
+
+[32] G. Zhou, N. Mou, Y. Fan, Q. Pi, W. Bian, C. Zhou, X. Zhu, and K. Gai. Deep interest evolution
+network for click-through rate prediction. In Proceedings of the AAAI conference on artiﬁcial
+intelligence, volume 33, pages 5941–5948, 2019.
+
+[33] Y. Zhou, Y. Yu, W. Dai, Y. Liang, and E. Xing. On convergence of model parallel proximal
+gradient algorithm for stale synchronous parallel system. In Artiﬁcial Intelligence and Statistics,
+pages 713–722. PMLR, 2016.
+
+11
+
+Appendix
+
+A Proof of Equation (4)
+
+Assumption. Throughout the paper, we make the following assumptions:
+1. F (w) is an L-smooth function, i.e., F (w1) ≤ F (w2) + (w1 − w2)T ∇F (w2) + L
+2. F (w) is strongly convex with parameter c, i.e., 2c(F (w) − F ∗) ≤ (cid:107)∇F (w)(cid:107)2
+2;
+3. The stochastic gradient g(wτ (m,k)) is an unbiased estimate of the true gradient, i.e.,
+
+2 (cid:107)w1 − w2(cid:107)2
+2;
+
+E(g(wτ (m,k))) = E(∇F (wτ (m,k)));
+
+4. The variance of the stochastic gradient g(wτ (m,k)) in the asynchronous training is bounded as
+
+(cid:16)
+
+E
+
+(cid:107)g(wτ (m,k)) − ∇F (wτ (m,k))(cid:107)2
+2
+
+(cid:17)
+
+≤
+
+σ2
+Ba
+
++
+
+Θ
+Ba
+
+E((cid:107)∇F (wτ (m,k))(cid:107)2
+
+2),
+
+and in the synchronous training is bounded as
+
+(cid:16)
+
+E
+
+(cid:107)g(wτ (m,k)) − ∇F (wτ (m,k))(cid:107)2
+2
+
+(cid:17)
+
+≤
+
+σ2
+Bs
+
++
+
+Θ
+Bs
+
+E((cid:107)∇F (wτ (m,k))(cid:107)2
+
+2).
+
+Theorem 1. Based on the above Assumption and η ≤
+
+1
+2L( Θ
+
+M Ba
+
++1)
+
+, also suppose that for some γ ≤ 1,
+
+(cid:16)
+
+E
+
+(cid:107)∇F (wk) − ∇F (wτ (m,k))(cid:107)2
+2
+
+(cid:17)
+
+≤ γE((cid:107)∇F (wk)(cid:107)2
+
+2),
+
+thus the expectation of error after k + 1 steps of gradient updates in the asynchronous training is
+deduced by
+
+E(F (wk+1) − F ∗) ≤
+
+ηLσ2
+2cγ(cid:48)M Ba
+
++ (1 − ηγ(cid:48)c)k+1(cid:16)
+
+E(F (w0) − F ∗) −
+
+ηLσ2
+2cγ(cid:48)M Ba
+
+(cid:17)
+
+,
+
+2 , p0 is a lower bound on the conditional probability that the token equals to
+
+where γ(cid:48) = 1 − γ + p0
+the global step, i.e., τ (m, k) = k.
+Corollary 1. To characterize the strong sparsity in the recommendation models, we suppose that for
+some γ ≤ 1,
+
+ζE((cid:107)∇F (wk) − ∇F (wτ (m,k))(cid:107)2
+
+2) ≤ γE((cid:107)∇F (wk)(cid:107)2
+
+2),
+
+γ =
+
+(cid:26) γ,
+
+ς = 1,
+ζγ, ς (cid:54)= 1,
+
+(5)
+
+thus the expectation of error after k + 1 steps of gradient updates in the asynchronous training is
++ (1 − ηρc)k+1(cid:16)
+
+E(F (w0) − F ∗) −
+
+(cid:17)
+
+,
+
+ηLσ2
+2cρM Ba
+
+E(F (wk+1) − F ∗) ≤
+
+ηLσ2
+2cρM Ba
+where ρ = 1 − p1γ − (1 − p1)ζγ + p0
+whether x belongs to A, p1 = P (ς = 1).
+
+2 , ς = Idense(parameter), IA(x) is the indicator function of
+
+It is worth noting that we have ρ > 0 and ρ > γ(cid:48) owing to ζγ < γ ≤ 1. Since 2+p0−2ζγ
+P (ς = 1) < 2+p0−2ζγ
+
+2(γ−ζγ) > 1,
+2(γ−ζγ) . The model GBA achieves a better performance in terms of dense and sparse
+parameters, like the error ﬂoor
+mentioned in Theorem 1, and the
+convergence speed is more quickly. Clearly, the value of p1 is differ for various distributions and
+accordingly the values of
+
+and 1 − ηρc are different.
+
+is smaller than
+
+ηLσ2
+2cγ(cid:48)M Ba
+
+ηLσ2
+2cρM Ba
+
+ηLσ2
+2cρM Ba
+
+Theorem 2. Based on the above Assumption and η ≤
+
+1
+2L( Θ
+
+NsBs
+
+, the expectation of error after
+
++1)
+
+k + 1 steps of gradient updates in the synchronous training is deduced by
+
+E(F (wk+1) − F ∗) ≤
+
+ηLσ2
+2cNsBs
+
++ (1 − ηc)k+1(cid:16)
+
+E(F (w0) − F ∗) −
+
+ηLσ2
+2cNsBs
+
+(cid:17)
+
+.
+
+To provide the proofs of Theorem 1, Corollary 1, and Theorem 2, we ﬁrst prove the following lemmas.
+
+12
+
+Lemma 1. Let g(wτ (i,k)) denote the i-th gradient of k-th global step, and assume its expectation
+E(g(wτ (i,k))) = E(∇F (wτ (i,k))). Then
+(cid:17)
+
+(cid:16)
+(cid:107)g(wτ (i,k)) − ∇F (wk)(cid:107)2
+2
+
+E
+
+= E((cid:107)g(wτ (i,k))(cid:107)2
+
+2) − E((cid:107)∇F (wτ (i,k))(cid:107)2
+
+2) + E
+
+(cid:16)
+
+(cid:107)∇F (wτ (i,k)) − ∇F (wk)(cid:107)2
+2
+
+(cid:17)
+.
+
+proof of Lemma 1.
+
+(cid:16)
+
+(cid:107)g(wτ (i,k)) − ∇F (wk)(cid:107)2
+2
+
+(cid:17)
+
+E
+(cid:16)
+
+= E
+
+(cid:107)g(wτ (i,k)) − ∇F (wτ (i,k)) + ∇F (wτ (i,k)) − ∇F (wk)(cid:107)2
+2
+
+(cid:17)
+
+(cid:16)
+
+= E
+
+(cid:107)g(wτ (i,k)) − ∇F (wτ (i,k))(cid:107)2
+2
+
+(cid:17)
+
+(cid:16)
+
++ E
+
+(cid:107)∇F (wτ (i,k)) − ∇F (wk)(cid:107)2
+2
+
+(cid:17)
+
+(cid:16)(cid:68)
+
++ 2E
+
+g(wτ (i,k)) − ∇F (wτ (i,k)), ∇F (wτ (i,k)) − ∇F (wk)
+
+(cid:69)(cid:17)
+
+.
+
+(6)
+
+Since E(g(wτ (i,k))) = E(∇F (wτ (i,k))),
+(cid:16)(cid:68)
+
+E
+
+g(wτ (i,k)) − ∇F (wτ (i,k)), ∇F (wτ (i,k)) − ∇F (wk)
+
+= 0.
+
+(cid:69)(cid:17)
+
+Returning to (6), we have
+(cid:16)
+
+(cid:107)g(wτ (i,k)) − ∇F (wk)(cid:107)2
+2
+
+(cid:17)
+
+E
+(cid:16)
+
+= E
+
+(cid:107)g(wτ (i,k)) − ∇F (wτ (i,k))(cid:107)2
+2
+
+(cid:17)
+
+(cid:16)
+
++ E
+
+(cid:107)∇F (wτ (i,k)) − ∇F (wk)(cid:107)2
+2
+
+(cid:17)
+
+2) + E((cid:107)∇F (wτ (i,k))(cid:107)2
+
+2) − 2E
+
+(cid:16)
+
+(cid:104)g(wτ (i,k)), ∇F (wτ (i,k))(cid:105)
+
+(cid:17)
+
+(7)
+
+= E((cid:107)g(wτ (i,k))(cid:107)2
+(cid:16)
+
++ E
+
+(cid:107)∇F (wτ (i,k)) − ∇F (wk)(cid:107)2
+2
+
+(cid:17)
+
+= E((cid:107)g(wτ (i,k))(cid:107)2
+
+2) − E((cid:107)∇F (wτ (i,k))(cid:107)2
+
+2) + E
+
+(cid:16)
+
+(cid:107)∇F (wτ (i,k)) − ∇F (wk)(cid:107)2
+2
+
+(cid:17)
+
+.
+
+Lemma 2. Let vk = 1
+M
+
+M
+(cid:80)
+i=1
+
+g(wτ (i,k)), and suppose the variance of g(wτ (i,k)) is bounded as
+
+(cid:16)
+
+E
+
+(cid:107)g(wτ (i,k)) − ∇F (wτ (i,k))(cid:107)2
+2
+
+(cid:17)
+
+≤
+
+σ2
+Ba
+
++
+
+Θ
+Ba
+
+(cid:107)∇F (wτ (i,k))(cid:107)2
+2.
+
+Then the sum of g(wτ (i,k)) is bounded as follows
+
+E((cid:107)vk(cid:107)2
+
+2) ≤
+
+σ2
+M Ba
+
++
+
+M
+(cid:88)
+
+i=1
+
+Θ
+M 2Ba
+
+E((cid:107)∇F (wτ (i,k))(cid:107)2
+
+2) +
+
+1
+M
+
+M
+(cid:88)
+
+i=1
+
+E((cid:107)∇F (wτ (i,k))(cid:107)2
+
+2).
+
+proof of Lemma 2.
+(cid:32)
+(cid:107)
+
+E((cid:107)vk(cid:107)2
+
+2) = E
+
+1
+M
+
+M
+(cid:88)
+
+i=1
+
+(cid:33)
+
+g(wτ (i,k))(cid:107)2
+2
+
+=
+
+1
+M 2 E
+
+(cid:32)
+(cid:107)
+
+M
+(cid:88)
+
+i=1
+
+(cid:33)
+
+g(wτ (i,k))(cid:107)2
+2
+
+(cid:32)
+(cid:107)
+
+(cid:32)
+(cid:107)
+
+M
+(cid:88)
+
+i=1
+
+M
+(cid:88)
+
+=
+
+=
+
+1
+M 2 E
+
+1
+M 2 E
+
++
+
+2
+M 2 E
+
+i=1
+(cid:32)(cid:42) M
+(cid:88)
+
+i=1
+
+(g(wτ (i,k)) − ∇F (wτ (i,k))) +
+
+M
+(cid:88)
+
+∇F (wτ (i,k))(cid:107)2
+2
+
+(cid:33)
+
+(g(wτ (i,k)) − ∇F (wτ (i,k)))(cid:107)2
+2
+
++
+
+i=1
+(cid:33)
+
+1
+M 2 E
+
+(cid:32)
+(cid:107)
+
+M
+(cid:88)
+
+i=1
+
+∇F (wτ (i,k))(cid:107)2
+2
+
+(8)
+
+(cid:33)
+
+(g(wτ (i,k)) − ∇F (wτ (i,k))),
+
+(cid:43)(cid:33)
+
+∇F (wτ (i,k))(cid:107)2
+2
+
+M
+(cid:88)
+
+i=1
+
+13
+
+Owing to E(g(wτ (i,k))) = E(∇F (wτ (i,k))),
+
+E((cid:107)vk(cid:107)2
+
+2) =
+
+1
+M 2 E
+
+(cid:32)
+(cid:107)
+
+M
+(cid:88)
+
+i=1
+
+(g(wτ (i,k)) − ∇F (wτ (i,k)))(cid:107)2
+2
+
++
+
+(cid:33)
+
+=
+
+1
+M 2
+
+(cid:16)
+
+E
+
+M
+(cid:88)
+
+i=1
+
+(cid:107)g(wτ (i,k)) − ∇F (wτ (i,k))(cid:107)2
+2
+
+(cid:17)
+
++
+
+1
+M 2 E
+
+1
+M 2 E
+(cid:32)
+(cid:107)
+
+(cid:32)
+(cid:107)
+
+(cid:33)
+
+∇F (wτ (i,k))(cid:107)2
+2
+
+M
+(cid:88)
+
+i=1
+
+(cid:33)
+
+∇F (wτ (i,k))(cid:107)2
+2
+
+M
+(cid:88)
+
+i=1
+
++
+
+2
+M 2
+
+M −1
+(cid:88)
+
+M
+(cid:88)
+
+(cid:16)(cid:68)
+
+E
+
+i=1
+
+j=i+1
+
+g(wτ (i,k)) − ∇F (wτ (i,k)), g(wτ (j,k)) − ∇F (wτ (j,k))
+
+=
+
+≤
+
+1
+M 2
+
+M
+(cid:88)
+
+i=1
+
+(cid:16)
+
+E
+
+(cid:107)g(wτ (i,k)) − ∇F (wτ (i,k))(cid:107)2
+2
+
+(cid:17)
+
++
+
+σ2
+M Ba
+
++
+
+M
+(cid:88)
+
+i=1
+
+Θ
+M 2Ba
+
+E((cid:107)∇F (wτ (i,k))(cid:107)2
+
+2) +
+
+(cid:32)
+(cid:107)
+
+M
+(cid:88)
+
+i=1
+
+1
+M 2 E
+(cid:32)
+(cid:107)
+
+1
+M 2 E
+
+∇F (wτ (i,k))(cid:107)2
+2
+
+(cid:33)
+
+∇F (wτ (i,k))(cid:107)2
+2
+
+.
+
+M
+(cid:88)
+
+i=1
+
+(9)
+
+(cid:69)(cid:17)
+
+(cid:33)
+
+The second term in (9) could be obtained by
+
+(cid:32)
+(cid:107)
+
+E
+
+M
+(cid:88)
+
+i=1
+
+(cid:33)
+
+∇F (wτ (i,k))(cid:107)2
+2
+
+E((cid:107)∇F (wτ (i,k))(cid:107)2
+
+2) +
+
+M −1
+(cid:88)
+
+M
+(cid:88)
+
+2E((cid:104)∇F (wτ (i,k)), ∇F (wτ (j,k))(cid:105))
+
+E((cid:107)∇F (wτ (i,k))(cid:107)2
+
+2) +
+
+i=1
+
+j=i+1
+
+M −1
+(cid:88)
+
+M
+(cid:88)
+
+i=1
+
+j=i+1
+
+(cid:16)
+
+E
+
+(cid:107)∇F (wτ (i,k))(cid:107)2
+
+2 + (cid:107)∇F (wτ (j,k))(cid:107)2
+2
+
+(cid:17)
+
+(10)
+
+E((cid:107)∇F (wτ (i,k))(cid:107)2
+
+2) +
+
+M
+(cid:88)
+
+(M − 1)E((cid:107)∇F (wτ (i,k))(cid:107)2
+2)
+
+i=1
+
+M E((cid:107)∇F (wτ (i,k))(cid:107)2
+
+2).
+
+=
+
+(a)
+≤
+
+=
+
+=
+
+M
+(cid:88)
+
+i=1
+
+M
+(cid:88)
+
+i=1
+
+M
+(cid:88)
+
+i=1
+
+M
+(cid:88)
+
+i=1
+
+Here step (a) follows from 2(cid:104)x, y(cid:105) ≤ (cid:107)x(cid:107)2
+
+2 + (cid:107)y(cid:107)2
+2.
+
+Based on (9) and (10), we have
+
+E((cid:107)vk(cid:107)2
+
+2) ≤
+
+σ2
+M Ba
+
++
+
+M
+(cid:88)
+
+i=1
+
+Θ
+M 2Ba
+
+E((cid:107)∇F (wτ (i,k))(cid:107)2
+
+2) +
+
+1
+M
+
+M
+(cid:88)
+
+i=1
+
+E((cid:107)∇F (wτ (i,k))(cid:107)2
+
+2).
+
+Lemma 3. Suppose p0 is a lower bound on the conditional probability that the token equals to the
+global step, i.e., τ (i, k) = k, thus
+
+E((cid:107)∇F (wτ (i,k))(cid:107)2
+
+2) ≥ p0E((cid:107)∇F (wk)(cid:107)2
+
+2).
+
+proof of Lemma 3.
+
+E((cid:107)∇F (wτ (i,k))(cid:107)2
+
+2) = p0E
+
+(cid:16)
+
+(cid:107)∇F (wτ (i,k))(cid:107)2
+(cid:16)
+
+2 | τ (i, k) = k
+
+(cid:17)
+
++ (1 − p0)E
+
+(cid:107)∇F (wτ (i,k))(cid:107)2
+
+2 | τ (i, k) (cid:54)= k
+
+(cid:17)
+
+(11)
+
+≥ p0E((cid:107)∇F (wk)(cid:107)2
+
+2).
+
+14
+
+Next, we will provide the proofs of Theorem 1, Corollary 1, and Theorem 2.
+
+proof of Theorem 1. Let wk+1 = wk − ηvk, vk = 1
+M
+
+M
+(cid:80)
+i=1
+
+g(wτ (i,k)), we have
+
+F (wk+1) ≤ F (wk) + (wk+1 − wk)T ∇F (wk) +
+
+(cid:107)wk+1 − wk(cid:107)2
+2
+
+≤ F (wk) + (cid:104)−ηvk, ∇F (wk)(cid:105) +
+
+L
+2
+
+(12)
+
+L
+2
+η2(cid:107)vk(cid:107)2
+2
+
+= F (wk) −
+
+η
+M
+
+M
+(cid:88)
+
+(cid:104)g(wτ (i,k)), ∇F (wk)(cid:105) +
+
+i=1
+
+L
+2
+
+η2(cid:107)vk(cid:107)2
+2.
+
+Owing to 2(cid:104)x, y(cid:105) = (cid:107)x(cid:107)2
+
+2 + (cid:107)y(cid:107)2
+
+2 − (cid:107)x − y(cid:107)2
+
+2, (12) is shown as follows,
+
+F (wk+1) ≤ F (wk) −
+
+η
+M
+
+M
+(cid:88)
+
+i=1
+
+(cid:18) 1
+2
+
+(cid:107)g(wτ (i,k))(cid:107)2
+
+2 +
+
+1
+2
+
+(cid:107)∇F (wk)(cid:107)2
+
+2 −
+
+1
+2
+
+(cid:107)g(wτ (i,k)) − ∇F (wk)(cid:107)2
+2
+
+(cid:19)
+
++
+
+L
+2
+
+η2(cid:107)vk(cid:107)2
+2
+
+= F (wk) −
+
+η
+2
+
+(cid:107)∇F (wk(cid:107)2
+
+2 −
+
+η
+2M
+
+M
+(cid:88)
+
+i=1
+
+(cid:107)g(wτ (i,k))(cid:107)2
+
+2 +
+
+η
+2M
+
+M
+(cid:88)
+
+i=1
+
+(cid:107)g(wτ (i,k)) − ∇F (wk)(cid:107)2
+
+2 +
+
+Taking expectation,
+
+E(F (wk+1)) ≤ E(F (wk)) −
+
+η
+2
+
+E((cid:107)∇F (wk(cid:107)2
+
+2) −
+
+η
+2M
+
+M
+(cid:88)
+
+i=1
+
+E((cid:107)g(wτ (i,k))(cid:107)2
+2)
+
++
+
+η
+2M
+
+(cid:16)
+
+E
+
+M
+(cid:88)
+
+i=1
+
+(cid:107)g(wτ (i,k)) − ∇F (wk)(cid:107)2
+2
+
+(cid:17)
+
++
+
+L
+2
+
+η2E((cid:107)vk(cid:107)2
+2)
+
+(13)
+
+L
+2
+
+η2(cid:107)vk(cid:107)2
+2.
+
+(a)= E(F (wk)) −
+
+η
+2
+
+E((cid:107)∇F (wk(cid:107)2
+
+2) −
+
+−
+
+η
+2M
+
+M
+(cid:88)
+
+i=1
+
+E((cid:107)∇F (wτ (i,k))(cid:107)2
+
+2) +
+
+(b)
+≤ E(F (wk)) −
+
+η
+2
+
+E((cid:107)∇F (wk(cid:107)2
+
+2) −
+
+η
+2M
+
+η
+2M
+
+η
+2M
+
+M
+(cid:88)
+
+i=1
+
+M
+(cid:88)
+
+i=1
+
+M
+(cid:88)
+
+i=1
+
++
+
+η
+2
+
+γE((cid:107)∇F (wk)(cid:107)2
+
+2) +
+
+L
+2
+
+η2E((cid:107)vk(cid:107)2
+2)
+
+= E(F (wk)) −
+
+(c)
+≤ E(F (wk)) −
+
+η
+2
+
+η
+2
+
+(1 − γ)E((cid:107)∇F (wk)(cid:107)2
+
+2) −
+
+(1 − γ)E((cid:107)∇F (wk)(cid:107)2
+
+2) −
+
+E((cid:107)g(wτ (i,k))(cid:107)2
+
+2) +
+
+η
+2M
+
+M
+(cid:88)
+
+i=1
+
+E((cid:107)g(wτ (i,k))(cid:107)2
+2)
+
+(cid:16)
+
+E
+
+(cid:107)∇F (wτ (i,k)) − ∇F (wk)(cid:107)2
+2
+
+(cid:17)
+
++
+
+L
+2
+
+η2E((cid:107)vk(cid:107)2
+2)
+
+E((cid:107)∇F (wτ (i,k))(cid:107)2
+2)
+
+(14)
+
+η
+2M
+
+η
+2M
+
+M
+(cid:88)
+
+i=1
+
+M
+(cid:88)
+
+i=1
+
+E((cid:107)∇F (wτ (i,k))(cid:107)2
+
+2) +
+
+L
+2
+
+η2E((cid:107)vk(cid:107)2
+2)
+
+E((cid:107)∇F (wτ (i,k))(cid:107)2
+2)
+
+(cid:32)
+
++
+
+L
+2
+
+η2
+
+σ2
+M Ba
+
++
+
+M
+(cid:88)
+
+i=1
+
+Θ
+M 2Ba
+
+E((cid:107)∇F (wτ (i,k))(cid:107)2
+
+2) +
+
+E((cid:107)∇F (wτ (i,k))(cid:107)2
+2)
+
+(cid:33)
+
+1
+M
+
+M
+(cid:88)
+
+i=1
+
+= E(F (wk)) −
+
+η
+2
+
+(1 − γ)E((cid:107)∇F (wk)(cid:107)2
+
+2) +
+
+Lη2σ2
+2M Ba
+
+−
+
+η
+2M
+
+M
+(cid:88)
+
+(cid:18)
+
+1 −
+
+i=1
+
+LηΘ
+M Ba
+
+(cid:19)
+
+− Lη
+
+E((cid:107)∇F (wτ (i,k))(cid:107)2
+
+2).
+
+Here step (a) follows from Lemma 1, step (b) follow from E((cid:107)∇F (wk) − ∇F (wτ (m,k))(cid:107)2
+γE((cid:107)∇F (wk)(cid:107)2
+
+2), and step (c) follows from Lemma 2.
+
+2) ≤
+
+15
+
+Since η ≤
+
+1
+2L( Θ
+
+M Ba
+
++1) , (14) could be obtained by
+
+E(F (wk+1)) ≤ E(F (wk)) −
+
+(d)
+≤ E(F (wk)) −
+
+η
+2
+
+η
+2
+
+(1 − γ)E((cid:107)∇F (wk)(cid:107)2
+
+2) +
+
+Lη2σ2
+2M Ba
+
+(1 − γ)E((cid:107)∇F (wk)(cid:107)2
+
+2) +
+
+−
+
+−
+
+η
+4M
+
+M
+(cid:88)
+
+i=1
+
+E((cid:107)∇F (wτ (i,k))(cid:107)2
+2)
+
+η
+4
+
+p0E((cid:107)∇F (wk)(cid:107)2
+2)
+
+(15)
+
+(e)
+≤ E(F (wk)) − ηc(1 − γ)E(F (wk) − F ∗) −
+
+E(F (wk) − F ∗) +
+
+Lη2σ2
+2M Ba
+
+Lη2σ2
+2M Ba
+ηcp0
+2
+
+= E(F (wk)) − ηcγ(cid:48)E(F (wk) − F ∗) +
+
+Lη2σ2
+2M Ba
+2 . Here step (d) follows from Lemma 3, step (e) follows from F (w) is strongly
+
+,
+
+where γ(cid:48) = 1 − γ + p0
+convex with parameter c.
+
+Therefore,
+
+E(F (wk+1) − F ∗) ≤
+
+ηLσ2
+2cγ(cid:48)M Ba
+
++ (1 − ηγ(cid:48)c)k+1(cid:16)
+
+E(F (w0) − F ∗) −
+
+ηLσ2
+2cγ(cid:48)M Ba
+
+(cid:17)
+
+.
+
+proof of Corollary 1. Based on ζE((cid:107)∇F (wk) − ∇F (wτ (m,k))(cid:107)2
+of (14) should be written as follows,
+
+2) ≤ γE((cid:107)∇F (wk)(cid:107)2
+
+2), the step (b)
+
+E(F (wk+1)) ≤ E(F (wk)) −
+
+η
+2
+
+E((cid:107)∇F (wk)(cid:107)2
+
+2) −
+
+η
+2M
+
+M
+(cid:88)
+
+i=1
+
+E((cid:107)∇F (wτ (i,k))(cid:107)2
+2)
+
++
+
+Lη2
+2
+
+E((cid:107)vk(cid:107)2
+
+2) +
+
+η
+2M
+
+M
+(cid:88)
+
+i=1
+
+(cid:16)
+
+E
+
+(cid:107)∇F (wτ (i,k)) − ∇F (wk) | ς = 1(cid:107)2
+2
+
+(cid:17)
+
++
+
+η
+2M
+
+(cid:16)
+
+E
+
+M
+(cid:88)
+
+i=1
+
+≤ E(F (wk)) −
+
+(cid:107)∇F (wτ (i,k)) − ∇F (wk) | ς (cid:54)= 1(cid:107)2
+2
+
+(cid:17)
+
+η
+2
+
+E((cid:107)∇F (wk)(cid:107)2
+
+2) −
+
+η
+2M
+
+M
+(cid:88)
+
+i=1
+
+E((cid:107)∇F (wτ (i,k))(cid:107)2
+2)
+
++
+
+Lη2
+2
+
+E((cid:107)vk(cid:107)2
+
+2) +
+
+ηγp1
+2M
+
+M
+(cid:88)
+
+i=1
+
+E((cid:107)∇F (wk)(cid:107)2
+
+2) +
+
+ηζγ(1 − p1)
+2M
+
+M
+(cid:88)
+
+i=1
+
+E((cid:107)∇F (wk)(cid:107)2
+2)
+
+= E(F (wk)) −
+
+1 − p1γ − (1 − p1)ζγ
+
+(cid:17)
+
+E((cid:107)∇F (wk)(cid:107)2
+2)
+
+(cid:16)
+
+η
+2
+
+−
+
+η
+2M
+
+M
+(cid:88)
+
+i=1
+
+E((cid:107)∇F (wτ (i,k))(cid:107)2
+
+2) +
+
+Lη2
+2
+
+E((cid:107)vk(cid:107)2
+2)
+
+≤ E(F (wk)) −
+
+(cid:16)
+
+η
+2
+
+1 − p1γ − (1 − p1)ζγ
+
+(cid:17)
+
+E((cid:107)∇F (wk)(cid:107)2
+
+2) +
+
+Lη2σ2
+2M Ba
+
+(16)
+
+−
+
+η
+4M
+
+M
+(cid:88)
+
+i=1
+
+E((cid:107)∇F (wτ (i,k))(cid:107)2
+2)
+
+≤ E(F (wk)) −
+
+(cid:16)
+
+η
+2
+
+1 − p1γ − (1 − p1)ζγ +
+
+(cid:17)
+
+E((cid:107)∇F (wk)(cid:107)2
+
+2) +
+
+Lη2σ2
+2M Ba
+
+≤ E(F (wk)) − ηcρE(F (wk) − F ∗) +
+
+where ρ = 1 − p1γ − (1 − p1)ζγ + p0
+ηLσ2
+2cρM Ba
+
+E(F (wk+1) − F ∗) ≤
+
+2 , p1 = P (ς = 1). Therefore,
+
++ (1 − ηρc)k+1(cid:16)
+
+E(F (w0) − F ∗) −
+
+ηLσ2
+2cρM Ba
+
+(cid:17)
+
+.
+
+16
+
+p0
+2
+Lη2σ2
+2M Ba
+
+proof of Theorem 2. Let wk+1 = wk − ηvk, vk = 1
+Ns
+
+Ns(cid:80)
+i=1
+
+g(wτ (i,k)), we have
+
+F (wk+1) ≤ F (wk) + (wk+1 − wk)T ∇F (wk) +
+
+(cid:107)wk+1 − wk(cid:107)2
+2
+
+= F (wk) + (cid:104)−ηvk, ∇F (wk)(cid:105) +
+
+L
+2
+
+L
+2
+η2(cid:107)vk(cid:107)2
+2
+
+= F (wk) −
+
+= F (wk) −
+
+η
+Ns
+
+η
+Ns
+
+i=1
+
+Ns(cid:88)
+
+i=1
+
+(cid:18) 1
+2
+
+Ns(cid:88)
+
+(cid:104)g(wτ (i,k)), ∇F (wk)(cid:105) +
+
+L
+2
+
+η2(cid:107)vk(cid:107)2
+2
+
+(17)
+
+(cid:107)g(wτ (i,k))(cid:107)2
+
+2 +
+
+1
+2
+
+(cid:107)∇F (wk)(cid:107)2
+
+2 −
+
+1
+2
+
+(cid:107)g(wτ (i,k)) − ∇F (wk)(cid:107)2
+2
+
+(cid:19)
+
++
+
+L
+2
+
+η2(cid:107)vk(cid:107)2
+2
+
+= F (wk) −
+
+η
+2
+
+(cid:107)∇F (wk)(cid:107)2
+
+2 −
+
+η
+2Ns
+
+Ns(cid:88)
+
+i=1
+
+(cid:107)g(wτ (i,k))(cid:107)2
+
+2 +
+
+η
+2Ns
+
+Ns(cid:88)
+
+i=1
+
+(cid:107)g(wτ (i,k)) − ∇F (wk)(cid:107)2
+
+2 +
+
+L
+2
+
+η2(cid:107)vk(cid:107)2
+2.
+
+Taking expectation,
+
+E(F (wk+1)) ≤ E(F (wk)) −
+
+η
+2
+
+E((cid:107)∇F (wk)(cid:107)2
+
+2) −
+
+η
+2Ns
+
+Ns(cid:88)
+
+i=1
+
+E((cid:107)g(wτ (i,k))(cid:107)2
+
+2) +
+
+L
+2
+
+η2E((cid:107)vk(cid:107)2
+2)
+
++
+
+η
+2Ns
+
+Ns(cid:88)
+
+i=1
+
+(cid:16)
+(cid:107)g(wτ (i,k)) − ∇F (wk)(cid:107)2
+2
+
+(cid:17)
+
+.
+
+E
+
+(18)
+
+The last term in (18) could be obtained on the basis of E(g(wτ (i,k))) = E(∇F (wk)),
+
+(cid:16)
+
+E
+
+(cid:107)g(wτ (i,k)) − ∇F (wk)(cid:107)2
+2
+
+(cid:17)
+
+= E((cid:107)g(wτ (i,k))(cid:107)2
+= E((cid:107)g(wτ (i,k))(cid:107)2
+
+2) + E((cid:107)∇F (wk)(cid:107)2
+2) − E((cid:107)∇F (wk)(cid:107)2
+
+2) − 2E((cid:104)g(wτ (i,k)), ∇F (wk)(cid:105))
+2).
+
+(19)
+
+Returning to (18), we have
+
+E(F (wk+1)) ≤ E(F (wk)) −
+
+η
+2
+
+E((cid:107)∇F (wk)(cid:107)2
+
+2) −
+
++
+
+η
+2Ns
+
+Ns(cid:88)
+
+i=1
+
+E((cid:107)g(wτ (i,k))(cid:107)2
+
+2) −
+
+η
+2Ns
+
+i=1
+
+η
+2Ns
+Ns(cid:88)
+
+Ns(cid:88)
+
+i=1
+
+E((cid:107)g(wτ (i,k))(cid:107)2
+
+2) +
+
+L
+2
+
+η2E((cid:107)vk(cid:107)2
+2)
+
+(20)
+
+E((cid:107)∇F (wk)(cid:107)2
+
+2).
+
+Similar to Lemma 2,
+
+E((cid:107)vk(cid:107)2
+
+2) = E
+
+(cid:32)
+(cid:107)
+
+=
+
+=
+
+≤
+
+1
+N 2
+s
+
+E
+
+Ns(cid:88)
+
+i=1
+
+1
+N 2
+s
+σ2
+NsBs
+
+1
+Ns
+(cid:32)
+(cid:107)
+
+(cid:33)
+
+g(wτ (i,k))(cid:107)2
+2
+
+Ns(cid:88)
+
+i=1
+
+Ns(cid:88)
+
+(g(wτ (i,k)) − ∇F (wk))(cid:107)2
+2
+
+i=1
+
+(cid:33)
+
++
+
+1
+N 2
+s
+
+(cid:32)
+(cid:107)
+
+E
+
+Ns(cid:88)
+
+i=1
+
+(cid:33)
+
+∇F (wk)(cid:107)2
+2
+
+(21)
+
+(cid:16)
+(cid:107)g(wτ (i,k)) − ∇F (wk)(cid:107)2
+2
+
+(cid:17)
+
+E
+
++ E((cid:107)∇F (wk)(cid:107)2
+2)
+
++
+
+(cid:16) Θ
+
+NsBs
+
+(cid:17)
+
++ 1
+
+E((cid:107)∇F (wk)(cid:107)2
+
+2).
+
+17
+
+Based on (20) and (21), we obtain
+
+E(F (wk+1)) ≤ E(F (wk)) − ηE((cid:107)∇F (wk)(cid:107)2
+
+2) +
+
+= E(F (wk)) − η
+
+1 −
+
+(cid:18)
+
+LηΘ
+2NsBs
+
+−
+
+Lη
+2
+
+(a)
+≤ E(F (wk)) −
+
+η
+2
+
+E((cid:107)∇F (wk)(cid:107)2
+
+2) +
+
+(b)
+≤ E(F (wk)) − ηcE(F (wk) − F ∗) +
+
+Lη2σ2
+2NsBs
+(cid:19)
+
+Lη2σ2
+2NsBs
+Lη2σ2
+2NsBs
+
+.
+
++
+
+Lη2
+2
+
+(cid:16) Θ
+
+NsBs
+
+(cid:17)
+
++ 1
+
+E((cid:107)∇F (wk)(cid:107)2
+2)
+
+E((cid:107)∇F (wk)(cid:107)2
+
+2) +
+
+Lη2σ2
+2NsBs
+
+(22)
+
+Here step (a) follows from η ≤
+
+1
+2L( Θ
+
+NsBs
+
++1) , step (b) follows from 2c(F (w) − F ∗) ≤ (cid:107)∇F (w)(cid:107)2
+2.
+
+Therefore,
+
+E(F (wk+1) − F ∗) ≤ (1 − ηc)E(F (wk) − F ∗) +
+
+Lη2σ2
+2NsBs
+
+≤ (1 − ηc)k+1
+
+(cid:18)
+
+E(F (w0) − F ∗) −
+
+Lησ2
+2cNsBs
+
+(cid:19)
+
++
+
+Lησ2
+2cNsBs
+
+.
+
+(23)
+
+B Workﬂows of GBA
+
+In this section, we abstract the workﬂows of GBA. Algorithm 1 summarizes the workﬂow on workers
+in GBA. We implement pipeline between data downloading and data ingestion to accelerate the
+training. After completing the computation of gradients, the worker would directly send the gradient
+with the token back to the PS in a non-blocking way. In this way, the fast workers would ingest much
+more data than the straggling workers. When a worker recovered from a failure, it would drop the
+previous state (e.g., data in the batch buffer and token) and proceed to deal with the new batch. The
+disappearance of a speciﬁc token would not change the correctness and efﬁciency of GBA.
+
+Algorithm 1 Workﬂow on workers
+Ensure: Downloading threads: Download data asynchronously to a download buffer;
+Pack threads: Prepare the batch of data from the download buffer to a batch buffer;
+Computation threads: Execute the forward and backward pass of the model;
+Communication threads: Pull and push parameters by GRPC;
+
+Get the addresses of a number of batches (data shard) from PS.
+repeat
+
+if The download buffer is not full then
+
+until All the data from this shard has been downloaded
+
+Download a batch of data.
+
+else
+
+end if
+
+Sleep 100ms.
+
+1: Downloading threads
+2: repeat
+3:
+4:
+5:
+6:
+7:
+8:
+9:
+10:
+11: until No more data shards to get
+12:
+13: Computation threads
+14: repeat
+15:
+16:
+17:
+18:
+19: until No more data to ingest
+
+Get a batch from the batch buffer in a blocking way.
+Pull the parameters and fetch a token from PS.
+Compute the forward and backward pass.
+Send the local gradient and the token back to PS in a non-blocking way.
+
+Algorithm 2 summarizes the workﬂow on PSs in GBA. The token generation threads, the pull
+responding threads, and the push responding threads work asynchronously to avoid blocking of the
+
+18
+
+process. Different from the dense parameters, the embedding parameters are processed and updated
+by IDs, instead of by the entire embedding parameters. In practice, we optimize the memory usage as
+we could execute the weighted sum over some gradients in advance based on the tokens.
+
+Algorithm 2 Workﬂow on PSs
+Ensure: Token generation thread: Generate tokens to the token list;
+
+Pull responding threads: Send the parameters and a token to the worker;
+Push responding threads: Receive the gradients from a worker and apply them if necessary.
+
+end if
+
+Insert new tokens to the tail of the token list (a Queue)
+
+if The number of tokens in the token list is less than the number of workers then
+
+1: Token generation thread (Only on PS 0, with lock)
+2: if Successfully acquire the lock then
+3:
+4:
+5:
+6: end if
+7:
+8: Pull responding threads
+9: Receive the request from a worker with the embedding IDs.
+10: Look up the embedding tables based on the IDs for the embedding parameters.
+11: Fetch a token from the token list and trigger the token generation thread (only on PS 0).
+12: Send the parameters (and the token) back to the worker.
+13:
+14: Push responding threads
+15: Receive the gradients from a worker.
+16: Store the gradients with the token to the gradient buffer.
+17: if At least Na gradients are cached in the gradient buffer then
+18:
+19:
+20:
+
+Pop Na gradients from the gradient buffer.
+Update the global step of appearance tagged to each ID.
+Decay the gradients of the dense parameters based on the current global step and the attached
+token.
+Decay the gradients of the embedding parameter based on the tagged global step of each ID
+and the attached token to the gradient.
+Calculate the weighted sum of the gradients of the dense parameters, divided by Na.
+Calculate the weighted sum of the gradients of the embedding parameters, divided by the
+number of workers that encountered the particular ID.
+
+21:
+
+22:
+23:
+
+24: end if
+
+C Detailed statistics of Table 6 in the submission
+
+Here we want to clarify the statements about Figure 6 in the submission, and present the detailed
+statistics. Table 6.1-6.3 depict the AUCs after inheriting the checkpoints trained via synchronous
+training. Table 6.5-6.7 introduce the AUCs after inheriting the checkpoints trained by the compared
+training modes and being switched to synchronous training. We collect the mean AUCs from the
+ﬁrst day, the last day, and all days across the three datasets, as shown in Table 6.4 and Table 6.8. We
+can infer from the two tables that GBA provides the closest AUC scores as synchronous training.
+GBA appears with the lowest immediate AUC drop after switching, i.e., merely 0.1% decrement
+after switching from/to synchronous training at the ﬁrst day. Throughout the three datasets, GBA
+outperforms the other baselines by at least 0.2% (Hop-BW in Table 6.4) when switching from
+synchronous training and 0.1% (Hop-BS in Table 6.8) when switching to synchronous training.
+
+D Proof of sudden drop in performance after switching.
+
+Theorem 3. Based on the above Assumption and
+some γ ≤ 1,
+
+1
+N L( Θ
+B +1)
+
+≤ η ≤
+
+1
+2L( Θ
+B +1)
+
+, also suppose that for
+
+(cid:16)
+
+E
+
+(cid:107)∇F (wk) − ∇F (wτ (i,k))(cid:107)2
+2
+
+(cid:17)
+
+≤ γE((cid:107)∇F (wk)(cid:107)2
+
+2),
+
+in the asynchronous training, the expectation of loss in the k + 1 step is deduced by
+
+E(F (wk+1)) ≤ E(F (wk)) −
+
+η
+2
+
+(1 − γ)E((cid:107)∇F (wk)(cid:107)2
+
+2) +
+
+Lη2σ2
+2B
+
+−
+
+η
+4
+
+E((cid:107)∇F (wτ (k))(cid:107)2
+
+2).
+
+(24)
+
+19
+
+Table 6.1: Figure 6(a) - Criteo (from Sync.)
+
+Sync.
+
+GBA
+
+Hop-BW Hop-BS
+
+BSP
+
+0.7999
+0.7957
+0.7967
+0.7963
+0.7962
+0.7957
+0.7972
+0.7974
+0.7965
+0.7957
+0.7987
+0.7969
+
+0.7964
+0.7932
+0.7957
+0.7956
+0.7955
+0.7950
+0.7966
+0.7973
+0.7959
+0.7955
+0.7986
+0.7959
+
+0.7954
+0.7959
+0.7895
+0.7932
+0.7930
+0.7939
+0.7968
+0.7985
+0.7948
+0.7939
+0.7933
+0.7944
+
+0.7924
+0.7869
+0.7891
+0.5040
+0.5040
+0.5030
+0.5030
+0.5030
+0.5050
+0.5040
+0.5060
+0.5819
+
+0.7930
+0.7886
+0.7889
+0.7891
+0.7883
+0.7862
+0.7863
+0.7868
+0.7863
+0.7865
+0.7871
+0.7879
+
+Date
+
+13
+14
+15
+16
+17
+18
+19
+20
+21
+22
+23
+Avg.
+
+Aysnc.
+
+0.5000
+0.5000
+0.5000
+0.5000
+0.5000
+0.5000
+0.5000
+0.5000
+0.5000
+0.5000
+0.5000
+0.5000
+
+Table 6.2: Figure 6(b) - Alimama (from Sync.)
+
+Date
+
+6
+7
+8
+Avg.
+
+Sync.
+
+GBA
+
+Hop-BW Hop-BS
+
+BSP
+
+0.6490
+0.6503
+0.6523
+0.6505
+
+0.6489
+0.6502
+0.6523
+0.6505
+
+0.6472
+0.6478
+0.6483
+0.6478
+
+0.6488
+0.6503
+0.6523
+0.6505
+
+0.6472
+0.6500
+0.6512
+0.6495
+
+Aysnc.
+
+0.5000
+0.5000
+0.5000
+0.5000
+
+Table 6.3: Figure 6(c) - Private (from Sync.)
+
+Date
+
+15
+16
+17
+18
+19
+20
+21
+22
+Avg.
+
+Sync.
+
+GBA
+
+Hop-BW Hop-BS
+
+BSP
+
+0.7877
+0.7874
+0.7856
+0.7884
+0.7894
+0.7785
+0.7865
+0.7862
+0.7862
+
+0.7880
+0.7877
+0.7860
+0.7888
+0.7905
+0.7788
+0.7868
+0.7870
+0.7867
+
+0.7870
+0.7860
+0.7840
+0.7850
+0.7855
+0.7750
+0.7823
+0.7825
+0.7834
+
+0.7875
+0.7878
+0.7858
+0.7882
+0.7890
+0.7781
+0.7863
+0.7858
+0.7861
+
+0.7880
+0.7870
+0.7850
+0.7877
+0.7886
+0.7774
+0.7850
+0.7862
+0.7856
+
+Aysnc.
+
+0.7795
+0.7785
+0.7774
+0.7873
+0.7878
+0.7598
+0.7769
+0.7754
+0.7778
+
+Table 6.4: Average AUC decrement on three datasets between GBA and the other baselines (from
+Sync.)
+
+Sync.
+
+Hop-BW Hop-BS
+
+BSP
+
+Aysnc.
+
+1st day
+last day
+Average
+
++0.0011
+-0.0002
++0.0002
+
+-0.0012
+-0.0046
+-0.0025
+
+-0.0015
+-0.0979
+-0.0716
+
+-0.0017
+-0.0045
+-0.0034
+
+-0.1513
+-0.1542
+-0.1518
+
+20
+
+Table 6.5: Figure 6(d) - Criteo (to Sync.)
+
+Sync.
+
+GBA
+
+Hop-BW Hop-BS
+
+BSP
+
+0.7999
+0.7957
+0.7967
+0.7963
+0.7962
+0.7957
+0.7972
+0.7974
+0.7965
+0.7957
+0.7987
+0.7969
+
+0.7963
+0.7947
+0.7957
+0.7954
+0.7956
+0.7958
+0.7966
+0.7970
+0.7963
+0.7955
+0.7982
+0.7961
+
+0.7968
+0.7933
+0.7952
+0.7956
+0.7946
+0.7949
+0.7960
+0.7970
+0.7956
+0.7955
+0.7978
+0.7957
+
+0.7937
+0.7917
+0.7932
+0.7937
+0.7943
+0.7931
+0.7952
+0.7962
+0.7950
+0.7953
+0.7973
+0.7944
+
+0.7913
+0.7907
+0.7923
+0.7944
+0.7945
+0.7922
+0.7944
+0.7957
+0.7931
+0.7940
+0.7964
+0.7935
+
+Date
+
+13
+14
+15
+16
+17
+18
+19
+20
+21
+22
+23
+Avg.
+
+Aysnc.
+
+0.7872
+0.7902
+0.7922
+0.7939
+0.7935
+0.7929
+0.7946
+0.7957
+0.7952
+0.7950
+0.7972
+0.7934
+
+Table 6.6: Figure 6(e) - Alimama (to Sync.)
+
+Date
+
+6
+7
+8
+Avg.
+
+Sync.
+
+GBA
+
+Hop-BW Hop-BS
+
+BSP
+
+0.6490
+0.6503
+0.6523
+0.6505
+
+0.6492
+0.6504
+0.6523
+0.6506
+
+0.6401
+0.6437
+0.6471
+0.6436
+
+0.6484
+0.6499
+0.6520
+0.6501
+
+0.6452
+0.6487
+0.6503
+0.6481
+
+Aysnc.
+
+0.6352
+0.6426
+0.6456
+0.6411
+
+Table 6.7: Figure 6(f) - Private (to Sync.)
+
+Date
+
+15
+16
+17
+18
+19
+20
+21
+22
+Avg.
+
+Sync.
+
+GBA
+
+Hop-BW Hop-BS
+
+BSP
+
+0.7877
+0.7874
+0.7856
+0.7884
+0.7894
+0.7785
+0.7865
+0.7862
+0.7862
+
+0.7878
+0.7877
+0.7855
+0.7883
+0.7896
+0.7786
+0.7865
+0.7863
+0.7863
+
+0.7783
+0.7844
+0.7813
+0.7858
+0.7870
+0.7761
+0.7843
+0.7855
+0.7828
+
+0.7859
+0.7867
+0.7853
+0.7880
+0.7889
+0.7784
+0.7864
+0.7861
+0.7857
+
+0.7732
+0.7767
+0.7782
+0.7805
+0.7848
+0.7746
+0.7828
+0.7838
+0.7793
+
+Aysnc.
+
+0.7870
+0.5000
+0.5000
+0.5000
+0.5000
+0.5000
+0.5000
+0.5000
+0.5359
+
+Table 6.8: Average AUC decrement on three datasets between GBA and the other baselines (to Sync.)
+
+Sync.
+
+Hop-BW Hop-BS
+
+BSP
+
+Aysnc.
+
+1st day
+last day
+Average
+
++0.0011
++0.0001
++0.0002
+
+-0.0060
+-0.0021
+-0.0036
+
+-0.0018
+-0.0005
+-0.0009
+
+-0.0079
+-0.0021
+-0.0040
+
+-0.0080
+-0.0980
+-0.0875
+
+21
+
+If we switch to the synchronous training in the k + 1 step, the expectation of loss is shown as follows
+
+E(F (wk+1)) ≤ E(F (wk)) −
+
+(1 − γ)E((cid:107)∇F (wk(cid:107)2
+
+2) +
+
++ (
+
+Lη2Θ
+2B
+
++
+
+−
+
+η
+2N
+
+(cid:16)
+(cid:107)∇F (wk)(cid:107)2
+2
+
+)E
+
+(cid:17)
+
+η
+2
+Lη2
+2
+
+Lη2σ2
+2B
+η
+4N
+
+−
+
++
+
+Lη2σ2
+2BN
+
+(cid:16)
+
+E
+
+(cid:107)∇F (wτ (k))(cid:107)2
+2
+
+(cid:17)
+
+(25)
+
+and switching the asynchronous mode to the synchronous mode may drop in performance.
+
+proof of Theorem 3. According to Theorem 1, (24) could be obtained if we apply the asynchronous
+training mode. Next, we will prove (25).
+
+Let wk+1 = wk − ηvk, vk = 1
+N
+
+N
+(cid:80)
+i=1
+
+g(wτ (i,k)), we have
+
+L
+2
+η2(cid:107)vk(cid:107)2
+2
+
+F (wk+1) ≤ F (wk) + (wk+1 − wk)T ∇F (wk) +
+
+(cid:107)wk+1 − wk(cid:107)2
+2
+
+≤ F (wk) + (cid:104)−ηvk, ∇F (wk)(cid:105) +
+
+L
+2
+
+(26)
+
+= F (wk) −
+
+η
+N
+
+N
+(cid:88)
+
+i=1
+
+(cid:104)g(wτ (i,k)), ∇F (wk)(cid:105) +
+
+L
+2
+
+η2(cid:107)vk(cid:107)2
+2.
+
+Since we switch the asynchronous training to the synchronous training, the gradient of each worker
+g(wτ (i,k)), i = 1, 2, ..., N, in the k step may be different.
+2 + (cid:107)y(cid:107)2
+
+2, the expectation of (26) is shown as follows,
+
+Owing to 2(cid:104)x, y(cid:105) = (cid:107)x(cid:107)2
+
+2 − (cid:107)x − y(cid:107)2
+
+E(F (wk+1)) ≤ E(F (wk)) −
+
+η
+2
+
+E((cid:107)∇F (wk(cid:107)2
+
+2) −
+
+η
+2N
+
+N
+(cid:88)
+
+i=1
+
+E((cid:107)g(wτ (i,k))(cid:107)2
+2)
+
++
+
+η
+2N
+
+(cid:16)
+
+E
+
+N
+(cid:88)
+
+i=1
+
+(cid:107)g(wτ (i,k)) − ∇F (wk)(cid:107)2
+2
+
+(cid:17)
+
++
+
+L
+2
+
+η2E((cid:107)vk(cid:107)2
+
+2).
+
+(27)
+
+Since there applied a gradient in the k step of the asynchronous training, we may assume g(wτ (1,k)) =
+g(wk). Hence,
+
+η
+2N
+
+N
+(cid:88)
+
+i=1
+
+(cid:16)
+
+E
+
+(cid:107)g(wτ (i,k)) − ∇F (wk)(cid:107)2
+2
+
+(cid:17)
+
+=
+
+=
+
+(cid:16)
+
+(cid:16)
+
+η
+2N
+
+η
+2N
+
+E((cid:107)g(wτ (1,k)) − ∇F (wk)(cid:107)2
+
+2) +
+
+N
+(cid:88)
+
+E((cid:107)g(wτ (j,k)) − ∇F (wk)(cid:107)2
+2)
+
+(cid:17)
+
+E((cid:107)g(wk)(cid:107)2
+
+2) − E((cid:107)∇F (wk)(cid:107)2
+2)
+
+j=2
+(cid:17)
+
+(28)
+
+E((cid:107)g(wτ (j,k))(cid:107)2
+
+2) − E((cid:107)∇F (wτ (j,k))(cid:107)2
+
+2) + E((cid:107)∇F (wτ (j,k)) − ∇F (wk)(cid:107)2
+2)
+
+(cid:17)
+
++
+
+η
+2N
+
+N
+(cid:88)
+
+(cid:16)
+
+j=2
+
+Besides,
+
+η
+2N
+
+N
+(cid:88)
+
+i=1
+
+E((cid:107)g(wτ (i,k))(cid:107)2
+
+2) =
+
+η
+2N
+
+E((cid:107)g(wk)(cid:107)2
+
+2) +
+
+η
+2N
+
+N
+(cid:88)
+
+j=2
+
+E((cid:107)g(wτ (j,k))(cid:107)2
+
+2).
+
+(29)
+
+22
+
+Based on (28) and (29), we have
+η
+2
+
+E(F (wk+1)) ≤ E(F (wk)) −
+
+E((cid:107)∇F (wk(cid:107)2
+
+2) −
+
+−
+
+η
+2N
+
+N
+(cid:88)
+
+j=2
+
+E((cid:107)∇F (wτ (j,k))(cid:107)2
+
+2) +
+
+(a)
+≤ E(F (wk)) −
+
+η
+2
+
+E((cid:107)∇F (wk(cid:107)2
+
+2) −
+
+η
+2N
+
+η
+2N
+
+η
+2N
+
+E((cid:107)∇F (wk)(cid:107)2
+
+2) +
+
+L
+2
+
+η2E((cid:107)vk(cid:107)2
+2)
+
+N
+(cid:88)
+
+j=2
+
+E((cid:107)∇F (wτ (j,k)) − ∇F (wk)(cid:107)2
+2)
+
+E((cid:107)∇F (wk)(cid:107)2
+
+2) +
+
+L
+2
+
+η2E((cid:107)vk(cid:107)2
+2)
+
+−
+
+η
+2N
+
+N
+(cid:88)
+
+j=2
+
+E((cid:107)∇F (wτ (j,k))(cid:107)2
+
+2) +
+
+γη
+2
+
+E((cid:107)∇F (wk(cid:107)2
+2)
+
+(30)
+
+= E(F (wk)) −
+
+η
+2
+
+(1 − γ)E((cid:107)∇F (wk(cid:107)2
+
+2) −
+
+η
+2N
+
+E((cid:107)∇F (wk)(cid:107)2
+
+2) +
+
+L
+2
+
+η2E((cid:107)vk(cid:107)2
+2)
+
+−
+
+η
+2N
+
+N
+(cid:88)
+
+j=2
+
+E((cid:107)∇F (wτ (j,k))(cid:107)2
+
+2).
+
+Here, step (a) follows from E
+
+(cid:16)
+
+(cid:107)∇F (wk) − ∇F (wτ (j,k))(cid:107)2
+2
+
+(cid:17)
+
+≤ γE((cid:107)∇F (wk)(cid:107)2
+
+2).
+
+E((cid:107)vk(cid:107)2
+
+2) = E
+
+(cid:16)
+
+(cid:107)
+
+1
+N
+
+N
+(cid:88)
+
+i=1
+
+g(wτ (i,k))(cid:107)2
+2
+
+(cid:17)
+
+=
+
+1
+N 2 E
+
+(cid:16)
+(cid:107)
+
+N
+(cid:88)
+
+i=1
+
+g(wτ (i,k))(cid:107)2
+2
+
+(cid:17)
+
+=
+
+=
+
+1
+N 2 E
+
+(cid:16)
+(cid:107)
+
+1
+N 2 E
+
+(cid:16)
+(cid:107)
+
+N
+(cid:88)
+
+i=1
+
+N
+(cid:88)
+
+i=1
+
+g(wτ (i,k)) − ∇F (wτ (i,k)) + ∇F (wτ (i,k))(cid:107)2
+2
+
+(cid:17)
+
+g(wτ (i,k)) − ∇F (wτ (i,k))(cid:107)2
+2
+
+(cid:17)
+
++
+
+1
+N 2 E
+
+(cid:16)
+
+(cid:107)
+
+N
+(cid:88)
+
+i=1
+
+∇F (wτ (i,k))(cid:107)2
+2
+
+(cid:17)
+
+(cid:16)
+
+≤ E
+
+(cid:107)g(wk) − ∇F (wk)(cid:107)2
+2
+
+(cid:17)
+
++
+
+1
+N 2
+
+(cid:16)
+
+E
+
+N
+(cid:88)
+
+j=2
+
+(cid:107)g(wτ (j,k)) − ∇F (wτ (j,k))(cid:107)2
+2
+
+(cid:17)
+
+(31)
+
+(cid:16)
+
++ E
+
+(cid:107)∇F (wk)(cid:107)2
+2
+
+(cid:17)
+
++
+
+1
+N
+
+N
+(cid:88)
+
+j=2
+
+(cid:16)
+
+E
+
+(cid:107)∇F (wτ (j,k))(cid:107)2
+2
+
+(cid:17)
+
+≤
+
+σ2
+B
+
++
+
+(cid:16)
+
+E
+
+Θ
+B
+
+(cid:107)∇F (wk)(cid:107)2
+2
+
+(cid:17)
+
++
+
+1
+N 2
+
+N
+(cid:88)
+
+j=2
+
+(cid:16) σ2
+B
+
++
+
+Θ
+B
+
+E((cid:107)∇F (wτ (j,k))(cid:107)2
+2)
+
+(cid:17)
+
+(cid:16)
+
++ E
+
+(cid:107)∇F (wk)(cid:107)2
+2
+
+(cid:17)
+
++
+
+1
+N
+
+N
+(cid:88)
+
+j=2
+
+(cid:16)
+
+E
+
+(cid:107)∇F (wτ (j,k))(cid:107)2
+2
+
+(cid:17)
+
+Based on (31), we obtain
+
+E(F (wk+1)) ≤ E(F (wk)) −
+
+(1 − γ)E((cid:107)∇F (wk(cid:107)2
+
+2) +
+
+Lη2σ2
+2B
+
++
+
+Lη2σ2
+2BN
+
+η
+2
+Lη2
+2
+
++
+
++
+
++
+
+(cid:16) Lη2Θ
+2B
+(cid:16) Lη2Θ
+2BN 2 +
+
+N
+(cid:88)
+
+j=2
+
+−
+
+η
+2N
+
+(cid:16)
+
+(cid:17)
+
+E
+
+(cid:107)∇F (wk)(cid:107)2
+2
+
+(cid:17)
+
+Lη2
+2N
+
+−
+
+η
+2N
+
+(cid:16)
+
+(cid:17)
+
+E
+
+(cid:107)∇F (wτ (j,k))(cid:107)2
+2
+
+(cid:17)
+
+.
+
+In (32),
+
+N
+(cid:88)
+
+j=2
+
+η
+2N
+
+=
+
+(cid:16) Lη2Θ
+2BN 2 +
+
+Lη2
+2N
+
+−
+
+η
+2N
+
+(cid:16)
+
+(cid:17)
+
+E
+
+(cid:107)∇F (wτ (j,k))(cid:107)2
+2
+
+(cid:17)
+
+N
+(cid:88)
+
+j=2
+
+(cid:16) LηΘ
+BN
+
+(cid:17)
+
++ Lη − 1
+
+(cid:16)
+
+E
+
+(cid:107)∇F (wτ (j,k))(cid:107)2
+2
+
+(cid:17)
+
+≤ −
+
+(cid:16)
+
+E
+
+η
+4N
+
+(cid:107)∇F (wτ (k))(cid:107)2
+2
+
+(cid:17)
+
+.
+
+23
+
+(32)
+
+(33)
+
+Therefore,
+
+E(F (wk+1)) ≤ E(F (wk)) −
+
+(1 − γ)E((cid:107)∇F (wk(cid:107)2
+
+2) +
+
++
+
+(cid:16) Lη2Θ
+2B
+
++
+
+−
+
+η
+2N
+
+(cid:16)
+
+(cid:17)
+
+E
+
+(cid:107)∇F (wk)(cid:107)2
+2
+
+η
+2
+Lη2
+2
+
+Lη2σ2
+2B
+
++
+
+(cid:17)
+
+−
+
+η
+4N
+
+E
+
+Lη2σ2
+2BN
+(cid:16)
+
+(cid:107)∇F (wτ (k))(cid:107)2
+2
+
+(34)
+
+(cid:17)
+
+Owing to η ≥
+
+1
+N L( Θ
+
+B +1) , we have LΘη
+(cid:16)
+
+)E
+
+(cid:107)∇F (wk)(cid:107)2
+2
+
+(
+
+Lη2Θ
+2B
+
++
+
+Lη2
+2
+
+−
+
+η
+2N
+
+B + Lη ≥ 1
+
+N and
+
+(cid:17)
+
+=
+
+η
+2
+
+(
+
+LηΘ
+B
+
++ Lη −
+
+(cid:16)
+
+)E
+
+1
+N
+
+(cid:107)∇F (wk)(cid:107)2
+2
+
+(cid:17)
+
+≥ 0.
+
+(35)
+
+Since − η
+
+4N E
+
+(cid:16)
+
+(cid:107)∇F (wτ (k))(cid:107)2
+2
+
+(cid:17)
+
+(cid:16)
+
+> − η
+
+4 E
+
+(cid:107)∇F (wτ (k))(cid:107)2
+2
+
+(cid:17)
+
+, we have
+
+E(F (wk)) −
+
+η
+2
+
+(1 − γ)E((cid:107)∇F (wk)(cid:107)2
+
+2) +
+
+≤ E(F (wk)) −
+
+(1 − γ)E((cid:107)∇F (wk(cid:107)2
+
+2) +
+
++ (
+
+Lη2Θ
+2B
+
++
+
+−
+
+(cid:16)
+
+)E
+
+η
+2N
+
+(cid:107)∇F (wk)(cid:107)2
+2
+
+η
+2
+Lη2
+2
+
+−
+
+Lη2σ2
+2B
+Lη2σ2
+2B
+η
+4N
+
+−
+
+(cid:17)
+
+η
+4
+
++
+
+E((cid:107)∇F (wτ (k))(cid:107)2
+2)
+
+Lη2σ2
+2BN
+
+(cid:16)
+
+E
+
+(cid:107)∇F (wτ (k))(cid:107)2
+2
+
+(cid:17)
+
+.
+
+(36)
+
+Therefore, switching the asynchronous mode to the synchronous mode in the k + 1 step may drop in
+performance.
+
+Theorem 4. Based on the above Assumption and η ≤
+expectation of loss in the k + 1 step is deduced by
+
+1
+2L( Θ
+B +1)
+
+, in the synchronous training, the
+
+E(F (wk+1)) ≤ E(F (wk)) − η
+
+1 −
+
+(cid:18)
+
+(cid:19)
+
+LηΘ
+2N B
+
+−
+
+Lη
+2
+
+E((cid:107)∇F (wk)(cid:107)2
+
+2) +
+
+Lη2σ2
+2N B
+
+.
+
+(37)
+
+If we switch to the asynchronous training in the k + 1 step, the expectation of loss becomes as
+follows
+
+E(F (wk+1)) ≤ E(F (wk)) − η(1 −
+
+LηΘ
+2B
+
+−
+
+Lη
+2
+
+)E((cid:107)∇F (wk))(cid:107)2
+
+2 +
+
+Lη2σ2
+2B
+
+,
+
+(38)
+
+and switching the synchronous mode to the asynchronous mode may drop in performance.
+
+proof of Theorem 4. According to the Theorem 2, (37) could be obtained. Next, we will prove (38).
+
+E(F (wk+1)) ≤ E(F (wk)) −
+
+η
+2
+
+E((cid:107)∇F (wk(cid:107)2
+
++
+
+(cid:16)
+
+E
+
+η
+2
+
+(cid:107)g(wτ (1,k)) − ∇F (wk)(cid:107)2
+2
+
+2) −
+(cid:17)
+
+η
+2
+
+E((cid:107)g(wτ (1,k))(cid:107)2
+2)
+
++
+
+L
+2
+
+η2E((cid:107)vk(cid:107)2
+
+2).
+
+(cid:16)
+
+Since E
+
+(cid:107)g(wτ (1,k)) − ∇F (wk)(cid:107)2
+2
+
+(cid:17)
+
+= E((cid:107)g(wk)(cid:107)2
+
+2) − E((cid:107)∇F (wk)(cid:107)2
+
+2), we have
+
+E(F (wk+1)) ≤ E(F (wk)) − ηE((cid:107)∇F (wk)(cid:107)2
+
+2) +
+
+Lη2
+2
+
+E((cid:107)vk(cid:107)2
+
+2).
+
+Owing to
+
+E((cid:107)vk(cid:107)2
+
+2) = E((cid:107)g(wτ (1,k))(cid:107)2
+
+= E((cid:107)g(wτ (1,k)) − ∇F (wk))(cid:107)2
+
+2) = E((cid:107)g(wτ (1,k)) − ∇F (wk) + ∇F (wk)(cid:107)2
+2)
+2) + E((cid:107)∇F (wk))(cid:107)2
+2)
+
+≤
+
+σ2
+B
+
++ (
+
+Θ
+B
+
++ 1)E((cid:107)∇F (wk))(cid:107)2
+2,
+
+we obtain
+
+E(F (wk+1)) ≤ E(F (wk)) − η(1 −
+
+Lη
+2
+
+−
+
+LηΘ
+2B
+
+)E((cid:107)∇F (wk))(cid:107)2
+
+2 +
+
+Lη2σ2
+2B
+
+.
+
+24
+
+(39)
+
+(40)
+
+(41)
+
+Owing to Lη2σ2
+
+2B > Lη2σ2
+
+2N B , we have
+(cid:19)
+
+E(F (wk)) − η
+
+2B > LηΘ
+2N B and LηΘ
+(cid:18)
+LηΘ
+2N B
+LηΘ
+2B
+
+1 −
+
+≤ E(F (wk)) − η(1 −
+
+−
+
+−
+
+Lη
+2
+Lη
+2
+
+E((cid:107)∇F (wk)(cid:107)2
+
+2) +
+
+)E((cid:107)∇F (wk))(cid:107)2
+
+2 +
+
+Lη2σ2
+2N B
+Lη2σ2
+2B
+
+.
+
+(42)
+
+Hence, switching the synchronous mode to the asynchronous mode may drop in performance.
+
+25
+
+

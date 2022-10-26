@@ -1,0 +1,1823 @@
+Compiler Support for Sparse Tensor Computations in MLIR
+
+Aart J.C. Bik1, Penporn Koanantakool1, Tatiana Shpeisman1, Nicolas Vasilache1, Bixia
+Zheng1, and Fredrik Kjolstad2
+
+1Google
+2Stanford University
+
+Corresponding author: ajcbik@google.com
+
+Abstract
+
+Sparse tensors arise in problems in science, engineering, machine learning, and data analytics. Pro-
+grams that operate on such tensors can exploit sparsity to reduce storage requirements and computational
+time. Developing and maintaining sparse software by hand, however, is a complex and error-prone task.
+Therefore, we propose treating sparsity as a property of tensors, not a tedious implementation task, and
+letting a sparse compiler generate sparse code automatically from a sparsity-agnostic deﬁnition of the
+computation. This paper discusses integrating this idea into MLIR.
+
+1
+
+Introduction
+
+Vectors, matrices, and their higher dimensional generalization into tensors that contain many zero elements
+are called sparse tensors. Sparse tensors arise in a wide range of problems in science, engineering, machine
+learning, and data analytics. Programs that operate on such tensors can exploit sparsity to reduce both
+storage requirements and computational time by only storing the nonzero elements and skipping computa-
+tions with a trivial outcome (such as x+0=x and x*0=0). This exploitation comes at a cost, though, since
+developing and maintaining sparse software by hand is a rather complex and error-prone task. Therefore, we
+propose treating sparsity merely as a property of tensors, not a tedious implementation task, and letting a
+sparse compiler generate sparse code automatically from a sparsity-agnostic deﬁnition of the computation.
+In this paper, we describe our experience integrating compiler support for sparse tensor computations
+into the MLIR open-source compiler infrastructure [48] and the opportunities and challenges that arise. The
+idea of making sparsity a property composes well with MLIR’s ease of deﬁning multi-level abstractions and
+progressively lowering transformations that continuously operate at the most appropriate level of abstraction.
+The sparse compiler support in MLIR consists of a new sparse dialect that provides the attributes,
+types, operations, and transformations that are required to make sparse tensor types ﬁrst class citizens in
+MLIR. The sparse dialect forms a bridge between high-level operations on sparse tensors types and low-level
+operations on sparse storage formats that avoid redundant work by only storing and operating on nonzero
+elements. Central to sparse tensor types is an encoding attribute that deﬁnes the desired way of storing
+sparse tensors. For example, the well-known CSC (Compressed Sparse Column) storage format for sparse
+matrices can be deﬁned with the following attribute, using a per-dimension dense or compressed level type
+to indicate full or compressed storage in that dimension and a permutation map to indicate the desired
+dimension order (here, column-wise).
+
+2
+2
+0
+2
+
+b
+e
+F
+9
+
+]
+L
+P
+.
+s
+c
+[
+
+1
+v
+5
+0
+3
+4
+0
+.
+2
+0
+2
+2
+:
+v
+i
+X
+r
+a
+
+#CSC = #sparse_tensor.encoding<{
+
+dimLevelType = [ "dense", "compressed" ],
+dimOrdering = affine_map<(i,j) -> (j,i)>
+
+}>
+
+1
+
+ 
+ 
+ 
+ 
+ 
+ 
+The dense MLIR representation of a matrix multiplication C[i,j] = A[i,k] * B[k,j]
+
+%C = linalg.matmul ins(%A, %B: tensor<?x?xf64>,
+
+tensor<?x?xf64>) -> tensor<?x?xf64>
+
+changes into a sparse operation by merely adding a sparse attribute to the tensor type of one or more
+operands, as done below to deﬁne a SpMM kernel that uses the CSC storage for matrix A.
+
+%C = linalg.matmul ins(%A, %B: tensor<?x?xf64, #CSC>, tensor<?x?xf64>) -> tensor<?x?xf64>
+
+By making sparsity an optional property of the tensors, we avoid the proliferation of specialized routines
+for such operations. Instead, after introducing the sparse tensor attribute, compiler transformations take
+care of lowering the operation to imperative constructs and sparse storage formats that only store and iterate
+over nonzero elements to perform the matrix multiplication. Modifying the sparse attribute of matrix A, such
+as preferring row-wise access, or adding sparse attributes to the tensor types of matrices B, C, or both, will
+prompt the compiler to generate completely diﬀerent sparse kernels. Since programmers merely annotate
+sparse tensor types, and leave the tedious implementation task to the sparse compiler, this approach greatly
+simpliﬁes sparse code development compared to traditional hand-written approaches. Now, a single sparsity-
+agnostic description can be mapped into a wide range of sparse implementations, each tailored to speciﬁc
+instances of the same problem.
+
+The rest of this paper is organized as follows. Section 2 provides preliminaries related to sparse tensors.
+Sections 3 and 4 dive into the design and implementation details of adding sparse compiler support to
+the MLIR compiler infrastructure. Section 5 explores various ways to use the new support in MLIR. An
+experimental validation of the sparse compiler follows in Section 6. Related work is discussed in Section 7.
+Finally, conclusions and future plans appear in Section 8.
+
+2 Sparse Preliminaries
+
+This section provides preliminaries on sparse tensors, sparse storage formats, and sparse compilers.
+
+2.1 Sparse Tensors and Storage Formats
+
+A tensor is a d-dimensional generalization of one-dimensional vectors and two-dimensional matrices. If many
+elements in the tensor are zero, the tensor is called a sparse tensor, which is a situation that arises often
+in problems in science, engineering, machine learning, and data analytics. In contrast, a tensor without this
+property is called a dense tensor. One can furthermore distinguish between unstructured sparse tensors that
+have no discernible nonzero structures and structured sparse tensors that have particular nonzero structures,
+such as tensors with nonzero elements conﬁned within blocks, bands, diagonals, or borders, or with certain
+statistical properties on the distribution of nonzero elements.
+
+Programs that operate on sparse tensors can take advantage of the sparsity to reduce storage requirements
+by only storing the nonzero elements and computational time by skipping trivial operations (such as x+0=x
+and x*0=0). How to eﬀectively exploit sparse vectors and matrices has been well-studied in the past for
+linear algebra problems [1, 17, 19, 22, 24, 23, 26, 28, 33, 51, 59, 81, 50, 62, 76, 88]. The growing popularity
+of deep learning and big data has sparked a similar interest in studying how machine learning kernels can
+take advantage of sparse tensors [15, 40, 41, 43, 67, 70, 75].
+
+Many diﬀerent ways of storing sparse tensors have been proposed [66, 78, 13, 56, 63, 65, 12, 71, 49] and
+which of these storage formats is most eﬀective in terms of minimizing storage as well as computation depends
+on the peculiarities of the nonzero structure, the operations to be performed, and the target architecture.
+All sparse storage formats consist of a primary storage that stores the numerical values of the nonzero
+elements and some overhead storage needed to map those values to their tensor coordinates, in order to
+reconstruct the enveloping tensor from these values. Note that sometimes, even some zero elements are stored
+explicitly to accommodate for simpler structured formats or to avoid costly removals of nonzero elements
+that become zero during the computation. Such explicit zeros, however, do not impact the correctness of
+tensor operations.
+
+2
+
+Well-known examples of sparse storage formats include coordinate format (COO) [66], compressed sparse
+row/column (CSR and CSC) [78], doubly compressed sparse row/column (DCSR and DCSC) [13], com-
+pressed sparse ﬁber (CSF) [71], block, band, diagonal and jagged diagonal formats, and hash maps. Although
+several examples appear later in the paper, for an in-depth survey of sparse storage formats, we must refer
+to the literature.
+
+2.2 Sparse Compilers
+
+Writing eﬀective sparse code is a time-consuming and error-prone task, further complicated by the large
+number of possible combinations of storage formats, nonzero structures, operations, and target architectures.
+Due to the complexity, programmers instead usually restrict themselves to hand-optimizing a small set
+of library methods for speciﬁc operations and storage formats, and building larger sparse programs by
+composing available library methods. This approach may lead to sub-optimal performance when costly data
+structure conversions are needed in between library methods or, worse, sub-optimal asymptotic complexity
+when many avoidable intermediate results produced by one library method are nulliﬁed after multiplication
+by zeros in the next method.
+
+Rather we would like to treat sparsity merely as a property, not a tedious implementation task, and let a
+sparse compiler generate sparse code automatically from a sparsity-agnostic deﬁnition of the computation.
+This idea of keeping sparsity completely transparent to the programmer was pioneered in the MT1 sparse
+compiler for linear algebra [6, 7, 8, 9] and later formalized and generalized to tensor algebra in TACO (Tensor
+Algebra Compiler) [42, 40, 41, 43]. With the ﬁgurative “push of a button”, a sparse compiler can convert
+a single sparsity-agnostic description into a wide range of sparse implementations, each tailored to speciﬁc
+instances of the same problem with tensors stored in diﬀerent data structures. This automatic approach not
+only enables non-expert programmers to generate sparse code quickly, but also enables expert programmers
+to explore the full space of possible sparse implementations.
+
+3 A Sparse Compiler in MLIR
+
+This section discusses some of our design considerations from implementing a sparse compiler in the MLIR
+compiler infrastructure, which is part of the LLVM open-source project.
+
+3.1 MLIR Compiler Infrastructure
+
+The MLIR open-source project [47, 48] provides an extensible infrastructure for building compilers for
+domain speciﬁc languages. The infrastructure provides a way to specify new intermediate representations
+through dialects together with transformations on these representations. Transformations can be written as
+compositions of orthogonal localized match and rewrite primitives. These are often decomposed further into
+rewriting rules when applied within a dialect and lowering rules when converting from a higher-level
+dialect to a lower-level dialect. Each dialect can deﬁne custom attributes, types, and operations. Throughout
+the compilation, separate dialects can co-exist to form a hybrid representation of a program. The ability
+to progressively lower to dialects closer and closer to the target hardware during the compilation process,
+together with an intuitive transformation mechanism, has made MLIR a popular compiler infrastructure for
+domain speciﬁc languages that need to bridge large semantic gaps, such as compiling for machine learning.
+In this paper, we rely on several MLIR dialects, whose relationships are shown in Figure 1. The dialects
+
+are brieﬂy described below, ordered from higher to lower levels of abstraction.
+
+Linalg The Linalg dialect, inspired by the tensor index notation found in tensor comprehensions [80], pro-
+vides high-level primitives that know how to decompose themselves in a generic fashion and capture structural
+information useful for maintaining invariants and implementing transformations for high-performance. The
+central idea is carrying high-level static information as a ﬁrst-class citizen in the IR. A key design of the
+
+3
+
+Figure 1: The MLIR dialects that are involved in sparse compilation. Ovals contain data, rounded squares
+contain code, lines indicate data that is used by a code dialect, and arrow indicates a code dialect can be
+lowered to another code dialect. Although sparse compilation only adds the SparseTensor dialect with a
+new tensor type, it reuses Linalg to deﬁne its operations and SCF as its target.
+
+current work was to leave the operational semantics of the dialect unchanged, except that it now supports
+either dense or sparse data types. We assume that a high-level kernel written in, e.g., Tensorﬂow, JAX, or
+Python, is presented to the sparse compiler as a sequence of Linalg operations, possibly after lowering from
+higher-level dialects.
+
+Tensor The Tensor dialect operations manipulate an abstract tensor type for which the compiler infras-
+tructure has not yet decided on a representation in memory. When tensors are small and of static sizes,
+they may be directly promoted to constants or vectors and can bypass memory to be stored in registers.
+When tensors are large enough and/or have dynamic sizes, they are assigned memory storage through a
+buﬀerization process.
+
+SparseTensor The SparseTensor dialect, discussed in more detail in Section 4, is new to this work and
+provides the attributes, types, operations, and transformations that are required to make sparse tensor types
+ﬁrst-class citizens within the MLIR compiler infrastructure. The dialect provides a bridge between high-level
+operations on these sparse tensors types and low-level operations that only store and operate on nonzero
+elements to avoid performing redundant work.
+It co-exists with the Tensor dialect to provide a logical
+separation between purely dense and sparse functionality.
+
+SCF The structured control-ﬂow SCF dialect provides operations that represent looping and conditionals,
+e.g.
+regular for and while loops (without early exit) as well as an if conditional construct. This is
+structured at a higher-level of abstraction than control-ﬂow graphs (CFG). Notably, loop operations may
+yield SSA values and compose well with other operations and dialects with either SSA-based side-eﬀect-free
+or memory-based side-eﬀecting semantics. This dialect is used by the sparse compiler to decompose sparse
+Linalg operations into explicit imperative constructs.
+
+Memref The Memref dialect introduces the memref data type which is the main representation for memory
+buﬀers in MLIR and the entry point to the side-eﬀecting memory-based operations. The memref data type
+also provides an unsurprising ABI to interoperate with external C code and serves as a bridge for calling
+libraries from MLIR codegen. Dense tensors undergo a relatively straightforward buﬀerization into memory
+buﬀers (viz. multi-dimensional arrays). The buﬀerization of sparse tensors is more elaborate, as will be seen
+later in this paper.
+
+3.2 Sparse Compiler Design Philosophy
+
+The growing popularity of the MLIR open-source project together with the growing interest in sparse tensors
+in machine learning and data analytics prompted adding compiler support for sparse tensor computations to
+the MLIR compiler infrastructure. The idea of making sparsity a property composes well with MLIR’s ease
+of deﬁning multi-level abstractions and progressively lowering transformations that continuously operate at
+the most appropriate level of abstraction.
+
+4
+
+LinalgTensorSparseTensorMemrefSCFLLVMThe north star vision of this project consists of providing an excellent, reusable sparse ecosystem to
+academia and industry that is based on ﬁrst principles. To this end, emphasis was put on introducing
+sparse tensor types as proper ﬁrst-class citizens into MLIR. Furthermore, a ﬁrst reference implementation
+provides a fully functional implementation of this sparse ecosystem against which future versions can be
+compared. The long-term north star vision together with the shorter-term ﬁrst reference implementation
+enables researchers to independently start developing MLIR front-ends for array languages that incorporate
+some form of sparsity annotations as well as new MLIR transformations that implement improved or even
+alternative sparse compilers for prototyping and production. Our hope is that the open-source nature of
+MLIR will work both ways, that is, beneﬁt researchers that are new to the sparse domain as well as as solicit
+useful contributions from experts in the open-source community at large.
+
+4 The Sparse Tensor Dialect
+
+Sparse tensor support in MLIR mostly resides within a new SparseTensor dialect, which provides the
+attributes, types, operations, and transformations that are required to make sparse tensor types ﬁrst class
+citizens within the MLIR compiler infrastructure. The dialect forms a bridge between high-level operations
+on sparse tensors types and low-level operations on the actual sparse storage formats that only store and
+operate on nonzero elements to avoid performing redundant work.
+
+4.1 Sparse Tensor Attributes and Types
+
+Many choices are possible for the sparse tensor type speciﬁcation itself, varying from simply annotating a
+tensor type as sparse to providing detailed information on the nonzero structure or other characteristics. We
+support a TACO-ﬂavored mechanism of annotating sparse tensors [40], since this provides an elegant and
+powerful way of specifying a large number of diﬀerent sparse storage formats. In true MLIR fashion, however,
+the type speciﬁcation has been kept extensible to allow for more advanced annotations in the future.
+
+Central to the chosen annotation mechanism is an encoding attribute that deﬁnes the desired way of
+storing each sparse tensor by means of (1) per-dimension level types of either dense or compressed, (2) a
+dimension ordering, and (3) bit widths for pointers and indices.
+
+#SparseTensor = #sparse_tensor.encoding<{
+
+dimLevelType = [ "dense", "compressed", ... ],
+dimOrdering = affine_map<(i,j,k,...) -> (i,j,k,...)>,
+pointerBitWidth = ...,
+indexBitWidth = ...,
+
+}>
+
+Sparse tensor types are obtained by annotating the built-in tensor types of MLIR with sparse format
+
+attributes as illustrated below.
+
+tensor<..., #SparseTensor>
+
+The attribute indicates that when the d-dimensional tensor is lowered into an actual storage scheme
+during buﬀerization, rather than selecting a straightforward memref buﬀer used for dense tensors, the sparse
+tensor is lowered into a compact sparse storage scheme that conceptually consists of two integral jagged
+arrays pointers[d][*] and indices[d][*], where each entry in the ﬁrst dimension stores, respectively, the
+pointer and index array of a single tensor dimension, and a one-dimensional values array values[*] that
+provides suﬃcient space for all stored elements.
+
+Consider, for example, the following sparse vector type.
+
+#SparseVector= #sparse_tensor.encoding<{
+
+dimLevelType = [ "compressed" ]
+
+}>
+tensor<16xf64, #SparseVector>
+
+5
+
+Then, the sparse vector1
+
+(cid:126)x = (0, 0, 0, x3, 0, 0, x6, x7, 0, 0, x10, 0, 0, 0, 0, 0)
+has the following compressed format results. Contents of pointers[0][0] and pointers[0][1] denote that
+elements appear at range [0,4) in the indices and values arrays. There, indices[0][*] and values[*]
+provide, respectively, the indices and values of nonzero elements. Memory is saved by only storing 10 values
+(4 doubles primary and 6 integers overhead storage) rather than the 16 consecutive doubles that would result
+in the dense case.
+
+pointers[0]:
+indices[0]:
+values:
+
+0
+3
+x3
+
+4
+6
+x6
+
+7
+x7
+
+10
+x10
+
+For matrices, compressed sparse row (CSR) is deﬁned with dimension level type dense for the ﬁrst
+dimension and compressed for the second dimension, as follows. When absent, the dimension ordering
+defaults to lexicographic index order, thus, row-wise order in this case.
+
+#CSR = #sparse_tensor.encoding<{
+
+dimLevelType = [ "dense", "compressed" ]
+
+}>
+tensor<3x4xf64, #CSR>
+
+Then, the following sparse matrix
+
+A =
+
+0
+0
+0
+maps to the following compressed format which has an implicit dense ﬁrst dimension of size 3 and only
+uses the second dimension of the jagged arrays. The nonzero values and corresponding column coordinates
+in each row 0 ≤ i < 3 can be found in the indices and values arrays at range pointers[1][i] up to
+pointers[1][i+1]. There, indices[1][*] and values[*] provide, respectively, column indices and values.
+Note that the number 2 is repeated in the pointers array because the second row of the matrix A is empty.
+
+a0,3
+0
+0
+
+0
+0
+0
+
+(cid:32)a0,0
+0
+a2,0
+
+(cid:33)
+
+pointers[1]:
+indices[1]:
+values:
+
+0
+0
+a0,0
+
+2
+3
+a0,3
+
+2
+0
+a2,0
+
+3
+
+Alternatively, using compressed for the ﬁrst dimension and dense for the second dimension maps to the
+following storage format which only uses the ﬁrst dimension of the jagged arrays and contains some explicit
+zeros in the, now, fully stored dense rows with implicit size 4 for the second dimension. This storage scheme
+only skips one row in this case, but may favor target architectures with eﬃcient vector instructions.
+
+pointers[0]:
+indices[0]:
+values:
+
+0
+0
+a0,0
+
+2
+2
+0
+
+0
+
+a0,3
+
+a2,0
+
+0
+
+0
+
+0
+
+The storage format can be made doubly compressed using compressed for both dimension level types.
+In addition, an explicit dimension ordering can be used to enforce column-wise storage over the default
+lexicographic index order storage, as illustrated below with the deﬁnition of doubly compressed sparse
+column (DCSC).
+
+#DCSC = #sparse_tensor.encoding<{
+
+dimLevelType = [ "compressed", "compressed" ],
+dimOrdering = affine_map<(i,j) -> (j,i)>
+
+}>
+tensor<3x4xf64, #DCSC>
+
+This type maps to the following column-wise sparse storage format for the example matrix A. The contents
+in pointers[0][0] and pointers[0][1] denote that range [0,2) is used in the next arrays to store two
+columns. There, indices[0][*] denote that only column 0 and column 3 contain nonzero elements. The
+next level provides a similar structure within each explicitly stored column.
+
+1Tensors in this paper use zero-based indexing, e.g. a three-dimensional tensor T starts with element t0,0,0 with, from
+
+left-to-right, layer, row, and column index 0.
+
+6
+
+pointers[0]:
+indices[0]:
+pointers[1]:
+indices[1]:
+values:
+
+0
+0
+0
+0
+a0,0
+
+2
+3
+2
+2
+a2,0
+
+3
+0
+a0,3
+
+The encoding attribute easily generalizes to tensor or arbitrary dimensions, as illustrated below for a
+
+3-dimensional tensor.
+
+#SparseTensor = #sparse_tensor.encoding<{
+
+dimLevelType = [ "compressed", "compressed", "compressed" ]
+
+}>
+tensor<3x3x4xf64, #SparseTensor>
+
+Consider the tensor T shown below, with layers ordered front to back.
+
+
+
+
+
+t2,0,0
+0
+0
+
+0
+0
+0
+
+
+
+
+
+0
+0
+0
+
+0
+0
+0
+
+0
+0
+0
+
+0
+0
+0
+
+0
+0
+0
+
+
+
+
+0
+0
+0
+
+
+
+
+
+t0,0,0
+0
+0
+
+
+
+
+
+0
+t2,1,3
+0
+
+t2,0,2
+t2,1,2
+0
+
+
+
+
+0
+0
+0
+
+With the triply-compressed encoding attribute shown above, the following compressed data structure
+results. Stored elements appear in the default lexicographic index order. Contents in pointers[0][0] and
+pointers[0][1] reveal two ﬁlled layers, with indices[0][*] specifying layer 0 and 2 in particular. The
+next level pointers[1][*] shows that the matrix in the ﬁrst stored layer has one ﬁlled row and the matrix
+in the second stored layer has two ﬁlled rows. The last level provides structure within each compressed row.
+
+pointers[0]:
+indices[0]:
+pointers[1]:
+indices[1]:
+pointers[2]:
+indices[2]:
+values:
+
+0
+0
+0
+0
+0
+0
+t0,0,0
+
+2
+2
+1
+0
+1
+0
+t2,0,0
+
+3
+1
+3
+2
+t2,0,2
+
+5
+2
+t2,1,2
+
+3
+t2,1,3
+
+In addition to the per-dimension level types and optional dimension ordering, the encoding attribute can
+also specify alternative bit-widths ranging from 8 to 64 for pointers and indices, defaulting to 0 to denote
+the native bit-width of the target architecture. Narrower bit-widths can be used to reduce overhead storage
+requirements even further, provided that both widths still suﬃce to store the maximum possible integral
+pointer and index value throughout the full storage format. Given the two choices for each per-dimension
+level type, all possible permutations for the dimension ordering, and the four choices for both bit-widths,
+this relatively simply sparse tensor type encoding already supports 2d · d! · 16 diﬀerent ways of storing a
+single d-dimensional tensor. Nevertheless, as stated before, the encoding has been kept extensible to allow
+for specifying even more sparse storage formats in the future, such as the new dimension level types discussed
+in [15].
+
+4.2 Sparse Tensor Operations
+
+With sparse tensor types as proper ﬁrst-class citizens, the idea is that any MLIR tensor operation can be
+made sparse by simply annotating the tensor types of the operands. For example, the Linalg dialect is
+an intermediate representation commonly used by MLIR to progressively lower machine learning kernels
+to actual executable code. The dense MLIR representation of a matrix multiplication operation C[i,j] =
+A[i,k] * B[k,j]
+
+%C = linalg.matmul ins(%A, %B: tensor<?x?xf64>, tensor<?x?xf64>) -> tensor<?x?xf64>
+
+7
+
+changes into a sparse kernel by merely adding sparse attributes to the tensor types of the operands, as was
+already shown in the introduction for SpMM. Here, we convert the operation into a SpMSpM kernel as
+follows, where all matrices are stored in CSR format.
+
+%C = linalg.matmul ins(%A, %B: tensor<?x?xf64, #CSR>, tensor<?x?xf64, #CSR>) -> tensor<?x?xf64, #CSR>
+
+As such, the SparseTensor dialect only needs to provide a few operations speciﬁc to sparse tensor types:
+(1) materialization operations, (2) conversion operations, (3) operations that support progressive lowering.
+Below, we brieﬂy explore each category.
+
+The new operation materializes a sparse tensor from some source.
+
+%0 = sparse_tensor.new %source : !Source to tensor<?x?x?xf32, #SparseTensor>
+
+Most commonly, the source is a ﬁle in one of the external formats provided by the Matrix Market [11]
+(a popular sparse matrix repository and successor of earlier sets like the Harwell-Boeing Sparse Matrix
+Collection [25] and SPARSKIT [64]), or FROSTT [69] (a repository of open sparse tensors). Reading from
+ﬁle assumes a target platform that supports a ﬁle system, but other more architecturally neutral sources
+are possible as well, such as initializing a sparse tensor from code or through some API from a memory-
+resident format owned by an external library. Another materialization operation is the init operation, which
+materializes an uninitialized tensor into a computation. Conversely, the out operation, illustrated below,
+dematerializes a sparse tensor to some destination, typically by writing an external format like FROSTT to
+a ﬁle if the target architecture provides a ﬁle system. The operation is kept general, however, to support
+other kinds of destinations in the future as well.
+
+sparse_tensor.out %0, %dest : tensor<?x?x?xf32, #SparseTensor>, !Destination
+
+Since MLIR is strongly typed, built-in veriﬁcation rejects implicit type casts between dense and sparse
+tensor types or between diﬀerently annotated sparse tensor types, since most of such type conversions would
+incur non-trivial costs. Instead, conversions that involve sparse tensor types must be made explicit with the
+convert operation.
+
+An example of converting a 10×10 sparse matrix in CSR format to CSC format with dynamic dimensions
+
+is shown below.
+
+%to = sparse_tensor.convert %from : tensor<10x10xf64, #CSR> to tensor<?x?xf64, #CSC>
+
+In the ﬁrst reference implementation, conversion operations between sparse formats are implemented by
+converting to and from an intermediate coordinate scheme, which avoids the quadratic trap of implementing
+all possible direct conversions. In the longer term, however, this approach can be replaced by more advanced
+schemes, at least in special cases, such as proposed in [16].
+
+The convert operation also converts between dense tensor types and sparse tensor types. Although not
+practical for many real-world sparse tensors, where storage requirements of an enveloping dense tensor would
+be prohibitive, such conversions are useful to manipulate smaller data sets in tests. An example of initializing
+a sparse vector with only the nonzero integers from a compile-time dense constant vector is shown below.
+
+%v = arith.constant dense<[ 0, 0, 2, -1, 0, 0, 2, 0, 0, 0 ]> : tensor<10xi32>
+%s = sparse_tensor.convert %v : tensor<10xi32> to tensor<10xi32, #SparseVector>
+
+MLIR also provides a compile-time sparse constant that uses a COO-ﬂavored mechanism of specifying
+the indices and values of all nonzero elements in two diﬀerent lists, as shown below. Although, perhaps
+somewhat surprising, the type of SSA value %m is actually a dense 10 × 8 matrix, the subsequent conversion
+ensures that the sparse matrix in %s is initialized directly from the nonzero elements, without ever fully
+materializing the enveloping dense matrix at runtime.
+
+%m = arith.constant sparse<
+
+[ [0, 0], [0, 7], [1, 2], [4, 2], [5, 3], [6, 4], [6, 6], [9, 7]],
+
+[1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0]> : tensor<10x8xf64>
+
+%s = sparse_tensor.convert %m : tensor<10x8xf64> to tensor<10x8xf64, #CSR>
+
+8
+
+Lastly, the SparseTensor dialect provides operations that facilitate progressively lowering, ﬁrst from
+annotated kernels to an intermediate form that only stores and iterates over nonzero elements, without fully
+committing to an underlying storage format yet, then from this intermediate form to a buﬀerized form with
+actual sparse storage schemes, and then ﬁnally to executable code that runs on the target hardware. In
+the intermediate form, it is useful to have some primitives that provide sparsity-speciﬁc functionality while
+still hiding full implementation details of the underlying sparse storage formats. For instance, the indices
+operation returns the indices array of the sparse storage format at the given dimension for the given sparse
+tensor through a one-dimensional array, called a memref after buﬀerization. An example is shown below.
+
+%ind = sparse_tensor.indices %t, %c3 : tensor<10x10x10x10xf64, #SparseTensor> to memref<?xindex>
+
+Other operations related to sparsity consist of obtaining the pointers or values array, and inserting ele-
+ments into a sparse tensor, possibly assisted by expanding and compressing access patterns within innermost
+loops, as further explained in the next section.
+
+4.3 Sparse Tensor Transformations
+
+The sparse compiler itself is implemented as a set of lowering transformations that reside in the SparseTensor
+dialect. These transformations take care of lowering annotated kernels, i.e. operations on sparse tensor types,
+to imperative constructs and sparse storage formats that only store and iterate over the nonzero elements,
+In true MLIR fashion,
+possibly optimized with parallelization or vectorization of the generated loops.
+transformation deﬁnitions separate mechanism, i.e. how to modify an intermediate form, from policy, i.e.
+which transformations should be applied and in what order to get the best performing result.
+
+The MLIR sparse compiler transformations closely follow the sparse iteration model of TACO [40]. Start-
+ing with a tensor index notation expressed in the Linalg dialect, a topologically sorted iteration graph is
+constructed that reﬂects the required order on the implicit indices with respect to the dimension ordering
+of each sparse tensor. Next, iteration lattices are constructed for the tensor expression for every index in
+topological order. Each iteration lattice point consists of a conjunction of tensor indices together with a
+tensor (sub)expression that drive the actual sparse code generation, consisting of a straightforward mapping
+to loops and conditionals using the SCF dialect. The resulting sparse intermediate form that only (co)iterates
+over the nonzero elements is subsequently buﬀerized to another intermediate form with actual sparse storage
+schemes, and then ﬁnally lowered to executable code that runs on the target hardware, typically by handing
+oﬀ LLVM IR to the LLVM back-end compiler.
+
+As a simple example, consider the following straightforward Linalg operation that scales the elements
+
+in a vector by a constant in-place, viz. x[i] *= c.
+
+%0 = linalg.generic #trait_scale
+
+outs(%vecx: tensor<?xf64, #SparseVector>) {
+^bb(%x: f64):
+
+%1 = arith.mulf %x, %c : f64
+linalg.yield %1 : f64
+
+} -> tensor<?xf64, #SparseVector>
+
+The steps discussed above reveal that the loop-body only needs to execute for nonzero elements in
+the sparse vector. This yields the following intermediate form that updates these elements in-place using
+primitives of the SparseTensor and SCF dialects.
+
+%x_pointers = sparse_tensor.pointers %vecx, %c0
+%x_values = sparse_tensor.values %vecx
+%x_lo = memref.load %x_pointers[%c0] : memref<?xindex>
+%x_hi = memref.load %x_pointers[%c1] : memref<?xindex>
+scf.for %ii = %x_lo to %x_hi step %c1 {
+
+%0 = memref.load %x_values[%ii] : memref<?xf64>
+%1 = arith.mulf %0, %c : f64
+memref.store %1, %x_values[%ii] : memref<?xf64>
+
+}
+
+9
+
+The sparse iteration model also provides an elegant way to generate code that implements co-iteration,
+i.e. iterating over a disjunction or a conjunction of several sparse data structures simultaneously. Consider,
+for example, computing the inner product x += a[i] * b[i] of two sparse vectors, represented by the
+following Linalg operation.
+
+%0 = linalg.generic #trait_inner
+
+ins(%veca, %vecb: tensor<?xf64, #SparseVec>, tensor<?xf64, #SparseVec>) outs(%acc: tensor<f64>) {
+
+^bb(%a: f64, %b: f64, %x: f64):
+%0 = arith.mulf %a, %b : f64
+%1 = arith.addf %x, %0 : f64
+linalg.yield %1 : f64
+
+} -> tensor<f64>
+
+Then following the sparse iteration model reveals that the loop-body only needs to execute when both
+elements of the sparse vectors are nonzero. This eventually yields in the following SCF construct, presented
+in a reduced and simpliﬁed form to enhance readability (mostly by omitting some of the machinery needed
+to correctly represent reduction and induction cycles in SSA).
+
+%a_lo = memref.load %a_pointers[%c0] : memref<?xindex>
+%a_hi = memref.load %a_pointers[%c1] : memref<?xindex>
+%b_lo = memref.load %b_pointers[%c0] : memref<?xindex>
+%b_hi = memref.load %b_pointers[%c1] : memref<?xindex>
+... = scf.while (...) : (index, index, f64) -> (index, index, f64) {
+
+%cond = %ia < %a_hi && %ib < %a_hi
+scf.condition(%cond)
+
+} do {
+...
+%ixa = memref.load %a_indices[%ia] : memref<?xindex>
+%ixb = memref.load %b_indices[%ib] : memref<?xindex>
+%i = min(%ixa, %ixb)
+%acc = scf.if (%ixa == %i && %ixb == %i) -> (f64) {
+%0 = memref.load %a_values[%ia] : memref<?xf64>
+%1 = memref.load %b_values[%ib] : memref<?xf64>
+%2 = arith.mulf %0, %1 : f64
+%3 = arith.addf %acc_in, %2 : f64
+scf.yield %3 : f64
+
+} else {
+
+scf.yield %acc_in : f64
+
+}
+update %ia++ if %ixa == %i
+update %ib++ if %ixb == %i
+
+}
+
+Sparse tensor outputs are handled with direct insertions in pure lexicographical index order if all loops
+that correspond to left-hand-side indices are outermost. Otherwise, the sparse compiler uses a technique
+called access pattern expansion or workspace [6, 24, 31, 41, 59, 60], which is a well-known way of eﬃciently
+dealing with sparse insertions as well as an alternative way to implement co-iteration over a conjunction or
+disjunction. Consider, for instance, the following SpMSpM kernel for C[i,j] = A[i,k] * B[k,j].
+
+%C = linalg.matmul ins(%A, %B: tensor<?x?xf64, #CSR>, tensor<?x?xf64, #CSR>) -> tensor<?x?xf64, #CSR>
+
+With row-wise storage for all matrices, the reduction loop cannot appear innermost. As a result, the
+sparse compiler transformations lower this kernel to the following sparse intermediate form, again presented
+in a slightly reduced and simpliﬁed form to enhance readability.
+
+10
+
+scf.for %i = %c0 to %m step %c1 {
+
+%c_i_values, %filled, %added, %count = sparse_tensor.expand %C
+...
+scf.for %kk = %a_lo to %a_hi step %c1 {
+
+%k = memref.load %a_indices[%kk] : memref<?xindex>
+%aik = memref.load %a_values[%kk] : memref<?xf64>
+...
+scf.for %jj = %b_lo to %b_hi step %c1 {
+
+%j = memref.load %b_indices[%jj] : memref<?xindex>
+%bkj = memref.load %b_values[%jj] : memref<?xf64>
+%cij = memref.load %c_i_values[%j] : memref<?xf64>
+%0 = arith.mulf %aik, %bkj : f64
+%1 = arith.addf %cij, %0 : f64
+scf.if (not %filled[%j]) {
+
+memref.store %true, %filled[%j] : memref<?xi1>
+record insertion as %added[ %count++ ] = %j
+
+}
+memref.store %1, %c_i_values[%j] : memref<?xf64>
+
+}
+
+}
+sparse_tensor.compress %C, %c_i_values, %filled, %added, %count
+
+}
+
+The expand operation yields two arrays c i values and filled with sizes that suﬃce for a dense inner-
+most dimension (viz. a full row of C). Array added and scalar count are used to keep track of new indices
+when a false value is encountered in the filled array. The internal allocation and initialization should be
+done before the loop (preferably even shared between loops of diﬀerent kernels) so that these dense assign-
+ments are amortized over many iterations. Resetting the dense arrays in the loop nest itself is kept sparse by
+only iterating over set elements through an indirection during the compress operation, so that that amount
+of work is kept proportional to the number of nonzero elements. This operation also sorts the indices of the
+new entries, which enables insertions in pure lexicographical index order without costly data movement.
+
+5 Sparse Compiler Usage
+
+The previous section gave details on the design and implementation of sparse compiler support in the MLIR
+compiler infrastructure. This section explores two ways to use this new support: end-to-end support for
+array languages and sparse state space search for testing or library development.
+
+5.1 End-to-End Sparse Compiler Support for Array Languages
+
+Our long-term north star vision centered around sparse tensors types as ﬁrst class citizens enables researchers
+to independently start developing front-ends for array languages that incorporate some form of sparsity anno-
+tations as well as adding new MLIR transformations that implement improved sparse compilers. This vision
+would result in the retargetable approach illustrated in Figure 2, where several front-ends and several sparse
+compilers share the MLIR infrastructure. All paths eventually generate sparse code in some intermediate
+form, such as LLVM IR, which can be handed oﬀ to a back-end compiler, like LLVM, to generate code for
+various target architectures.
+
+PyTACO
+annotated Python
+. . .
+sparse JAX
+annotated Tensorﬂow
+
+(cid:38)
+MLIR
+→ with sparse →
+(cid:37) tensor types (cid:38) alternative impl. (cid:37)
+
+(cid:37) CPUs
+→ LLVM → LLVM → GPUs
+(cid:38) TPUs
+
+(cid:37) reference impl. (cid:38) sparse
+
+. . .
+
+IR
+
+Figure 2: Overview of retargetable sparse compiler support for array languages. Multiple front-ends map
+diﬀerent array languages with sparse annotations, such as PyTACO, to a shared high-level intermediate
+representation, such as Linalg with sparse tensor types. Alternative sparse compiler pipelines, such as the
+reference implementation, lower this intermediate to imperative constructs and sparse storage formats that
+only store and iterate over nonzero elements. This intermediate is handed oﬀ to a retargetable backend
+compiler, like LLVM, that can generate code for a variety of target architectures.
+
+11
+
+The end product enables non-expert programmers to exploit sparsity easily, since, by merely adding
+annotations, a single sparsity-agnostic program in, e.g., Python, could map to a wide range of sparse im-
+plementations, each tailored to speciﬁc instances of the same problem, both in terms of sparsity properties
+as well as characteristics of the target architecture. MLIR ships with an initial reference implementation of
+the sparse compiler transformations. In addition, to illustrate end-to-end support for an array language, we
+added support for PyTACO [42], which is TACO’s Python-based domain speciﬁc language for expressing
+sparse tensor algebra computations.
+
+For example, the following PyTACO code expresses an element-wise matrix addition. The ﬁrst three
+lines deﬁne tensors A and B, and C. The fourth line deﬁnes the two index variables i and j. The last line
+describes the actual computation, using a tensor index notation to describe how each element in the result
+tensor can be computed from elements in the two source tensors.
+
+A = tensor([1024, 1024], [compressed, dense])
+B = tensor([1024, 1024], [compressed, dense])
+C = tensor([1024, 1024], [compressed, dense])
+i, j = get_index_var(2)
+C[i,j] = A[i,j] + B[i,j]
+
+As another example, a matrix multiplication can be expressed as follows.
+
+C[i,j] = A[i,k] * B[k,j]
+
+PyTACO supports implicit broadcast and implicit reduction.
+
+If an index variable is deﬁned in the
+iteration space but does not appear in the expression of a tensor operand, the tensor operand is broadcast
+along the dimension represented by the index variable. If an index variable appears in the expression of
+some tensor operands but not in the expression of the destination tensor, then the corresponding dimension
+is reduced on the smallest sub-expression that captures the use of the index variable.
+
+The following code illustrates these two rules.
+
+C[i,j] = A[i,j] + B[i]
+D[i] = A[i,j] + B[i,j] + C[i] =>
+
+=> C[i,j] = A[i,j] + broadcast(j, B[i])
+
+D[i] = sum(j, A[i,j] + B[i,j]) + C[i]
+
+To support PyTACO, we implemented Python classes for sparsity annotations, index variables, tensors,
+to process
+tensor accesses and tensor expressions. Then, we implemented the dunder method
+tensor accesses. A tensor access is a leaf node and a trivial tensor expression. Tensor expressions can
+participate in operations, such as additions and multiplications, to construct more complicated expressions.
+We also implemented the dunder method
+to assign a left-hand-side tensor expression to the
+right-hand-side tensor.
+
+getitem
+
+setitem
+
+When a tensor with an assignment is evaluated, we generate the MLIR representation for the tensor
+assignment. The Linalg dialect has a generic operation that can be used to express the PyTACO tensor
+computation with only one diﬀerence. That is, a reduction in the generic operation is performed on the whole
+expression, not on the smallest expression that captures the use of the index variables as in the PyTACO.
+As such, we need to break the following PyTACO expression
+
+D[i] = A[i,j] + B[i,j] + C[i]
+
+into two generic operations
+
+T[i] = A[i,j] + B[i,j]
+D[i] = T[i] + C[i]
+
+to implement the PyTACO expression correctly. When we need to introduce such temporary tensors, we use
+heuristics to estimate the sparsity for each dimension in the temporary tensor. In particular, if an operation
+only preserves zero values from both source operands, such as an addition, we choose compressed format
+for a destination dimension only if both source dimensions are compressed. If an operation preservers zero
+values from either source operand, such as a multiplication, we choose compressed format for a destination
+dimension if at least one of its source dimensions is compressed. After generating the MLIR code for
+the tensor assignment, we invoke MLIR compilation passes, including the sparse tensor code generator, to
+compile the code down to a runnable representation. We then invoke the MLIR JIT execution engine to
+execute this runnable and retrieve the result for the tensor.
+
+12
+
+5.2 Sparse State Space Search
+
+The MLIR infrastructure provides a Python interface for building, compiling, and running MLIR IR from
+code. This interface provides a convenient way to loop over all possible sparse storage formats and compiler
+optimizations for a particular kernel. Given the SpMM kernel in which only one matrix is sparse, for
+example, the code below can be used to exhaustively explore all possible sparsity attributes attr and
+compiler strategies opt for building and running the kernel.
+
+for level in [ [dense, dense], [dense, compressed], [compressed, dense], [compressed, compressed] ]:
+for ordering in [ ir.AffineMap.get_permutation([0, 1]), ir.AffineMap.get_permutation([1, 0]) ]:
+
+for ptrWidth in [0, 8, 16, 32, 64]:
+
+for indxWidth in [0, 8, 16, 32, 64]:
+
+attr = st.EncodingAttr.get(level, ordering, ptrWidth, idxWidth)
+mlir = buildSpMM(attr)
+for opt in compilerStrategies:
+
+exec = compileKernel(mlir, opt)
+result = runKernel(exec, input)
+verify(result)
+
+This approach is useful to stress test the actual sparse compiler implementation, since the computed
+result should be independent of the actual sparsity annotations or compiler optimizations used (at least
+within acceptable numerical diﬀerences due to ﬂoating-point reassociation). However, the same approach
+can also be used by an expert programmer to exhaustively explore the performance of a library method
+within the full state space of possible sparse implementations and optimizations before deciding on which
+one to ship into production.
+
+The loop nest above shows that choosing a proper format for a single sparse matrix already gives rise
+to a state space of 200 conﬁgurations. For kernels with higher dimensional or multiple sparse tensors, the
+size of the state space grows further. Then, when combined with diﬀerent compiler optimization strategies,
+diﬀerent target architectures, and diﬀerent characteristics of the sparse tensor inputs, the combinatorial
+explosion of the state space becomes apparent. Although long oﬀ-line running times are acceptable while
+exhaustively searching for the best possible implementation of a library method that will be widely used, at
+some point exploring the full state space may become infeasible, and the programmer may have to resort to
+using machine learning for this exploration [68].
+
+6 Experimental Results
+
+Even though our long term objective is to provide an excellent, reusable sparse ecosystem that simpliﬁes
+sparse code generation for a wide variety of target architectures (CPUs, GPUs, and TPUs), MLIR ships with
+a ﬁrst reference implementation that provides a fully functional implementation of the sparse ecosystem (for
+CPUs). In this section, we presents experimental validation of this initial reference implementation compared
+to the state-of-the-art TACO compiler [42]. All measurements were taken on an Intel Xeon W2135 3.7GHz.
+
+6.1 Sparse Tensor Input
+
+To validate the quality of the reference implementation for reading tensors from ﬁles, we measured the time
+taken to read and pack tensors to an all-dimensions compressed format for a few tensors with varying
+dimensions from the Matrix Market [11] and FROSTT [69]. For TACO, we used the built-in timing bench-
+mark which invokes GCC during execution to compile generated code. For fair comparison, we compensated
+the reports to exclude compilation time. For MLIR, we used identical timing methods but the LLVM JIT
+compiler as back-end. Also, since MLIR reads tensors from an extended FROSTT format with extra size
+metadata in the header, it has a slight advantage pre-allocating data structures while reading. Table 1
+shows the results, with the relative performance improvement of MLIR over TACO for the total reading and
+packing time in the last column. The latter gives clear evidence that the reference implementation provides
+state-of-the-art performance for reading sparse tensors.
+
+13
+
+MLIR
+
+TACO
+
+tensor
+ﬁdap011
+nell-2
+uber
+vast-2015
+
+dim
+2
+3
+4
+5
+
+nnz
+1,091,362
+76,879,419
+3,309,490
+26,021,945
+
+read
+228
+9568
+418
+3796
+
+pack
+136
+2055
+107
+1728
+
+read
+262
+13303
+594
+5191
+
+pack
+142
+6974
+398
+2832
+
+1.1x
+1.7x
+1.9x
+1.5x
+
+Table 1: Sparse Tensor Input (time in ms.)
+
+6.2 Sparse Linear Algebra
+
+To validate the quality of the generated sparse code, we measured the runtime of the SpMSpM kernel for
+C[i,j] = A[i,k] * B[k,j] that was discussed in Section 4.3, using various n × n uniform random sparse
+matrices with a ﬁxed density of ρA,B = 0.01, illustrated on the left in Figure 3, as input operands A and B.
+Table 2 summarizes the resulting density ρC for output matrix C, the measured runtime of the kernel, as well
+as the relative performance improvement of MLIR over TACO. Since both sparse compilers generate more
+or less the same code, as expected, the performance is quite similar, with a minor speedup using MLIR,
+probably due to back-end optimization diﬀerences.
+
+Figure 3: Sparse Matrices (uniform random and row band)
+
+n
+1,024
+2,048
+4,096
+8,192
+
+ρC MLIR TACO
+3.9
+3.7
+29.1
+27.0
+244.7
+224.4
+1,900.4
+1,775.1
+
+0.10
+0.19
+0.34
+0.56
+
+1.06x
+1.08x
+1.09x
+1.07x
+
+Table 2: SpMSpM Kernel (time in ms.)
+
+To demonstrate the impact of sparse storage format selection on performance, consider the following
+
+sparse matrix times vector operation, where we have a choice for the sparse type SparseMatrix.
+
+%x = linalg.matvec ins(%A, %b: tensor<?x?xf64, #SparseMatrix>, tensor<?xf64>)-> tensor<?xf64>
+
+Obvious choices for an unstructured sparse matrix A as input would be formats like CSR or DCSR, with
+the latter favoring sparse matrices that have many empty rows. However, for row band matrices, illustrated
+on the right in Figure 3, where many rows are empty, but non-empty rows are dense, using a type encoding
+with compressed for the outermost dimension and dense for the innermost dimension would make more
+sense. Lets call this format CDR. Table 3 compares the performance of these storage formats for the sparse
+code generated by MLIR and TACO for various n × n row band matrices where the ﬁrst 1000 rows are kept
+dense, so that density ρA decreases as size n increases.
+
+14
+
+MLIR
+
+TACO
+
+n
+8,192
+16,384
+32,768
+65,536
+
+ρA CSR DCSR CDR CSR DCSR CDR
+6.62
+5.22
+11.90
+10.52
+24.79
+21.07
+47.07
+42.18
+
+7.88
+15.76
+31.51
+77.28
+
+10.78
+19.21
+37.27
+76.84
+
+7.85
+15.69
+31.41
+72.19
+
+10.99
+19.77
+38.63
+77.55
+
+0.12
+0.06
+0.03
+0.02
+
+1.27x
+1.13x
+1.18x
+1.12x
+
+Table 3: SpMV Kernel (time in ms.)
+
+For MLIR, we also enabled the built-in vectorization strategy to take full advantage of AVX512 instruc-
+tions on the target architecture along dense rows. As expected, CSR and DCSR perform similar for both
+compilers, with a slight advantage in the doubly compressed format due to skipping empty rows completely.
+For both compilers, however, the CDR version performs best. In addition, MLIR takes full advantage of the
+SIMD instructions, as indicated by the last column which shows the relative performance improvement of
+MLIR over TACO for the best version. This performance improvement demonstrates the utility of integrating
+sparse compilation into a modern multi-level compiler infrastructure.
+
+Lastly, to illustrate the use of a sparse state space search to ﬁnd a suitable sparse storage scheme, we
+conducted some experiments with the well-known sampled dense-dense matrix multiplication (SDDMM)
+kernel [55] that samples the result of a regular matrix multiplication by means of an element-wise multipli-
+cation with a sparse matrix, expressed in tensor index notation as X[i,j] = S[i,j] * A[i,k] * B[k,j]
+for a sparse matrix S. Figure 4 plots the runtime of this kernel for diﬀerent versions generated by MLIR
+using various sparse storage schemes for S (left-to-right) and compiler optimization strategies (sorted front-
+to-back). The ﬁgure clearly visualizes how an expert programmer can ﬁnd the best storage format and
+optimization strategy by looking for the minimum runtime in the plot (here, DCSR and an optimization
+that corresponds to vectorization using 32-bit indices).
+
+Figure 4: Sparse Runtime State Space for SDDMM (lower is better)
+
+6.3 Sparse Tensor Algebra
+
+To validate the quality of the generated code for tensor algebra, we measured the runtime of Matricized
+Tensor Times Khatri-Rao Product, or MTTKRP for short. This kernel, expressed in tensor index notation
+as A[i,j] = B[i,k,l] * D[l,j] * C[k,j] (viz. two reduction loops) for a sparse 3-dimensional tensor
+B, forms the bottleneck of various problems in data analytics. Table 4 shows the runtime of this kernel
+for the 12092 × 9184 × 28818 sparse tensor nell-2 of FROSTT, used earlier in the input experiment, and
+size 12092 × 42 for the output matrix. For both MLIR and TACO, we measured the time for the sparse
+versions generated for formats with an outermost dense and two innermost compressed dimensions and
+default lexicographic index order, as well as an alternative format with dimension ordering that interchanges
+the two innermost dimension (at the expense of a slightly higher packer time). For MLIR, we also measured
+the runtime using a vectorization strategy for the latter format. The table clearly shows the advantage of the
+alternative dimension ordering, as well as the beneﬁts obtained by using MLIR’s optimization capabilities.
+
+15
+
+tensor
+nell-2
+
+7 Related Work
+
+MLIR
+
+TACO
+
+DSS DSS-alt DSS-vec
+1,299.97
+
+1,754.98
+
+2,340.82
+
+DSS DSS-alt
+1,871.64
+
+2,587.81
+
+1.44x
+
+Table 4: MTTKRP Kernel (time in ms.)
+
+This section discusses related work, organized by sparsity support in compilers and libraries.
+
+7.1 Sparse Compilers
+
+To the best of our knowledge, Bik and Wijshoﬀ were the ﬁrst to propose the concept of treating sparsity
+merely as a property and letting a sparse compiler generate sparse code automatically from a sparsity-agnostic
+deﬁnition of the computation [8], which resulted in the MT1 sparse compiler for linear algebra [6, 9]. This
+Fortran compiler ﬁrst evaluates an attribute grammar to associate sparse conditions for execution with all
+expressions and statements in the input program. Then, driven by annotations and automatic nonzero
+structure analysis of representative sparse input matrices [10], the program is automatically converted into
+a form that only stores and operates on nonzero elements for unstructured and structured sparse matrices.
+Using this sparse compiler for automatic sparse library generation was demonstrated in [7] for linear algebra
+primitives.
+
+The concept of generating sparse code from dense abstractions is shared with subsequent work. The
+Vienna-Fortran / HPF sparse extensions [79] provides High-Performance Fortran language features where
+users can characterize a matrix as sparse and specify the associated representation for its underlying compiler.
+The Bernoulli project [45, 52] generates eﬃcient serial and distributed sparse matrix code from HPF-style,
+dense DO-ANY loops through relational algebra. By viewing arrays as relations and execution of loop
+nests as evaluation of relational queries, the problem of eﬀectively traversing the sparse iteration space
+becomes ﬁnding optimal select and join schedules. Users have to manually describe desired sparse storage
+format by deﬁning access methods for searching and enumerating indices. The SIPR framework [60] applies
+compilation to sparse algorithms with auxiliary data structures, such as a sparse accumulator [29]. Leveraging
+the concepts of Aspect Oriented Programming, SIPR represents sparse programs as a combination of dense
+algorithms and dynamic sparse storage speciﬁcations, mapping array references and loop iterations to storage
+formats and array access descriptors. The latter specify an algorithm used to access the array elements, such
+as, direct access, enumeration, or binary search. The associated cost model allows for automatic computation
+of asymptotic complexity. The backend tool converts SIPR programs to C++ achieving performance on par
+with hand-written Fortran.
+
+Sparse compilation was formalized and generalized to sparse tensor algebra in TACO (Tensor Algebra
+Compiler) [42, 40, 41, 43]. Starting with a “loopless” tensor index notation, the programmer annotates
+tensors as sparse. For this, TACO was the ﬁrst to propose the elegant way of expressing desired sparse
+storage schemes with a combination of per-dimension level types and a dimension ordering. The dimension
+level types were expanded by Chou et al. [15] to include more sparse storage formats. Kjolstad et al. were
+also the ﬁrst to present a sparse iteration model that drives sparse code generation by topologically sorting
+the iteration graph to ﬁnd a suitable index order, and using iteration lattices to emit loops, conditions, and
+tensor expressions for every index in topological order. For this, TACO provides the co-iteration formulation
+that can be used to generate code to co-iterate over any number of sparse and dense tensors, which is
+necessary for general kernel fusion. Kjolstad et al. [41] and Senanayake et al. [67] also extended the TACO
+compiler with a scheduling language that lets users (or automatic systems) organize the iteration over tensor
+expressions, which lets them tile, control fusion/ﬁssion, statically load-balance, and generate GPU code for
+sparse tensor algebra kernels. Sparse tensor support in MLIR borrows heavily from the foundation laid by
+TACO.
+
+16
+
+Taichi [36] is a programming language that oﬀers a data structure-agnostic interface for writing compu-
+tation code. The user speciﬁes the data structure with diﬀerent sparsity properties independent of the code
+to create a wide range of sparse data structures. As with the approaches above, decoupling data structures
+from computation simpliﬁes experimenting with diﬀerent data structures without the need to change the
+actual computation code.
+
+COMET [53, 77] is a MLIR-based compiler infrastructure for dense and sparse tensor algebra compu-
+tations. It uses a dimension-wise sparse storage scheme and a code generation algorithm similar to TACO,
+but has more performance portability building upon MLIR. Its DSL can succinctly describe tensor algebra
+expressions using Einstein summation notation and format tags for sparse tensors. The DSL is mapped
+to a custom Sparse Tensor Algebra dialect, which is progressively lowered to LLVM IR through MLIR di-
+alects. The framework also incorporates a data reordering algorithm to help with data locality. Among
+compiler-based approaches, COMET’s is the closest to ours.
+
+Henry et al. [35] generalized the sparse tensor algebra compilation theory from TACO [43] to support
+compilation of general dense and sparse array expressions, laying the foundation for a sparse NumPy-style
+system. In this system, arrays (tensors) can have any implicit ﬁll value and any function can be computed
+across sparse and dense arrays. The new scheme covers sparse iteration spaces outside of union (addition)
+and intersection (multiplication) for arbitrary user-deﬁned functions. It can also iterate over slices or strides
+of sparse arrays, allowing for a much wider range of kernels and applications.
+
+Another line of work is to directly optimize sparse code, i.e., codes that deal with compressed data struc-
+tures. SPARSITY [37] provides a framework that selects optimization parameters to automatically build
+sparse matrix kernels that are tuned to their matrices and machines. The framework combines traditional
+loop transformations with data structure transformations that are speciﬁc to sparse matrices. LL (Little
+Language) [3] is a small functional language aiming to increase programming productivity of sparse opera-
+tions. It provides built-in nested list and pair types, with which users can naturally represent compressed
+matrices in many formats. Sparse computations are deﬁned through a data ﬂow graph. The compiler can
+generate eﬃcient, fully veriﬁed C code.
+
+The Sparse Polyhedral Framework (SPF) [74] provides code and data transformations for non-aﬃne loop
+bounds and array index expressions [82] which can be combined with existing transformation in polyhedral
+framework. Each transformation controls whether a dimension in the sparse iteration space is traversed fully
+(make-dense) or sparsely (compact), with an option to pad the underlying data storage for that dimension
+(compact-and-pad ). The generated code is akin to converting sparse tensor to a speciﬁc layout then per-
+forming the computation. SPF can cover a large variety of tensor storage formats, at the expense of users
+having to write a sequence of transformations to produce the desired computations.
+
+TIRAMISU [4] is a polyhedral compiler for deep learning that maps sparse and recurrent neural networks
+
+to the polyhedral model in order to generate highly-optimized sparse code for the target architecture.
+
+7.2 Sparse Libraries and Kernels
+
+A large number of applications build upon sparse computation library primitives optimized for their target
+architectures. There are numerous sparse libraries for diﬀerent application domains with varying performance
+and productivity goals.
+
+Classic sparse linear algebra binary libraries like MKL [84] and cuSPARSE [54] implements sparse basic
+linear algebra subroutines with a few data types. More recent generic C++ libraries such as Eigen [30] and
+CUSP [20] allow writing math-like expressions and can support more data types. OSKI [83] library oﬀers
+automatically-tuned sparse matrix CPU primitives for linear solvers, with an easy-to-use interface.
+
+PETSc [5] is a library of scalable PDE solvers that has modular structure and multiple abstraction
+layers, making it easy to add support for new devices, kernels, data types, etc., including new sparse matrix
+formats [46]. It can also be integrated with a compiler-based autotuning approach to further optimize its
+hotspot kernels [61].
+
+Matrix algebra can also be beneﬁcial in graph processing [32]. The GraphBLAS [39] standard speciﬁes a
+core set of general sparse matrix-based graph operations, e.g., generalized matrix operations over arbitrary
+
+17
+
+semirings (replacing element-wise addition and multiplication with other operators), providing additional
+operation coverage to common sparse linear algebra libraries. Libraries implementing this standard includes
+Combinatorial BLAS [14], GraphPad [2], GraphBLAST [86], SuiteSparse:GraphBLAS [21], etc.
+
+Outside of deep learning, most common sparse tensor computations are tensor decompositions [44] and
+contractions [57, 38]. The Cyclops Tensor Framework [73, 72] is a C++ template library for distributed
+dense and sparse tensor algebra targeting quantum chemistry domain. Through operator overloading, users
+can write tensor algebra expression with Einstein summation notation directly in C++, e.g., C["hij"] +=
+A["ijhk"] * B["hkij"]. It supports templated data types and can substitute element-wise operations in
+tensor addition and contraction with other operations through user-deﬁned algebraic structures (e.g., semir-
+ings, groups, etc). CTF’s execution strategy is to transform tensors into a layout that ﬁts hand-implemented
+library routines, including a 2.5D matrix multiplication, invoke those routines, and then transform the data
+back. Among library-based approaches, CTF is the closest related work to ours due to its generality.
+
+The rising popularity of deep learning poses new challenges to sparse libraries, e.g., new sparsity char-
+acteristics, kernels, data types, hardware accelerators, etc. While there are libraries such as Sputnik [27],
+cuSPARSELt [18], and LIBXSMM [34] adding new kernels and data types speciﬁc to deep learning, these
+kernels still have limited composability and portability.
+
+Specializing sparse kernels for speciﬁc sparsity characteristics or hardware architecture can bring signif-
+icant performance gains. Numerous applications implement custom sparse formats that better suit their
+sparsity patterns and target hardware [66, 78, 13, 56, 63, 65, 12, 71, 49]. Recent studies [87, 58, 85] on sparse
+matrix format classiﬁcation uses machine learning determine the best input storage format to maximize the
+performance of a particular kernel. Only a small number of matrix formats were compared, because each of
+them needs separate implementation. With our work, an arbitrarily large number of formats can simply be
+explored as compiler tuning knobs [68].
+
+8 Conclusions and Future Plans
+
+In this paper, we proposed treating sparsity as a property, not a tedious implementation task, and showed
+how the concept of letting a sparse compiler generate sparse code automatically from a sparsity-agnostic
+deﬁnition of the computation is being integrated into the MLIR open-source compiler infrastructure. MLIR’s
+ease of deﬁning multi-level abstractions and transformations composes well with this idea of making sparsity
+a property. We discussed our north star vision of providing an excellent, reusable sparse ecosystem by
+introducing sparse tensor types as proper ﬁrst-class citizens into MLIR. A reference implementation provides
+a fully functional implementation of this sparse ecosystem. We discussed two ways of using sparse compiler
+support in MLIR, namely, end-to-end support for array languages and state space search for sparse library
+development. Lastly, we provided some experimental validation of our initial reference implementation.
+
+Going forward, our hope is that the open-source nature of this project will not only beneﬁt researchers
+that are new to the sparse domain but also solicit useful contributions from experts in the open-source
+community at large. Many interesting topics remain under active research and development. For instance,
+our current sparsity encoding with just dense and compressed dimension level types can be generalized to
+allow other dimension level types as well, which will widen the scope of the current implementation from
+unstructured and block-structured sparse tensors into new unstructured and structured sparse tensor storage
+formats that better exploit speciﬁc features of the tensors, the computation, and the target architecture.
+Also, mapping general array language constructs into a suitable intermediate representation is under active
+investigation. Furthermore, even though MLIR has the ability to apply fusion, ﬁssion, tiling, and various
+other optimizations to Linalg operations, more work is needed on compiler strategies for doing so in the
+context of sparse tensors. More research is also needed to generate eﬃcient code for kernels with complex
+access patterns, such as sparse convolutions. The introduction of set-oriented looping constructs to MLIR
+would enable a more gradual progressive lowering into sparse code, since the current direct lowering to SCF
+bridges a rather wide semantic gap. Finally, we plan to extend the scope of our reference implementation
+from CPUs to GPUs, TPUs, and other kinds of accelerators eventually.
+
+18
+
+The MLIR project was in part started to provide an extensible and powerful compiler infrastructure for
+domain-speciﬁc languages. Of particular interest was dense tensor algebra for deep neural networks. But
+while dense tensor computations remain the bulk of machine learning workloads, sparse neural networks
+are increasingly being explored, whether weight-sparse, activation-sparse, or input sparse such as graph-
+convolutional neural networks.
+
+With the MLIR sparse compiler we seek to put compilation for sparse tensor algebra on the same
+strong footing as compilation for dense tensor algebra. We believe this is necessary to enable both eﬃcient
+exploration and eﬃcient computation of sparse computations in machine learning and in data analytics.
+In fact, classical compiler transformations for dense tensor computations, such as reordering, ﬁssion, and
+fusion, can be even more important for sparse computation, as getting loop ordering and fusion/ﬁssion wrong
+often leads to asymptotically worse complexity. This eﬀect occurs even in staple computations like sparse
+matrix-matrix multiplication and sampled dense-dense matrix multiplication, which are used in sparse neural
+networks. The MLIR sparse compiler is positioned to address these challenges and we are therefore excited
+about its potential.
+
+Acknowledgments The authors would like to extend their thanks to the MLIR team, with a special
+shout-out to Mehdi Amini, Eugene Burmako, Diego Caballero, Albert Cohen, Sanjoy Das, Tobias Gysi,
+Stephan Herhut, Stella Laurenzo, Jacques Pienaar, Thomas Raoux, River Riddle, Wren Romano, Sean
+Silva, Gus Smith, Matthias Springer, Reid Tatge, Jake van der Plas, Alex Zinenko, and Eugene Zhulenev.
+
+References
+
+[1] Anderson, E., and Saad, Y. Solving sparse triangular linear systems on parallel computers. Inter-
+
+national Journal of High Speed Computing 1, 6 (1989), 73–95.
+
+[2] Anderson, M. J., Sundaram, N., Satish, N., Patwary, M. M. A., Willke, T. L., and Dubey,
+In 2016 IEEE
+
+P. Graphpad: Optimized graph primitives for parallel and distributed platforms.
+International Parallel and Distributed Processing Symposium (IPDPS) (2016), IEEE, pp. 313–322.
+
+[3] Arnold, G. Data-Parallel Language for Correct and Eﬃcient Sparse Matrix Codes. University of
+
+California, Berkeley, 2011.
+
+[4] Baghdadi, R., Debbagh, A. N., Abdous, K., Benhamida, F. Z., Renda, A., Frankle, J. E.,
+Carbin, M., and Amarasinghe, S. Tiramisu: A polyhedral compiler for dense and sparse deep
+learning. arXiv preprint arXiv:2005.04091 (2020).
+
+[5] Balay, S., Gropp, W. D., McInnes, L. C., and Smith, B. F. Eﬃcient management of parallelism in
+object-oriented numerical software libraries. In Modern software tools for scientiﬁc computing. Springer,
+1997, pp. 163–202.
+
+[6] Bik, A. J. Compiler Support for Sparse Matrix Computations. PhD thesis, Department of Computer
+
+Science, Leiden University, 1996. ISBN 90-9009442-3.
+
+[7] Bik, A. J., Brinkhaus, P. J., Knijnenburg, P. M., and Wijshoff, H. A. The automatic
+
+generation of sparse primitives. Transactions on Mathematical Software 24 (1998), 190–225.
+
+[8] Bik, A. J., and Wijshoff, H. A. Advanced compiler optimizations for sparse computations. Journal
+
+of Parallel and Distributed Computing 31 (1995), 14–24.
+
+[9] Bik, A. J., and Wijshoff, H. A. Automatic data structure selection and transformation for sparse
+matrix computations. IEEE Transactions on Parallel and Distributed Systems 7, 2 (1996), 109–126.
+
+[10] Bik, A. J., and Wijshoff, H. A. Automatic nonzero structure analysis. SIAM J. Computing 28, 5
+
+(1999), 1576–1587.
+
+19
+
+[11] Boisvert, R., Pozo, R., and Remington, K. The Matrix Market Exchange Formats: Initial design,
+1996. NIST Interagency/Internal Report (NISTIR), National Institute of Standards and Technology,
+Gaithersburg, MD.
+
+[12] Buluc¸, A., Fineman, J. T., Frigo, M., Gilbert, J. R., and Leiserson, C. E. Parallel sparse
+matrix-vector and matrix-transpose-vector multiplication using compressed sparse blocks.
+In ACM
+Symposium on Parallelism in Algorithms and Architectures (New York, NY, USA, 2009), ACM, p. 233.
+
+[13] Buluc¸, A., and Gilbert, J. R. On the representation and multiplication of hypersparse matrices. In
+IEEE International Symposium on Parallel and Distributed Processing, (IPDPS). (Apr. 2008), pp. 1–11.
+
+[14] Buluc¸, A., and Gilbert, J. R. The combinatorial blas: Design, implementation, and applications.
+The International Journal of High Performance Computing Applications 25, 4 (2011), 496–509.
+
+[15] Chou, S., Kjolstad, F., and Amarasinghe, S. Format abstraction for sparse tensor algebra
+
+compilers. Proc. ACM Program. Lang. 2, OOPSLA (Oct. 2018), 123:1–123:30.
+
+[16] Chou, S., Kjolstad, F., and Amarasinghe, S. Automatic generation of eﬃcient sparse tensor
+format conversion routines. In Proceedings of the 41st ACM SIGPLAN Conference on Programming
+Language Design and Implementation (New York, NY, USA, 2020), PLDI 2020, Association for Com-
+puting Machinery, pp. 823–838.
+
+[17] Coleman, T. F. Large sparse numerical optimization. In Lecture Notes in Computer Science, No. 165,
+
+G. Goos and J. Hartmanis, Eds. Springer-Verlag, Berlin, 1984.
+
+[18] Corporation, N. cusparselt: A high-performance cuda library for sparse matrix-matrix multiplication,
+
+2021.
+
+[19] Curtis, A., and Reid, J. The solution of large sparse unsymmetric systems of linear equations.
+
+Journal Inst. Maths. Applics. 8 (1971), 344–353.
+
+[20] Dalton, S., Bell, N., Olson, L., and Garland, M. Cusp: Generic parallel algorithms for sparse
+
+matrix and graph computations, 2014. Version 0.5.0.
+
+[21] Davis, T. A. Algorithm 1000: Suitesparse: Graphblas: Graph algorithms in the language of sparse
+
+linear algebra. ACM Transactions on Mathematical Software (TOMS) 45, 4 (2019), 1–25.
+
+[22] Duff, I. S. A survey of sparse matrix research. In Proceedings of the IEEE (1977), pp. 500–535.
+
+[23] Duff, I. S. Data structures, algorithms and software for sparse matrices. In Sparsity and Its Applica-
+
+tions, D. J. Evans, Ed. Cambridge University Press, 1985, pp. 1–29.
+
+[24] Duff, I. S., Erisman, A., and Reid, J. Direct Methods for Sparse Matrices. Oxford Science
+
+Publications, Oxford, 1990.
+
+[25] Duff, I. S., Grimes, R. G., and Lewis, J. G. Sparse matrix test problems. ACM Transactions on
+
+Mathematical Software 15 (1989), 1–14.
+
+[26] Evans, D. Iterative sparse matrix algorithms. In Software for Numerical Mathematics, D. Evans, Ed.
+
+Academic Press, New York, NY, 1974, pp. 49–83.
+
+[27] Gale, T., Zaharia, M., Young, C., and Elsen, E. Sparse GPU kernels for deep learning. In
+Proceedings of the International Conference for High Performance Computing, Networking, Storage
+and Analysis, SC 2020 (2020).
+
+[28] George, A., and Liu, J. W. Computer Solution of Large Sparse Positive Deﬁnite Systems. Prentice
+
+Hall, Englewood Cliﬀs, New York, 1981.
+
+20
+
+[29] Gilbert, J., Moler, C., and Schreiber, R. Sparse matrices in matlab: Design and implementation.
+
+SIAM J. on Matrix Analysis and Applications 13, 1 (1992), 333–356.
+
+[30] Guennebaud, G., Jacob, B., et al. Eigen. URl: http://eigen. tuxfamily. org 3 (2010).
+
+[31] Gustavson, F. G. Some basic techniques for solving sparse systems of linear equations. In Sparse
+Matrices and Their Applications, D. J. Rose and R. A. Willoughby, Eds. Plenum Press, New York, NY,
+1972, pp. 41–52.
+
+[32] Harary, F. Graph theory, chs. 2, 13. Reading: Addison Wesley (1969).
+
+[33] Harary, F. Sparse matrices and graph theory. In Large Sparse Sets of Linear Equations, J. Reid, Ed.
+
+Academic Press, 1971, pp. 139–150.
+
+[34] Heinecke, A., Henry, G., Hutchinson, M., and Pabst, H. Libxsmm: accelerating small matrix
+multiplications by runtime code generation. In SC’16: Proceedings of the International Conference for
+High Performance Computing, Networking, Storage and Analysis (2016), IEEE, pp. 981–991.
+
+[35] Henry, R., Hsu, O., Yadav, R., Chou, S., Olukotun, K., Amarasinghe, S., and Kjolstad, F.
+Compilation of sparse array programming models. Proceedings of the ACM on Programming Languages
+5, OOPSLA (2021), 1–29.
+
+[36] Hu, Y., Li, T.-M., Anderson, L., Ragan-Kelley, J., and Durand, F. Taichi: a language for
+high-performance computation on spatially sparse data structures. ACM Transactions on Graphics
+(TOG) 38, 6 (2019), 1–16.
+
+[37] Im, E.-J., Yelick, K., and Vuduc, R. Sparsity: Optimization framework for sparse matrix kernels.
+The International Journal of High Performance Computing Applications 18, 1 (2004), 135–158.
+
+[38] Kats, D., and Manby, F. R. Sparse tensor framework for implementation of general local correlation
+
+methods. The Journal of Chemical Physics 138, 14 (2013), 144101.
+
+[39] Kepner, J., Bader, D., Buluc¸, A., Gilbert, J., Mattson, T., and Meyerhenke, H. Graphs,
+matrices, and the graphblas: Seven good reasons. Procedia Computer Science 51 (2015), 2453–2462.
+
+[40] Kjolstad, F. Sparse Tensor Algebra Compilation. PhD thesis, Massachusetts Institute of Technology,
+
+Cambridge, MA, Feb 2020.
+
+[41] Kjolstad, F., Ahrens, P., Kamil, S., and Amarasinghe, S. Tensor algebra compilation with
+workspaces. Proceedings of the 2019 IEEE/ACM International Symposium on Code Generation and
+Optimization (2019), 180–192.
+
+[42] Kjolstad, F., et al. TACO: The tensor algebra compiler, 2017. Open-source project available at
+
+http://tensor-compiler.org/.
+
+[43] Kjolstad, F., Kamil, S., Chou, S., Lugato, D., and Amarasinghe, S. The tensor algebra
+
+compiler. Proc. ACM Program. Lang. 1, OOPSLA (Oct. 2017), 77:1–77:29.
+
+[44] Kolda, T. G., and Bader, B. W. Tensor decompositions and applications. SIAM review 51, 3
+
+(2009), 455–500.
+
+[45] Kotlyar, V., Pingali, K., and Stodghill, P. A relational approach to the compilation of sparse
+matrix programs. In European Conference on Parallel Processing (1997), Springer, pp. 318–327.
+
+[46] Kumbhar, P. Performance of petsc gpu implementation with sparse matrix storage schemes. PhD
+
+thesis, Master’s thesis, The University of Edinburgh (Aug 2011), 2011.
+
+21
+
+[47] Lattner, C., Amini, M., Bondhugula, U., Cohen, A., Davis, A., Pienaar, J., Riddle, R.,
+Shpeisman, T., Vasilache, N., and Zinenko, O. MLIR: Scaling compiler infrastructure for do-
+main speciﬁc computation.
+In 2021 IEEE/ACM International Symposium on Code Generation and
+Optimization (CGO) (2021), pp. 2–14.
+
+[48] Lattner, C., Pienaar, J. A., Amini, M., Bondhugula, U., Riddle, R., Cohen, A., Shpeisman,
+T., Davis, A., Vasilache, N., and Zinenko, O. MLIR: A compiler infrastructure for the end of
+moore’s law. CoRR abs/2002.11054 (2020).
+
+[49] Li, J., Sun, J., and Vuduc, R. Hicoo: Hierarchical storage of sparse tensors. In SC18: International
+Conference for High Performance Computing, Networking, Storage and Analysis (2018), IEEE, pp. 238–
+252.
+
+[50] Liu, J. W. A compact row storage scheme for cholesky factors using elimination trees. ACM Transac-
+
+tions on Mathematical Software (1986), 127–148.
+
+[51] Mann, K. J. Inversion of large sparse matrices: Direct methods. In Numerical Solutions of Partial
+Diﬀerential Equations, J. Noye, Ed. North-Holland Publishing Company, Amsterdam, 1982, pp. 313–
+366.
+
+[52] Mateev, N., Pingali, K., Stodghill, P., and Kotlyar, V. Next-generation generic programming
+and its application to sparse matrix computations. In Proceedings of the 14th international conference
+on Supercomputing (2000), pp. 88–99.
+
+[53] Mutlu, E., Tian, R., Ren, B., Krishnamoorthy, S., Gioiosa, R., Pienaar, J., and Kestor, G.
+COMET: A domain-speciﬁc compilation of high-performance computational chemistry. arXiv preprint
+arXiv:2102.06827 (2021).
+
+[54] Naumov, M., Chien, L., Vandermersch, P., and Kapasi, U. Cusparse library. In GPU Technology
+
+Conference (2010).
+
+[55] Nisa, I., Sukumaran-Rajam, A., Kurt, S. E., Hong, C., and Sadayappan, P. Sampled dense
+matrix multiplication for high-performance machine learning. In 2018 IEEE 25th International Confer-
+ence on High Performance Computing (HiPC) (2018), pp. 32–41.
+
+[56] Oppe, T. C., and Kincaid, D. R. The performance of ITPACK on vector computers for solving large
+sparse linear systems arising in sample oil reservoir simulation problems. Communications in Applied
+Numerical Methods 3, 1 (1987), 23–29.
+
+[57] Parkhill, J. A., and Head-Gordon, M. A sparse framework for the derivation and implementation
+
+of fermion algebra. Molecular Physics 108, 3-4 (2010), 513–522.
+
+[58] Pichel, J. C., and Pateiro-Lopez, B. Sparse matrix classiﬁcation on imbalanced datasets using
+
+convolutional neural networks. IEEE Access 7 (2019), 82377–82389.
+
+[59] Pissanetsky, S. Sparse Matrix Technology. Academic Press, London, 1984.
+
+[60] Pugh, W., and Shpeisman, T. Sipr: A new framework for generating eﬃcient code for sparse matrix
+computations. In International Workshop on Languages and Compilers for Parallel Computing (1998),
+Springer, pp. 213–229.
+
+[61] Ramalingam, S., Hall, M., and Chen, C.
+
+compiler-assisted specialization: A petsc case study.
+Distributed Processing Symposium Workshops & PhD Forum (2012), IEEE, pp. 487–496.
+
+Improving high-performance sparse libraries using
+In 2012 IEEE 26th International Parallel and
+
+[62] Reid, J. Direct methods for sparse matrices. In Software for Numerical Mathematics, D. Evans, Ed.
+
+Academic Press, New York, NY, 1974, pp. 29–47.
+
+22
+
+[63] Rice, J. R., and Boisvert, R. F. Solving Elliptic Problems Using ELLPACK. Springer-Verlag, 1985.
+
+[64] Saad, Y. SPARSKIT: a basic tool kit for sparse matrix computations, 1990. CSRD/RIACS.
+
+[65] Saad, Y. Iterative Methods for Sparse Linear Systems. SIAM, 2003.
+
+[66] Sato, N., and Tinney, W. F. Techniques for exploiting the sparsity of the network admittance
+
+matrix. IEEE Transactions on Power Apparatus and Systems 82, 69 (1963), 944–950.
+
+[67] Senanayake, R., Hong, C., Wang, Z., Wilson, A., Chou, S., Kamil, S., Amarasinghe, S.,
+and Kjolstad, F. A sparse iteration space transformation framework for sparse tensor algebra. Proc.
+ACM Program. Lang. 4, OOPSLA (Nov. 2020).
+
+[68] Smith, G. H., Bik, A. J., Koanantakool, P., and Phothilimthana, P. M. ML-driven auto-
+
+conﬁgurator for sparse tensor kernels in mlir, 2022. Unpublished Manuscript.
+
+[69] Smith, S., Choi, J. W., Li, J., Vuduc, R., Park, J., Liu, X., and Karypis, G. FROSTT: The
+
+formidable repository of open sparse tensors and tools, 2017. http://frostt.io/.
+
+[70] Smith, S., and Karypis, G. Tensor-matrix products with a compressed sparse tensor. In Proceedings
+of the 5th Workshop on Irregular Applications: Architectures and Algorithms (New York, NY, USA,
+2015), IA3 ’15, Association for Computing Machinery.
+
+[71] Smith, S., and Karypis, G. Tensor-matrix products with a compressed sparse tensor. In Workshop
+
+on Irregular Applications: Architectures and Algorithms (2015), ACM, pp. 1–7.
+
+[72] Solomonik, E., and Hoefler, T. Sparse tensor algebra as a parallel programming model. arXiv
+
+preprint arXiv:1512.00066 (2015).
+
+[73] Solomonik, E., Matthews, D., Hammond, J., and Demmel, J. Cyclops tensor framework:
+Reducing communication and eliminating load imbalance in massively parallel contractions. In 2013
+IEEE 27th International Symposium on Parallel and Distributed Processing (2013), IEEE, pp. 813–824.
+
+[74] Strout, M. M., Hall, M., and Olschanowsky, C. The sparse polyhedral framework: Composing
+compiler-generated inspector-executor code. Proceedings of the IEEE 106, 11 (2018), 1921–1934.
+
+[75] Tew, P. A. An investigation of sparse tensor formats for tensor libraries. M.eng. thesis, Massachusetts
+
+Institute of Technology, Cambridge, MA, Jun 2016.
+
+[76] Tewarson, R. P. Sparse Matrices. Academic Press, New York, NY, 1973.
+
+[77] Tian, R., Guo, L., Li, J., Ren, B., and Kestor, G. A high performance sparse tensor algebra
+compiler in MLIR. In 2021 IEEE/ACM 7th Workshop on the LLVM Compiler Infrastructure in HPC
+(LLVM-HPC) (2021), pp. 27–38.
+
+[78] Tinney, W. F., and Walker, J. W. Direct solutions of sparse network equations by optimally
+
+ordered triangular factorization. In Proceedings of the IEEE (1967), pp. 1801–1809.
+
+[79] Ujaldon, M., Zapata, E. L., Chapman, B. M., and Zima, H. P. Vienna-fortran/hpf extensions
+for sparse and irregular problems and their compilation. IEEE Transactions on Parallel and Distributed
+Systems 8, 10 (1997), 1068–1083.
+
+[80] Vasilache, N., Zinenko, O., Theodoridis, T., Goyal, P., DeVito, Z., Moses, W. S., Ver-
+doolaege, S., Adams, A., and Cohen, A. Tensor comprehensions: Framework-agnostic high-
+performance machine learning abstractions. CoRR abs/1802.04730 (2018).
+
+[81] Veldhorst, M. An Analysis of Sparse Matrix Storage Schemes. PhD thesis, Mathematisch Centrum,
+
+Amsterdam, 1982.
+
+23
+
+[82] Venkat, A., Hall, M., and Strout, M. Loop and data transformations for sparse matrix code.
+
+ACM SIGPLAN Notices 50, 6 (2015), 521–532.
+
+[83] Vuduc, R., Demmel, J. W., and Yelick, K. A. OSKI: A library of automatically tuned sparse
+
+matrix kernels. Journal of Physics: Conference Series 16 (jan 2005), 521–530.
+
+[84] Wang, E., Zhang, Q., Shen, B., Zhang, G., Lu, X., Wu, Q., and Wang, Y. Intel math kernel
+library. In High-Performance Computing on the Intel® Xeon Phi™. Springer, 2014, pp. 167–188.
+
+[85] Xie, Z., Tan, G., Liu, W., and Sun, N. Ia-spgemm: An input-aware auto-tuning framework for
+parallel sparse matrix-matrix multiplication. In Proceedings of the ACM International Conference on
+Supercomputing (2019), pp. 94–105.
+
+[86] Yang, C., Buluc, A., and Owens, J. D. Graphblast: A high-performance linear algebra-based
+
+graph framework on the gpu. arXiv preprint arXiv:1908.01407 (2019).
+
+[87] Zhao, Y., Li, J., Liao, C., and Shen, X. Bridging the gap between deep learning and sparse matrix
+format selection. In Proceedings of the 23rd ACM SIGPLAN symposium on principles and practice of
+parallel programming (2018), pp. 94–108.
+
+[88] Zlatev, Z. Computational Methods for General Sparse Matrices. Kluwer Academic Publishers, Dor-
+
+drecht, 1991.
+
+24
+
+

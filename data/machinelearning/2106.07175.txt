@@ -1,0 +1,2476 @@
+1
+2
+0
+2
+
+v
+o
+N
+1
+
+]
+
+G
+L
+.
+s
+c
+[
+
+2
+v
+5
+7
+1
+7
+0
+.
+6
+0
+1
+2
+:
+v
+i
+X
+r
+a
+
+Learning to Combine Per-Example Solutions for
+Neural Program Synthesis
+
+Disha Shrivastava ∗
+Mila, Université de Montréal
+Google Research
+
+Hugo Larochelle
+Mila, Université de Montréal
+Google Research
+CIFAR Fellow
+
+Daniel Tarlow
+Mila, McGill University
+Google Research
+
+Abstract
+
+The goal of program synthesis from examples is to ﬁnd a computer program
+that is consistent with a given set of input-output examples. Most learning-based
+approaches try to ﬁnd a program that satisﬁes all examples at once. Our work,
+by contrast, considers an approach that breaks the problem into two stages: (a)
+ﬁnd programs that satisfy only one example, and (b) leverage these per-example
+solutions to yield a program that satisﬁes all examples. We introduce the Cross
+Aggregator neural network module based on a multi-head attention mechanism
+that learns to combine the cues present in these per-example solutions to synthesize
+a global solution. Evaluation across programs of different lengths and under two
+different experimental settings reveal that when given the same time budget, our
+technique signiﬁcantly improves the success rate over PCCoder [32] and other
+ablation baselines. The code, data and trained models for our work can be found at:
+https://github.com/shrivastavadisha/N-PEPS.
+
+1
+
+Introduction
+
+Program synthesis from examples tackles the problem of coming up with a computer program that
+satisﬁes a given set of Input-Output (IO) examples. Since the space of possible programs is large, an
+exhaustive search can be extremely time-consuming. Therefore, development of systems for program
+synthesis that can come up with a solution (program satisfying the given IO examples) within a
+limited time, such that it is practical for real-world applications, is a challenging task.
+
+Neural-guided program synthesis systems [4, 32] try to expedite the search by using a neural network
+conditioned on the IO examples as a learned heuristic for the search procedure. In these systems, a
+neural network outputs probabilities over programs or properties of programs (e.g. functions). These
+probabilities are then utilized to guide a search like depth-ﬁrst or beam search. These systems try
+to ﬁnd a program that satisﬁes all IO examples simultaneously, which under most of the settings
+can be hard. What if instead, we try to ﬁnd this program in parts? To understand this motivation,
+imagine a process wherein a programmer is asked to write a program that satisﬁes a set of unit test
+cases. They may begin by ﬁguring out a program that satisﬁes a subset of unit test cases ﬁrst, and
+later modifying the program to incorporate other corner cases. Shi et al. [28] uses this intuition to
+iteratively reﬁne a program by mining fragments of Java code from partial solutions, based on a set
+of rules and predeﬁned heuristics. Gupta et al. [12] also uses the same intuition, but in a different
+application for program repair.
+
+In this work, we consider breaking the complex problem of ﬁnding a program that satisﬁes all N
+given IO examples (called the global solution) into N smaller, easy to solve sub-problems, where
+each sub-problem involves ﬁnding a program satisfying only one IO example (called per-example
+
+∗Correspondence to: <dishu.905@gmail.com>
+
+35th Conference on Neural Information Processing Systems (NeurIPS 2021), Sydney, Australia.
+
+ 
+ 
+ 
+ 
+ 
+ 
+Figure 1: Idea of N-PEPS: (Left) Illustrating the two stages of N-PEPS with an example; (Right)
+Synthesizing line 2 of pg using contributions from CA and GPS, with details of how query, keys,
+values and relation scores are formed. White box shows an example of obtaining a PE state embedding.
+
+solution). The cues present in these per-example (PE) solutions are then combined to provide useful
+signals that can help guide the search for the global solution effectively. As a motivating example,
+consider the left part of Figure 1, where ﬁve IO examples are given as a speciﬁcation (green box) and
+we need to ﬁnd a global solution pg (red box) that satisﬁes these ﬁve examples. The ﬁrst stage of our
+approach consists of performing per-example searches to ﬁnd a program pi conditioned on the i-th
+IO example. In our example, we start from IO example #1 and ﬁnd program p1. In addition, we also
+check if p1 satisﬁes any other examples (#3 in ﬁgure). Iterating through the examples in this way
+results in a set of programs (p1, p2, p3) that, taken together, in the ideal scenario, would satisfy all ﬁve
+IO examples. Looking closely at the discovered PE solutions, we see that they contain fragments of
+the global solution. This brings us to the second stage of our approach that addresses the challenge of
+how best to aggregate these PE solutions to produce a global solution. Towards that goal, we propose
+a neural network based architecture, which we refer to as Cross Aggregator (CA). It is designed to
+learn to combine the cues present in these PE solutions, in a way that helps guide the search for pg.
+We model this aggregation using a multi-head cross-attention mechanism, which leverages the state
+of step-wise execution of the PE solutions and the synthesized global solution so far (see Section 3.2
+for details). Our key contributions can be listed as follows:
+
+• We consider breaking the standard program synthesis pipeline into two stages: (a) discovering PE
+solutions, and (b) aggregating the PE solutions such that it leads to a global solution. We refer
+to our approach that uses neural networks at both these stages as Neural Per-Example Program
+Synthesis (N-PEPS).
+
+• We propose a neural network based multi-head attention architecture called Cross Aggregator (CA)
+that makes use of step-wise execution information to learn to combine the PE cues such that it
+helps guide the search for the global solution.
+
+• We demonstrate via experiments with programs of different lengths and under two different
+evaluation settings that when given the same time budget, our formulation shows signiﬁcant
+improvements in success rate when compared to PCCoder [32] (one of the leading techniques for
+neural-guided program synthesis) and other ablation baselines.
+
+2 Background
+
+i=1 = {ri}N
+Suppose we are given a set X = {(xi, yi)}N
+i=1 of N IO examples and our task is to come
+up with a program pg that satisﬁes these examples. The i-th IO example ri consists of a pair of input
+xi and output yi. The program consists of T lines (excluding lines with input variable declarations),
+i.e. pg = [pt
+t=1. To be practically meaningful, we impose the constraint that pg has to be found
+
+g]T
+
+2
+
+Figure 2: (Left): Sample program along with two IO examples that forms the program state at t = 0;
+(Right): Block Diagram explaining the training of PCCoder at line 2 of the program.
+
+within a given time budget, speciﬁed by a timeout value. The syntax and semantics of pg are governed
+by a domain-speciﬁc language (DSL). We use the DSL provided by Balog et al. [4], which contains
+ﬁrst-order functions (e.g. SORT, REVERSE ) and higher-order functions (e.g. MAP, FILTER ) that
+can take lambda functions (e.g. (*4), (<0)) as input. The inputs and outputs can be either an integer
+or a list of integers (see Appendix F of Balog et al. [4] for more details about the DSL). The Predict
+and Collect Coder (PCCoder) [32] provides state-of-art results for this DSL and is illustrative of
+methods that directly solve for all available IO examples at once. We refer to these methods as Global
+Program Search (GPS). We will be building on PCCoder to propose our per-example approach.
+
+2.1 PCCoder
+
+PCCoder synthesizes programs one line at a time, through a model based on the notion of a program
+state. The program state is a two-dimensional memory of size N × (ν + 1) obtained during the
+execution of t lines (steps) of a program on a set of N inputs. This means that for each IO example
+ri, there are up to ν slots for storing the input and intermediate program variables, with an additional
+slot for storing the output (see Appendix A.2 for more details). Note that the initial state at t = 0
+consists of only the IO examples (see left part of Figure 2).
+
+PCCoder consists of two learnable components (i.e. neural networks), Hθ and Wφ, with parameters θ
+and φ. Hθ obtains the embedding of the current program state by average-pooling the representation
+of the ν + 1 slots corresponding to individual examples (white boxes inside the state in Figure 2)
+into a vector of ﬁxed size in RZ, where Z denotes the embedding size (see Appendix A.2 for details
+of how these representations of slots are obtained). Wφ maps this state embedding to predictions
+of three quantities of interest for the next line in the program: (a) the next operator ˆot (or function
+e.g. MAP ); (b) the next statement ˆst (operator along with its arguments e.g. MAP(/2) b ); and (c)
+next drop vector ˆdt which represents positions of variables that can be dropped from the state. The
+dropping is desirable as it creates slots for storing new variables, which in turn allows for synthesizing
+longer programs. There is a module called DropExec which executes a given line of the program
+against an example ri and stores the resulting variable ci in the next available slot in the state. If all
+ν slots in the state are ﬁlled, a variable is dropped from one of the slots using the drop vector and
+ci is stored there. The updated state can then be used for predicting the next line (see right part of
+Figure 2). Next, we provide details of how training and inference is done in PCCoder.
+
+Training: For training Hθ and Wφ, several instances of a speciﬁcation X and the ground-truth
+program pg are provided. Given an instance and line t of the program, training operates by obtaining
+the ground-truth values of statements (st), operator (ot) and drop vector (dt). The statement and
+operator values are represented as one-hot vectors of size equal to the number of statements (ns)
+and number of operators (no), respectively in the DSL. The drop vector is a multi-hot vector of
+size ν with ones at positions corresponding to the variables in the program that can be dropped, i.e.
+variables that don’t appear in subsequent lines in the program. The step-wise loss L is the sum of
+cross-entropy losses between the actual and predicted statement and operator, and the binary cross
+entropy loss between each position in the actual and predicted drop vector. The task of predicting the
+
+3
+
+operator is an auxiliary task, i.e. it is used only during training and not at inference time, and is found
+to improve the training performance. During training, to obtain the updated state, the DropExec
+module chooses the drop-index to be a random entry from those positions in the drop vector dt that
+are ones. The right part of Figure 2 illustrates the process of training at step 2.
+
+Inference: Inference is done using complete anytime beam search (CAB) [31] where the time for
+search is upper bounded by the timeout value. The CAB algorithm operates by performing different
+beam searches repeatedly in an outer loop. The pruning conditions of the beam search (i.e., beam
+size, expansion size) are weakened with each iteration of the outer loop, until a solution is found.
+The inner loop consists of different steps of a single beam search. At each step, the beam consists of
+the most promising program preﬁxes, with each preﬁx represented as a tuple of the current program
+state, synthesized program until now and the product of the probabilities of the statements in the
+synthesized program. To synthesize the next line of the program, preﬁxes are expanded by executing
+the statements in decreasing order of statement probabilities and taking the argmax of the drop
+vector probabilities. The statement and drop vector probabilities are obtained using the trained neural
+networks Hθ and Wφ. The search terminates if we ﬁnd a candidate program preﬁx that satisﬁes all N
+IO examples. The corresponding program is the synthesized global solution pg. Note that the search
+may fail and not discover a global solution within the speciﬁed timeout. Appendix A gives details of
+training and inference procedures, and modules of PCCoder.
+
+3 Neural Per-Example Program Synthesis (N-PEPS)
+
+As stated in Section 1, in this work, we decide to break the complex problem of ﬁnding a global
+solution pg that satisﬁes all N IO examples, into N smaller sub-problems. Each sub-problem aims to
+ﬁnd a program pi that will satisfy only the IO example ri. The cues present in these PE solutions are
+then aggregated to help guide the search for pg. We constrain the process of breaking and combining
+to ﬁt within the speciﬁed timeout value. The distribution of total timeout between these stages is
+treated as a hyperparameter. In this section, we discuss our process of ﬁnding PE solutions and follow
+it with a description of our neural network module that learns to combine the PE solutions.
+
+3.1 Per Example Program Synthesis
+
+We refer to the general framework of ﬁnding PE solutions ﬁrst and later aggregating the PE cues to
+ﬁnd a global solution, as Per-Example Program Synthesis (PEPS). We call the module that ﬁnds PE
+solutions as the PE Searches module. To train the PE Searches module, we use the PCCoder model
+as it is, except that it is trained to take a single IO example as input as opposed to all the examples
+in X. We will call this trained model as the PE model. We allocate a ﬁxed value of PEPS timeout,
+which is the maximum time given to ﬁnd each PE solution. The sum of PEPS timeouts across all PE
+solutions should be less than the total timeout, so that there is some time left for the CA module to
+aggregate the PE cues (i.e., N × PEPS Timeout < Total Timeout). We start from the ﬁrst example,
+and using the PE model, try to ﬁnd a solution that satisﬁes it. Once found, we also check if this
+solution satisﬁes other examples in X. We record the fraction of IO examples satisﬁed by pi, and
+call it the PE solution score ui. If pi satisﬁes all examples in X (i.e. ui = 1.0), we stop and return
+pg = pi as the global solution. Otherwise, we proceed to ﬁnd the next PE solution (based on the
+order of examples given in X). Note that it is possible that for certain examples in X, we fail to ﬁnd
+a PE solution within the PEPS timeout. Once we have our list of M PE solutions (0 ≤ M ≤ N ),
+which ideally satisﬁes all N examples but may not necessarily, we proceed to aggregating them. Note
+that when comparison with baselines is not a requirement, we can increase speedup by ﬁnding PE
+solutions in parallel (see Appendix D.1 for more details).
+
+3.2 Cross Aggregator
+
+Notation: To formulate the program state, we deﬁne a basic unit called an execution tuple (ET).
+An ET e = (p, S, t) is a tuple consisting of a program p, a subset S of example indices in X and
+a step number t. Executing the ﬁrst t steps (lines) of a program p on every example ri for i ∈ S
+yields a program state which we note as X (e). Like PCCoder, we pool the representation of slots of
+the state corresponding to each example ri for i ∈ S to obtain a state embedding (see Section 2.1),
+hence making its size independent of the size of S. To represent different combinations of programs
+executed against different sets of examples at different time steps, we deﬁne a list e of such execution
+
+4
+
+tuples, with its size denoted by L. (p1, {1}, 0) and (p3, {2}, 2) in the bottom right of Figure 1 are
+examples of such combinations. We then execute each entry in e to get a list of states X (e). This is
+followed by embedding each entry in states X (e) using Hθ to yield a tensor of state embeddings
+H(X (e)) ∈ RL×Z (henceforth referred to as H(e) for simplicity). The white box towards the
+bottom of Figure 1 shows an example of obtaining a single entry of a PE state embedding.
+
+Motivation: To explain the motivation behind CA, let’s look at Figure 1, which illustrates the process
+of synthesizing line 2 of pg. Intuitively, at this step, we will want our aggregation mechanism to have
+more contribution from line 2 of p1 and p3 (i.e., DROP c a ). A simple way of aggregating the PE
+solutions can be to take the sum or mean of the PE one-hot statement vectors (these form our ablation
+baselines as detailed in Section 4.2). However, this strategy will fail for scenarios that require taking
+a non-trivial combination of the PE solution statements or cases where the global solution requires
+the generation of a new statement that is not found in the PE solutions.
+
+In this work, we propose another way of anticipating what line of pg comes next, that makes use of
+the execution information of the programs. The idea is to compare the state embedding obtained
+before executing line 2 of pg with the PE state embeddings corresponding to each step of execution of
+the PE solutions. Then, based on the learned relevance of these state embeddings, their corresponding
+next PE program statements can form valuable cues for synthesizing the next line. In other words,
+if a particular PE program state has high relevance with the global program state at a given step,
+then the following PE program line is likely to be useful in synthesizing the next line of pg. We
+measure this relevance by employing a cross-attention mechanism, with the query formed by the
+global program state embedding at step t, a key formed by the PE program state embedding at step t
+and the corresponding value formed by the PE program statement at t + 1. We take a set of such keys
+and values to form the key matrix K and the value matrix V, respectively.
+
+query) ∈ R1×Z, where et
+
+Model: For synthesizing line t+1 of pg, the query Q is formed from the global state embedding at step
+query = [(pg, {1, 2, . . . N }, t)]. The keys K ∈ RL×Z
+t, denoted by H(et
+are formed from the state embeddings H(ekeys) of the PE solutions. Let P denote the list of M
+discovered PE solutions, then the list of execution tuples ekeys = [(pm, {j}, t)], where pm ∈ P, j ∈
+{1, 2, ..N }, t ∈ {0, 1, ..|pm| − 1}, making L = M × N × (cid:80)M
+m=1 |pm|. The corresponding PE
+solution statements form the values V ∈ RL×Z (more details on how values are obtained is given
+later). In addition, we have the relation scores U ∈ RL×1 obtained by taking the PE solution score
+um corresponding to pm that is part of each ET in ekeys. Note that entries in U are dependent only
+on the program part in the ET, and independent of the subset of example indices and the time index.
+
+We add position encodings (depending on the time step value of each ET) to Q, K and V. This
+is followed by multiheaded relative attention between our keys, values and query as described in
+Equation 3. For each head, we perform a scaled dot-product attention [30](Equation 1) and a form of
+relative attention2, i.e. taking a mean of the relation scores and attention scores before normalizing
+with softmax and multiplying with values (Equation 2).
+
+Att(Q, K) =
+
+QKT
+√
+dk
+
+RelAtt(Q, K, V) = softmax
+
+(cid:16) U T + Att(Q, K)
+2
+
+(cid:17)
+
+V
+
+M ultiHead(Q, K, V) = concat(headi, head2, . . . headτ )W O
+
+where headi = RelAtt(QW Q
+
+i , KW K
+i
+
+, VW V
+
+i )
+
+(1)
+
+(2)
+
+(3)
+
+In the equations above, dk is the dimension of the key, W Q
+i are the query, key and value
+projection matrices, τ is the number of heads and W O is the linear projection that combines the heads.
+The output from Equation 3 is fed to a positionwise fully-connected feedforward network. We employ
+a residual connection [13] followed by layer normalization [3] before and after the feedforward
+network. The resulting encoding is then linearly projected and softmax is applied to get the prediction
+of the statement for line t + 1 of pg. We see that our model resembles one layer of the transformer
+
+i , W K
+i
+
+, W V
+
+2Note that our formulation of relative attention differs from the formulation used in Shaw et al. [27],
+
+Hellendoorn et al. [14], where the relation scores are added either to the query or values.
+
+5
+
+encoder block [30]. Since the keys and query come from different sources, we refer to our model as a
+cross aggregator. Like standard transformers, we can stack multiple blocks of CA. However, since
+we are operating on a low timeout (5s), we opted for a simple network consisting of only one layer.
+Details of model parameters can be found in Appendix D.3.
+
+Obtaining V: For a key corresponding to an ET consisting of the PE solution pm and having step
+index t, the value is associated with the statement vector (one-hot vector of size = ns) for step t + 1
+of pm. Putting together the statement vectors for all execution tuples that are part of ekeys, we get a
+tensor pvalues of size L × ns. Embedding each entry in this tensor using an embedding layer Fγ
+gives us V = F (pvalues) of size L × Z. This is then fed as input to the model described above.
+The output from the model is then linearly projected to give the logits for the statement predictions
+∈ Rns for step t + 1 of the global program pg. In addition to the statement predictions, we can also
+obtain the operator predictions ∈ Rno, starting from the operator vector (one-hot vector of size = no)
+and following a process similar to the statements, except that we use a different embedding and ﬁnal
+projection layer. The right of Figure 1 shows an example of how a query (top) is combined with keys,
+values and relation scores (bottom) for our model.
+
+3.3 Training
+
+The two main components of N-PEPS, the PE Searches module and the Cross-Aggregator, are trained
+separately. To create samples for training the PE model, we take one data point (X = {ri}N
+i=1 and
+pg) from the GPS approach and create N data points out of it. Since we do not have supervision
+for the PE solutions, for every example ri in X, we use pg as a proxy for ground-truth PE solution.
+We believe that using pg as proxy supervision even though not being entirely correct, forces the PE
+search component to avoid overﬁtting to a single example and hence is more likely to produce PE
+solutions that generalize to examples outside the ones given as speciﬁcation (see Appendix D.2 for
+more details).
+
+For training the CA module, we generate data points that we call aggregator instances. Each
+aggregator instance consists of X, a list Y of tuples of PE solutions pi and corresponding PE solution
+scores ui, and global program pg. The pi’s and ui’s are generated via CAB from a trained PE model
+(more details on how they are generated in Appendix C.2). Given X and Y as input, the objective is
+to learn the parameters of the CA module such that the output is the line-wise statement and operator
+predictions corresponding to pg. The net loss at step t is the sum of two terms: (a) a cross entropy loss
+between the predicted statement ˆst (obtained from CA) and the actual statement vector st (obtained
+from pt
+g); (b) a cross entropy loss between the predicted operator ˆot and the actual operator vector ot.
+Like PCCoder, the operator loss is used as an auxiliary loss to improve training. Note that for each
+aggregator instance, since we have X and Y to begin with, we need to compute the keys and values
+only once. However, the computation of query has to be done at each step of the global program
+execution. While training, since pg is known, we can use teacher forcing and increase efﬁciency by
+batching, where an element in the batch corresponds of one step of execution of pg.
+
+3.4
+
+Inference
+
+The process of inference in PEPS is the same as in PCCoder (see Section 2.1), except that in addition
+to the contribution from GPS, we add another term that accounts for the contribution from CA. The
+contribution from GPS is obtained by using a GPS model that is trained as in standard PCCoder.
+The net value of the predicted statement at step t is then obtained by taking a weighted contribution
+from the statement predictions from the trained GPS model ˆst
+1−α and the statement prediction from
+α. For predicting the drop vector ˆdt, we take contributions only from GPS.
+the trained CA module ˆst
+When α = 0, our approach becomes equivalent to GPS.
+
+α + (1 − α) ∗ ˆst
+
+1−α
+
+ˆst = α ∗ ˆst
+ˆdt = ˆdt
+
+1−α
+
+(4)
+
+We perform CAB until we ﬁnd a global solution or we exceed the speciﬁed timeout. The right part of
+Figure 1 illustrates an example of the steps involved in synthesizing step 2 of pg.
+
+6
+
+4 Experiments and Results
+
+Following prior work [4, 32]3, we generate programs for training and testing, with each program
+consisting of ﬁve IO example pairs, i.e., N = 5. The data generation process ensures that there is no
+overlap between the training and test programs, with programs being functionally non-equivalent
+to programs of shorter or equivalent lengths (see Appendix C.1 for more details). In the ﬁrst set of
+experiments (henceforth referred to as E1), we generated 105036 training programs of length up to
+4 (i.e., consisting of lengths 1, 2, 3, 4). For the second set of experiments (henceforth referred to
+as E2), we generated 189328 training programs of length up to 12. 10% of the training data was
+used for validation. To ensure robustness and reproducibility of results, for each method, we carry
+out experiments over 30 different test splits, where each split contains 500 programs of a speciﬁc
+length. For E1, we generate test programs of length 4, and for E2 we generate programs of lengths
+5, 8, 10, 12 and 14. We learn separate GPS models and PE models for E1 and E2. All GPS results
+were obtained using the original PCCoder implementation3. A notable difference in our experiments
+from PCCoder [32] is that we consider a short timeout of 5s (in both E1 and E2, for all methods),
+instead of 5000s and 10000s. This choice is representative of the timeout required for satisfactory user
+experience in program synthesis systems used in real-world interactive use-cases (such as FlashFill
+feature in Microsoft Excel [11]). Given a particular timeout value, we record the Success Ratio,
+which is the fraction of test samples that succeeded in ﬁnding a global solution.
+
+4.1
+
+Initial Experiment: Analysis of PE Solutions
+
+The promise of PEPS is rooted in the assumption that it is much easier to ﬁnd PE solutions than
+ﬁnding a global solution. In order to test this hypothesis and get an idea of the types of cues discovered
+by PEPS, we performed a set of analysis experiments using data from E1. Using the trained PE
+model to ﬁnd PE solutions, we consider two variants. The ﬁrst variant called tot(k) is similar to the
+strategy of ﬁnding PE solutions that we use in PEPS (Section 3.1), where we search for PE solutions
+sequentially (in the order of examples in X) until the discovered PE solutions taken together satisfy
+k examples in X (where k ≤ 5). This helps us understand how much the coverage (= k) from a list
+of PE solutions can be. In the second variant called ind(k), we record success by searching for PE
+solutions sequentially until we ﬁnd an individual PE solution that satisﬁes k out of N examples in X.
+Here, the success ratio helps us assess how good a single PE solution is. In other words, can we rely
+solely on individual solutions or do we need to aggregate them? For the initial experiment, since no
+aggregation is done, we divide the timeout of 5s evenly amongst PE searches, i.e., each PE search
+gets 1
+5 × 5 = 1s as the timeout value. For GPS, we use the trained GPS model with a timeout of 5s.
+
+Table 1: Success ratio of GPS, ind and tot for different values of k for test programs of length 4.
+ind(5)
+
+ind(3)
+
+ind(1)
+
+ind(4)
+
+ind(2)
+
+tot(2)
+
+tot(1)
+
+tot(3)
+
+tot(5)
+
+tot(4)
+
+GPS
+
+77.0
+
+99.2
+
+95.4
+
+85.4
+
+70.4
+
+43.2
+
+99.2
+
+97.6
+
+97.0
+
+94.8
+
+82.4
+
+Table 1 gives the results of these analysis experiments on one of test splits for programs of length 4.
+Note that in tot, we are not aggregating the cues to ﬁnd a global program. Hence, the value given
+under tot(5) is not directly comparable to GPS. We make a few observations. First, the success ratio
+increases with decreasing value of k. Therefore, as speculated, it is easier to ﬁnd solutions that satisfy
+examples partially. Second, we see that even though the numbers for ind are encouraging, they are
+less than the corresponding values (for same k) for tot. This suggests that aggregating PE solutions
+is better than dealing with them individually. Third, the success ratio of tot(5) is better than GPS.
+This suggests there is potential in thinking of an architecture that can learn to combine these solutions.
+Even for cases where we couldn’t ﬁnd PE solutions that satisfy all 5 examples, we can hope to make
+use of the rich partial cues (indicated by high success ratios) coming from tot(k < 5).
+
+4.2 Methods
+
+In addition to the standard GPS baseline (PCCoder [32]), we experimented with three ablation
+baselines that represent simple ways of aggregating the PE solutions without making use of the
+program state. Hence, they help us understand the role of PE cues alone. These baselines are: (i)
+
+3We used the implementation from PCCoder [32], at https://github.com/amitz25/PCCoder (MIT License) for
+
+data generation and obtaining results for PCCoder.
+
+7
+
+Model
+
+Success Ratio
+
+PCCoder [32]
+
+77.75 ± 0.38
+
+Sum-PEPS
+Mean-PEPS
+Mean-PEPS+U
+N-PEPS
+N-PEPS+U
+
+82.71 ± 0.32
+82.68 ± 0.33
+82.70 ± 0.32
+86.22 ± 0.25
+87.07 ± 0.28
+
+Figure 3: Results for E1: (Left) Success Ratio with standard error for all models (top row = GPS);
+(Center) Success Ratio vs. time taken; (Right) Visualization of attention scores for N-PEPS+U
+
+Sum-PEPS: Replacing the contribution from CA module in Equation 4 by a module that combines
+the PE solutions by taking the sum of all PE one-hot statement vectors; (ii) Mean-PEPS: Same as (i)
+except that sum is replaced by mean; (iii) Mean-PEPS+U : Same as (ii) except that the one-hot PE
+statement vectors are multiplied by their corresponding solution scores before taking the mean. To
+understand the beneﬁt of aggregating with our proposed CA architecture on top of the value brought
+by the PE cues, we experimented with the following variations: (i) N-PEPS: Our neural model of
+PEPS described in Section 3.2 with U being a zero tensor; (ii) N-PEPS+U : Same as (i) but with U
+included. Complete details of hyperparameters for all methods can be found in Appendix D.
+
+4.3 Results
+
+For each test data point, we record either a success or failure (based on whether within 5s, we ﬁnd a
+global solution or not) and the actual time taken to ﬁnd a global solution. As described in Section 3.1,
+for all PEPS methods, we start by allocating a PEPS timeout value that is less than 1s (= 1
+N × total
+timeout). We sum the actual time (≤ PEPS timeout) taken for ﬁnding individual PE solutions. The
+residual times (if any) left out is added and used for aggregation and global inference. Note that PEPS
+timeout and α are treated as hyperparameters that are chosen using the validation set.
+
+To provide fair comparison across all methods, each test split is run using a single core and single
+CPU thread with a timeout of 5s. To account for variability across machines, we chose to run a test
+split on a machine chosen randomly from a collection of 7 machines of similar conﬁguration (Google
+Cloud instances with 120GB RAM each)4. We report standard error across the 30 test runs.
+
+Main result: The left and center parts of Figure 3 show the success ratio and success ratio vs. time
+taken (average of the actual time taken) plots, respectively, for test programs of length 4 when trained
+on programs up to length 4 (E1). The left part of Figure 4 shows the success ratio for test programs
+of lengths 5, 8, 10, 12 and 14, when trained on programs up to length 12 (E2). In both these settings,
+we observe that performance of the ablation baselines is better than GPS, illustrating the promise in
+the quality of PE solutions. When we use our CA module to aggregate these cues instead, we see
+that the performance improves even further. We used the default value of ν = 11 used in PCCoder,
+which means that for programs of length > 8, certain variables will be dropped from the program
+state. Also, note that the results for test length 14 represent a case of length generalization. We show
+that in both these scenarios, our proposed method is quite advantageous5. In addition, we compare
+the performance of N-PEPS with GPS for the cases of intent generalization, i.e., generalization of
+the synthesized program to examples other than those given as part of X (Appendix F.2) and when
+given a longer timeout of 1000s (Appendix F.1). In both these settings, N-PEPS shows superior
+performance, highlighting its generality.
+
+Attention visualization: The right part of Figure 3 shows a visualization of attention scores at t = 2
+and t = 3 obtained from our best model under E1 for the example shown in Figure 1. This example
+represents a case from the test set where N-PEPS succeeds in ﬁnding a global solution, whereas
+other methods fail. As can be seen, the actual statement of p2
+g is DROP c a and our model indeed
+
+4We additionally verify that different runs on the same machine produce similar results (Appendix D.6)
+5See Appendix B for success cases of N-PEPS & Appendix F.3 and Appendix F.4 for empirical analysis of
+
+synthesized programs.
+
+8
+
+012345Time Taken (s)020406080Success Ratio (%)GPSSum-PEPSMean-PEPSMean-PEPS+UN-PEPSN-PEPS+UModel
+
+Length = 5
+
+Length = 8
+
+Length = 10
+
+Length = 12
+
+Length=14
+
+PCCoder [32]
+
+70.91 ± 0.35
+
+44.17 ± 0.45
+
+28.18 ± 0.33
+
+19.69 ± 0.34
+
+14.71 ± 0.23
+
+Sum-PEPS
+Mean-PEPS
+Mean-PEPS+U
+N-PEPS
+N-PEPS+U
+
+76.45 ± 0.33
+75.79 ± 0.31
+75.99 ± 0.32
+79.18 ± 0.31
+79.19 ± 0.30
+
+43.4 ± 0.56
+44.42 ± 0.51
+44.49 ± 0.52
+47.23 ± 0.49
+46.31 ± 0.61
+
+28.96 ± 0.27
+29.55 ± 0.29
+29.75 ± 0.25
+32.3 ± 0.34
+31.84 ± 0.36
+
+20.94 ± 0.32
+21.45 ± 0.27
+21.74 ± 0.30
+23.34 ± 0.28
+22.71 ± 0.28
+
+15.67 ± 0.32
+16.35 ± 0.27
+16.45 ± 0.33
+17.35 ± 0.31
+16.68 ± 0.21
+
+Figure 4: Results for E2: (Left) Success Ratio with standard error for all models (top row = GPS);
+(Right) Variation of success ratio with PEPS Timeout (top) and α (below) for N-PEPS
+
+gives relatively higher attention scores to p2
+Similarly at t = 3, our model gives more attention to p3
+
+1 and p2
+
+3, both of which correspond to the same statement.
+
+3 = MAP (*-1) d = p3
+g.
+
+Variation with PEPS timeout and α: There is a non-trivial tradeoff in the division of the total
+timeout into the time given to ﬁnd PE solutions and the time given to the CA module. A higher PEPS
+timeout results in better chances of discovering rich PE cues. This means that there may be less or
+almost no time needed for aggregation. On the other hand, if we start with a low PEPS timeout, the
+cues from PE solutions may not be as good, but we have more time to perform aggregation. Also,
+there is a question of how much contribution should be taken from CA and how much from GPS,
+which is determined by the value of α. The right part of Figure 4 analyzes this tradeoff. In the top,
+we show the variation of success ratio with PEPS timeout and in the bottom, we have the variation
+with α, for the validation set under E2. We see that the performance improves with increase in PEPS
+timeout with slight decrease towards the end. Also, we see that generally higher values of α are better
+indicating that the contribution from CA is more important than the contribution from GPS.
+
+Variants of K: In addition to obtaining H(ekeys) in the way described
+in Section 3.2, we tried two other ways of composing the keys by vary-
+ing the set S in the execution tuple against which the PE solutions
+are executed. In the ﬁrst variant, PE solution pm from the list P of
+M discovered PE solutions is executed against the global set X, i.e.,
+ekeys = [(pm, {1, 2, ..N }, t)] where pm ∈ P and t ∈ {0, 1, ..|pm| − 1}.
+We denote this variant as N-PEPS-PG (PG = PE-global ET). In the
+second variant, pm is executed against the set Sm consisting only of
+examples indices that pm satisﬁes, i.e., ekeys = [(pm, {j}, t)] where
+j ∈ Sm. We call this variant as N-PEPS-PP (PP = PE-PE ET). Table 2
+shows the test results of these variants for E1 with and without U. We see
+that all the variants perform better than GPS and the three ablation baselines (N-PEPS variant used in
+Section 3.2 was chosen using the validation set). We see similar trend for E2 (see Appendix E).
+
+Table 2: Performance of
+variants of K for E1
+
+N-PEPS-PG
+N-PEPS-PG+U
+N-PEPS-PP
+N-PEPS-PP+U
+N-PEPS
+N-PEPS+U
+
+85.19 ± 0.26
+85.94 ± 0.26
+85.97 ± 0.26
+86.21 ± 0.27
+86.22 ± 0.25
+87.07 ± 0.28
+
+Success Ratio
+
+Variant
+
+New operator discovery by N-PEPS: We were interested in determining that while synthesizing
+the global solution how often does N-PEPS rely on copying statements from the PE solutions and
+how often does it generate new operators. We studied this trend for the cases when α < 1.0, i.e.,
+contributions are taken from both CA and GPS as well as when α = 1.0, i.e., contributions are taken
+only from CA (Appendix G.2). This question is important as it helps us understand the generalization
+capabilities of CA outside the statements in the PE solutions. We found that CA alone (with α = 1.0)
+is capable of generating new operators. In addition, we found that the new operators are present as
+part of the nearest neighbours of the PE statements, thereby pointing to an increased likelihood of
+these being ranked higher in the beam search and hence being present in the global solution (see
+Appendix G.3 and G.4 for details).
+
+5 Related Work
+
+There have been numerous efforts on using deep learning for program synthesis [4, 6, 9, 15, 8, 18–
+20, 22]. However, there is less work that uses the execution of partial programs to assist in synthesis.
+
+9
+
+0.10.20.30.40.50.60.70.80.9PEPS Timeout (s)74.575.075.576.076.577.077.578.0Success Ratio (%)0.00.20.40.60.81.0alpha737475767778Success Ratio (%)PCCoder [32] is one such work, which we describe in Section 2.1. BUSTLE [21] reweighs the
+sub-expressions in bottom-up program synthesis using the intermediate values obtained by execution
+of sub-expressions along with property signatures. REPL [10] executes partial programs using learned
+policy and value networks. Chen et al. [7] uses a neural encoder-decoder architecture to generate
+program tokens conditioned on intermediate states obtained from execution of partial programs. They
+work with the Karel DSL [24, 6] that contains loops and conditionals, an attribute missing from the
+DSL which we work with. Therefore, extending N-PEPS for Karel is an interesting future work. Note
+that all the approaches mentioned above are examples of purely GPS approaches.
+
+Few works use solutions that satisfy examples partially, to aid in program synthesis. Initial motivation
+for our work comes from FrAngel [28], which is a component-wise synthesis system that relies
+on mining fragments of Java code that satisfy examples partially, given target program function
+signatures and a list of Java libraries. The mining of fragments as well as combination is done using a
+set of heuristics and predeﬁned rules with no deep learning involved. Assuming that the user provides
+IO examples in order of increasing difﬁculty, Perelman et al. [26] iteratively reﬁnes a program, with
+the current program satisfying the sequence of IO examples encountered till now. STUN [1] extends
+the CEGIS [29] approach by providing domain-speciﬁc explicit uniﬁcation operators for combining
+partial solutions while Alur et al. [2] uses decision trees for the same. Recently, BESTER [25] and
+later PROBE [5] perform bottom-up enumeration of programs in a loop by enumerating all programs
+that satisfy IO examples partially. This is followed by heuristics-based selection of promising
+programs. However, as opposed to N-PEPS that automatically learns to aggregate partial solutions
+producing the global program in one shot, PROBE relies on using these programs to iteratively update
+the weights of useful productions in their probabilistic grammar using a ﬁxed update rule. This update
+can be viewed similar to our ablation baselines that do not use the neural network based learned
+aggregation. The guided-search component of PROBE provides an interesting alternative to ﬁnding
+PE solutions. One way of incorporating this in our top-down setting might be to start with the CAB
+search as in GPS and then select promising solutions based on evaluating examples on preﬁxes of
+programs obtained during the beam search. It may be useful to then aggregate the selected solutions
+using a neural architecture similar to ours.
+
+6 Conclusions and Future Directions
+
+In this work, we propose N-PEPS, where the idea is to break the problem of ﬁnding a program
+that solves all examples into two stages: (a) ﬁnding programs that solve a single example (PE
+solutions) (b) aggregating the PE solutions such that it leads to a program that solves all examples.
+For aggregation, we propose a neural-network based multi-head attention architecture (CA module)
+that utilizes the state of program execution to learn to combine the PE cues. We note that program
+synthesis systems in general should be deployed with caution for use in real-world applications. Blind
+trust on these systems can create chances for potential negative impact, as there might be cases where
+the generated program contains bugs, especially for unseen examples outside the speciﬁcation. In
+the future, we want to work with programs that contain loops and conditionals [24, 7, 6]. Another
+interesting research direction would be to explore the interaction of N-PEPS with out-of-distribution
+generalization settings like compositional generalization [17].
+
+Acknowledgments and Disclosure of Funding
+
+Hugo Larochelle would like to acknowledge the support of Canada Research Chairs and CIFAR for
+research funding. The authors would like to thank Google Cloud for providing compute resources
+required for this project. We would like to thank the anonymous reviewers for their valuable comments
+and thorough engagement during the rebuttal phase that helped us improve our paper. We would also
+like to extend our vote of thanks to Daniel Johnson, Petros Maniatis, Jacob Austin, Koushik Sen,
+David Bieber, Sandeep Subramanian, Varsha Embar, Nicolas Gontier and Andreea Deac for feedback
+and comments on the draft that helped us improve writing. We would also like to acknowledge
+the quick and helpful response from Amit Zohar and Lior Wolf on queries related to the PCCoder
+implementation.
+
+10
+
+References
+[1] Rajeev Alur, Pavol ˇCern`y, and Arjun Radhakrishna. Synthesis through uniﬁcation. In Interna-
+
+tional Conference on Computer Aided Veriﬁcation, pages 163–179. Springer, 2015.
+
+[2] Rajeev Alur, Arjun Radhakrishna, and Abhishek Udupa. Scaling enumerative program synthesis
+
+via divide and conquer. In TACAS, 2017.
+
+[3] Jimmy Lei Ba, Jamie Ryan Kiros, and Geoffrey E. Hinton. Layer normalization, 2016.
+
+[4] Matej Balog, Alexander L Gaunt, Marc Brockschmidt, Sebastian Nowozin, and Daniel Tarlow.
+Deepcoder: Learning to write programs. In International Conference on Learning Representa-
+tions, 2016.
+
+[5] Shraddha Barke, Hila Peleg, and Nadia Polikarpova. Just-in-time learning for bottom-up
+enumerative synthesis. Proceedings of the ACM on Programming Languages, 4(OOPSLA):
+1–29, 2020.
+
+[6] Rudy Bunel, Matthew Hausknecht, Jacob Devlin, Rishabh Singh, and Pushmeet Kohli. Lever-
+aging grammar and reinforcement learning for neural program synthesis. In International
+Conference on Learning Representations, 2018.
+
+[7] Xinyun Chen, Chang Liu, and Dawn Song. Execution-guided neural program synthesis. In
+
+International Conference on Learning Representations, 2018.
+
+[8] Jacob Devlin, Rudy R Bunel, Rishabh Singh, Matthew Hausknecht, and Pushmeet Kohli.
+Neural Program Meta-Induction. In I Guyon, U V Luxburg, S Bengio, H Wallach, R Fergus,
+S Vishwanathan, and R Garnett, editors, Advances in Neural Information Processing Systems,
+volume 30. Curran Associates, Inc., 2017.
+
+[9] Jacob Devlin, Jonathan Uesato, Surya Bhupatiraju, Rishabh Singh, Abdel-rahman Mohamed,
+and Pushmeet Kohli. Robustﬁll: Neural program learning under noisy i/o. In Proceedings of
+the 34th International Conference on Machine Learning - Volume 70, ICML’17, page 990–998.
+JMLR.org, 2017.
+
+[10] Kevin Ellis, Maxwell Nye, Yewen Pu, Felix Sosa, Josh Tenenbaum, and Armando Solar-
+Lezama. Write, execute, assess: Program synthesis with a repl. In H. Wallach, H. Larochelle,
+A. Beygelzimer, F. d'Alché-Buc, E. Fox, and R. Garnett, editors, Advances in Neural Information
+Processing Systems, volume 32. Curran Associates, Inc., 2019.
+
+[11] Sumit Gulwani. Automating string processing in spreadsheets using input-output examples.
+In Proceedings of the 38th Annual ACM SIGPLAN-SIGACT Symposium on Principles of
+Programming Languages, POPL ’11, page 317–330, New York, NY, USA, 2011. Association
+for Computing Machinery. ISBN 9781450304900. doi: 10.1145/1926385.1926423.
+
+[12] Kavi Gupta, Peter Ebert Christensen, Xinyun Chen, and Dawn Song. Synthesize, execute
+and debug: Learning to repair for neural program synthesis. In H. Larochelle, M. Ranzato,
+R. Hadsell, M. F. Balcan, and H. Lin, editors, Advances in Neural Information Processing
+Systems, volume 33, pages 17685–17695. Curran Associates, Inc., 2020.
+
+[13] Kaiming He, Xiangyu Zhang, Shaoqing Ren, and Jian Sun. Deep residual learning for image
+recognition. In Proceedings of the IEEE conference on computer vision and pattern recognition,
+pages 770–778, 2016.
+
+[14] Vincent J. Hellendoorn, Charles Sutton, Rishabh Singh, Petros Maniatis, and David Bieber.
+Global relational models of source code. In International Conference on Learning Representa-
+tions, 2020.
+
+[15] Ashwin Kalyan, Abhishek Mohta, Oleksandr Polozov, Dhruv Batra, Prateek Jain, and Sumit
+Gulwani. Neural-guided deductive search for real-time program synthesis from examples. In
+International Conference on Learning Representations, 2018.
+
+[16] Diederik P. Kingma and Jimmy Ba. Adam: A method for stochastic optimization. In Yoshua
+Bengio and Yann LeCun, editors, 3rd International Conference on Learning Representations,
+ICLR 2015, San Diego, CA, USA, May 7-9, 2015, Conference Track Proceedings, 2015.
+
+11
+
+[17] Brenden Lake and Marco Baroni. Generalization without systematicity: On the compositional
+skills of sequence-to-sequence recurrent networks. In Jennifer Dy and Andreas Krause, edi-
+tors, Proceedings of the 35th International Conference on Machine Learning, volume 80 of
+Proceedings of Machine Learning Research, pages 2873–2882. PMLR, 10–15 Jul 2018.
+
+[18] Woosuk Lee, Kihong Heo, Rajeev Alur, and Mayur Naik. Accelerating search-based program
+In Proceedings of the 39th ACM SIGPLAN
+synthesis using learned probabilistic models.
+Conference on Programming Language Design and Implementation, PLDI 2018, page 436–449,
+New York, NY, USA, 2018. Association for Computing Machinery. ISBN 9781450356985. doi:
+10.1145/3192366.3192410.
+
+[19] Maxwell Nye, Luke Hewitt, Joshua Tenenbaum, and Armando Solar-Lezama. Learning to infer
+program sketches. In Kamalika Chaudhuri and Ruslan Salakhutdinov, editors, Proceedings of
+the 36th International Conference on Machine Learning, volume 97 of Proceedings of Machine
+Learning Research, pages 4861–4870. PMLR, 09–15 Jun 2019.
+
+[20] Augustus Odena and Charles Sutton. Learning to represent programs with property signatures.
+
+In International Conference on Learning Representations, 2020.
+
+[21] Augustus Odena, Kensen Shi, David Bieber, Rishabh Singh, Charles Sutton, and Hanjun Dai.
+{BUSTLE}: Bottom-up program synthesis through learning-guided exploration. In International
+Conference on Learning Representations, 2021.
+
+[22] Emilio Parisotto, Abdel rahman Mohamed, Rishabh Singh, Lihong Li, Dengyong Zhou, and
+
+Pushmeet Kohli. Neuro-symbolic program synthesis, 2016.
+
+[23] Adam Paszke, Sam Gross, Francisco Massa, Adam Lerer, James Bradbury, Gregory Chanan,
+Trevor Killeen, Zeming Lin, Natalia Gimelshein, Luca Antiga, Alban Desmaison, Andreas
+Kopf, Edward Yang, Zachary DeVito, Martin Raison, Alykhan Tejani, Sasank Chilamkurthy,
+Benoit Steiner, Lu Fang, Junjie Bai, and Soumith Chintala. Pytorch: An imperative style, high-
+performance deep learning library. In H. Wallach, H. Larochelle, A. Beygelzimer, F. d'Alché-
+Buc, E. Fox, and R. Garnett, editors, Advances in Neural Information Processing Systems 32,
+pages 8024–8035. Curran Associates, Inc., 2019.
+
+[24] Richard E. Pattis. Karel the Robot: A Gentle Introduction to the Art of Programming. John
+
+Wiley & Sons, Inc., USA, 2nd edition, 1994. ISBN 0471107026.
+
+[25] Hila Peleg and Nadia Polikarpova. Perfect is the enemy of good: Best-effort program synthesis.
+In 34th European Conference on Object-Oriented Programming (ECOOP 2020). Schloss
+Dagstuhl-Leibniz-Zentrum für Informatik, 2020.
+
+[26] Daniel Perelman, Sumit Gulwani, Dan Grossman, and Peter Provost. Test-driven synthesis.
+
+ACM Sigplan Notices, 49(6):408–418, 2014.
+
+[27] Peter Shaw, Jakob Uszkoreit, and Ashish Vaswani. Self-attention with relative position rep-
+resentations. In Proceedings of the 2018 Conference of the North American Chapter of the
+Association for Computational Linguistics: Human Language Technologies, Volume 2 (Short
+Papers), pages 464–468, New Orleans, Louisiana, June 2018. Association for Computational
+Linguistics. doi: 10.18653/v1/N18-2074.
+
+[28] Kensen Shi, Jacob Steinhardt, and Percy Liang. Frangel: component-based synthesis with
+control structures. Proceedings of the ACM on Programming Languages, 3(POPL):1–29, 2019.
+
+[29] Armando Solar-Lezama, Liviu Tancau, Rastislav Bodík, Sanjit A. Seshia, and Vijay A. Saraswat.
+Combinatorial sketching for ﬁnite programs. In John Paul Shen and Margaret Martonosi, editors,
+Proceedings of the 12th International Conference on Architectural Support for Programming
+Languages and Operating Systems, ASPLOS 2006, San Jose, CA, USA, October 21-25, 2006,
+pages 404–415. ACM, 2006. doi: 10.1145/1168857.1168907.
+
+[30] Ashish Vaswani, Noam Shazeer, Niki Parmar, Jakob Uszkoreit, Llion Jones, Aidan N. Gomez,
+undeﬁnedukasz Kaiser, and Illia Polosukhin. Attention is all you need. In Proceedings of
+the 31st International Conference on Neural Information Processing Systems, NIPS’17, page
+6000–6010, Red Hook, NY, USA, 2017. Curran Associates Inc. ISBN 9781510860964.
+
+12
+
+[31] Weixiong Zhang. Complete anytime beam search. In Proceedings of the Fifteenth National/Tenth
+Conference on Artiﬁcial Intelligence/Innovative Applications of Artiﬁcial Intelligence, AAAI
+’98/IAAI ’98, page 425–430, USA, 1998. American Association for Artiﬁcial Intelligence.
+ISBN 0262510987.
+
+[32] Amit Zohar and Lior Wolf. Automatic program synthesis of long programs with a learned
+garbage collector. In Advances in Neural Information Processing Systems, pages 2094–2103,
+2018.
+
+13
+
+A Details of PCCoder [32]
+
+We provide our version of the training and inference algorithms and description of modules used in
+PCCoder [32] next. Note that the terminology used in PCCoder differs from what we have used here.
+
+A.1 Training and Inference Algorithms of PCCoder
+
+Algorithm 1 Train (GPS)
+
+Require: pg = [pt
+Require: ν = max # allowed variables = memory-size
+Require: X = {(xi, yi)}N
+
+t=1 = ground-truth program with T lines
+
+i=1 = {ri}N
+
+i=1 = set of N IO
+
+g]T
+
+examples
+
+(cid:46) Initial State
+
+(cid:46) Obtain current state
+
+(cid:46) Obtain predictions
+
+j=1 BCE (dtj
+
+, ˆdtj
+
+)
+
+i=1
+
+1: X 0 = [ri]n
+2: for t in range(T )) do
+3:
+4:
+5:
+
+(cid:46) Obtain ground truth
+st, ot, dt = R(pt
+g, [pj
+Ht−1 = Hθ(X t−1)
+
+embedding
+
+g]j≥t, Ht−1)
+
+g, X t−1, d(cid:48)t
+
+= random_choice(dt)
+
+g to get updated state
+
+ˆst, ˆot, ˆdt = Wφ(Ht−1)
+6:
+7:
+(cid:46) Calculate loss and update parameters
+8:
+L = CE (st, ˆst ) + CE (ot, ˆot) + Σν
+9:
+θ ← θ − α ∗ ∇θL
+10:
+φ ← φ − α ∗ ∇φL
+11:
+(cid:46) Randomly chose an index to drop
+d(cid:48)t
+12:
+13:
+(cid:46) Execute pt
+14:
+X t = DropExec(pt
+15: procedure DROPEXEC(p, x, d(cid:48), ν)
+16:
+17:
+18:
+19:
+20:
+21:
+22:
+23:
+24:
+25:
+26:
+27:
+28:
+
+l = get_num_vars(x)
+N = shape(x)[0]
+for i in range(N ) do
+xi = x[i]
+(cid:46) Execute p against xi to obtain result ci
+ci = Execute(p, xi)
+if l > ν then
+
+l = l + 1
+set_num_vars(x, l)
+return x
+
+xi.append(ci)
+
+xi[d(cid:48)] = ci
+
+, ν)
+
+else
+
+(cid:46) return the updated state
+
+(cid:46) Need to drop a variable
+
+(cid:46) # IO examples
+
+b
+
+b
+
+]
+
+i=1
+
+(cid:46) new beams
+
+)) in enum(B) do
+
+, st−1
+b
+) then
+
+while beam search conditions are met do
+
+beam_size*=2; beam_expansion_size+=10
+
+(cid:46) CAB outer loop
+
+(cid:46) CAB inner loop
+
+(cid:46) Initial Beam: (state, program, prob)
+B = [(X 0, [
+], 1.0)]
+(cid:46) pg = global solution
+pg = BeamSearch(B)
+if pg == FAILED then
+
+B(cid:48) = [
+(cid:46) For each parent node
+, pt−1
+for (b, (X t−1
+b
+
+Algorithm 2 Inference (GPS)
+1: X 0 = [ri]n
+2: while time < timeout do
+3:
+4:
+5:
+6:
+7:
+8:
+9: procedure BEAMSEARCH(B)
+10:
+11:
+12:
+13:
+14:
+15:
+16:
+17:
+18:
+19:
+20:
+21:
+22:
+23:
+24:
+25:
+26:
+27:
+28:
+29:
+30:
+31:
+32:
+33:
+34:
+
+if is_solution(X t−1
+b
+return pt−1
+b = Hθ(X t−1
+Ht−1
+)
+b,, ˆdt
+b = Wφ(Ht−1
+ˆst
+(cid:46) sort ˆst
+b by decreasing probability
+ˆst
+b = sort(ˆst
+b)
+(cid:46) choose argmax of ˆdt
+d(cid:48)t
+b = argmax( ˆdt
+b)
+(cid:46) Expand the parent node
+for ˜st
+
+b in ˆst
+b[: expansion_size] do
+(cid:46) get statement id for the prob entry
+pt
+b = prob_to_stat(˜st
+b)
+(cid:46) get updated memory
+, d(cid:48)t
+X t
+b = DropExec(pt
+pt−1
+.append(pt
+(cid:46) updated program
+b)
+b
+st−1
+b = st−1
+∗ ˜st
+b (cid:46) updated probability
+b , pt−1
+, st−1
+B(cid:48).append((X t
+))
+b
+(cid:46) sort beams by decreasing probability
+B(cid:48) = sort (B(cid:48)) [:beam_size]
+B = B(cid:48)
+return FAILED
+
+(cid:46) if no solution found during beam
+
+b, X t−1
+
+b to drop
+
+b , ν)
+
+)
+
+b
+
+b
+
+b
+
+b
+
+b
+
+search, return Failed solution
+
+A.2 Description of Modules in PCCoder
+
+The inputs to a program can either be an integer or an array of integers of maximum length 20. The
+integers can be in the range [-256, 255]. There can be a maximum of three input arguments to a
+program. There are 1298 statements and 38 operators in the DSL, i.e., ns = 1298 and no = 38.
+Execution of a line in the program returns exactly one variable. Below, we describe the blocks present
+at different stages of PCCoder:
+
+• State Representation: For each of the N IO examples, the corresponding inputs are taken and all
+entries are made positive by subtracting the minimum integer value under the DSL (i.e. -256) from
+them. For shorter inputs, NULL values up to length q = 20 are padded. Then two bits indicating
+the type of input (list or int) are appended at the beginning of this representation. Therefore, each
+variable is now represented as a vector of size q + 2 = 22. There can be a maximum of ν input
+variables and one output variable (corresponding to the output of the IO example given). If there
+are less than ν variables, NULL values are padded to make it uniform. An account of the actual
+number of variables (i.e. number of ﬁlled slots) present in the state is also kept, denoted by l. The
+output of this stage is an array of size N × (ν + 1) × (q + 2). This forms the state X .
+
+• State Embedding (Hθ): The output obtained in the previous step is then passed through a series
+of neural network blocks to obtain a state embedding H. An embedding layer projects each entry
+
+14
+
+in the state (excluding the type bits) into an vector of size e = 20, giving us a tensor of size
+N × (ν + 1) × (q ∗ e + 2). This is then passed through a linear layer of size 56 and then reshaped to
+obtain a tensor of size N × (ν + 1) ∗ 56. It is then passed through a dense block to obtain a tensor
+of size N × Z where Z = 256. This pre-pooling version is what we refer to as the representation
+of slots in Section 3.2. An average pooling of these representations across all N examples gives a
+vector of size 1 × 256 that forms the state embedding.
+
+• Predicting quantities of interest in next line (Wφ): The state embedding obtained above is
+projected into three linear heads of size 1298, 38 and ν followed by softmax, softmax and sigmoid,
+respectively which gets us the statement, operator and drop probabilities.
+
+• DropExec: In the DropExec module, after a statement is executed against the variables present in
+the slots in the state X 0, we get new values of resulting variables. If the actual number of variables
+l exceeds ν, one of the existing variables is dropped based on the drop vector. If not, this new
+variable is simply appended to the existing variables by ﬁlling the next slot in the memory. This
+updated state is then passed through Hθ to get the updated state embedding H1. This completes
+one step of execution of the program.
+
+For the next steps, we repeat the last two steps mentioned above till we reach the end of the program.
+See Figure 2 for an illustration of the process at t = 2.
+
+B Sample Cases
+
+Below we provide two sample cases where GPS fails and our N-PEPS model (for E2) succeeds in
+ﬁnding a global solution. Foe each sample case, we show the synthesized global solution on the left,
+the set of IO examples in the center and the discovered PE solutions along with PE solution scores in
+the right. We also report the actual time taken to ﬁnd the solutions. Note that for the second case,
+even though the global ground-truth test program is of length 8, N-PEPS discovers a global solution
+of shorter length.
+
+Global Solution:
+(Time taken to ﬁnd=3.21s)
+
+a ← LIST
+b ← ZIPWITH (+) a a
+c ← TAIL b
+d ← TAKE c b
+e ← COUNT (>0) d
+f ← TAKE e d
+g ← COUNT (>0) f
+h ← TAKE g f
+i ← TAKE g h
+j ← HEAD i
+k ← TAKE j i
+l ← TAKE j k
+m ← TAKE j k
+n ← TAKE j k
+o ← REVERSE n
+
+IO examples:
+#1. Input:
+[4, 5, 6, 2, 6, 2, 1, 6, 1,
+4, 2, 5, 6, 3, 2, 2]
+Output:
+[4, 12, 10, 8]
+#2. Input:
+[3, 2, 5, 0, 3, 2, 3, 0, 4,
+1, 0, 2, 3, 0, 3, 4]
+Output:
+[6, 0, 10, 4, 6]
+#3. Input:
+[1, 1, 4, 0, 0, 0, 0, 5, 0,
+5, 3, 5]
+Output:
+[2, 2]
+#4. Input:
+[4, 4, 1, 4, 4, 1, 4, 2, 2,
+1, 3, 4]
+Output:
+[4, 8, 2, 8, 8, 2, 8, 8]
+#5. Input:
+[4, 1, 1„ 3, 3, 1, 4, 0, 4,
+2, 4]
+Output:
+[8, 2, 6, 6, 2, 2, 8]
+
+15
+
+PE Solutions:
+p1 : Time taken to ﬁnd=0.2s
+Satisﬁes #1, #4 (u1 = 0.2)
+
+a ← LIST
+b ← ZIPWITH (+) a a
+c ← TAIL b
+d ← TAKE c b
+e ← REVERSE d
+
+p2 : Time taken to ﬁnd=0.34s
+#5
+Satisﬁes #2,
+(u2 = 0.8)
+
+#3,
+
+#4,
+
+a ← LIST
+b ← ZIPWITH (+) a a
+c ← HEAD b
+d ← TAKE c b
+e ← COUNT (>0) d
+f ← TAKE e d
+g ← REVERSE f
+
+PE Solutions:
+p1 : Time taken to ﬁnd=0.17s
+Satisﬁes #1, #4, #5 (u1 = 0.6)
+
+a ← LIST
+b ← INT
+c ← TAIL a
+d ← TAKE c a
+e ← ZIPWITH (+) d d
+f ← MAP (+1) e
+
+p2 : Time taken to ﬁnd=0.37s
+Satisﬁes #1, #5 (u2 = 0.4)
+
+a ← LIST
+b ← INT
+c ← TAKE b a
+d ← TAIL c
+e ← ACCESS d c
+f ← TAKE e c
+g ← ZIPWITH (+) f f
+h ← MAP (+1) g
+
+p3 : Time taken to ﬁnd=0.8s
+Satisﬁes None (u3 = 0.0)
+
+FAILED
+
+p4 : Time taken to ﬁnd=0.17s
+Satisﬁes #1, #4, #5 (u4 = 0.6)
+
+a ← LIST
+b ← INT
+c ← TAIL a
+d ← TAKE c a
+e ← ZIPWITH (+) d d
+f ← MAP (+1) e
+
+p5 : Time taken to ﬁnd=0.17s
+Satisﬁes #1, #4, #5 (u5 = 0.6)
+
+a ← LIST
+b ← INT
+c ← TAIL a
+d ← TAKE c a
+e ← ZIPWITH (+) d d
+f ← MAP (+1) e
+
+Global Solution:
+(Time taken to ﬁnd=2.98s)
+
+a ← LIST
+b ← INT
+c ← MAXIMUM a
+d ← TAKE c a
+e ← TAIL c
+f ← TAKE b c
+g ← ZIPWITH (+) f f
+h ← MAP (+1) g
+i ← TAKE e h
+
+IO examples:
+#1. Input:
+[1, 0, 3, 3, 3], 35
+Output:
+[3, 1, 7]
+#2. Input:
+[6, 3, 3, 1, 2, 2, 0, 3, 8,
+7], 50
+Output:
+[13, 7, 7]
+#3. Input:
+[1, 5, 6, 10, 5, 11, 7, 0,
+7, 11, 10, 9, 4], 78
+Output:
+[3, 11, 13, 21, 11, 23, 15,
+1, 15, 23]
+#4. Input:
+[12, 4, 11, 11, 4, 7, 12,
+11, 11, 10, 5, 8, 9, 8],
+166
+Output:
+[25, 9, 23, 23, 9, 15, 25,
+23]
+#5. Input:
+[4, 0, 5, 5, 1, 1, 1, 1],
+126
+Output:
+[9]
+
+16
+
+C Data Generation
+
+C.1 Generation of Training and Test set
+
+Similar to the data generation process described in Balog et al. [4], Zohar and Wolf [32] and using
+the implementation from PCCoder 6, we generated programs for training and testing where each
+program consists of ﬁve input-output examples. The process starts by generating training programs
+iteratively starting from length 1 till the maximum length speciﬁed (4 and 12 in our case). For each
+length, ﬁrst a program of that length is generated followed by generating corresponding IO examples
+which correspond to that program. This is followed by checking for functional non-equivalence of
+that program with all generated programs so far (i.e., programs of length less than or equal to the
+current length). Functional non-equivalence means that given a set of IO examples, we can’t have
+a program of length x that satisﬁes the set of examples when we already have a program of length
+less than or equal to x in our dataset that satisﬁes the same set of examples. If the program is found
+functionally equivalent to any other programs, it is discarded, else it is added to the training set.
+
+Once the generation of training set is complete, we proceed to generating the test set. Given a test
+length, we generate a program of that length followed by generating the corresponding IO example
+pair. In addition to checking for functional non-equivalence with all programs in the test set so far,
+we also test for functional non-equivalence with every program in the training set. This makes sure
+that there there is no overlap between the training and test sets and all the programs are functionally
+non-equivalent to each other. We have two experimental settings: (a) E1: Training set = 105036
+programs till length 4 and 30 test sets of 500 programs each of length = 4; (b) E2: Training set =
+189328 programs of length up to 12 and 30 test sets of 500 programs each of lengths = 5, 8, 10,
+12 and 14. In each setting, 10% of the training data was used for validation. Figure 5 shows the
+distribution of training programs with length in both the settings. There are less programs of longer
+lengths as there is high probability that they end up being discarded because a functionally equivalent
+program of shorter length was found.
+
+Figure 5: Distribution of training programs: (Left) For E1; (Right) For E2
+
+C.2 Generation of Aggregator Instances
+
+An aggregator instance consists of the set of IO examples X, a list Y of PE solutions pi along
+with the corresponding PE solution scores ui, and the corresponding global program pg. To create
+aggregator instances, for each data point (given X and pg) in the original training dataset (generated
+as described in C.1), we generate PE solutions and PE solution scores using the PE Searches module.
+For generating the PE solutions, we need to choose a value of PEPS timeout. We generated aggregator
+instances with PE solutions obtained using the trained PE model, in three ways: (a) one aggregator
+instance with a ﬁxed PEPS timeout of 0.5s; (b) two aggregator instances with PEPS timeout randomly
+chosen from [0.1s, 0.2s, .. 0.9s]; (c) three aggregator instances each with PEPS timeouts of 0.4s,
+0.5s and 0.6s, respectively. These options will lead to the same, twice and thrice the number of data
+points present in the original training set. We chose to omit a sample from being part of training data
+formed from aggregator instances if either (a) An aggregator instance consists of a PE solution that
+satisﬁes all examples (i.e., ui = 1.0) or (b) When we fail to get any PE solution (i.e., all ui = 0.0).
+We can then generate data which omits both (a) and (b). The datasets formed after removing these
+
+6https://github.com/amitz25/PCCoder (MIT License)
+
+17
+
+Table 3: Aggregator data statistics for E1 and E2
+
+Dataset
+
+# of samples
+
+E1
+
+E2
+
+16408
+
+82102
+
+2132
+
+9492
+
+41707
+
+176235
+
+5365
+
+20035
+
+49116
+
+248972
+
+6396
+
+28734
+
+Dtrain
+0.5
+Dval
+0.5
+Dtrain
+rand
+Dval
+rand
+Dtrain
+Dval
+
+0.5±0.1
+
+0.5±0.1
+
+aggregator instances will be referred to as D0.5, Drand and D0.5±0.1 for cases (a), (b) and (c),
+respectively. In addition, within each aggregator instance, we can chose to discover all 5 PE solutions
+(all) or alternatively ﬁnd a list of M PE solutions where M ≤ 5 such that taken together these
+satisfy all examples in X (tot). Therefore, in total we have 12 different variations (3 PEPS timeouts
+× 2 inclusion conditions × 2 modes of discovering PE solutions) of training datasets which can
+be used for training the cross-aggregator. We follow a similar procedure to generate variations of
+corresponding validation datasets which are used to select the hyperparameters and early-stopping
+for training with each dataset variation. Table 3 gives the training and validation data statistics (note
+that the 2 modes for discovering PE solutions will affect the content of a single aggregator instance,
+but the number of aggregator instances will remain the same in both cases).
+
+D Experimental details
+
+All our implementations are based on PyTorch [23] version 1.4.0. The training for the GPS and PE
+models and the CA was done using Tesla V100 (16GB) and Tesla P100 (16GB) GPUs on Google
+Cloud instances with 120GB RAM.
+
+D.1 Parallel Execution for PEPS
+
+In the current formulation, we ﬁnd PE solutions sequentially. However, the running time can be
+reduced further by ﬁnding PE solution in parallel as the process of ﬁnding PE solution i is dependent
+only on the IO example ri. So, instead of ﬁnding PE solutions one by one, we can ﬁnd PE solutions
+for all examples in parallel and then check whether the PE solution pi satisfy any other example from
+X apart from ri. The total time for PEPS can then be thought of max(time taken to ﬁnd a PE solution
+that satisﬁes ri) + time taken to aggregate. However, one could argue that PCCoder can also employ
+more threads in parallel to speed up their search. Therefore, for a fair comparison with PCCoder, we
+decided to ﬁnd PE solutions sequentially where we evaluate both N-PEPS and PCCoder on a single
+CPU thread (with no parallel computations). However, when being deployed for an application where
+comparisons with other methods are not required, N-PEPS can signiﬁcantly boost the speed up by
+searching for PE solutions in parallel in a way suggested above.
+
+D.2 Training the GPS and PE models
+
+For each experimental setting, we used the training set (generated as described in C.1) as it is for
+training the GPS model. For training the PE model, we created ﬁve entries out of a single training
+data point such that a modiﬁed entry has a single IO example and the corresponding program is the
+same across all ﬁve entries = program in the data point for GPS. Since we don’t have supervision
+available for PE solutions, we chose pg to serve as a proxy for ground-truth of these PE solutions.
+Another way of creating this supervision would have been to perform separate PE searches for each
+example and recording the discovered PE solution as ground-truth. However, this procedure would
+have required the selection of a speciﬁc PE timeout. We didn’t have any good idea of how to select
+this value as it would have inﬂuenced the generated PE solutions, hence the supervision itself. Also,
+
+18
+
+we didn’t know what would have been the best supervision to use for cases where the PE search
+fails to ﬁnd a solution. We believe that using pg as proxy supervision even though not being entirely
+correct, forces the PE search component to avoid overﬁtting to a single example and hence is more
+likely to produce PE solutions that exhibit intent generalization (generalization to examples outside
+the ones given as speciﬁcation).
+
+The number of training points for PE model = 5 * number of training data points for GPS. The
+corresponding validation split was used to select hyperparameters. The selected hyperparameter
+values were:
+
+• GPS model: learning rate = 0.001; batch size = 32 for E1 and 100 for E2.
+• PE model: learning rate = 0.001; batch size = 100 for E1 and 256 for E2.
+
+For both settings ν = 11. This means that the state has slot for storing 7 intermediate variables, 3 slots
+for input variables (there can be a maximum of 3 input arguments to a program) and an additional slot
+for storing the output. This means that for E2, dropping will happen for programs of length greater
+than 8. We used Adam [16] optimizer with a learning rate scheduler that decayed the learning rate by
+0.1 every 4 epochs. We used the validation set for early-stopping. Let’s call the learned PE modules
+as Hθpe and Wφpe whereas, the corresponding GPS modules to be Hθg and Wφg .
+
+D.3 Training the Cross Aggregator
+
+For both E1 and E2, we train our cross aggregator (CA) module using the variants of keys mentioned
+in Section 3.2 and Section 4.3. For N-PEPS-PG, we use Hθg to obtain state embeddings that
+forms the keys, whereas for N-PEPS and N-PEPS-PP we used Hθpe. For faster convergence, we
+initialize the statement and operator heads with the corresponding statement and operator linear heads
+from Wφg . We tried ﬁnetuning the parameters of H, but it didn’t result in signiﬁcant difference
+in training performance. Hence, we decided to leave the parameters of the H module unaltered
+during training. As mentioned in C.2, we tried both all and tot ways of discovering PE solutions
+while training. In equations 1, 2 and 3 in Section 3.2, the projection matrices W Q
+i ∈ Rdmodel×dq ,
+i ∈ Rdmodel×dv , W O ∈ Rτ dv×dmodel . For the multihead relative attention,
+W K
+we used dk = dq = dv = 64, τ = 8 and dmodel = 256. A dropout value of 0.1 was used while
+training.
+
+i ∈ Rdmodel×dk , W V
+
+D.4 Details of Training Hyperparameters
+
+We tried different values of learning rates, optimizers, learning rate schedulers, datasets and
+the PE discovery options. We tried three types of learning rate schedulers7:
+(a) cosine:
+torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=10, eta_min=0) ;
+
+(b) cosinewarm: torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(optimizer, T_0=10)
+
+; (c) reduceonplateau: torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, ’min’)
+
+where optimizer = Adam, SGD . Below we provide the hyperparameter conﬁguration for the
+best models chosen using the validation set.
+
+D.5 Details of Inference Hyperparameters
+
+For inference we use CAB [31] which consists of performing beam search iteratively, with pruning
+conditions of beam search (i.e., beam size, expansion size, etc.) weakened with each iteration, until a
+solution is found. Simialr to PCCoder [32], we start with beam size = 100, expansion size = 10 and
+maximum depth of beam search = number of steps = maximum program length. If the beam search
+fails, we double the beam size and increase the expansion size by 10, and perform beam search again
+with the modiﬁed parameters. The beam search terminates if we exceed the timeout. If no solution is
+found at the end of CAB, we mark that solution as FAILED.
+
+We created a smaller validation split called smallval which consists of 5% of the samples chosen
+randomly from the larger validation data. The size of smallval is 525 samples and 946 samples for E1
+and E2, respectively. We used this set to ﬁnd optimal values of PEPS timeout and α for each model.
+
+7see https://pytorch.org/docs/stable/optim.html for more details
+
+19
+
+Table 4: Hyperparameter values for training the CA. lr= learning rate, lrs = learning rate scheduler,
+o=optimizer
+
+Model
+
+Hyperparameters
+
+E1
+
+E2
+
+N-PEPS-PP
+
+D0.5, all, lr=1e-4, o =Adam, lrs=cosine
+
+D0.5±0.1, tot, lr=1e-4, o=Adam, lrs=reduceonplateau
+
+N-PEPS-PP+U
+
+Drand, all, lr=1e-4, o=SGD, lrs=cosinewarm
+
+Drand, all, lr=1e-4, o=SGD, lrs=cosinewarm
+
+N-PEPS-PG
+
+Drand, tot, lr=1e-4, o=SGD, lrs=cosine
+
+D0.5, all, lr=1e-4, o=SGD, lrs=cosine
+
+N-PEPS-PG+U Drand, all, lr=1e-4, o=SGD, lrs=cosinewarm
+
+D0.5, all, lr=1e-4, o=Adam, lrs=reduceonplateau
+
+N-PEPS
+
+Drand, all, lr=1e-4, o=SGD, lrs=cosine
+
+Drand, all, lr=3e-4, o=Adam, lrs=cosine
+
+N-PEPS+U
+
+D0.5, tot, lr=3e-4, o=Adam, lrs=cosinewarm
+
+Drand, all, lr=1e-4, o=Adam, lrs=reduceonplateau
+
+Table 5 provides the selected hyperparameter values for all the models in both the settings. Timeout
+of 5s is divided between PE Searches module and the aggregation + GPS module. The time allocated
+to latter is denoted by GT in the table. For GPS, since no PE solutions are discovered, the whole
+timeout is allocated to the GPS inference block and no aggregation happens, i.e., α = 0.0.
+
+Table 5: Hyperparameter values for Inference. PT = PEPS timeout, GT = 5 - ( 5 * PT ).
+
+Model
+
+GPS
+
+Sum
+
+Mean
+
+Hyperparameters
+
+E1
+
+E2
+
+GT=5.0s, PT=0.0s, α=0.0
+
+GT=5.0s, PT=0s, α=0.0
+
+GT=2.5s, PT=0.5s, α=0.8 GT=0.5s, PT=0.9s, α=0.2
+
+GT=2.5s, PT=0.5s, α=0.8 GT=0.5s, PT=0.9s, α=0.2
+
+Mean+U
+
+GT=2.5s, PT=0.5s, α=0.9 GT=0.5s, PT=0.9s, α=0.4
+
+N-PEPS-PP
+
+GT=1.0s, PT=0.8s, α=0.8 GT=1.5s, PT=0.7s, α=0.8
+
+N-PEPS-PP+U
+
+GT=1.0s, PT=0.8s, α=0.7 GT=2.5s, PT=0.5s, α=1.0
+
+N-PEPS-PG
+
+GT=1.0s, PT=0.8s, α=0.8 GT=2.0s, PT=0.6s, α=0.9
+
+N-PEPS-PG+U GT=1.0s, PT=0.8s, α=0.8 GT=1.0s, PT=0.8s, α=1.0
+
+N-PEPS
+
+GT=0.5s, PT=0.9s, α=0.8 GT=1.0s, PT=0.8s, α=0.8
+
+N-PEPS+U
+
+GT=1.0s, PT=0.8s, α=0.8 GT=2.0s, PT=0.6s, α=0.9
+
+D.6 Variation across different runs and machines
+
+To ensure robustness and reproducibility of our results, we performed experiments with variations
+along three dimensions: different runs on the same machine, different machines and different test
+splits. Table 6 presents the results of variation in success ratio for E1 when run across different test
+splits, machines and runs across a single machine. Each run consists of a single CPU thread and
+single core setting on a machine (Google Cloud instance with 120GB RAM). We can see that there is
+very little variation for runs across the same machine. Hence, for our main experiments we chose to
+report standard error across different test splits with single runs on machines that are chosen randomly
+from a pool of 7 Google Cloud instances with same conﬁguration.
+
+E Results for Variants of Key for E2
+
+Table 7 presents the test results of ablation studies with different variants of keys for E2. Similar to
+E1, we see that all the variants perform better than the corresponding values for GPS and the three
+ablation baselines (see Figure 4 in Section 4.3). We also see that the variant mentioned in Section 3.2
+(denoted by N-PEPS in the table) performs the best. Note that even though, these results are on test
+data, we had chosen the best variant based on the results on the validation data.
+
+20
+
+Table 6: Variation in success ratio for runs across the same machine (run1, run2, run3), different
+machines (M1, M2, M3) and different test splits (split-1, split-2) for E1
+
+run-1
+
+77.4
+82.8
+82.8
+82.8
+86.8
+86.4
+86.4
+87.8
+
+M1
+run-2
+
+77.4
+83.2
+82.6
+82.8
+86.8
+86.6
+86.4
+88
+
+run-3
+
+run-1
+
+78
+82.8
+82.6
+82.8
+86.6
+86.6
+86.4
+88
+
+77
+82.6
+82.4
+82.8
+86.6
+86.4
+86.4
+87.8
+
+split-1
+M2
+run-2
+
+77.8
+82.8
+82.6
+82.6
+86.6
+86.4
+86.4
+87.8
+
+GPS
+Sum
+Mean
+Mean+U
+N-PEPS-PP
+N-PEPS-PP+U
+N-PEPS-PG
+N-PEPS-PG+U
+
+run-3
+
+run-1
+
+77.2
+82.8
+82.4
+82.4
+86.6
+86.4
+86.4
+87.8
+
+77.2
+83.2
+82.6
+82.6
+86.6
+86.6
+86.4
+88
+
+M3
+run-2
+
+77.2
+82.8
+82.6
+82.8
+86.6
+86.6
+86.4
+88
+
+run-3
+
+run-1
+
+77.6
+82.8
+82.6
+82.8
+86.8
+86.6
+86.4
+87.8
+
+78.4
+84.6
+85
+85
+89.4
+88.6
+87.6
+89
+
+M1
+run-2
+
+78.2
+84.6
+85
+85
+89.4
+88.6
+87.6
+89
+
+run-3
+
+run-1
+
+78.6
+84.8
+85
+85
+89.4
+88.6
+87.6
+89
+
+78
+84.4
+84.8
+84.8
+89.2
+88.4
+87.4
+88.8
+
+split-2
+M2
+run-2
+
+78
+84.4
+84.8
+85
+89.2
+88.4
+87.4
+89
+
+run-3
+
+run-1
+
+78
+84.4
+85
+84.8
+89.2
+88.4
+87.4
+88.8
+
+78.2
+84.6
+85
+85
+89.4
+88.6
+87.6
+89
+
+M3
+run-2
+
+78
+84.6
+85
+85
+89.2
+88.6
+87.6
+89
+
+run-3
+
+78
+84.6
+84.8
+85
+89.4
+88.6
+87.6
+88.8
+
+Table 7: Success Ratio with standard error for key variants for E2
+Variant
+
+Length = 10
+
+Length = 12
+
+Length = 8
+
+Length = 5
+
+Length=14
+
+N-PEPS-PG
+N-PEPS-PG+U
+N-PEPS-PP
+N-PEPS-PP+U
+N-PEPS
+N-PEPS+U
+
+78.49 ± 0.35
+78.16 ± 0.30
+78.74 ± 0.32
+78.87 ± 0.35
+79.18 ± 0.31
+79.19 ± 0.30
+
+45.92 ± 0.53
+46.37 ± 0.57
+45.9 ± 0.57
+44.87 ± 0.50
+47.23 ± 0.49
+46.31 ± 0.61
+
+31.36 ± 0.33
+31.88 ± 0.35
+31.16 ± 0.33
+30.69 ± 0.41
+32.3 ± 0.34
+31.84 ± 0.36
+
+22.83 ± 0.33
+23.17 ± 0.33
+22.67 ± 0.32
+22.43 ± 0.36
+23.34 ± 0.28
+22.71 ± 0.28
+
+17.15 ± 0.31
+17.62 ± 0.30
+16.91 ± 0.28
+16.59 ± 0.32
+17.35 ± 0.31
+16.68 ± 0.21
+
+F Additional Results
+
+F.1 Longer Timeout Results
+
+We wanted to know whether the performance gains of N-PEPS gets translated to scenarios with a
+higher computational budget (as opposed to a lower budget of 5s in our setting). We performed
+inference with a timeout of 1000s using our previously trained models for GPS and N-PEPS in the
+E2 setting. For one test split consisting of 500 examples of length=12, the success ratios for GPS
+and N-PEPS were 54.38% and 57.14%, respectively. As expected, when given a higher budget, the
+numbers for both methods increase. However, N-PEPS still outperforms GPS. Note that here we
+chose the inference hyperparameters based on an educated guess, i.e., α = 0.8, PEPS timeout = 160s
+and the time given to the CA module = 200s. The test performance of N-PEPS is likely to increase
+further if the values of these hyperparameters are selected from the validation set. This result provides
+promising evidence towards the wide applicability of our framework for longer timeout settings.
+
+F.2 Intent Generalization Results
+
+There is an interesting scenario of intent generalization where generalization to examples outside of
+those given as speciﬁcation is required, in assumption that the additional examples sufﬁciently deﬁne
+the intent. To see how N-PEPS fares in this setting, we performed experiments where we generated 5
+additional IO examples apart from the 5 already present as part of our test data and then evaluated
+whether the discovered global solutions satisfy the newly generated examples. In Table 8 we provide
+the success ratio with standard error for GPS and N-PEPS across 30 test splits. As can be seen from
+the results that even though the numbers have reduced from those provided in the tables provided
+in Figures 3 and 4 of our paper (as expected because the examples are outside of the speciﬁcation),
+N-PEPS still outperforms GPS in both E1 and E2 across all lengths.
+
+Table 8: Success Ratio with standard error for intent generalization experiments
+
+Method
+
+Length = 4 (E1)
+
+Length = 5 (E2)
+
+Length = 8 (E2)
+
+Length = 10 (E2)
+
+Length = 12 (E2)
+
+Length = 14 (E2)
+
+GPS
+N-PEPS
+
+75.80 ± 0.38
+84.09 ± 0.27
+
+68.31 ± 0.38
+76.16 ± 0.32
+
+33.87 ± 0.35
+36.33 ± 0.43
+
+18.19 ± 0.30
+21.02 ± 0.29
+
+10.99 ± 0.26
+13.17 ± 0.25
+
+7.48 ± 0.17
+9.17 ± 0.23
+
+F.3 Function wise performance
+
+We wanted to see which instructions in the DSL are "difﬁcult" and compare the difﬁculty across GPS
+and N-PEPS. To do this, we record the count of instructions in the cases where the model was not
+
+21
+
+able to ﬁnd any solution divided by the total count of the instructions. Note that we look only at the
+operator and not the full statement, i.e., we ignore the arguments. Figure 6 shows this plot for GPS and
+N-PEPS+U for E1 with numbers across all 30 test splits. We see that usually higher-order functions
+like COUNT, ZIPWITH are "difﬁcult" and functions like MAXIMUM, MINIMUM are comparatively
+"easy". Also, when compared with GPS, PEPS improves the failure rate across all instructions with
+improvements ranging from 32.67% for SUM to 52.72% for FILTER . Other notable improvements
+being 49.10% for MAXIMUM , 44.69% for MAP , 45.67% for SCAN1L and 47.14% for TAIL .
+
+Figure 6: Function-wise breakdown of failing cases for GPS and our N-PEPS model on E1
+
+F.4 Perfect PE solutions
+
+One of the advantages of PEPS is that we may get a single PE solution which satisﬁes all IO examples
+(we call this perfect PE solution). In these cases, we do not even need to go to the CA and depending
+on when this perfect PE solution is discovered, it can lead to signiﬁcant time savings (e.g., if the ﬁrst
+PE solution discovered turns out to be a perfect solution, then the time taken to ﬁnd the solution is
+equal to just the PEPS timeout which is upper bounded by 1/5th of the total timeout). Figure 7 shows
+the fraction of perfect PE solutions with the length of test programs for N-PEPS for E2. We see that
+as the program length increases, we have less chances to ﬁnd a perfect PE solution. This is expected
+because it will be difﬁcult for a single PE solution to satisfy all IO examples as the programs become
+lengthy (and hence complex). Note that even though we increase the depth of beam search based
+on the length of the test program, the overall budget (=5s) and the PEPS timeout (=0.8s in this case)
+remains the same across different lengths. This also means that for higher lengths, N-PEPS needs to
+rely more on CA to ﬁnd a global solution.
+
+22
+
+MINIMUMMAXIMUMTAILHEADTAKEFILTERSUMMAPSCAN1LDROPACCESSZIPWITHREVERSESORTCOUNT0.000.050.100.150.200.250.300.35GPSPEPSFigure 7: Fraction of perfect PE solutions with length of test programs for our best model for E2
+
+G More insights into the workings of CA
+
+We tried to gain more insights into how our Cross Aggregator mechanism works. First, we looked
+into some general patterns learnt by the CA module. Second, we were interested in ﬁnding out how
+often does CA rely on copying from the PE solutions, how often does it generate new operators
+(in isolation with the GPS module) and how does it generate new operators. The last question is
+important as it helps us understand the generalization capabilities of CA outside the statements in the
+PE solutions. Even though we found it difﬁcult to ﬁgure out a ﬁxed scheme that worked across all
+the settings and different examples, by doing nearest-neighbour analysis, we were able to ﬁnd some
+useful patterns that might shed some light towards answering this question.
+
+G.1 General Patterns Learnt by CA
+
+To look for general patterns, we inspected the representations of the ﬁnal linear layer of our trained
+CA model (that is responsible for providing the logits used in the global statement prediction). The
+size of this weight matrix is ns × Z, where the i-th row can be interpreted as a learned embedding
+corresponding to the statement index i. We ran t-SNE on these embeddings and looked for interesting
+clusters. We found many cases where functionally similar statements or statements with similar
+signatures were clustered together. We give few examples of these patterns below:
+
+1. REVERSE b almost overlaps with SORT b . This is interesting because both take in the list b
+
+and return another list without performing transformations on the elements in b .
+
+2. MINIMUM b , MAXIMUM b , HEAD b , and TAIL b are clustered together. This is interesting
+
+because all these operators select a single element from b .
+
+3. FILTER (ODD) a is close to FILTER (ODD) b . In this case, there is a difference of only the
+argument. For cases, where the prior statements in the program lead to transformations such that
+the contents of lists a and b are the same, like b = SORT a or b = REVERSE a , swapping
+FILTER (ODD) a with FILTER(ODD) b and vice-versa will give the same result.
+
+G.2 Overlap of PE Solutions with Global Solution
+
+We wanted to see in how many cases do the operators present in the global solution also occur in
+one of the discovered PE solutions. This number gives us a rough estimate of how much can our
+
+23
+
+68101214Program Length5101520253035Fraction of Perfect PE solutions (%)attention mechanism do with just trying to copy these operators from one of the PE solutions when
+synthesizing the global solution. This is a rough estimate because we measure only the overlap of the
+operators and not statements, i.e., the arguments to the operators in the PE solutions and the global
+solution can be completely different. Speciﬁcally, we record the number of operators that overlap
+between the global solution (taken as the ground-truth program) and one of the PE solutions, divided
+by the total number of statements in the ground truth programs across all cases.
+
+The left part of Figure 8 shows the variation of this number with different lengths of test programs for
+N-PEPS for E2 when α = 0.8 (which is the best-chosen hyperparameter value for this setting). We
+see that there is signiﬁcant overlap between the operators indicating the quality of our PE solutions.
+However, the overlap decreases with length, which is also indicated by a decrease in overall success
+ratio with length (see left part of Figure 4). This is expected because we keep the same budget (PEPS
+timeout = 0.8s in this case) to discover PE solutions across all lengths. Improvements in the CA
+architecture focused to improve performance across longer length of programs in limited time budget,
+can be one of the potential directions to address this.
+
+Figure 8: Variation of fraction of operator overlap with length of test programs for our best
+model for E2: (Left) α < 1.0 (CA + GPS); (Right) α = 1.0 (CA alone)
+
+There is signiﬁcant overlap (about 79% for length 5), but not 100% between the operators, highlighting
+that in many cases (21% for length 5), N-PEPS performs discovery of new operators that are not
+present in the global solution. To further segregate the role of CA alone in the discovery of new
+operators as opposed to CA + GPS, we set α = 1.0 and analyzed the operator overlap. The right part
+of Figure 8 shows this variation. As expected, the overlap percentages increase as compared to the
+case when α < 1.0. However, we can see that even when all the contribution to the global solution
+comes from the CA module alone, there is not a 100% overlap between the operators and therefore,
+there are non-zero chances of discovery of new operators. From these plots, we can conclude that the
+CA is not merely a copy mechanism and is useful in scenarios where the discovered PE solutions are
+not signiﬁcantly overlapping with the global solution.
+
+G.3 Sample cases where new operators are discovered
+
+Apart from the analysis done above, we wanted to gain further intuition of how the new operators
+are being discovered by the CA module. To this effect, we looked at sample cases of the generation
+of new operators by just CA (i.e., α = 1.0). In each box below (Figures 9-13), for test programs of
+length = 5, we report a case from the cases when the number of new operators discovered is 1, 2,
+3, 4 and 5, respectively. The reported example shows the global solution discovered along with the
+
+24
+
+68101214Program Length556065707580Fraction of Function Overlap (%)68101214Program Length8082848688Fraction of Function Overlap (%)corresponding PE solutions and is randomly chosen out of the total cases that fall within that category
+(i.e., not cherry-picked). For clarity, we bold the new operator in the global solution.
+
+Global Solution:
+
+a ← LIST
+b ← SORT a
+c ← SCAN1L (+) b
+d ← MAP (+1) c
+e ← REVERSE d
+f ← SCAN1L (-) e
+
+PE Solutions:
+
+p1 :
+a ← LIST
+b ← SCAN1L (+) a
+c ← MAP (+1) b
+d ← SORT c
+e ← SCAN1L (-) d
+
+p2 :
+a ← LIST
+b ← SCAN1L (+) a
+c ← MAP (+1) b
+d ← SCAN1L (-) c
+
+p4 :
+a ← LIST
+b ← MAP (+1) a
+c ← SCAN1L (+) b
+d ← SORT c
+e ← MAP (-1) d
+
+p3 = p5 :
+FAILED
+
+Figure 9: New operators discovered = 1, Total cases = 2169
+
+Global Solution:
+
+a ← LIST
+b ← MINIMUM a
+c ← DROP b a
+d ← SORT c
+e ← TAKE b d
+f ← MAXIMUM e
+
+PE Solutions:
+
+p1 :
+a ← LIST
+b ← FILTER (EVEN) a
+c ← MAXIMUM b
+
+p2 :
+a ← LIST
+b ← MINIMUM a
+c ← DROP b a
+d ← COUNT (>0) c
+e ← ACCESS d a
+
+p3 :
+a ← LIST
+b ← MINIMUM a
+c ← DROP b a
+d ← FILTER (ODD) c
+e ← MAXIMUM d
+
+p4 :
+a ← LIST
+b ← MINIMUM a
+c ← DROP b a
+d ← FILTER (EVEN) c
+e ← MAXIMUM d
+
+Figure 10: New operators discovered = 2, Total cases = 1155
+
+25
+
+Global Solution:
+
+a ← LIST
+b ← REVERSE a
+c ← COUNT (>0) b
+d ← ACCESS c b
+e ← TAKE d b
+f ← FILTER (ODD) e
+
+PE Solutions:
+
+p1 :
+a ← LIST
+b ← MINIMUM a
+c ← REVERSE a
+d ← FILTER (ODD) c
+
+p2 = p3 = p4 :
+a ← LIST
+b ← FILTER (ODD) a
+c ← REVERSE b
+
+p5 :
+a ← LIST
+b ← FILTER (<0) a
+
+Figure 11: New operators discovered = 3, Total cases = 395
+
+Global Solution:
+
+a ← LIST
+b ← LIST
+c ← TAIL b
+d ← COUNT (>0) a
+e ← DROP d b
+f ← SORT e
+g ← ACCESS c f
+
+PE Solutions:
+
+p1 :
+a ← LIST
+b ← LIST
+c ← MAP (+1) b
+d ← TAIL c
+
+p2 :
+a ← LIST
+b ← LIST
+c ← TAIL b
+
+Figure 12: New operators discovered = 4, Total cases = 119
+
+Global Solution:
+
+a ← LIST
+b ← LIST
+c ← SORT b
+d ← MAP (+1) a
+e ← FILTER (>0) d
+f ← REVERSE c
+g ← ZIPWITH (+) f e
+
+PE Solutions:
+
+p1 = p2 = p3 = p4 = p5 :
+FAILED
+
+Figure 13: New operators discovered = 5, Total cases = 15
+
+Looking at the above samples, there appears to be a trend where discovering fewer and shorter PE
+solutions leads to more new operators discovered. This may be attributed to the fact that when there
+is less information in the PE solutions, there is usually more of a need to generate new operators.
+The example in Figure 13 is an extreme case of this, where no PE solutions were found, so all the
+operators need to be new.
+
+G.4 Nearest-neighbour analysis for new operators
+
+To gain intuition about how new operators are being generated by then CA module, we make two
+assumptions:
+
+26
+
+• If a statement occurs frequently among the PE solutions, there is a high likelihood that it will also
+be present in the global solution. We ﬁnd some evidence of this from our experiments in the paper
+where we show that the Sum-PEPS baseline performs better than GPS.
+
+• If two statements s1 and s2 are close to each other in the output embedding space (with embeddings
+e1 and e2), they will also be similar in their corresponding logits. Here, we are assuming that
+e1 ≈ e2 → x ∗ e1 ≈ x ∗ e2, with x being the input activation.
+
+With the above assumptions, for each of the examples provided in Appendix G.3, we calculated the
+top-10 nearest neighbours of the PE statements (using the representations obtained in a way described
+Appendix G.1). After this, we checked if the new operators in the global solution are present as
+part of the nearest neighbours of the PE statements. The presence of new operators points to a high
+likelihood of these being ranked higher in the beam search and hence being present in the global
+solution. In our analysis based on cases provided in Appendix G.3, we did observe this trend. We
+provide some instances below:
+
+• In Figure 9 above, the statements containing the new operator REVERSE occur as the topmost
+neighbour (based on distance) of SORT c , MAP (+1) b , as well as among top-3 neighbours
+
+of SCAN1L (+) a . Note that the variation in certain cases from the general pattern observed
+before might be attributed to the two assumptions mentioned above not completely holding true in
+all cases.
+– Top-3 neighbours of SORT c (occurs in p1, p4 ): [ REVERSE c, MAP (+1) c, COUNT (>0) c ]
+– Top-3
+MAP (+1) b
+
+neighbours
+
+(occurs
+
+of
+
+in
+
+p1, p2):
+
+[ REVERSE b, SORT b, COUNT (>0) b ]
+
+– Top-3
+
+neighbours
+
+of
+
+SCAN1L (+1) a
+
+(occurs
+
+in
+
+p1, p2):
+
+[ SCAN1L (-) a, SUM a, REVERSE a ]
+
+• In Figure 10 above, new operator SORT is among the top-2 neighbours of COUNT (>0) c .
+
+Similarly, the new operator TAKE is among the top-2 neighbors of DROP b a .
+
+– Top-3 neighbours of COUNT (>0) c (occurs in p2): [ REVERSE c, SORT c, MAXIMUM c ]
+p2, p3, p4):
+– Top-5
+DROP b a
+
+(occurs
+[ ACCESS b a, DROP b c, DROP b d, DROP c a, TAKE b a ]
+
+neighbours
+
+of
+
+in
+
+27
+
+

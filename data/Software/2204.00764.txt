@@ -1,0 +1,2282 @@
+2
+2
+0
+2
+
+r
+p
+A
+5
+
+]
+
+C
+D
+.
+s
+c
+[
+
+2
+v
+4
+6
+7
+0
+0
+.
+4
+0
+2
+2
+:
+v
+i
+X
+r
+a
+
+A Study of Real-World Data Races in Golang
+
+Milind Chabbi
+Programming Systems Group
+Uber Technologies Inc.
+Sunnyvale, CA, USA
+milind@uber.com
+
+Murali Krishna Ramanathan
+Programming Systems Group
+Uber Technologies Inc.
+New York City, NY, USA
+murali@uber.com
+
+Abstract
+The concurrent programming literature is rich with tools and
+techniques for data race detection. Less, however, has been
+known about real-world, industry-scale deployment, experi-
+ence, and insights about data races. Golang (Go for short) is
+a modern programming language that makes concurrency a
+first-class citizen. Go offers both message passing and shared
+memory for communicating among concurrent threads. Go
+is gaining popularity in modern microservice-based systems.
+Data races in Go stand in the face of its emerging popularity.
+In this paper, using our industrial codebase as an example,
+we demonstrate that Go developers embrace concurrency
+and show how the abundance of concurrency alongside lan-
+guage idioms and nuances make Go programs highly sus-
+ceptible to data races. Google’s Go distribution ships with
+a built-in dynamic data race detector based on ThreadSani-
+tizer. However, dynamic race detectors pose scalability and
+flakiness challenges; we discuss various software engineer-
+ing trade-offs to make this detector work effectively at scale.
+We have deployed this detector in Uber’s 46 million lines of
+Go codebase hosting 2100 distinct microservices, found over
+2000 data races, and fixed over 1000 data races, spanning 790
+distinct code patches submitted by 210 unique developers
+over a six-month period. Based on a detailed investigation
+of these data race patterns in Go, we make seven high-level
+observations relating to the complex interplay between the
+Go language paradigm and data races.
+
+CCS Concepts: • Software and its engineering → Paral-
+lel programming languages; Concurrent programming
+languages; Software verification and validation; • Com-
+puting methodologies → Concurrent programming lan-
+guages.
+
+Permission to make digital or hard copies of all or part of this work for
+personal or classroom use is granted without fee provided that copies
+are not made or distributed for profit or commercial advantage and that
+copies bear this notice and the full citation on the first page. Copyrights
+for components of this work owned by others than the author(s) must
+be honored. Abstracting with credit is permitted. To copy otherwise, or
+republish, to post on servers or to redistribute to lists, requires prior specific
+permission and/or a fee. Request permissions from permissions@acm.org.
+
+PLDI ’22, June 13–17, 2022, San Diego, CA, USA
+© 2022 Copyright held by the owner/author(s). Publication rights licensed
+to ACM.
+ACM ISBN 978-1-4503-9265-5/22/06. . . $15.00
+https://doi.org/10.1145/3519939.3523720
+
+Keywords: Data race, Golang, Dynamic analysis
+
+ACM Reference Format:
+Milind Chabbi and Murali Krishna Ramanathan. 2022. A Study of
+Real-World Data Races in Golang. In Proceedings of the 43rd ACM
+SIGPLAN International Conference on Programming Language Design
+and Implementation (PLDI ’22), June 13–17, 2022, San Diego, CA,
+USA. ACM, New York, NY, USA, 16 pages. https://doi.org/10.1145/
+3519939.3523720
+
+1 Introduction
+Uber∗ caters to hundreds of millions of daily customers who
+depend on its real-time transportation and delivery services.
+Uber’s back-end software is a microservice [70] architecture
+running on several million CPU cores in many data cen-
+ters. Different microservices talk to one another via remote-
+procedure calls (RPC). Individual services are written in
+various programming languages such as Go, Java, Python,
+and NodeJS. Uber has extensively adopted Go as a primary
+programming language for developing these microservices.
+Uber’s Go monorepo [65] comprises about 46 million lines of
+code and contains approximately 2100 unique Go services.
+Go is one of the de facto languages for implementing
+microservices. There are several benefits of Go [32, 40, 46,
+50, 60, 82]. Concurrency is a first-class citizen in Go. Go re-
+quires minimal garbage collection tuning effort, unlike other
+languages such as Java. Go is compiled to native binary, mak-
+ing it performant. Go embraces a minimalist approach with
+Python-like syntax making it easy to learn and well-suited
+for rapid code development. Finally, Go has rich tooling,
+library support, and a thriving open-source community.
+
+Go makes it easy to express asynchronous tasks in pro-
+grams. Prefixing a function call with the go keyword runs
+the call asynchronously in the address space of the calling
+process. These asynchronous function calls in Go are called
+goroutines [15]. Developers hide latency (e.g., IO or RPC calls
+to other services) by creating goroutines within Go programs.
+Goroutines are considered “lightweight”, and the Go runtime
+context switches them on the operating-system (OS) threads.
+Go programmers use goroutines liberally both for symmetric
+and asymmetric tasks. Two or more goroutines can commu-
+nicate data via message passing (channels [13]) or shared
+memory. Shared memory is the most commonly used means
+of data communication in Go [83].
+
+∗http://www.uber.com
+
+ 
+ 
+ 
+ 
+ 
+ 
+PLDI ’22, June 13–17, 2022, San Diego, CA, USA
+
+Milind Chabbi and Murali Krishna Ramanathan
+
+Go’s memory model [81] is loosely defined and not stan-
+dardized; it is claimed to be “like DRF-SC” [34]. Go mem-
+ory model defines a happens-before-based partial ordering
+among the events in different goroutines [35]. Synchroniza-
+tion events establish a happens-before partial order between
+two or more participating goroutines. For example, a send
+event on a channel by a goroutine is considered to happen
+before the corresponding receive event on the same channel
+in another goroutine; an unlock event on a mutex by a gor-
+outine is considered to happen before the subsequent lock
+event in another goroutine on the same mutex object. A data
+race occurs in Go when two or more goroutines access the
+same datum, at least one of them is a write, and there is no
+ordering between them [29, 35, 36].
+
+Outages caused by data races in Go programs are a recur-
+ring and painful problem in our microservices. These issues
+have brought down our critical customer-facing services
+for hours together, causing inconvenience to our customers
+and impacting our revenue. Our developers have also found
+it hard to debug data races and sometimes resorted to fix-
+ing them by conservative strategies such as eliminating the
+concurrency altogether in suspicious code regions.
+
+Data races form a popular category of bugs in shared-
+memory systems (including Go) and have been the focus of
+many proposals to detect them in the last three decades [1,
+30]. Two techniques for data race detection are popular —
+static analysis [28, 41, 42, 61, 71, 84] and dynamic analy-
+sis [27, 39, 43, 44, 48, 57, 58, 66, 69, 74, 76, 77, 80]. Google’s
+Go distribution ships with a built-in dynamic data race de-
+tector [10] based on ThreadSanitizer [79], which integrates
+lock-set [76] and happens-before [44, 66] algorithms to re-
+port races. The cost of race detection varies by program, but
+for a typical program, memory usage increases by 5×-10×
+and execution time grows by 2×-20× [10]. Additionally, the
+compilation time also increases by ∼2×.
+
+In this paper, we discuss deploying Go’s default dynamic
+race detector to continuously detect data races in Uber’s
+Go development environment. We elaborate on our learning
+from this deployment by providing a detailed overview of the
+common patterns for introducing data races in Go programs
+and the facilities inherent in the language infrastructure that
+eases the introduction of races into production code. Our
+analysis is based on more than one thousand data races fixed
+by more than two hundred engineers.
+
+While there have been many algorithms to perform dy-
+namic race detection, there is a significant gap in the know-
+how on deploying dynamic analysis in a real-world setting.
+Given the intrinsic non-determinism associated with dy-
+namic race detection, deploying it as part of continuous
+integration [63] is impractical. On the other hand, deploying
+it as a post-facto detection process introduces complexities
+in reporting races without duplication and challenges in de-
+termining the correct owner. We elaborate on the design
+choices for our deployment.
+
+We use more than 100K Go unit tests to exercise the code
+and detect data races in our repository. In about six months,
+our continuous monitoring system has detected over 2000
+data races in the repository; during this time 210 unique
+developers fixed more than 1000 data races (corresponding
+to 790 unique patches). The remaining (∼1000) data races
+are being actively worked upon. The system detects about
+five new data races every day in newly introduced code.
+
+Our analysis of the detected and fixed races from this
+period reveals a surprising result that suggests that there are
+aspects unique to Go, beyond common concurrency bug type
+patterns, that introduce these races. We find that several Go
+language design nuances such as t ransparent capture-by-
+reference of free variables [25], named return variables [8],
+deferred functions [14], ability to mix shared memory with
+message passing [13], indistinguishable value vs. pointer
+semantics [16, 25], extensive use of thread-unsafe built-in
+map [7], flexible group synchronization [37], and confusing
+slice [9] semantics when combined with the simplicity of
+introducing concurrency via goroutines make Go highly
+susceptible to data races.
+
+1.1 Technical Contributions
+We make the following technical contributions in this paper.
+
+1. Discuss the concurrency characteristics of Go pro-
+grams in production to motivate the need for effective
+solutions to detect and eliminate data races in Go.
+2. Identify technical gaps with deploying dynamic race
+detection in a production system to continuously de-
+tect races and scale to support thousands of developers.
+3. Perform an elaborate, first-of-a-kind study of various
+data race patterns found in our Go programs. This
+study is conducted by analyzing over 1000 data races
+fixed by 210 unique developers over a six-month pe-
+riod.
+
+2 Concurrency in Go Services
+In this section, we provide a few key static and dynamic
+concurrency-related characteristics of our Go programs and
+compare them with programs in other languages to highlight
+some of Go’s distinguishing features.
+
+Most of our Go programs reside in a single repository
+(monorepo [65]) of about 46 million lines of Go code (MLoC)
+hosting 2100 unique microservices. In contrast, our Java
+monorepo constitutes 19 MLoC and hosts 857 microservices.
+As a rough approximation of the use of concurrency, we
+counted the number of concurrency creation constructs and
+synchronization constructs in these repositories and made
+the following observation:
+
+Observation 1. Developers using Go employ significantly
+more concurrency and synchronization constructs than in Java.
+
+A Study of Real-World Data Races in Golang
+
+PLDI ’22, June 13–17, 2022, San Diego, CA, USA
+
+Table 1. Use of concurrency and synchronization constructs
+in Java vs. Go monorepo.
+
+Feature
+LoC
+services
+
+Subfeature
+-
+-
+
+Java
+19 Million
+857
+
+Go
+46 Million
+2100
+
+concurrency creation
+
+point-to-point
+communication
+
+Group
+communication
+
+-
+total/MLoC
+synchronized
+acquire+release
+lock+unlock
+rlock+runlock
+channel send/recv
+total/MLoC
+Latch/Barrier/Phaser
+WaitGroup
+total/MLoC
+
+4162
+219.1
+2378
+652
+624‡
+-
+-
+203
+1007
+-
+55.9
+
+11515
+250.3
+-
+-
+19062
+5511
+10120
+754.2
+-
+4795
+104.2
+
+Table 1 shows the number of concurrency creation, point-
+to-point synchronization, and group communication con-
+structs found in our Go and Java monorepos. For concurrency
+creation, we looked for the .start() construct in Java and
+the go construct in Go†. For point-to-point synchronization,
+we searched for constructs related to lock, unlock, acquire,
+release, and synchronized in Java and searched for Lock,
+Unlock, RLock, RUnlock, and the channel (<-) constructs in
+Go. For group communication, we looked for the instances of
+CyclicBarrier, CountDownLatch, and Phaser in Java and
+looked for the instances of WaitGroup [37] in Go. While this
+look-up is coarse-grained and imperfect, it sheds light on
+significant quantitative differences in the use of concurrency
+constructs in the two languages. Java code has 219 thread
+creation constructs per MLoC, whereas the same for Go is
+250 per MLoC, which is not significantly different. How-
+ever, the Java code has 203 point-to-point synchronization
+constructs per MLoC, whereas the same for Go is 754.2 per
+MLoC, which is 3.7× higher. Similarly, the Java code has 55.9
+group synchronization constructs per MLoC, whereas the
+same for Go is 104.2 per MLoC, which is 1.9× higher.
+
+Observation 2. Developers using Go for programming mi-
+croservices expose significantly more runtime concurrency than
+other languages such as Java, Python, and NodeJS used for the
+same purpose.
+
+To substantiate this fact, we scanned our data centers
+and counted the number of threads in the service instances
+(processes) running on each machine. For Go, we used the
+pprof [47] profiler to count the number of goroutines in
+each process. Our scan included 130K Go processes, 39.5K
+Java processes, 19K Python processes, and 7K NodeJS pro-
+cesses. Go programs are most widely deployed, and the next
+one is Java. Figure 1 shows the fraction of processes at dif-
+ferent concurrency levels for each language, plotted as a
+cumulative frequency distribution graph. The x-axis plots
+
+†the exact regular expressions are more involved.
+
+Figure 1. Cumulative frequency distribution of concurrency
+within programs of different languages.
+
+the concurrency level on a log scale. The y-axis is the cumu-
+lative fraction of processes of each language. The x value(s),
+where the line rises sharply, represents the common concur-
+rency level for the specific language. A line rising more on
+the higher value of x has a higher average concurrency.
+
+From the figure, we note that NodeJS typically has 16
+threads. Python typically has less than 16-32 threads. The sec-
+ond most used language in our fleet, Java, often has between
+128-1024 threads; about 10% of cases have 4096 threads, and
+7% have 8192 threads. In contrast, typically, Go processes
+have 1024-4096 goroutines; about 6% of processes contain
+8102 goroutines. The max reaches at about 130K goroutines
+with contributions to the cumulative sum along the inter-
+mediate steps. Put another way, the 50% percentile of the
+number of threads is 16 in NodeJS, 16 in Python, 256 in Java,
+and 2048 in Go. This data empirically demonstrates that Go
+programs, at runtime, expose a lot of concurrency — about
+8× more than Java.
+
+Since higher concurrency can introduce more concurrency
+bugs, it is only natural to expect more data races in Go, espe-
+cially when the language does not have a built-in mechanism
+to avoid data races, unlike languages such as Rust [38, 68].
+
+3 Deploying Dynamic Data Race Detector
+In this section, we provide a brief background on dynamic
+data race detection, discuss the design challenges of its de-
+ployment in an industrial setup, elaborate on our deployment
+design, and finally conclude with the impact of rolling this
+out to the engineering community internally.
+
+3.1 Dynamic Data Race Detection
+A data race happens when a shared memory location is ac-
+cessed concurrently by more than one thread and at least one
+of the accesses is a write access. The absence of a happens-
+before (HB) relation between the accesses results in the ac-
+cesses being considered concurrent.
+
+000000.080.10.130.160.190.390.690.920.980.9911110000000.010.150.420.70.80.810.931111110000.020.87111111111111110.280.280.340.360.760.920.960.991111111111100.20.40.60.811.212481632641282565121024204840968192163843276865536131072262144Cumulative fraction of total processesConcurrency (num threads or num goroutines)GoJavaNodePythonPLDI ’22, June 13–17, 2022, San Diego, CA, USA
+
+Milind Chabbi and Murali Krishna Ramanathan
+
+Executing a program and analyzing its execution, by in-
+strumenting the shared memory accesses and synchroniza-
+tion primitives, is used to detect underlying races. The exe-
+cution of unit tests in Go that spawn multiple goroutines is
+a good starting point for dynamic race detection. Go has a
+built-in race detector that can be used to instrument the code
+at compile time and detect the races during their execution.
+Internally, the Go race detector uses the ThreadSani-
+tizer [79] runtime library. ThreadSanitizer uses a combina-
+tion of lock-sets [76] and HB [44, 66] based algorithms to
+report races. The lock-sets algorithm tracks the set of locks
+held before every memory access. If the set intersection of
+lock-sets associated with the different accesses of a shared
+memory location across goroutines is empty, it might in-
+dicate a data race. The lock-sets algorithm does not track
+the HB relations and it may include races that may never
+manifest in practice.
+
+For higher precision, the Go race detector also uses vec-
+tor clocks [51] to track the HB relation between shared
+memory accesses. Vector clocks are expensive both in space
+and time since they track the relation between the times-
+tamps of accesses. We defer the reader to the vast literature
+that discusses these approaches elaborately. Although the
+scheduling of goroutines on underlying OS-threads is non-
+deterministic in Go, since the race detector maintains a vector
+clock per goroutine, the data race detector correctly reports
+a data race whether or not the goroutines ran on the same
+OS thread in a given execution.
+
+There are three attributes one needs to be aware of with
+
+respect to dynamic race detection:
+
+1. It may not report all races in the source code as it is
+
+dependent on the analyzed executions.
+
+2. The detected set of races depend on the thread in-
+terleavings and can vary across multiple runs, even
+though the input to the program remains unchanged.
+3. A reported race can be “benign” [62] and need not lead
+
+to a failing execution.
+
+3.2 Deployment Challenges
+We now discuss the challenges associated with deploying
+the dynamic race detector in a large codebase quickly and
+ensure that the appropriate developers fix these races.
+
+3.2.1 When to deploy? When code changes are sent for
+code review (e.g., a pull request (PR) [53]), it is common
+practice to run many low-cost static analysis checks [71]
+along with executing relevant unit tests [55]. This approach
+ensures that the problematic code changes are detected early
+and are not merged into the main branch of the source. This
+process has the following benefits:
+
+1. Defects are fixed before they are pushed to production,
+2. Defect ownership is straightforward as the author of
+the PR becomes responsible for fixing the bug, and
+
+3. The time taken to fix the issue is comparatively lower
+as the author has sufficient context on the changes.
+
+We explore the following three possibilities on when to
+deploy a dynamic data race detector. We ultimately adopt
+the last one — generating bug reports based on data race
+detection in our workflow also referred to as “post-facto data
+race bug reporting”.
+
+[Option I] Block the PR based on dynamic race detec-
+tion: An obvious question is whether a dynamic race detec-
+tor can also be used as part of this workflow, referred to as
+Continuous Integration (CI) [63]. In other words, when the
+PR is sent for review, should dynamic race detection also be
+performed to prevent potential data races from being intro-
+duced into the code? We observe that dynamic race detection
+is a misfit during this phase for the following reasons:
+
+1. Dynamic race detection is non-deterministic [78] as
+the paths followed by various executions may be dif-
+ferent due to the thread interleavings. The flakiness
+may result in races being dormant in the PR where
+the bug is introduced and being detected in a later,
+unrelated PR and impacting a different author.
+
+2. High overheads (2×-20× [36]) of dynamic data race
+detection impact the turnaround time for landing
+changes into the main branch. Reducing the overheads
+by instrumenting only the modified libraries will not
+be helpful as this affects overall analysis precision (e.g.,
+impacts the correctness of HB relations that may hap-
+pen in another library or the runtime).
+
+3. The presence of pre-existing races complicates the
+deployment as it can overwhelm a developer who may
+not have been responsible for the data races.
+
+A low overhead dynamic data race detector [56, 85] is not
+a panacea for this situation; the non-determinism of detected
+races prevents us from adopting it at a PR time.
+
+[Option II] Add warnings to a PR based on dynamic
+race detection: Given the challenges of blocking a PR based
+on the non-determinism of a dynamic data race detector,
+we considered making data races as non-blocking PR-time
+warnings. However, we did not pursue this direction for the
+following reasons:
+
+1. Thousands of pre-existing data races make the warn-
+
+ing report noisy,
+
+2. Developers ignore warnings and become immune to
+
+it, and
+
+3. The overhead of the dynamic race detector violates
+
+build-time SLAs.
+
+[Option III] Generate bug reports based on dynamic
+race detection: Based on these considerations, our deploy-
+ment strategy for dynamic race detection is to perform it
+periodically on a snapshot of code, post-facto, instead of
+incorporating it as part of the CI workflow. Meaning, we
+
+A Study of Real-World Data Races in Golang
+
+PLDI ’22, June 13–17, 2022, San Diego, CA, USA
+
+do not prevent data races from being introduced into our
+codebase; we actively find and fix them. This design assigns
+a detected data race as a defect to its owner using a heuristic.
+While incorrectly blocking a PR makes the build system
+flaky and hurts developer sentiments, accidentally assigning
+a data race defect to an incorrect owner is not a problem of
+the same magnitude. This is so because defects get triaged
+and eventually get reassigned to appropriate owners in a
+large software development environment.
+
+Despite our current design choice, our experience with
+this deployment (and other non-CI-based analyses) shows
+that algorithms enabling the deployment of dynamic race
+detection during the CI workflow are more impactful, as they
+increase the likelihood of races being fixed.
+
+3.3 Post-facto Data Race Bug Reporting
+Deploying dynamic race detection periodically, post-facto,
+will broadly involve the following steps — (a) clone the latest
+version of the repository, (b) perform dynamic race detection
+by executing all the unit tests in the repository, and (c) report
+all outstanding races by filing tasks to the appropriate bug
+owner. A detected race report contains the following details:
+
+1. The conflicting memory address,
+2. Two call chains (aka calling contexts or stack traces)
+
+of the two conflicting accesses, and
+
+3. The memory access types (read or a write) associated
+
+with each access.
+
+This process exposes interesting design choices with build-
+ing a practical developer workflow due to the challenges
+associated with the code constantly evolving, underlying
+non-determinism of dynamic race detection, and the fre-
+quent churn in the organization. We discuss these details
+below.
+
+3.3.1 Ensuring unique race reports. Each calling con-
+text comprises a list of function names and line numbers.
+Hashing all this information can help in unique identifica-
+tion of the race but can result in duplicated race reports, just
+because either a) the source line numbers change because of
+unrelated changes to the source file, or b) the order of two
+conflicting accesses is reversed.
+
+To avoid such duplication and to ensure consistency in
+reporting across source code revisions, we devised a simple
+hashing technique that is relatively resilient to these com-
+mon concerns. We first ignore the source line numbers in
+both call chains, which takes care of unrelated code modifica-
+tions within a function. Second, we order the two call stacks
+lexicographically; meaning two call chains P()->Q()->R()
+and A()->B()->C() are always ordered as A()->B()->C()
+and P()->Q()->R(), irrespective of the order in which the
+execution happened.
+
+The flip side of ignoring the line numbers is that it sup-
+presses different data races sharing exactly the same two call
+chains but differing only in line numbers if at least one of
+
+them is already reported. This approach is not a significant
+limitation because we suppress a defect iff there is an active
+one with the same hash that is already open in our bug data-
+base. As soon as the open defect with the same hash is fixed,
+our system files another defect with the same hash (sharing
+the call chains), if it finds one.
+
+On this topic, it must also be emphasized that the unique-
+ness of reporting is only about the manifested races and not
+the underlying root causes. For example, the same under-
+lying root cause may result in different pairs of conflicting
+memory accesses (e.g., absence of a lock causing multiple
+shared data structures to race). See statistics in Section 3.5.
+Automatically triaging the root cause and reporting them
+uniquely is an interesting area of research worth exploring
+but is outside the scope of our current effort.
+
+3.3.2 Determining assignee for a race. After detecting
+a race, our system needs to determine the developer who
+will be responsible for fixing the race. In the absence of the
+root cause, the potential list of assignees is restricted to the
+authors of the root and leaf nodes of the two call stacks. Even
+though the leaf nodes contain the race-inducing memory
+accesses, we choose to report it to the owner of the root
+nodes of the call stacks. We chose this option because the
+developers associated with the root nodes correspond to the
+author of code higher up in the call stack; these developers
+have a stake in the functional correctness of their code and
+are hence incentivized to eliminate a race and drive the issue
+to closure even if it is in a downstream library.
+
+Due to the churn in the organization and the presence
+of mass refactorings to source code, reporting a defect to
+the latest modifier of the code may result in an inaccurate
+assignment. Therefore, we consider a few additional statis-
+tics corresponding to a) the author(s) who frequently modify
+the associated source code, b) any metadata attached to the
+source describing the owning team, and c) the presence of
+the developer and their manager in the organization, etc. We
+found in our experience that attaching a log of how our algo-
+rithm arrived at the choice of the assignee and enumerating
+the potential set of assignees was useful to the developers,
+rather than simply assigning without explaining why the
+tool thinks the assignee should fix the data race.
+
+Based on our experiences, we make the following remarks:
+
+Remark 1. Design algorithms to enable dynamic race detec-
+tion during Continuous Integration.
+
+Remark 2. Design algorithms to automatically root cause
+and identify appropriate ownership for data races.
+
+3.4 Deployment
+Figure 2 presents the architecture diagram of our deployment.
+Periodically (daily), the workflow executes all the unit tests
+with race enabled; this step involves compiling the entire
+program with instrumentation followed by executing tests.
+
+PLDI ’22, June 13–17, 2022, San Diego, CA, USA
+
+Milind Chabbi and Murali Krishna Ramanathan
+
+Figure 2. The architecture of data race detection.
+
+Figure 3. Total outstanding detected races vs. time.
+
+The built-in dynamic race detector records encountered data
+races in each test to the standard error, which we capture for
+further processing. The detected races are de-duplicated, and
+tasks are generated for the resulting unique races and filed
+to the appropriate developer(s). The task contains the details
+on the source version on which the race was detected, stack
+traces of two conflict accesses, and the necessary instructions
+to help the developer reproduce the underlying race. The
+fixes to the races follow standard development procedures,
+and the resultant changes are merged into the main branch
+of the source.
+
+3.5 Experiences
+We rolled out this deployment in April 2021 and have col-
+lected data for about six months. Our approach has helped
+detect ∼2000 data races in our monorepo with hundreds of
+daily commits by hundreds of Go developers. Out of the re-
+ported races, 1011 races are fixed by 210 different engineers.
+In addition, we observe that there were 790 unique patches
+to fix these races, suggesting ∼78% unique root causes.
+
+We also collected the statistics for the total outstanding
+races over the last six months and report this data in Fig-
+ure 3. In the initial phase (2-3 months) of the rollout, we
+shepherded the assignees to fix the data races. The drop in
+the outstanding races is noticeable during this phase. Sub-
+sequently, as the shepherding was minimized, we notice a
+gradual increase in the total outstanding races. The figure
+also shows the fluctuations in the outstanding count, which is
+due to fixes to races, the introduction of new races, enabling
+and disabling of tests by developers, and the underlying non-
+determinism of dynamic race detection. After reporting all
+the pre-existing races, we also observe that the workflow
+creates about five new race reports, on average, every day.
+
+Figure 4. A timeline of data race issues found vs. fixed.
+
+Figure 4 also shows the activity on the tasks created by our
+deployment. There is a slow rise in reported races from April
+to June because we did not release all existing data races in
+a single day. Instead, we slowly ramped up the number of
+data races we reported as we were fine-tuning our workflow
+to best suit our developers. The sudden surge in July is a
+result of finally opening the flood gates, which also coincided
+with fixing a lot of bugs due to the authors a) driving the
+developers to fix the data races and b) themselves fixing
+several critical data races. The initial phase resulted in a
+significant resolution of the created tasks. Subsequently, we
+observe that the gradient for the task creation is higher than
+that of task resolution because the authors disengaged from
+shepherding.
+
+We believe that the presence of race detection as part of a
+CI workflow will help address this problem by preventing
+new races from being introduced, apart from reducing the
+outstanding race count to zero.
+
+In terms of the overhead of running our offline data race
+detector, we noticed that the 95th percentile of the running
+time of all tests without data race detection is 25 minutes,
+whereas it increases by 4× to about 100 minutes with data
+race enabled. Furthermore, in a survey taken by tens of engi-
+neers, about six months after rolling out the system, 52% of
+developers found the system useful, 40% of developers were
+not involved with the system, and 8% of developers did not
+find it useful.
+
+4 Observations of Data Races in Go
+In this section, we detail several common patterns of data
+races we found in our investigation of over 1000 data races
+that were fixed. We have chosen, as our examples, the ones
+that either happen frequently or are unique and subtle to
+root cause. In the following examples, we have changed the
+function and variable names, reduced the code, and retained
+only the basic structure needed to understand the root cause
+of races.
+
+Unit tests (race on)De-duplicateGenerateTasksFix and locally verifyGo monorepoData racesUnique racesJIRATask assignmentDiffsDataRaceSpyDaily*> 1K ﬁxed racesDetects 5-10 races/dayA Study of Real-World Data Races in Golang
+
+PLDI ’22, June 13–17, 2022, San Diego, CA, USA
+
+4.1 Essential Background on Go Syntax
+As a precursor to the rest of this section, we provide some
+essential background to the Go syntax [24]. Go is garbage
+collected, type-safe, and statically compiled.
+
+In Go, the variable name precedes its type in a decla-
+ration, e.g., var a int . The syntax, x := 10 , both de-
+clares x as an integer via type inference and defines its value
+to be 10. Functions can return multiple values, similar to
+Python. Arrays, declared as var myArr [SIZE]int , are
+value types in Go and are passed by value, unlike C, C++,
+or Java. Slices, declared var mySlice []int , are dynami-
+cally growing/shrinking indexable data structure. A slice in
+Go is a reference type, meaning it is heap-allocated. Hash
+table is a built-in type. var myMap map[int]string is a
+hash table with integer key and string value. Map is also a
+reference type in Go.
+
+Structs, like C++, are aggregate types in Go. Go does not
+have classes. However, one can define methods on types. A
+method is a function with a special “receiver” argument —
+the object it is invoked on. func (m *myStruct) Foo()
+declares Foo as a method on myStruct type. Here, m is called
+the “receiver”. Notice that the receiver is a pointer (*) to
+myStruct in this example.
+
+While C++, Java, and Python pass this/self as a
+pointer to the method, in Go, it can be passed either as
+a pointer or a value depending on the type of the re-
+ceiver. One can write a method on a value. For example,
+func (m myStruct) Foo() declares Foo as a method on
+myStruct value type, and the only difference is that the re-
+ceiver here is a value type. The method invocation in either
+case uses the same obj.Foo() syntax.
+
+Go has pointers, and they can be accessed by the standard
+address-of ( & ) operator on a value. Go uses the same dot
+( . ) operator to access fields of a struct or invoke a method,
+whether on a value type (e.g., myValue.Foo()) or a pointer
+type (e.g., myPtr.Foo()). The compiler infers whether a vari-
+able is a pointer or value and transparently arranges for
+dereferencing it or taking its address, as appropriate.
+
+Go allows nesting functions (aka closures). Nested func-
+tions are anonymous and capture all the free variables by-
+reference. One can launch any function asynchronously by
+prefixing the call with the go keyword. Any function call
+with the prefix defer delays its execution till the function’s
+return.
+
+We now discuss the various data race patterns by making
+an observation at the beginning of each subsection and ex-
+plain the observation elaborately with an example. All the ex-
+ample data races discussed in this section are available as an
+open-source artifact at https://zenodo.org/record/6330164.
+
+1 ▶ for _ , job := range jobs {
+2
+go func () {
+3 ▶ ProcessJob ( job )
+4
+5 } // end for
+
+}()
+
+Listing 1. Loop index variable capture.
+
+4.2 Races due to Transparent Capture-by-Reference
+Observation 3. Transparent capture-by-reference of free
+variables in goroutines is a recipe for data races.
+
+Nested functions, aka closures, in Go transparently cap-
+ture all free variables [5] by-reference. The programmer does
+not explicitly specify which free variables are captured in
+the closure syntax. This mode of usage is different from, say,
+C++, where the programmer must explicitly specify every
+captured free variable as well as specify whether it is cap-
+tured by-value or by-reference [12]. In Java, all free variables
+are captured by-value [23].
+
+Developers are often unaware that a variable used inside
+a closure is a free variable and captured by-reference, espe-
+cially when the closure is large. More often than not, Go
+developers use closures as goroutines. As a result of capture-
+by-reference and goroutine concurrency, Go programs end
+up potentially having unordered access to free variables, un-
+less explicit synchronization is performed. The capture in a
+closure manifests itself in different forms, which we show in
+the following subsections.
+
+4.2.1 Loop index variable capture. Listing 1 shows an
+example of iterating over a Go slice jobs and processing
+each element job via the ProcessJob function. Here the
+developer wraps the expensive ProcessJob in an anony-
+mous goroutine that is launched one per item. However, the
+loop index variable job is captured by-reference inside the
+goroutine. When the goroutine launched for the first loop
+iteration is accessing the job variable on line 3, the for loop
+will be advancing through the slice and updating the same
+loop-index variable job (on line 1) to point to the second
+element in the slice. This situation causes a data race, which
+we have highlighted by the two black right triangles in the
+code. This type of data race happens for value and reference
+types; slices, array, and maps; and read-only and write ac-
+cesses in the loop body. Go recommends a coding idiom to
+hide and privatize [17] the loop index variable in the loop
+body, which developers do not always follow.
+
+4.2.2 Idiomatic err variable capture. Go allows and ad-
+vocates multiple return values [19] from functions. It is com-
+mon to return the actual return value(s) and an error object
+to indicate if there was an error. The actual return value is
+considered meaningful if and only if the error value is nil. In
+Listing 2, Line 1 shows an example invocation of a function
+Foo, which returns an integer and an error object. It is a
+common practice to assign the returned error object to a
+variable named err, followed by checking for its nilness as
+
+PLDI ’22, June 13–17, 2022, San Diego, CA, USA
+
+Milind Chabbi and Murali Krishna Ramanathan
+
+}
+
+...
+
+x , err := Foo ()
+if err != nil {
+
+go func () {
+var y int
+y , err = Bar ()
+if err != nil {
+
+1
+2
+3
+4
+5
+6
+7
+8 ▶
+9
+10
+11
+12
+13
+14
+var z int
+15 ▶ z , err = Baz ()
+16
+if err != nil {
+17
+18
+
+}
+}()
+
+...
+
+...
+
+}
+
+1 func Redeem ( request Entity ) ( resp Response , err error )
+
+{
+
+defer func () {
+
+resp , err = c. Foo ( request , err )
+
+}()
+err = CheckRequest ( request )
+... // err check but no return
+go func () {
+
+2
+3 ▶
+4
+5
+6
+7
+8 ▶
+9
+10
+11 }
+Listing 4. Named return variable capture with a defer return.
+
+}()
+return // the defer function runs after here
+
+ProcessRequest ( request , err != nil )
+
+Listing 2. Error variable capture.
+
+}
+go func () {
+
+return // this has the effect of " return 10"
+
+result = 10
+if ... {
+
+1 func NamedReturnCallee () ( result int ){
+2
+3
+4
+5
+6
+7 ▶
+8
+9 ▶ return 20 // this is equivalent to result =20
+10 }
+11
+12 func Caller () {
+13
+14 }
+
+retVal := NamedReturnCallee ()
+
+... = result // read result
+
+}()
+
+Listing 3. Named return variable capture.
+
+shown in lines 2-4. Since multiple error-returning functions
+can be called inside a function body, there will be several
+assignments to the err variable followed by the nilness
+check each time, as shown on lines 8 and 15. Developers do
+not create a new error variable each time.
+
+When developers mix this idiom with a goroutine, as
+shown in lines 6-12, the err variable gets captured by-
+reference in the closure. As a result, the accesses (both read
+and write) to err in the goroutine run concurrently with
+subsequent reads and writes to the same err variable in the
+enclosing function (or multiple instances of the goroutine),
+which causes a data race. In the example in Listing 2, one
+write to err on line 8 and another write to the same err on
+line 15 cause a data race.
+
+4.2.3 Named return variable capture. Go introduces a
+syntactic sugar called “named” return values [8]. The named
+return variables are treated as variables defined at the top of
+the function, whose scope outlives the body of the function.
+A return statement without arguments, known as a "naked"
+return, returns the named return values. Go recommends
+using naked returns only in short functions because they can
+harm readability in longer functions. However, developers
+use named returns in larger functions also. In the presence
+of a closure, mixing normal (non-naked) returns with named
+returns or using a deferred [14] return in a function with a
+named return is a risky proposition as we show below.
+
+Normal return in a function with a named return:
+Listing 3 shows mixing a normal return in a function with a
+named return variable in the presence of a goroutine. The
+
+function NamedReturnCallee returns an integer, and the
+return variable is named as result on line 1. The rest of
+the function body can read and write to result without
+declaring it because of this syntax. If the function returns
+at line 4, which is a naked return, due to the assignment
+result=10 on line 2, the caller at line 13 would see the return
+value of 10. The compiler arranges for copying result to
+retVal.
+
+A named return function can also use the standard return
+syntax, as shown on line 9. This syntax makes the compiler
+copy the return value, 20 in the return statement, to be as-
+signed to the named return variable result.
+
+Line 6 creates a goroutine, which captures the named
+return variable result. In setting up this goroutine, even a
+concurrency expert might believe that the read from result
+on line 7 is safe because there is no other write to the same
+variable; the statement return 20 on line 9 is, after all, a
+constant return and does not seem to touch the named return
+variable result. The code generation, however, turns the
+return 20 statement into a write to result, as previously
+mentioned. Now suddenly, we have a concurrent read and a
+write to the shared result variable, a case of a data race.
+
+Deferred functions in a named return: Yet another fla-
+vor of data races happens when a named return is present
+alongside Go’s defer construct. The anonymous function
+on line 2 in Listing 4 is prefixed with the defer keyword.
+As a result, the anonymous function will execute after the
+return on line 10. In this case, the developer has written the
+deferred function such that the two named return variables
+resp and err are correctly populated on any return path —
+a defensive programming technique.
+
+Unfortunately, the developer also uses a goroutine on
+line 7, which captures the named return variable err on
+line 8. When the execution returns on line 10, the write to the
+named return variable err on line 3 executes after the return.
+In the meantime, the read to the same err variable in the
+goroutine on line 8 races with this write, causing a subtle data
+race. In the code where we found this situation, the enclosing
+function was large and complex. The developer could not
+foresee the data race while developing the code because
+there is no visible concurrent access to err in the code after
+the launch of the goroutine. Because of the complexity of
+
+A Study of Real-World Data Races in Golang
+
+PLDI ’22, June 13–17, 2022, San Diego, CA, USA
+
+mutex . Lock ()
+myResults = append ( myResults , res )
+mutex . Unlock ()
+
+var myResults [] string
+var mutex sync . Mutex
+safeAppend := func ( res string ) {
+
+1 func ProcessAll ( uuids [] string ) {
+2
+3
+4
+5
+6 ▶
+7
+8
+9
+10
+11
+12
+13
+14 ▶
+
+res := Foo ( id )
+safeAppend ( res )
+
+for _ , uuid := range uuids {
+
+}
+
+go func ( id string , results [] string ) {
+
+}( uuid , myResults ) // slice read without holding
+lock
+
+}
+...
+
+15
+16
+17 }
+
+Listing 5. Data race in slices even after using locks.
+
+the data race, the developer could not even understand the
+defect when our tool reported the issue.
+
+4.3 Data Races due to Slices
+Observation 4. Slices are highly confusing types that create
+subtle and hard to diagnose data races.
+
+Slices are dynamic arrays and reference types. Internally,
+a slice contains a pointer to the underlying array, its current
+length, and the maximum capacity to which the underlying
+array can expand. We refer to these variables as meta fields
+of a slice for ease of discussion. A common operation on a
+slice is to grow it via the append operation, as shown on
+line 6 in Listing 5. The slice is declared on line 2. When the
+size reaches the capacity, a new allocation (e.g., double the
+current size) is made, and the meta fields are updated. When
+goroutines concurrently access a slice, it is natural to protect
+accesses to it by a mutex, as shown by the Lock/Unlock op-
+erations surrounding it. In this code, the developer wraps the
+slice append operation into a standalone closure safeAppend
+and uses a mutex in the closure to ensure mutual exclusion;
+the closure correctly captures the free mutex variable.
+
+A subtle bug happens because the developer accidentally
+passes the slice myResults as an argument as well to the
+goroutine, as shown on line 14. This style of invocation
+causes the meta fields of the slice to be copied from the
+callsite to the callee. Notice that this copying is not lock
+protected. While one iteration of the loop on line 14 is making
+a copy of the meta fields of myResults, a goroutine invoked
+on some previous iteration could be modifying the meta
+fields of the captured myResults on line 6. The append to
+this slice, which may modify the three meta fields of the slice,
+races with the read of the same meta variables.
+
+This data race is not because of the goroutine capturing
+myResults by-reference, but because of a leftover passing
+of the slice. Given a slice is a reference type, one would not
+imagine its passing (copying) to a callee to cause a data race.
+However, a slice is not the same as a pointer type, hence the
+subtle data race. A better way to refactor this code is to a)
+pass a pointer to myResults and b) not capture myResults in
+
+go func ( uuid string ) {
+
+orderHandle , err := GetOrder ( uuid )
+if err != nil {
+
+var errMap = make ( map [ string ] error )
+for _ , uuid := range uuids {
+
+1 func processOrders ( uuids [] string ) error {
+2
+3
+4
+5
+6
+7 ▶
+8
+9
+10
+11
+12
+13 }
+
+errMap [ uuid ] = err
+return
+
+return combineErrors ( errMap )
+
+}
+...
+}( uuid )
+
+Listing 6. Concurrent access to hash map.
+
+the safeAppend closure, and instead arrange to dereference
+the incoming pointer to myResults while holding the lock.
+
+4.4 Data Races on Thread-Unsafe Map
+Observation 5. Built-in maps in Go make them commonly
+used. The array-style syntax of map accesses provides a false
+illusion of disjoint accesses of elements. However, map imple-
+mentation is thread-unsafe in Go causing frequent data races.
+
+Hash table (map) is a built-in language feature in Go. How-
+ever, the built-in hash table in Go is not thread-safe. Data
+race ensues if multiple goroutines simultaneously access the
+same hash table with at least one of them trying to modify
+the hash table (insert or delete an item).
+
+Line 2 in Listing 6 shows the syntax for creating a hash
+table with a string key and an error value type. The function
+processOrders receives a slice of uuids. It iterates through
+each item in uuids (line 3) and launches a goroutine per
+item to process each item asynchronously. The GetOrder
+API invoked on each uuid may return a failure in which case
+the error string for the corresponding uuid is recorded in the
+errMap hash table. The developer intends to accumulate all
+errors (if any) in errMap and later return a combined error
+on line 12. A write-write data race happens on line 7 during
+concurrent writes to the hash table even though each uuid
+is intended to be a separate entry in the hash table.
+
+In this case, the developer has full visibility into the concur-
+rent code and the hash table (which is in the same enclosing
+function scope) and yet makes a fundamental but common
+assumption (and a mistake) that the different entries in the
+hash table can be concurrently accessed. This assumption
+stems from developers viewing the errMap[uuid] syntax
+used for map accesses and misinterpreting them to be access-
+ing disjoint elements. However, a map (hash table), unlike an
+array or a slice, is a sparse data structure, and accessing one
+element might result in accessing another element; if during
+the same process another insertion/deletion happens, it will
+modify the sparse data structure and cause a data race.
+
+We found more complex concurrent map access data races
+(not shown) resulting from the same hash table being passed
+to deep call paths and developers losing track of the fact
+that these call paths mutate the hash table via asynchronous
+goroutines.
+
+PLDI ’22, June 13–17, 2022, San Diego, CA, USA
+
+Milind Chabbi and Murali Krishna Ramanathan
+
+m. Lock ()
+
+m. Unlock ()
+
+1 var a int
+2 // CriticalSection receives a copy of mutex .
+3 func CriticalSection (m sync . Mutex ) {
+4
+5 ▶ a ++
+6
+7 }
+8 func main () {
+9
+10
+11
+12
+13 }
+
+mutex := sync . Mutex {}
+// passes a copy of m to A.
+go CriticalSection ( mutex )
+go CriticalSection ( mutex )
+
+Listing 7. Method invocation by value or pointer.
+
+1 type Mutex struct {
+2 // internal state
+3 }
+4 func ( mtx * Mutex ) Lock () {
+5 // lock implementation
+6 }
+7 func ( mtx * Mutex ) Unlock () {
+8 // unlock implementation
+9 }
+
+Listing 8. sync.Mutex signature.
+
+While the hash table leading to data races is not unique
+to Go, the following reasons make map-based data races
+common in Go.
+Maps are more frequently used in Go: Since map is a
+built-in language construct, it is liberally used in Go. We
+have 83392 map-related constructs in our Java repository,
+whereas in Go, we have 273713 maps. This translates to 4389
+map constructs per MLoC in Java, whereas the same for Go
+is 5950 per MLoC, which is 1.34× higher.
+Array syntax and error tolerance: The map access syn-
+tax is just like array-access syntax (unlike Java’s get/put
+APIs), making it easy to use but often confused for a random
+access data structure. A non-existing map element can eas-
+ily be queried with the table[key] syntax, which simply
+returns the default value without producing any error. This
+error tolerance can make one complacent when using Go
+maps.
+
+4.5 Mistakes due to Pass-by-Value vs.
+
+Pass-by-Reference in Go
+
+Observation 6. Pass-by-value semantics are recommended
+in Go because it simplifies escape analysis and gives variables
+a better chance to be allocated on the stack, which reduces
+pressure on the garbage collector. Developers often err on the
+side of pass-by-value (or methods over values), which can cause
+non-trivial data races.
+
+Unlike Java, where all objects are reference types, in Go,
+an object can be a value type (struct) or a reference type (in-
+terface). There is no syntactic difference, leading to incorrect
+use of synchronization constructs such as sync.Mutex and
+sync.RWMutex, which are value types (structures) in Go.
+
+In Listing 7, the function main creates a mutex structure
+on line 9 and passes it by value to the goroutine invocation
+on lines 11 and 12. The two concurrent executions of the
+function CriticalSection, now operate on two different
+
+}()
+
+go func () {
+
+resp , err := f .f () // invoke a registered function
+f. response = resp
+f. err = err
+f. ch <- 1 // may block forever !
+
+1 func (f * Future ) Start () {
+2
+3
+4
+5 ▶
+6
+7
+8 }
+9 func (f * Future ) Wait ( ctx context . Context ) error {
+10 select {
+11
+12
+13
+14 ▶ f. err = ErrCancelled
+15
+return ErrCancelled
+16
+17 }
+Listing 9. Mixed use of shared memory and message
+passing.
+
+case <-f . ch :
+return nil
+
+case <- ctx . Done () :
+
+}
+
+mutex objects, which share no internal state. As a result, the
+Lock and Unlock operations on these two different mutexes
+do not ensure mutually exclusive access to the global variable
+a. A correct implementation should have passed the address
+of mutex (&mutex), and the signature of CriticalSection
+should have received a pointer (*sync.Mutex).
+
+Since the Go syntax is the same for invoking a method
+over pointers or values, less attention is given by the devel-
+oper to question that m.Lock is working on a copy of mutex
+instead of a pointer. Also, observe Listing 8 for how the Lock
+and Unlock are implemented. Even though they (correctly)
+operate on a pointer to Mutex, the caller can still invoke
+these APIs on a mutex value, and the compiler transparently
+arranges to pass the address of the value. Had this trans-
+parency not been there, the bug could have been detected as
+a compiler type-mismatch error.
+
+A converse of this situation happens when developers acci-
+dentally implement a method where the receiver is a pointer
+to the structure instead of a value/copy of the structure. In
+these situations, multiple goroutines invoking the method
+accidentally share the same internal state of the structure,
+whereas the developer intended otherwise. Even in this case,
+the caller is unaware that the value type was transparently
+converted to a pointer type at the receiver.
+
+4.6 Mixing Shared Memory with Message Passing
+Observation 7. Mixed use of message passing (channels) and
+shared memory makes code complex and susceptible to data
+races.
+
+Listing 9 shows an example of a generic Future [22] im-
+plementation by a developer using a channel for signaling
+and waiting. The Future can be started by calling the Start
+method, and one can block for the future’s completion by
+calling the Wait method on the Future. The Start method
+creates a goroutine, which executes a function registered
+with the Future and records its return values (response and
+err). The goroutine signals the completion of the Future to
+the Wait method by sending a message on the channel ch
+as shown on line 6. Symmetrically, the Wait method blocks
+to fetch the message from the channel (line 11).
+
+A Study of Real-World Data Races in Golang
+
+PLDI ’22, June 13–17, 2022, San Diego, CA, USA
+
+Contexts [18] in Go carry deadlines, cancelation signals,
+and other request-scoped values across API boundaries and
+between processes. This is a common pattern in microser-
+vices where timelines are set for tasks. Hence, Wait blocks on
+either the context being canceled (line 13) or the Future to
+complete (line 11). Furthermore, the wait employs a select
+statement [13] (line 10), which blocks until at least one of
+the select arms is ready.§
+
+If the context times out, the corresponding case records
+the err field of Future as ErrCancelled on line 14. This
+write to err races with the write to the same variable in
+the future on line 5. Also, the goroutine will block forever
+on line 6 when there is no receiver on the other side of the
+channel. Note that, if the context does not timeout, which is
+the common case, the channel send operation establishes a
+happens-before edge preventing a data race.
+
+4.7 Incorrect Use of Flexible Group Synchronization
+Observation 8. Go offers more leeway in its group synchro-
+nization construct sync.WaitGroup. The number of partici-
+pants is dynamic. Incorrect placement of Add and Done meth-
+ods of a sync.WaitGroup lead to data races.
+
+The sync.WaitGroup structure is a group synchroniza-
+tion construct in Go. Unlike C++ barrier [6], pthread bar-
+rier [3], and Java barrier [4] or latch [2] constructs, the num-
+ber of participants in a WaitGroup is not determined at the
+time of construction but is updated dynamically. Three op-
+erations are allowed on a WaitGroup object — Add(int),
+Done(), and Wait(). Add() increments the count of par-
+ticipants, and the Wait() blocks until Done() is called
+count number of times (typically once by each participant).
+WaitGroup is extensively used in Go. Table 1 shows that
+group synchronization is 1.9× higher in Go than in Java.
+
+In Listing 10, the developer intends to create as many gor-
+outines as the number of elements in the slice itemIds and
+process the items concurrently. Each goroutine records its
+success or failure status in results slice at different indices.
+The developer expects the parent function block at line 12 un-
+til all goroutines finish. The parent goroutine then accesses
+all elements of results to count the number of successful
+processings.
+
+For this code to work correctly, when Wait is invoked
+on line 12, the number of registered participants must be
+already equal to the length of itemIds. This is possible only
+if wg.Add(1) is performed as many times as the length of
+itemIds prior to invoking Wait, which means wg.Add(1)
+should have been placed on line 5, prior to each gorou-
+tine invocation. However, the developer incorrectly places
+wg.Add(1) inside the body of the goroutines on line 7, which
+is not guaranteed to have been executed by the time the outer
+function WaitGrpExample invokes Wait. As a result, there
+can be fewer than the length of itemIds registered with
+
+§if both are ready, one is chosen non-deterministically.
+
+go ( idx int ) {
+
+1 func WaitGrpExample ( itemIds [] int ) int {
+2 wg sync . WaitGroup
+3 results := make ([] int , len ( itemIds ))
+4 for i := 0; i < len ( itemIds ); i ++{
+5
+6
+7
+8 ▶
+9
+10
+11 }
+12 wg . Wait () // waits for the participants added so far .
+13 ▶ ... = results
+14 }
+
+wg . Add (1) // incorrect wg . Add placement
+results [ idx ] = ...
+wg . Done ()
+
+}( i)
+
+Listing 10. Incorrect WaitGroup.Add() function.
+
+the WaitGroup when the Wait is invoked. For that reason,
+the Wait can unblock prematurely, and the WaitGrpExample
+function can start to read from the slice results (line 13)
+while some goroutines are concurrently writing to it.
+
+We also found data races arising from a premature place-
+
+ment of the Done() call on a Waitgroup.
+
+4.8 Parallel Testing Idiom
+Observation 9. Running tests in parallel for Go’s table-
+driven test suite idiom can often cause data races, either in the
+product or test code.
+
+Testing is a built-in feature in Go. Any function with the
+prefix Test in a file with suffix _test.go can be run as a
+test via the Go build system. If the test code calls an API
+testing.T.Parallel(), it will run concurrently with other
+such tests. We found a large class of data races happen due
+to such concurrent test executions. The root causes of these
+data races were sometimes in the test code and sometimes
+in the product code.
+
+Additionally, Go developers often write many subtests
+and execute them via the Go-provided suite [20] package
+within a single Test-prefixed function. Go recommends a
+table-driven test suite idiom [33] to write and run a test
+suite. Our developers extensively write tens or hundreds of
+subtests in a test, which our systems run in parallel.
+
+This idiom becomes a source of problem for a test suite
+where the developer either assumed serial test execution or
+lost track of using shared objects in a large complex test suite.
+Problems also arise when the product API(s) was written
+without thread safety (perhaps because it was not needed)
+but were invoked in parallel, violating the assumption.
+
+4.9 Incorrect or Missing Mutual Exclusion
+Observation 10. Incorrect use of mutual exclusion primitives
+leads to data races.
+
+This class of data races due to logical mistakes while writ-
+ing concurrent programs is not unique to Go. It is also one
+of the most frequent reasons for data races in our code. We
+discuss this class of races for completeness.
+
+4.9.1 Mutating shared data in a Reader-lock-
+protected critical section. Go offers a reader-writer lock
+
+PLDI ’22, June 13–17, 2022, San Diego, CA, USA
+
+Milind Chabbi and Murali Krishna Ramanathan
+
+g. mutex . RLock ()
+defer g. mutex . RUnlock ()
+// ... several read - only operations ...
+if ... {
+
+1 func (g * HealthGate ) updateGate () {
+2
+3
+4
+5
+6 ▶
+7 ▶
+8
+9 }
+Listing 11. Mutating a shared variable while holding a read-
+only lock.
+
+g. ready = true // Concurrent writes .
+g. gate . Accept () // More than one Accept () .
+
+}
+
+Table 2. Count of data races due to different Go language
+features and idioms.
+
+Obs. # Description
+
+3
+
+4
+5
+6
+7
+8
+9
+
+Accidental capture-by-reference in a goroutine
+Capture-by-reference of err variable
+Capture-by-reference of loop range variable
+Capture of a named return
+Concurrent slice access
+Concurrent map access
+Confusing pass-by-value vs. pass-by-reference
+Mixing message passing with shared memory
+Missing or incorrect use of group synchronization
+Parallel test suite (table-driven testing)
+
+Count
+121
+50
+48
+4
+391
+38
+38
+25
+24
+139
+
+RWMutex, which allows concurrent readers to execute
+a critical section simultaneously. The RLock/RUnlock
+methods on a RWMutex hold the lock in a read-only mode.
+Sometimes developers accidentally put statements that may
+modify shared data in critical sections protected by RWMutex,
+while using RLock/RUnlock methods. Such a mistake could
+have happened due to code evolving to address some issues
+or new requirements. Listing 11 shows one such example
+where after acquiring an RLock, the code may modify a
+shared variable on line 6. Concurrent readers may modify
+the same data leading to a data race. Worse yet, on line 7,
+the data race violates idempotency, where a network IO
+operation is performed more than once.
+
+4.9.2 Other forms for incorrect mutual exclusion.
+There are numerous ways in which mutual exclusions can be
+incorrectly used. The subtle ones we found were partial mu-
+tual exclusion, where the developer used locks in one place
+and forgot to use it in another while accessing the same
+shared variable(s). In some cases, the developer used a lock
+but called unlock prematurely, leaving some shared variable
+access outside the critical section. We observed an analogous
+situation where the developer used sync.Atomic [21] par-
+tially — used for writing to a shared variable but forgot to
+use it to read from the same variable.
+
+Table 3. Count of data races due to language-agnostic rea-
+sons.
+
+Note
+Observation 10 Missing or partial locking
+
+Description
+
+Miscellaneous
+
+Uncategorized
+
+Mutating inside a reader-only lock
+Thread-safe APIs violating contract
+Mutating a global variable
+Missing or incorrect use of atomic ops
+Incorrect order of statements
+Complex multi-component interaction
+Racy metrics / logging
+Fixed by removing concurrency
+Fixed by disabling tests
+Fixed by a major refactor
+
+Count
+470
+2
+369
+24
+40
+5
+6
+18
+26
+3
+30
+
+data races, which are language agnostic, and hence are not
+discussed in detail. These labelings are not mutually exclu-
+sive; sometimes, multiple labels were assigned to the same
+bug because they fell into multiple categories.
+
+Overall, we see that missing or incorrect locking (Table 3)
+was the single largest reason for the data races. Concurrent
+accesses to slices and maps were also common. Capture-by-
+reference in goroutines can be seen to be the next common
+cause. Mixing channels with shared memory, interchanging
+by-reference with by-value, and incorrect group communica-
+tion are quite frequent causes of data races. The other subtle
+causes grouped under the miscellaneous category are less
+common. The last three lines in Table 3 pertain to those data
+races that were not root caused but instead addressed by
+refactoring the code: a) removing the concurrency, b) dis-
+abling tests, or c) changing the code/logic in a significant
+way.
+
+Remark 3. Future programming language designers should
+carefully weigh different language features and coding idioms
+with their potential to create common or arcane concurrency
+bugs.
+
+4.11 Threats to Validity
+The discussion in this paper is based on our experiences with
+data races in Uber’s Go monorepo and may have missed addi-
+tional patterns of data races that may happen elsewhere. Also,
+as dynamic race detection does not detect all possible races
+due to code and interleaving coverage, our discussion may
+have missed a few patterns of races. Despite these threats
+to the universality of our results, the discussion on the pat-
+terns in this paper and the deployment experiences hold
+independently.
+
+4.10 Summary of Findings
+We studied each of the 1011 fixed data races and manually
+labeled their root cause(s). Table 2 shows the count of data
+races categorized under different language features and id-
+ioms discussed in this section. Table 3 shows the count of
+
+5 Related Work
+Race detection is one of the most researched topics in the
+programming languages community with a vast body of
+literature. We discuss a few related works to help place our
+efforts in this context.
+
+A Study of Real-World Data Races in Golang
+
+PLDI ’22, June 13–17, 2022, San Diego, CA, USA
+
+Dynamic race detection: Dynamic analyses [39, 43, 44,
+48, 58, 66, 69, 77] instrument code to capture memory ac-
+cesses and synchronization events and reasons about them
+at runtime to prove a conflict between a pair of accesses.
+Eraser [76], which is based on the lock-sets algorithm, checks
+for empty lock-set intersection before accessing a shared
+variable to detect a race. Vector clocks [44, 51, 66] are com-
+monly used in dynamic data race detection in unstructured
+parallel programs; ThreadSanitizer [79], which is based on
+these algorithms and used for race detection, can introduce
+2×-5× space and 2×-20× runtime overheads. Race detection
+based on causally-precedes (CP) relation [80] improves pre-
+cision at the cost of increasing the overheads further. Many
+subsequent enhancements have used strategies to reduce ad-
+ditional instrumentation [27, 57]. While structured fork-join
+style parallel programs [11, 31, 45] can significantly alleviate
+the overheads of runtime race detection [43, 48, 58, 69], this
+facility is not available in unstructured parallel programs
+such as Go.
+
+Our study dives deeper into the deployment of a variant of
+dynamic race detection and the practical issues surrounding
+it. While any of the online approaches can be employed in
+our setup, the key problems of scalability and determinism
+of detecting races persist with all these approaches.
+
+Exploring thread interleavings: Executing multithreaded
+tests and observing assertion failures is yet another approach
+to help detect data races. As manifesting a race is depen-
+dent on the thread interleaving, RaceFuzzer [78] fuzzes the
+thread schedules by inserting random thread yields at differ-
+ent synchronization points to ensure different interleavings
+are explored. In contrast, Chess [59] systematically explores
+various thread interleavings by performing a tree traversal
+on the interleaving tree. Finally, TSVD [52] uses lightweight
+monitoring of calling behavior associated with thread-unsafe
+methods to inject delays to expose races. While these strate-
+gies can also be used instead of dynamic analysis for our
+deployment, the problem of non-determinism with the de-
+tected races and the scale of the overall state space poses its
+own challenges for practical deployment.
+
+Automated test generation: A key requirement for dy-
+namic analysis or testing-based approaches is the ability to
+analyze concurrent executions, which necessitates the avail-
+ability of effective test suites. Samak et al. leverage sequential
+execution traces to generate tests to expose data races [74],
+other types of concurrency bugs [72, 73], and assertion vio-
+lations [75]. In [67], Pradel and Gross develop a technique
+for automatically generating executions with random inputs
+and thread interleavings to expose thread safety violations.
+Billes et al., [26] use a two-phase approach to identify po-
+tential conflicts by analyzing single client executions and
+synthesizing multi-client interactions. Our current deploy-
+ment can benefit from all these approaches as they build the
+
+necessary test corpus for concurrent execution, which the
+dynamic race detector can analyze.
+
+Surveys on concurrency bugs: Tu et al., [83] analyze 171
+reported concurrency-related bugs in six open-source Go
+applications. They classify the bugs into blocking and non-
+blocking categories and provide the root causes in each case.
+Qin et al., [68] studied memory and thread-safety practices
+in real-world Rust programs, indicating the potential for
+data races in Rust programs where compile time checks are
+circumvented. More than a decade ago, Lu et al., [54] studied
+four open-source C/C++ applications and characterized con-
+currency bug patterns in them. In contrast to these studies,
+our study a) focuses on data race bugs in Go, b) explores
+significantly more (2100) services inside a real industrial set-
+ting, c) investigates more than 1000 data races, d) bubble-up
+the interplay between language features and data races, and
+e) discusses the software engineering aspects of deploying a
+dynamic race detection for industrial scale.
+
+While Lu et al., [54] found user-defined synchronization
+a common culprit in concurrency bugs, the same does not
+hold good for Go programs. Go developers rarely, if at all,
+use their own synchronization but liberally use Go’s Mutex
+locks and condition variables.
+
+Static analysis based race detection: Static analysis for
+data race detection inspects source code to report conflicting
+accesses to shared variables. RacerD [28] performs abstract
+interpretation to report concurrency issues, including data
+races. Chord [61] uses various static analysis strategies for
+Java programs, including alias analysis, lock analysis, thread-
+escape analysis, and call-graph construction, to reduce the
+possible pairs of memory accesses involved in a data race.
+Errorprone [71] employs AST analysis to detect possible
+data races. MC checker [42] also uses compiler extensions
+to perform abstract interpretation and statistical analysis to
+report locations of ineffective locking. We believe the bug
+patterns in Go presented in this paper can inspire further
+research in static race detection for Go.
+
+Detecting races in event-driven applications: Petrov et
+al. [64] explore data races in JavaScript web applications
+by developing a definition of happen-before for asynchro-
+nous event-based web execution environments. Hsiao et
+al. [49] explore data races in Android apps and observe that
+traditional dynamic data race detectors introduce false or-
+dering between events handled sequentially by the same
+thread. While Go has event-based asynchronous process-
+ing via channels, it is subsumed under the task-level paral-
+lelism of goroutines, where the traditional happens-before
+via vector clocks suffices. Further, unlike these efforts which
+explored novel race detection algorithms, the focus of this
+paper is on the deployment challenges and the interplay of
+language design with concurrency in Go.
+
+PLDI ’22, June 13–17, 2022, San Diego, CA, USA
+
+Milind Chabbi and Murali Krishna Ramanathan
+
+6 Conclusions
+In this paper, we discussed the characteristics of concur-
+rency in Go programs and a deployment strategy for detect-
+ing races continuously using dynamic race detection. Based
+on observed (including fixed) data races, we elaborate on
+the Go language paradigms that make it easy to introduce
+races in Go programs. We hope that this work will inspire
+future work towards enabling dynamic race detection during
+continuous integration, developing program analyses for de-
+tecting Go races, and designing language features such that
+their interplay with concurrency does not easily introduce
+races.
+
+References
+[1] JLS 2015. The Java Language Specification (Java SE 8 Edition). JLS.
+
+https://docs.oracle.com/javase/specs/jls/se8/jls8.pdf
+
+[2] Oracle Corp. 2018.
+
+Java CountDownLatch.
+
+Oracle Corp.
+
+https://docs.oracle.com/javase/7/docs/api/java/util/concurrent/
+CountDownLatch.html
+
+[3] Open Group 2018.
+
+Open Group.
+//pubs.opengroup.org/onlinepubs/9699919799/functions/
+pthread_barrier_destroy.html
+
+Pthread Barrier.
+
+https:
+
+[4] Oracle Corp. 2020.
+
+Java CyclicBarrier.
+
+Oracle Corp.
+
+https://docs.oracle.com/javase/7/docs/api/java/util/concurrent/
+CyclicBarrier.html
+
+[5] Wikipedia 2021. Free variables and bound variables. Wikipedia. https:
+
+//en.wikipedia.org/wiki/Free_variables_and_bound_variables
+std::barrier.
+
+[6] CPP Reference 2022.
+
+CPP Reference.
+
+https://
+
+en.cppreference.com/w/cpp/thread/barrier
+
+[7] Golang developers ∼2014. Effective Go: Maps. Golang developers.
+
+https://go.dev/doc/effective_go#maps
+
+[8] Golang developers ∼2014. Effective Go: Named result parameters.
+https://golang.org/doc/effective_go#named-
+
+Golang developers.
+results
+
+[9] Golang developers ∼2014. Effective Go: Slices. Golang developers.
+
+https://go.dev/doc/effective_go#slices
+
+[10] Golang developers ∼2014. Go Data Race Detector. Golang developers.
+
+https://golang.org/doc/articles/race_detector
+
+[11] OpenMP Organization ∼2019. The OpenMP API specification for parallel
+
+programmingc. OpenMP Organization. https://www.openmp.org/
+[12] C++ Reference Community ∼2022. C++ Reference: Lambda expres-
+sions. C++ Reference Community. https://en.cppreference.com/w/
+cpp/language/lambda
+
+[13] Golang developers ∼2022. Effective Go: Channel. Golang developers.
+
+https://golang.org/doc/effective_go#chan_of_chan
+
+[14] Golang developers ∼2022. Effective Go: Defer. Golang developers.
+
+https://golang.org/doc/effective_go#defer
+
+[15] Golang developers ∼2022. Effective Go: Goroutine. Golang developers.
+
+https://golang.org/doc/effective_go#goroutines
+
+[16] Golang developers ∼2022. Effective Go: Pointer vs. Value. Golang
+developers. https://go.dev/doc/effective_go#pointers_vs_values
+[17] Golang developers ∼2022. Go Common Mistakes. Golang developers.
+
+https://github.com/golang/go/wiki/CommonMistakes
+
+[18] Golang developers ∼2022. Go Context Package. Golang developers.
+
+https://pkg.go.dev/context
+
+[19] GoDocs ∼2022. GoDocs: Multiple return values in GoLang functions.
+GoDocs. https://golangdocs.com/multiple-return-values-in-golang-
+functions
+
+[20] Golang developers ∼2022. Golang Suite. Golang developers. https:
+
+//pkg.go.dev/github.com/stretchr/testify/suite
+
+[21] Golang developers ∼2022. Golang Sync Atomic. Golang developers.
+
+https://pkg.go.dev/sync/atomic
+
+[22] Oracle Corp. ∼2022.
+
+https://
+docs.oracle.com/javase/7/docs/api/java/util/concurrent/Future.html
+[23] Oracle Corp. ∼2022. The Java Tutorial: Lambda Expressions. Or-
+https://docs.oracle.com/javase/tutorial/java/javaOO/
+
+Java Futures.
+
+Oracle Corp.
+
+acle Corp.
+lambdaexpressions.html
+
+[24] Golang developers ∼2022. Welcome to a tour of Go. Golang developers.
+
+https://go.dev/tour/list
+
+[25] Eli Bendersky. 2019. Go internals: capturing loop variables in clo-
+sures. https://eli.thegreenplace.net/2019/go-internals-capturing-loop-
+variables-in-closures/
+
+[26] Marina Billes, Anders Moller, and Michael Pradel. 2017. Systematic
+Black-Box Analysis of Collaborative Web Applications. In Proceedings
+of the 38th ACM SIGPLAN Conference on Programming Language Design
+and Implementation (Barcelona, Spain) (PLDI 2017). 171–184.
+
+[27] Swarnendu Biswas, Minjia Zhang, Michael D. Bond, and Brandon Lucia.
+2015. Valor: Efficient, Software-Only Region Conflict Exceptions. In
+Proceedings of the 2015 ACM SIGPLAN International Conference on
+Object-Oriented Programming, Systems, Languages, and Applications
+(OOPSLA 2015). 241–259.
+
+[28] Sam Blackshear, Nikos Gorogiannis, Peter W. O’Hearn, and Ilya Sergey.
+2018. RacerD: Compositional Static Race Detection. Proc. ACM Pro-
+gram. Lang. 2, OOPSLA, Article 144 (oct 2018), 28 pages.
+
+[29] Hans-J. Boehm. 2011. How to Miscompile Programs with "Benign"
+Data Races. In Proceedings of the 3rd USENIX Conference on Hot Topic
+in Parallelism (Berkeley, CA) (HotPar’11). USENIX Association, USA,
+3.
+
+[30] Hans-J. Boehm and Sarita V. Adve. 2008. Foundations of the C++ Con-
+currency Memory Model. In Proceedings of the 29th ACM SIGPLAN
+Conference on Programming Language Design and Implementation (Tuc-
+son, AZ, USA) (PLDI ’08). Association for Computing Machinery, New
+York, NY, USA, 68–78.
+
+[31] Philippe Charles, Christian Grothoff, Vijay Saraswat, Christopher Don-
+awa, Allan Kielstra, Kemal Ebcioglu, Christoph von Praun, and Vivek
+Sarkar. 2005. X10: An Object-Oriented Approach to Non-Uniform Clus-
+ter Computing (OOPSLA ’05). Association for Computing Machinery,
+New York, NY, USA, 519–538.
+
+[32] Dave Cheney. 2017. Why Go? https://dave.cheney.net/2017/03/20/
+
+why-go
+
+[33] Dave Cheney. 2019. Prefer table driven tests. https://dave.cheney.net/
+
+2019/05/07/prefer-table-driven-tests
+
+[34] Russ Cox. 2016. Go’s Memory Model. http://nil.csail.mit.edu/6.824/
+
+2016/notes/gomem.pdf
+
+[35] Go developers. 2014. The Go Memory Model. https://go.dev/ref/mem
+[36] Go developers. ∼2022. Data Race Detector. https://go.dev/doc/articles/
+
+race_detector
+
+[37] Go developers. ∼2022. Golang sync.WaitGroup. https://pkg.go.dev/
+
+sync#WaitGroup
+
+[38] Rust developers. ∼2022. Rust. https://www.rust-lang.org/
+[39] A. Dinning and E. Schonberg. 1990. An Empirical Comparison of Moni-
+toring Algorithms for Access Anomaly Detection. In Proceedings of the
+Second ACM SIGPLAN Symposium on Principles and Practice of Parallel
+Programming (Seattle, Washington, USA) (PPOPP ’90). Association for
+Computing Machinery, New York, NY, USA, 1–10.
+
+[40] Erik Engheim. 2021. Go Does Not Need a Java Style GC. https://
+
+itnext.io/go-does-not-need-a-java-style-gc-ac99b8d26c60
+
+[41] Dawson Engler and Ken Ashcraft. 2003. RacerX: Effective, Static
+Detection of Race Conditions and Deadlocks. In Proceedings of the
+Nineteenth ACM Symposium on Operating Systems Principles (Bolton
+Landing, NY, USA) (SOSP ’03). Association for Computing Machinery,
+New York, NY, USA, 237–252.
+
+[42] Dawson Engler, Benjamin Chelf, Andy Chou, and Seth Hallem. 2000.
+Checking System Rules Using System-Specific, Programmer-Written
+
+A Study of Real-World Data Races in Golang
+
+PLDI ’22, June 13–17, 2022, San Diego, CA, USA
+
+Compiler Extensions. In Proceedings of the 4th Conference on Sympo-
+sium on Operating System Design and Implementation - Volume 4 (San
+Diego, California) (OSDI’00). Article 1.
+
+[43] Mingdong Feng and Charles E. Leiserson. 1997. Efficient Detection
+of Determinacy Races in Cilk Programs. In Proceedings of the Ninth
+Annual ACM Symposium on Parallel Algorithms and Architectures (New-
+port, Rhode Island, USA) (SPAA ’97). Association for Computing Ma-
+chinery, New York, NY, USA, 1–11.
+
+[44] Cormac Flanagan and Stephen N. Freund. 2009. FastTrack: Efficient
+and Precise Dynamic Race Detection. In Proceedings of the 30th ACM
+SIGPLAN Conference on Programming Language Design and Implemen-
+tation (PLDI ’09). 121–133.
+
+[45] Matteo Frigo, Charles E. Leiserson, and Keith H. Randall. 1998. The
+Implementation of the Cilk-5 Multithreaded Language. In Proceed-
+ings of the ACM SIGPLAN 1998 Conference on Programming Language
+Design and Implementation (Montreal, Quebec, Canada) (PLDI ’98).
+Association for Computing Machinery, New York, NY, USA, 212–223.
+[46] Mariano Gappa. 2017. Making The Move From Scala To Go, And Why
+We’re Not Going Back. https://movio.co/blog/migrate-Scala-to-Go/
+[47] Google. 2013. Profiling Go Programs. https://blog.golang.org/pprof
+[48] Yizi Gu and John Mellor-Crummey. 2018. Dynamic Data Race Detec-
+tion for OpenMP Programs. In Proceedings of the International Con-
+ference for High Performance Computing, Networking, Storage, and
+Analysis (Dallas, Texas) (SC ’18). IEEE Press, Article 61, 12 pages.
+[49] Chun-Hung Hsiao, Jie Yu, Satish Narayanasamy, Ziyun Kong, Cris-
+tiano L. Pereira, Gilles A. Pokam, Peter M. Chen, and Jason Flinn. 2014.
+Race Detection for Event-Driven Mobile Applications. In Proceedings of
+the 35th ACM SIGPLAN Conference on Programming Language Design
+and Implementation (Edinburgh, United Kingdom) (PLDI ’14). Associa-
+tion for Computing Machinery, New York, NY, USA, 326–336.
+[50] Tim Jenkins. 2014. How to Convince Your Company to Go With Golang.
+
+https://sendgrid.com/blog/convince-company-go-golang/
+
+[51] Leslie Lamport. 1978. Time, Clocks, and the Ordering of Events in a
+Distributed System. Commun. ACM 21, 7 (jul 1978), 558–565.
+[52] Guangpu Li, Shan Lu, Madanlal Musuvathi, Suman Nath, and Rohan
+Padhye. 2019. Efficient Scalable Thread-Safety-Violation Detection:
+Finding Thousands of Concurrency Bugs during Testing. In Proceedings
+of the 27th ACM Symposium on Operating Systems Principles (SOSP ’19).
+162–180.
+
+[53] Zhongxin Liu, Xin Xia, Christoph Treude, David Lo, and Shanping
+Li. 2019. Automatic Generation of Pull Request Descriptions. In Pro-
+ceedings of the 34th IEEE/ACM International Conference on Automated
+Software Engineering (San Diego, California) (ASE ’19). 176–188.
+[54] Shan Lu, Soyeon Park, Eunsoo Seo, and Yuanyuan Zhou. 2008. Learn-
+ing from Mistakes: A Comprehensive Study on Real World Concur-
+rency Bug Characteristics. In Proceedings of the 13th International
+Conference on Architectural Support for Programming Languages and
+Operating Systems (Seattle, WA, USA) (ASPLOS XIII). 329–339.
+[55] Mateusz Machalica, Alex Samylkin, Meredith Porth, and Satish Chan-
+dra. 2019. Predictive Test Selection. In Proceedings of the 41st Inter-
+national Conference on Software Engineering: Software Engineering in
+Practice (ICSE-SEIP ’19). 91–100.
+
+[56] Daniel Marino, Madanlal Musuvathi, and Satish Narayanasamy. 2009.
+LiteRace: Effective Sampling for Lightweight Data-Race Detection. In
+Proceedings of the 30th ACM SIGPLAN Conference on Programming
+Language Design and Implementation (Dublin, Ireland) (PLDI ’09). As-
+sociation for Computing Machinery, New York, NY, USA, 134–143.
+
+[57] Umang Mathur, Dileep Kini, and Mahesh Viswanathan. 2018. What
+Happens-after the First Race? Enhancing the Predictive Power of
+Happens-before Based Dynamic Race Detection. Proc. ACM Program.
+Lang. 2, OOPSLA, Article 145 (Oct. 2018), 29 pages.
+
+[58] John Mellor-Crummey. 1991. On-the-Fly Detection of Data Races for
+Programs with Nested Fork-Join Parallelism. In Proceedings of the 1991
+ACM/IEEE Conference on Supercomputing (Albuquerque, New Mexico,
+
+USA) (Supercomputing ’91). Association for Computing Machinery,
+New York, NY, USA, 24–33.
+
+[59] Madan Musuvathi. 2008. Systematic Concurrency Testing Using
+CHESS. In Proceedings of the 6th Workshop on Parallel and Distributed
+Systems: Testing, Analysis, and Debugging (Seattle, Washington) (PAD-
+TAD ’08). Article 10, 1 pages.
+
+[60] Sergio Nadir. 2017. Why I Love Golang. https://hackernoon.com/why-
+
+i-love-golang-90085898b4f7
+
+[61] Mayur Naik, Alex Aiken, and John Whaley. 2006. Effective Static Race
+Detection for Java. In Proceedings of the 27th ACM SIGPLAN Confer-
+ence on Programming Language Design and Implementation (PLDI ’06).
+308–319.
+
+[62] Satish Narayanasamy, Zhenghao Wang, Jordan Tigani, Andrew Ed-
+wards, and Brad Calder. 2007. Automatically Classifying Benign
+and Harmful Data Races Using Replay Analysis. In Proceedings of
+the 28th ACM SIGPLAN Conference on Programming Language De-
+sign and Implementation (San Diego, California, USA) (PLDI ’07).
+Association for Computing Machinery, New York, NY, USA, 22–31.
+https://doi.org/10.1145/1250734.1250738
+
+[63] Peter W. O’Hearn. 2018. Continuous Reasoning: Scaling the Impact of
+Formal Methods. In Proceedings of the 33rd Annual ACM/IEEE Sympo-
+sium on Logic in Computer Science (LICS ’18). 13–25.
+
+[64] Boris Petrov, Martin Vechev, Manu Sridharan, and Julian Dolby. 2012.
+Race Detection for Web Applications. In Proceedings of the 33rd ACM
+SIGPLAN Conference on Programming Language Design and Implemen-
+tation (Beijing, China) (PLDI ’12). Association for Computing Machin-
+ery, New York, NY, USA, 251–262.
+
+[65] Rachel Potvin and Josh Levenberg. 2016. Why Google Stores Billions
+of Lines of Code in a Single Repository. Commun. ACM 59, 7 (jun
+2016), 78–87.
+
+[66] Eli Pozniansky and Assaf Schuster. 2003. Efficient On-the-Fly Data
+Race Detection in Multithreaded C++ Programs. In Proceedings of the
+Ninth ACM SIGPLAN Symposium on Principles and Practice of Parallel
+Programming (San Diego, California, USA) (PPoPP ’03). 179–190.
+[67] Michael Pradel and Thomas R. Gross. 2012. Fully Automatic and
+Precise Detection of Thread Safety Violations. In Proceedings of the
+33rd ACM SIGPLAN Conference on Programming Language Design and
+Implementation. 521–530.
+
+[68] Boqin Qin, Yilun Chen, Zeming Yu, Linhai Song, and Yiying Zhang.
+2020. Understanding Memory and Thread Safety Practices and Issues
+in Real-World Rust Programs. In Proceedings of the 41st ACM SIGPLAN
+Conference on Programming Language Design and Implementation (Lon-
+don, UK) (PLDI 2020). 763–779.
+
+[69] Raghavan Raman, Jisheng Zhao, Vivek Sarkar, Martin Vechev, and
+Eran Yahav. 2012. Scalable and Precise Dynamic Datarace Detection
+for Structured Parallelism. In Proceedings of the 33rd ACM SIGPLAN
+Conference on Programming Language Design and Implementation (Bei-
+jing, China) (PLDI ’12). Association for Computing Machinery, New
+York, NY, USA, 531–542.
+
+[70] Chris Richardson. ∼2022. What are microservices?
+
+https://
+
+microservices.io/
+
+[71] Caitlin Sadowski, Edward Aftandilian, Alex Eagle, Liam Miller-Cushon,
+and Ciera Jaspan. 2018. Lessons from Building Static Analysis Tools
+at Google. Commun. ACM 61, 4 (mar 2018), 58–66.
+
+[72] Malavika Samak and Murali Krishna Ramanathan. 2014. Multithreaded
+Test Synthesis for Deadlock Detection. In Proceedings of the 2014
+ACM International Conference on Object Oriented Programming Systems
+Languages and Applications (Portland, Oregon, USA) (OOPSLA ’14).
+473–489.
+
+[73] Malavika Samak and Murali Krishna Ramanathan. 2015. Synthesizing
+Tests for Detecting Atomicity Violations. In Proceedings of the 2015
+10th Joint Meeting on Foundations of Software Engineering (Bergamo,
+Italy) (ESEC/FSE 2015). 131–142.
+
+PLDI ’22, June 13–17, 2022, San Diego, CA, USA
+
+Milind Chabbi and Murali Krishna Ramanathan
+
+[74] Malavika Samak, Murali Krishna Ramanathan, and Suresh Jagan-
+nathan. 2015. Synthesizing Racy Tests. In Proceedings of the 36th
+ACM SIGPLAN Conference on Programming Language Design and Im-
+plementation (Portland, OR, USA) (PLDI ’15). 175–185.
+
+[75] Malavika Samak, Omer Tripp, and Murali Krishna Ramanathan. 2016.
+Directed Synthesis of Failing Concurrent Executions. In Proceedings
+of the 2016 ACM SIGPLAN International Conference on Object-Oriented
+Programming, Systems, Languages, and Applications (OOPSLA 2016).
+430–446.
+
+[76] Stefan Savage, Michael Burrows, Greg Nelson, Patrick Sobalvarro, and
+Thomas Anderson. 1997. Eraser: A Dynamic Data Race Detector for
+Multithreaded Programs. ACM Trans. Comput. Syst. 15, 4 (Nov. 1997),
+391–411.
+
+[77] D. Schonberg. 1989. On-the-Fly Detection of Access Anomalies. In
+Proceedings of the ACM SIGPLAN 1989 Conference on Programming Lan-
+guage Design and Implementation (Portland, Oregon, USA) (PLDI ’89).
+Association for Computing Machinery, New York, NY, USA, 285–297.
+[78] Koushik Sen. 2008. Race Directed Random Testing of Concurrent
+Programs. In Proceedings of the 29th ACM SIGPLAN Conference on
+Programming Language Design and Implementation (PLDI ’08). 11–21.
+[79] Konstantin Serebryany and Timur Iskhodzhanov. 2009. ThreadSani-
+tizer: Data Race Detection in Practice. In Proceedings of the Workshop
+on Binary Instrumentation and Applications (New York, New York,
+USA) (WBIA ’09). Association for Computing Machinery, New York,
+NY, USA, 62–71.
+
+[80] Yannis Smaragdakis, Jacob Evans, Caitlin Sadowski, Jaeheon Yi, and
+Cormac Flanagan. 2012. Sound Predictive Race Detection in Polyno-
+mial Time. In Proceedings of the 39th Annual ACM SIGPLAN-SIGACT
+Symposium on Principles of Programming Languages (Philadelphia, PA,
+USA) (POPL ’12). Association for Computing Machinery, New York,
+NY, USA, 387–400.
+
+[81] Daniel J Sorin, Mark D Hill, and David A Wood. 2011. A primer
+on memory consistency and cache coherence. Synthesis lectures on
+computer architecture 6, 3 (2011), 1–212.
+
+[82] S. Thierry. 2019. Why we switched from Python to Go.
+
+https:
+
+//getstream.io/blog/switched-python-go/
+
+[83] Tengfei Tu, Xiaoyu Liu, Linhai Song, and Yiying Zhang. 2019. Under-
+standing Real-World Concurrency Bugs in Go. In Proceedings of the
+Twenty-Fourth International Conference on Architectural Support for
+Programming Languages and Operating Systems (Providence, RI, USA)
+(ASPLOS ’19). 865–878.
+
+[84] Jan Wen Voung, Ranjit Jhala, and Sorin Lerner. 2007. RELAY: static
+race detection on millions of lines of code. In Proceedings of the the 6th
+joint meeting of the European software engineering conference and the
+ACM SIGSOFT symposium on The foundations of software engineering.
+205–214.
+
+[85] Tong Zhang, Changhee Jung, and Dongyoon Lee. 2017. ProRace:
+Practical Data Race Detection for Production Use. In Proceedings of
+the Twenty-Second International Conference on Architectural Support
+for Programming Languages and Operating Systems (Xi’an, China)
+(ASPLOS ’17). Association for Computing Machinery, New York, NY,
+USA, 149–162.
+
+

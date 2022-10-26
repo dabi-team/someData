@@ -1,0 +1,1388 @@
+1
+2
+0
+2
+
+n
+u
+J
+
+7
+
+]
+
+G
+L
+.
+s
+c
+[
+
+1
+v
+2
+0
+8
+3
+0
+.
+6
+0
+1
+2
+:
+v
+i
+X
+r
+a
+
+Learning to Efﬁciently Sample from
+Diffusion Probabilistic Models
+
+Daniel Watson∗, Jonathan Ho, Mohammad Norouzi, William Chan
+
+Google Research, Brain Team
+{watsondaniel,jonathanho,mnorouzi,williamchan}@google.com
+
+Abstract
+
+Denoising Diffusion Probabilistic Models (DDPMs) have emerged as a powerful
+family of generative models that can yield high-ﬁdelity samples and competitive log-
+likelihoods across a range of domains, including image and speech synthesis. Key
+advantages of DDPMs include ease of training, in contrast to generative adversarial
+networks, and speed of generation, in contrast to autoregressive models. However,
+DDPMs typically require hundreds-to-thousands of steps to generate a high ﬁdelity
+sample, making them prohibitively expensive for high dimensional problems.
+Fortunately, DDPMs allow trading generation speed for sample quality through
+adjusting the number of reﬁnement steps as a post process. Prior work has been
+successful in improving generation speed through handcrafting the time schedule
+by trial and error. We instead view the selection of the inference time schedules as
+an optimization problem, and introduce an exact dynamic programming algorithm
+that ﬁnds the optimal discrete time schedules for any pre-trained DDPM. Our
+method exploits the fact that ELBO can be decomposed into separate KL terms,
+and given any computation budget, discovers the time schedule that maximizes
+the training ELBO exactly. Our method is efﬁcient, has no hyper-parameters of
+its own, and can be applied to any pre-trained DDPM with no retraining. We
+discover inference time schedules requiring as few as 32 reﬁnement steps, while
+sacriﬁcing less than 0.1 bits per dimension compared to the default 4,000 steps
+used on ImageNet 64x64 [Ho et al., 2020, Nichol and Dhariwal, 2021].
+
+1
+
+Introduction
+
+Denoising Diffusion Probabilistic Models (DDPMs) [Sohl-Dickstein et al., 2015, Ho et al., 2020]
+have emerged as a powerful class of generative models, which model the data distribution through
+an iterative denoising process. DDPMs have been applied successfully to a variety of applications,
+including unconditional image generation [Song and Ermon, 2019, Ho et al., 2020, Song et al., 2021,
+Nichol and Dhariwal, 2021], shape generation [Cai et al., 2020], text-to-speech [Chen et al., 2021,
+Kong et al., 2020] and single image super-resolution [Saharia et al., 2021, Li et al., 2021].
+
+DDPMs are easy to train, featuring a simple denoising objective [Ho et al., 2020] with noise schedules
+that successfully transfer across different models and datasets. This contrasts to Generative Adver-
+sarial Networks (GANs) [Goodfellow et al., 2014], which require an inner-outer loop optimization
+procedure that often entails instability and requires careful hyperparameter tuning. DDPMs also
+admit a simple non-autoregressive inference process; this contrasts to autoregressive models with
+often prohibitive computational costs on high dimensional data. The DDPM inference process starts
+with samples from the corresponding prior noise distribution (e.g., standard Gaussian), and iteratively
+denoises the samples under the ﬁxed noise schedule. However, DDPMs often need hundreds-to-
+thousands of denoising steps (each involving a feedforward pass of a large neural network) to achieve
+
+∗Work done as part of the Google AI Residency.
+
+Preprint. Under review.
+
+ 
+ 
+ 
+ 
+ 
+ 
+strong results. While this process is still much faster than autoregressive models, this is still often
+computationally prohibitive, especially when modeling high dimensional data.
+
+There has been much recent work focused on improving the sampling speed of DDPMs. WaveGrad
+[Chen et al., 2021] introduced a manually crafted schedule requiring only 6 reﬁnement steps; however,
+this schedule seems to be only applicable to the vocoding task where there is a very strong conditioning
+signal. Denoising Diffusion Implicit Models (DDIMs) [Song et al., 2020a] accelerate sampling
+from pre-trained DDPMs by relying on a family of non-Markovian processes. They accelerate the
+generative process through taking multiple steps in the diffusion process. However, DDIMs sacriﬁce
+the ability to compute log-likelihoods. Nichol and Dhariwal [2021] also explored the use of ancestral
+sampling with a subsequence of the original denoising steps, trying both a uniform stride and other
+hand-crafted strides. San-Roman et al. [2021] improve few-step sampling further by training a
+separate model after training a DDPM to estimate the level of noise, and modifying inference to
+dynamically adjust the noise schedule at every step to match the predicted noise level.
+
+All these fast-sampling techniques rely on a key property of DDPMs – there is a decoupling between
+the training and inference schedule. The training schedule need not be the same as the inference
+schedule, e.g., a diffusion model trained to use 1000 steps may actually use only 10 steps during
+inference. This decoupling characteristic is typically not found in other generative models. In past
+work, the choice of inference schedule was often considered a hyperpameter selection problem, and
+often selected via intuition or extensive hyperparmeter exploration [Chen et al., 2021]. In this work,
+we view the choice of inference schedule path as an independent optimization problem, wherein we
+attempt to learn the best schedule. Our approach relies on a dynamic programming algorithm, where
+given a ﬁxed budget of K reﬁnement steps and a pre-trained DDPM, we ﬁnd the set of timesteps
+that maximizes the corresponding evidence lower bound (ELBO). As an optimization objective, the
+ELBO has a key decomposability property: the total ELBO is the sum of individual KL terms, and
+for any two inference paths, if the timesteps (s, t) contiguously occur in both, they share a common
+KL term, therefore admitting memoization.
+
+Our main contributions are the following:
+
+• We introduce a dynamic programming algorithm that ﬁnds the optimal inference paths based on
+the ELBO for all possible computation budgets of K reﬁnement steps. The algorithm searches
+over T > K timesteps, only requiring O(T ) neural network forward passes. It only needs to
+be applied once to a pre-trained DDPM, does not require training or retraining a DDPM, and is
+applicable to both time-discrete and time-continuous DDPMs.
+
+• We experiment with DDPM models from prior work. On both Lsimple CIFAR10 and Lhybrid
+ImageNet 64x64, we discover schedules which require only 32 reﬁnement steps, yet sacriﬁce
+only 0.1 bits per dimension compared to their original counterparts with 1,000 and 4,000 steps,
+respectively.
+
+2 Background on Denoising Diffusion Probabilistic Models
+
+Denoising Diffusion Probabilistic Models (DDPMs) [Ho et al., 2020, Sohl-Dickstein et al., 2015] are
+deﬁned in terms of a forward Markovian diffusion process q and a learned reverse process pθ. The
+forward diffusion process gradually adds Gaussian noise to a data point x0 through T iterations,
+
+(cid:89)T
+
+q(x1:T | x0) =
+
+t=1
+q(xt | xt−1) = N (xt |
+
+q(xt | xt−1) ,
+√
+
+αt xt−1, (1 − αt)I) ,
+
+(1)
+
+(2)
+
+where the scalar parameters α1:T determine the variance of the noise added at each diffusion step,
+subject to 0 < αt < 1. The learned reverse process aims to model q(x0) by inverting the forward
+process, gradually removing noise from signal starting from pure Gaussian noise xT ,
+
+p(xT ) = N (xT | 0, I)
+
+pθ(x0:T ) = p(xT )
+
+(cid:89)T
+
+t=1
+
+pθ(xt−1 | xt)
+
+pθ(xt−1 | xt) = N (xt−1 | µθ(xt, t), σ2
+
+t I) .
+
+(3)
+
+(4)
+
+(5)
+
+2
+
+The parameters of the reverse process can be optimized by maximizing the following variational
+lower bound on the training set,
+
+Eq log p(x0) ≥ Eq
+
+log pθ(x0|x1) −
+
+(cid:34)
+
+T
+(cid:88)
+
+t=2
+
+(cid:35)
+(cid:0)q(xt−1|xt, x0)(cid:107)pθ(xt−1|xt)(cid:1) − LT (x0)
+
+DKL
+
+(6)
+
+(cid:0)q(xT |x0) (cid:107) p(xT )(cid:1). Nichol and Dhariwal [2021] have demonstrated that
+where LT (x0) = DKL
+training DDPMs by maximizing the ELBO yields competitive log-likelihood scores on both CIFAR-
+10 and ImageNet 64×64 achieving 2.94 and 3.53 bits per dimension respectively.
+
+Two notable properties of Gaussian diffusion process that help formulate DDPMs tractably and
+efﬁciently include:
+
+q(xt | x0) = N (xt |
+
+√
+
+q(xt−1 | x0, xt) = N
+
+xt−1
+
+(cid:18)
+
+(cid:12)
+(cid:12)
+(cid:12)
+
+γt x0, (1 − γt)I) ,
+√
+
+γt−1 (1 − αt)x0 +
+
+√
+
+where γt =
+
+(cid:89)t
+
+i=1
+
+αi ,
+
+αt (1 − γt−1)xt
+
+,
+
+(1 − γt−1)(1 − αt)
+1 − γt
+
+1 − γt
+
+(7)
+
+(cid:19)
+I
+
+.(8)
+
+Given the marginal distribution of xt given x0 in (7), one can sample from the q(xt | x0) indepen-
+dently for different t and perform SGD on a randomly chosen KL term in (6). Furthermore, given
+that the posterior distribution of xt−1 given xt and x0 is Gaussian, one can compute each KL term
+in (6) between two Gaussians in closed form and avoid high variance Monte Carlo estimation.
+
+3 Linking DDPMs to Continuous Time Afﬁne Diffusion Processes
+
+Before describing our approach to efﬁciently sampling from DDPMs, it is helpful to link DDPMs
+to continuous time afﬁne diffusion processes, as it shows the compatibility of our approach to both
+time-discrete and time-continuous DDPMs. Let x0 ∼ q(x0) denote a data point drawn from the
+empirical distribution of interest and let q(xt|x0) denote a stochastic process for t ∈ [0, 1] deﬁned
+through an afﬁne diffusion process through the following stochastic differential equation (SDE):
+
+dXt = fsde(t)Xtdt + gsde(t)dBt ,
+
+(9)
+
+where fsde, gsde : [0, 1] → [0, 1] are integrable functions satisfying fsde(0) = 1 and gsde(0) = 0.
+Following Särkkä and Solin [2019] (section 6.1), we can compute the exact marginals q(xt|xs) for
+any 0 ≤ s < t ≤ 1. This differs from Ho et al. [2020], where their marginals are those of the
+discretized diffusion via Euler-Maruyama, where it is not possible to compute marginals outside the
+discretization since they are formulated as cumulative products. We get:
+
+q(xt | xs) = N
+
+xt
+
+(cid:18)
+
+(cid:12)
+(cid:12)
+(cid:12) ψ(t, s)xs,
+
+(cid:16) (cid:90) t
+
+s
+
+ψ(t, u)2g(u)2du
+
+(cid:17)
+
+(cid:19)
+
+I
+
+(10)
+
+where ψ(t, s) = exp
+propose to deﬁne the marginals directly as
+
+(cid:16)(cid:82) t
+
+(cid:17)
+s f (u)du
+
+. Since these integrals are difﬁcult to work with, we instead
+
+q(xt | x0) = N (xt | f (t)x0, g(t)2I)
+
+(11)
+
+where f, g : [0, 1] → [0, 1] are differentiable, monotonic functions satisfying f (0) = 1, f (1) =
+0, g(0) = 0, g(1) = 1. Then, by implicit differentiation it follows that the corresponding diffusion is
+
+dXt =
+
+f (cid:48)(t)
+f (t)
+
+(cid:115)
+
+Xtdt +
+
+2g(t)
+
+(cid:18)
+
+g(cid:48)(t) −
+
+f (cid:48)(t)g(t)
+f (t)
+
+(cid:19)
+
+dBt .
+
+(12)
+
+To complete our formulation, let fts = f (t)
+any 0 < s < t ≤ 1 we have that
+
+f (s) and gts = (cid:112)g(t)2 − f 2
+
+tsg(s)2. Then, it follows that for
+
+q(xt | xs) = N (cid:0)xt | ftsxs, g2
+
+tsI(cid:1) ,
+
+q(xs | xt, x0) = N
+
+xs
+
+(cid:18)
+
+(cid:12)
+(cid:12)
+(cid:12)
+
+1
+g2
+t0
+
+(fs0g2
+
+tsx0 + ftsg2
+
+s0xt),
+
+(cid:19)
+
+I
+
+,
+
+s0g2
+g2
+ts
+g2
+t0
+
+(13)
+
+(14)
+
+3
+
+Note that (13) and (14) can be thought of as generalizations of (7) and (8) to continuous time diffusion,
+i.e., this formulation not only includes that of Ho et al. [2020] as a special case, but also allows
+training DDPMs by sampling t ∼ Uniform(0, 1) like Song et al. [2021], and is compatible with any
+choice of SDE (as opposed to Song et al. [2021] where one is limited to marginals and posteriors
+where the integrals in Equation 10 can be solved analytically). More importantly, we can also perform
+inference with any ancestral sampling path (i.e., the timesteps can attain continuous values) by
+formulating the reverse process in terms of the posterior distribution as
+
+pθ(xs | xt) = q(cid:0)xs | xt, ˆx0 = 1
+ft0
+
+(xt − gt0(cid:15)θ(xt, t))(cid:1),
+
+(15)
+
+justifying the compatibility of our main approach with time-continuous DDPMs. We note that this
+reverse process is also mathematically equivalent to a reverse process based on a time-discrete DDPM
+derived from a subsequence of the original timesteps as done by Song et al. [2020a], Nichol and
+Dhariwal [2021].
+
+For the case of s = 0 in the reverse process, we follow the parametrization of Ho et al. [2020] to
+obtain discretized log likelihoods and compare our log likelihoods fairly with prior work.
+
+4 Learning to Efﬁciently Sample from DDPMs
+
+We now introduce our dynamic programming (DP) approach. In general, after training a DDPM,
+there is a decoupling between training and inference schedules. One can use a different inference
+schedule compared to training. Additionally, we can optimize a loss or reward function with respect
+to the timesteps themselves (after the DDPM is trained). In this paper, we use the ELBO as our
+objective, however we note that it is possible to directly optimize the timesteps with other metrics.
+
+4.1 Optimizing the ELBO
+
+In our work, we choose to optimize ELBO as our objective. We rely on one key property of ELBO,
+its decomposability. We ﬁrst make a few observations. The DDPM models the transition probability
+pθ(xs | xt), or the cost to move from xt → xs. Given a pretrained DDPM, one can construct any
+valid ELBO path through it as long as two properties hold:
+1. The path starts at t = 0 and ends at t = 1.
+2. The path is contiguously connected without breaks.
+
+We can construct an ELBO path that entails K ∈ N reﬁnement steps. I.e., for any K, and any given
+path of inference timesteps 0 = t(cid:48)
+K = 1, one can derive a corresponding
+ELBO
+
+1 < ... < t(cid:48)
+
+K−1 < t(cid:48)
+
+0 < t(cid:48)
+
+−LELBO = EqDKL
+
+(cid:0)q(x1|x0)(cid:107)pθ(x1)(cid:1) +
+
+K
+(cid:88)
+
+L(t(cid:48)
+
+i, t(cid:48)
+
+i−1)
+
+where
+
+L(t, s) =
+
+(cid:26)−Eq log pθ(xt|x0)
+
+EqDKL
+
+(cid:0)q(xs|xt, x0)(cid:107)pθ(xs|xt)(cid:1)
+
+s = 0
+s > 0
+
+i=1
+
+(16)
+
+(17)
+
+In other words, the ELBO is a sum of individual ELBO terms that are functions of contiguous
+timesteps (t(cid:48)
+i−1). Now the question remains, given a ﬁxed budget K steps, what is the optimal
+ELBO path?
+
+i, t(cid:48)
+
+First, we observe that any two paths that share a (t, s) transition will share a common L(t, s) term.
+We exploit this property in our dynamic programming algorithm. When given a grid of timesteps
+0 = t0 < t1 < ... < tT −1 < tT = 1 with T ≥ K, it is possible to efﬁciently ﬁnd the exact optimum
+(i.e., ﬁnding {t(cid:48)
+K−1} ⊂ {t1, ..., tT −1} with the best ELBO) by memoizing all the individual
+L(t, s) ELBO terms for s, t ∈ {t0, ..., tT } with s < t. We can then solve the canonical least-cost-path
+problem on a directed graph where s → t are nodes and the edge connecting them has cost L(t, s).
+
+1, ..., t(cid:48)
+
+For time-continuous DDPMs, the choice of grid (i.e., the t1, ..., tT −1) can be arbitrary. For models
+trained with discrete timesteps, the grid must be a subset of (or the full) original steps used during
+training, unless the model was regularized during training with methods such as the sampling
+procedure proposed by Chen et al. [2021].
+
+4
+
+# L = KL cost table (Equation 17)
+
+Algorithm 1 Vectorized DP (all budgets)
+input: L, T
+D = np.full((T + 1, T + 1), −1)
+C = np.full((T + 1, T + 1), np.inf)
+C[0, 0] = 0
+for k in range(1, T + 1) do
+
+bpds = C[k, None] + L[:, :]
+C[k] = np.amin(bpds, axis = − 1)
+D[k] = np.argmin(bpds, axis = − 1)
+
+end
+return D
+
+4.2 Dynamic Programming Algorithm
+
+Algorithm 2 Fetch shortest path of K steps
+input: D, K
+optpath = [ ]
+t = K
+for k in reversed(range((K)) do
+
+optpath.append(t)
+t = D[k, t]
+
+end
+return optpath
+
+We now outline our methodology to solve the least-cost-path problem. Our solution is similar to
+Dijkstra’s algorithm, but it differs to the classical least-cost-path problem where the latter is typically
+used, as our problem has additional constraints: we restrict our search to paths of exactly K + 1
+nodes, and the start and end nodes are ﬁxed.
+
+Let C and D be (K + 1) × (T + 1) matrices. C[k, t] will be the total cost of the least-cost-path of
+length k from t to 0. D will be ﬁlled with the timesteps corresponding to such paths; i.e., D[k, t] will
+be the timestep s immediately previous to t for the optimal k-step path (assuming t is also part of
+such path).
+
+We initialize C[0, 0] = 0 and all the other C[0, ·] to ∞ (the D[0, ·] are irrelevant, but for ease of index
+notation we keep them in this section). Then, for each k from 1 to K, we iteratively set, for each t,
+
+C[k, t] = min
+
+s
+
+(C[k − 1, s] + L(t, s))
+
+D[k, t] = arg min
+
+s
+
+(C[k − 1, s] + L(t, s))
+
+where L(t, s) is the cost to transition from t to s (see Equation 17). For all s ≥ t, we set L(t, s) = ∞
+(e.g., we only move backwards in the diffusion process). This procedure captures the shortest path
+cost in C and the shortest path itself in D.
+
+We further observe that running the DP algorithm for each k from 1 to T (instead of K), we can
+extract the optimal paths for all possible budgets K. Algorithm 1 illustrates a vectorized version of
+the procedure we have outlined in this section, while Algorithm 2 shows how to explicitly extract the
+optimal paths from D.
+
+4.3 Efﬁcient Memoization
+
+A priori, our dynamic programming approach appears to be inefﬁcient because it requires computing
+O(T 2) terms (recall, as we rely on all the L(t, s) terms which depend on a neural network forward
+pass). We however observe that a single forward pass of the DDPM can be used to compute all the
+L(t, ·) terms. This holds true even in the case where the pre-trained DDPM learns the variances. For
+example, in Nichol and Dhariwal [2021] instead of ﬁxing them to ˜gts as we outlined in the previous
+section, the forward pass itself still only depends on t and not s, and the variance of pθ(xs|xt) is
+obtained by interpolating the forward pass’s output logits v with exp(v log g2
+ts).
+Thus, computing the table of all the L(t, s) ELBO terms only requires O(T ) forward passes.
+
+ts + (1 − v) log ˜g2
+
+5 Experiments
+
+We apply our method on a wide variety of pre-trained DDPMs from prior work. This emphasizes the
+fact that our method is applicable to any pre-trained DDPM model. In particular, we rely the CIFAR10
+model checkpoints released by Nichol and Dhariwal [2021] on both their Lhybrid and Lvlb objectives.
+We also showcase results on CIFAR10 [Krizhevsky et al., 2009] with the exact conﬁguration used
+by Ho et al. [2020], which we denote as Lsimple, as well as Lhybrid on ImageNet 64x64 [Deng et al.,
+
+5
+
+Table 1: Negative log likelihoods (bits/dim) in the few-step regime across various DDPMs trained on
+CIFAR10, as well as state-of-the-art unconditional generative models in the same dataset. The last
+column corresponds to 1,000 steps for Lsimple and 4,000 steps for all other models.
+
+Model \ # reﬁnement steps
+DistAug Transformer [Jun et al., 2020]
+DDPM++ (deep, sub-VP) [Song et al., 2021]
+Lsimple
+
+Even stride
+Quadratic stride
+DP stride
+
+Lvlb
+
+Even stride
+Quadratic stride
+DP stride
+
+Lhybrid
+
+Even stride
+Quadratic stride
+DP stride
+
+8
+–
+–
+
+6.95
+5.39
+4.59
+
+6.20
+4.89
+4.20
+
+6.14
+4.91
+4.33
+
+16
+–
+–
+
+6.15
+4.86
+3.99
+
+5.48
+4.09
+3.41
+
+5.39
+4.15
+3.62
+
+32
+–
+–
+
+5.46
+4.52
+3.79
+
+4.89
+3.58
+3.17
+
+4.77
+3.71
+3.39
+
+64
+–
+–
+
+4.91
+3.84
+3.74
+
+4.42
+3.23
+3.08
+
+4.29
+3.42
+3.30
+
+128
+–
+–
+
+4.47
+3.74
+3.73
+
+4.03
+3.09
+3.05
+
+3.92
+3.30
+3.27
+
+256 All
+2.53
+–
+2.99
+–
+
+3.73
+
+2.94
+
+3.17
+
+4.14
+3.73
+3.72
+
+3.73
+3.05
+3.04
+
+3.66
+3.26
+3.26
+
+Table 2: Negative log likelihoods (bits/dim) in the few-step regime for a DDPM model trained with
+Lhybrid on ImageNet 64x64 [Nichol and Dhariwal, 2021], as well as state-of-the-art unconditional
+generative models in the same dataset. We underline that, with just 32 steps, our DP stride achieves a
+score of ≤ 0.1 bits/dim higher than the same model with the original 4,000 step budget (∗the authors
+report 3.57 bits/dim, but we trained the model for 3M rather than 1.5M steps).
+
+Model \ # reﬁnement steps
+Routing Transformer [Roy et al., 2021]
+Lvlb [Nichol and Dhariwal, 2021]
+Lhybrid
+
+Even stride
+Quadratic stride
+DP stride
+
+8
+–
+–
+
+16
+–
+–
+
+32
+–
+–
+
+64
+–
+–
+
+6.07
+4.83
+4.29
+
+5.38
+4.14
+3.80
+
+4.39
+4.82
+3.82
+3.65
+3.65 3.59
+
+4000
+3.43
+3.53
+
+3.55∗
+
+128
+–
+–
+
+4.08
+3.58
+3.56
+
+256
+–
+–
+
+3.87
+3.56
+3.56
+
+2009] following Nichol and Dhariwal [2021], training these last two models ourselves for 800K and
+3M steps, respectively, but otherwise using the exact same conﬁgurations as the authors.
+
+In our experiments, we always search over a grid that includes all the timesteps used to train the
+model, i.e., {t/T : t ∈ {1, ..., T − 1}}. For our CIFAR10 results, we computed the memoization
+tables with Monte Carlo estimates over the full training dataset, while on ImageNet 64x64 we limited
+the number of datapoints in the Monte Carlo estimates to 16,384 images on the training dataset.
+
+Figure 1: Negative log likelihoods (bits/dim) for Lvlb CIFAR10 (left) and Lhybrid ImageNet 64x64
+(right) for strides discovered via dynamic programming v.s. even and quadratic strides.
+
+For each pre-trained model, we compare the negative log likelihoods (estimated using the full heldout
+dataset) of the strides discovered by our dynamic programming algorithm against even and quadratic
+strides, following Song et al. [2020a]. We ﬁnd that our dynamic programming algorithm discovers
+
+6
+
+Figure 2: FID scores for Lsimple CIFAR10, as a function of computation budget (left) and negative
+log likelihood (right).
+
+strides resulting in much better log likelihoods than the hand-crafted strides used in prior work,
+particularly in the few-step regime. We provide a visualization of the log likelihood curves as a
+function of computation budget in Figure 1 for Lsimple CIFAR10 and Lhybrid ImageNet 64x64 [Deng
+et al., 2009], a full list of the scores in the few-step regime in Table 1, and a visualization of the
+discovered steps themselves in Figure 2.
+
+5.1 Comparison with FID
+
+We further evaluate our discovered strides by reporting FID scores [Heusel et al., 2017] on 50,000
+model samples against the same number of samples from the training dataset, as is standard in the
+literature. We ﬁnd that, although our strides are yield much better log likelihoods, such optimization
+does not necessarily translate to also improving the FID scores. Results are included in Figure 3.
+This weakened correlation between log-likehoods and FID is consistent with observations in prior
+work [Ho et al., 2020, Nichol and Dhariwal, 2021].
+
+5.2 Monte Carlo Ablation
+
+To investigate the feasibility of our approach using minimal computation, we experimented with
+setting the number of Monte Carlo datapoints used to compute the dynamic programming table of
+negative log likelihood terms to 128 samples (i.e., easily ﬁt into a single batch of GPU memory).
+We ﬁnd that, for CIFAR10, the difference in log likelihoods is negligible, while on ImageNet 64x64
+there is a visible yet slight improvement in negative log likelihood when ﬁlling the table with more
+samples. We hypothesize that this is due to the higher diversity of ImageNet. Nevertheless, we
+highlight that our procedure can be applied very quickly (i.e., with just T forward passes of a neural
+network when using a single batch, as opposed to a running average over batches), even for large
+models, to signiﬁcantly improve log their likelihoods in the few-step regime.
+
+Figure 3: Negative log likelihoods (bits/dim) for Lsimple CIFAR10 and Lhybrid ImageNet 64x64 for
+strides discovered via dynamic programming with log-likelihood term tables estimated with a varying
+number of datapoints.
+
+7
+
+32 steps
+
+64 steps
+
+128 steps
+
+256 steps
+
+1,000 steps
+
+Real samples
+
+Figure 4: Non-cherrypicked Lsimple CIFAR10 samples for even (top), quadratic (middle), and DP
+strides (bottom), for various computation budgets. Samples are based on the same 8 random seeds.
+
+32 steps
+
+64 steps
+
+128 steps
+
+256 steps
+
+4,000 steps
+
+Real samples
+
+Figure 5: Non-cherrypicked Lhybrid ImageNet 64x64 samples for even (top), quadratic (middle), and
+DP strides (bottom), for various computation budgets. Samples are based on the same 8 random
+seeds.
+
+6 Related Work
+
+DDPMs [Ho et al., 2020] have recently shown results that are competitive with GANs [Goodfellow
+et al., 2014], and they can be traced back to the work of Sohl-Dickstein et al. [2015] as a restricted
+family of deep latent variable models. Dhariwal and Nichol [2021] have more recently shown that
+DDPMs can outperform GANs in FID scores [Heusel et al., 2017]. Song and Ermon [2019] have
+also linked DDPMs to denoising score matching [Vincent et al., 2008, 2010], which is crucial to
+the continuous-time formulation [Song et al., 2021]. This connection to score matching has been
+explored further by Song and Kingma [2021], where other score-matching techniques (e.g., sliced
+score matching, Song et al. [2020b]) have been shown to be valid DDPM objectives and DDPMs
+are linked to energy-based models. More recent work on the few-step regime of DDPMs [Song
+
+8
+
+Figure 6: Timesteps discovered via dynamic programming for Lsimple CIFAR10 (left) and Lhybrid
+ImageNet 64x46 (right) for various computation budgets. Each step (forward pass) is between two
+contiguous points. Our DP algorithm prefers allocates steps towards the end of the diffusion, agreeing
+with intuition from prior work where steps closer to x0 are important as they capture ﬁner image
+details, but curiously, it may also allocate steps closer to x1, possibly to better break modes early on
+in the diffusion process.
+
+et al., 2020a, Chen et al., 2021, Nichol and Dhariwal, 2021, San-Roman et al., 2021, Kong and Ping,
+2021, Jolicoeur-Martineau et al., 2021] has also guided our research efforts. DDPMs are also very
+closely related to variational autoencoders [Kingma and Welling, 2013], where more recent work has
+shown that, with many stochastic layers, they can also attain competitive negative log likelihoods in
+unconditional image generation [Child, 2020]. Also very closely related to DDPMs, there has also
+been work on non-autoregressive modeling of text sequences that can be regarded as discrete-space
+DDPMs with a forward process that masks or remove tokens [Lee et al., 2018, Gu et al., 2019, Stern
+et al., 2019, Chan et al., 2020, Saharia et al., 2020]. The UNet architecture [Ronneberger et al.,
+2015] has been key to the recent success of DDPMs, and as shown by Ho et al. [2020], Nichol and
+Dhariwal [2021], augmenting UNet with self-attention [Shaw et al., 2018] in scales where attention is
+computationally feasible has helped bring DDPMs closer to the current state-of-the-art autoregressive
+generative models [Child et al., 2019, Jun et al., 2020, Roy et al., 2021].
+
+7 Conclusion and Discussion
+
+By regarding the selection of the inference schedule as an optimization problem, we present a novel
+and efﬁcient dynamic programming algorithm to discover the optimal inference schedule for a
+pre-trained DDPM. Our DP algorithm ﬁnds an optimal inference schedule based on the ELBO given
+a ﬁxed computation budget. Our method need only be applied once to discover the schedule, and
+does not require training or re-training the DPPM. In the few-step regime, we discover schedules
+on Lsimple CIFAR10 and Lhybrid ImageNet 64x64 that require only 32 steps, yet sacriﬁce ≤ 0.1
+bits per dimension compared to state-of-the-art DDPMs using hundreds-to-thousands of reﬁnement
+steps. Our approach only needs forward passes of the DDPM neural network to ﬁll the dynamic
+programming table of L(t, s) terms, and we show that we can ﬁll the dynamic programming table
+with just O(T ) forward passes. Moreover, we show that we can estimate the table using only 128
+Monte Carlo samples, ﬁnding this to be sufﬁcient even for datasets such as ImageNet with high
+diversity. Our method achieves strong likelihoods with very few reﬁnement steps, outperforming
+prior work utilizing hand-crafted strides [Ho et al., 2020, Nichol and Dhariwal, 2021].
+
+Despite very strong log-likelihood results, especially in the few step regime, we observe limitations
+to our method. There is a disconnect between log-likehoods and FID scores, where improvements in
+log-likelihoods do not necessarily translate to improvements in FID scores. This is consistent with
+prior work, showing that the correlation between log likelihood and FID can be mismatched [Ho
+et al., 2020, Nichol and Dhariwal, 2021]. We hope our work will encourage future research exploiting
+our general framework of optimization post-training in DDPMs, potentially utilizing gradient-based
+optimization over not only the ELBO, but also other, non-decomposable metrics. We particularly
+note that other sampling steps such as MCMC corrector steps or alternative predictor steps (e.g.,
+following the reverse SDE) [Song et al., 2021] can also be incorporated into computation budget, and
+general learning frameworks like reinforcement learning are well-suited to explore this space as well
+as non-differentiable learning signals.
+
+9
+
+References
+
+Ruojin Cai, Guandao Yang, Hadar Averbuch-Elor, Zekun Hao, Serge Belongie, Noah Snavely, and
+
+Bharath Hariharan. Learning Gradient Fields for Shape Generation. In ECCV, 2020.
+
+William Chan, Chitwan Saharia, Geoffrey Hinton, Mohammad Norouzi, and Navdeep Jaitly. Imputer:
+
+Sequence Modelling via Imputation and Dynamic Programming. In ICML, 2020.
+
+Nanxin Chen, Yu Zhang, Heiga Zen, Ron J. Weiss, Mohammad Norouzi, and William Chan. WaveG-
+
+rad: Estimating Gradients for Waveform Generation. In ICLR, 2021.
+
+Rewon Child. Very deep vaes generalize autoregressive models and can outperform them on images.
+
+arXiv preprint arXiv:2011.10650, 2020.
+
+Rewon Child, Scott Gray, Alec Radford, and Ilya Sutskever. Generating long sequences with sparse
+
+transformers. arXiv preprint arXiv:1904.10509, 2019.
+
+Jia Deng, Wei Dong, Richard Socher, Li-Jia Li, Kai Li, and Li Fei-Fei. Imagenet: A large-scale
+hierarchical image database. In 2009 IEEE conference on computer vision and pattern recognition,
+pages 248–255. Ieee, 2009.
+
+Prafulla Dhariwal and Alex Nichol. Diffusion models beat gans on image synthesis. arXiv preprint
+
+arXiv:2105.05233, 2021.
+
+Ian J Goodfellow, Jean Pouget-Abadie, Mehdi Mirza, Bing Xu, David Warde-Farley, Sherjil
+Ozair, Aaron Courville, and Yoshua Bengio. Generative adversarial networks. arXiv preprint
+arXiv:1406.2661, 2014.
+
+Jiatao Gu, Changhan Wang, and Jake Zhao. Levenshtein Transformer. In NeurIPS, 2019.
+
+Martin Heusel, Hubert Ramsauer, Thomas Unterthiner, Bernhard Nessler, and Sepp Hochreiter. Gans
+trained by a two time-scale update rule converge to a local nash equilibrium. arXiv preprint
+arXiv:1706.08500, 2017.
+
+Jonathan Ho, Ajay Jain, and Pieter Abbeel. Denoising Diffusion Probabilistic Models. NeurIPS,
+
+2020.
+
+Alexia Jolicoeur-Martineau, Ke Li, Rémi Piché-Taillefer, Tal Kachman, and Ioannis Mitliagkas.
+
+Gotta go fast when generating data with score-based models, 2021.
+
+Heewoo Jun, Rewon Child, Mark Chen, John Schulman, Aditya Ramesh, Alec Radford, and Ilya
+
+Sutskever. Distribution Augmentation for Generative Modeling. In ICML, 2020.
+
+Diederik P Kingma and Max Welling. Auto-Encoding Variational Bayes. In ICLR, 2013.
+
+Zhifeng Kong and Wei Ping. On fast sampling of diffusion probabilistic models, 2021.
+
+Zhifeng Kong, Wei Ping, Jiaji Huang, Kexin Zhao, and Bryan Catanzaro. DiffWave: A Versatile
+
+Diffusion Model for Audio Synthesis. arXiv preprint arXiv:2009.09761, 2020.
+
+Alex Krizhevsky, Geoffrey Hinton, et al. Learning multiple layers of features from tiny images.
+
+Technical Report, 2009.
+
+Jason Lee, Elman Mansimov, and Kyunghyun Cho. Deterministic non-autoregressive neural sequence
+
+modeling by iterative reﬁnement. arXiv preprint arXiv:1802.06901, 2018.
+
+Haoying Li, Yifan Yang, Meng Chang, Huajun Feng, Zhihai Xu, Qi Li, and Yueting Chen. SRDiff:
+Single Image Super-Resolution with Diffusion Probabilistic Models. arXiv:2104.14951, 2021.
+
+Alex Nichol and Prafulla Dhariwal. Improved denoising diffusion probabilistic models. arXiv
+
+preprint arXiv:2102.09672, 2021.
+
+Olaf Ronneberger, Philipp Fischer, and Thomas Brox. U-net: Convolutional networks for biomedical
+image segmentation. In International Conference on Medical image computing and computer-
+assisted intervention, pages 234–241. Springer, 2015.
+
+10
+
+Aurko Roy, Mohammad Saffar, Ashish Vaswani, and David Grangier. Efﬁcient content-based sparse
+attention with routing transformers. Transactions of the Association for Computational Linguistics,
+9:53–68, 2021.
+
+Chitwan Saharia, William Chan, Saurabh Saxena, and Mohammad Norouzi. Non-Autoregressive
+
+Machine Translation with Latent Alignments. EMNLP, 2020.
+
+Chitwan Saharia, Jonathan Ho, William Chan, Tim Salimans, David J Fleet, and Mohammad Norouzi.
+
+Image super-resolution via iterative reﬁnement. arXiv preprint arXiv:2104.07636, 2021.
+
+Robin San-Roman, Eliya Nachmani, and Lior Wolf. Noise estimation for generative diffusion models.
+
+arXiv preprint arXiv:2104.02600, 2021.
+
+Simo Särkkä and Arno Solin. Applied stochastic differential equations, volume 10. Cambridge
+
+University Press, 2019.
+
+Peter Shaw, Jakob Uszkoreit, and Ashish Vaswani. Self-attention with relative position representations.
+
+arXiv preprint arXiv:1803.02155, 2018.
+
+Jascha Sohl-Dickstein, Eric Weiss, Niru Maheswaranathan, and Surya Ganguli. Deep unsupervised
+learning using nonequilibrium thermodynamics. In International Conference on Machine Learning,
+pages 2256–2265. PMLR, 2015.
+
+Jiaming Song, Chenlin Meng, and Stefano Ermon. Denoising diffusion implicit models. arXiv
+
+preprint arXiv:2010.02502, 2020a.
+
+Yang Song and Stefano Ermon. Generative Modeling by Estimating Gradients of the Data Distribution.
+
+NeurIPS, 2019.
+
+Yang Song and Diederik P Kingma. How to train your energy-based models. arXiv preprint
+
+arXiv:2101.03288, 2021.
+
+Yang Song, Sahaj Garg, Jiaxin Shi, and Stefano Ermon. Sliced score matching: A scalable approach
+to density and score estimation. In Uncertainty in Artiﬁcial Intelligence, pages 574–584. PMLR,
+2020b.
+
+Yang Song, Jascha Sohl-Dickstein, Diederik P. Kingma, Abhishek Kumar, Stefano Ermon, and Ben
+Poole. Score-Based Generative Modeling through Stochastic Differential Equations. In ICLR,
+2021.
+
+Mitchell Stern, William Chan, Jamie Kiros, and Jakob Uszkoreit. Insertion Transformer: Flexible
+
+Sequence Generation via Insertion Operations. In ICML, 2019.
+
+Pascal Vincent, Hugo Larochelle, Yoshua Bengio, and Pierre-Antoine Manzagol. Extracting and
+composing robust features with denoising autoencoders. In Proceedings of the 25th international
+conference on Machine learning, pages 1096–1103, 2008.
+
+Pascal Vincent, Hugo Larochelle, Isabelle Lajoie, Yoshua Bengio, Pierre-Antoine Manzagol, and
+Léon Bottou. Stacked denoising autoencoders: Learning useful representations in a deep network
+with a local denoising criterion. Journal of machine learning research, 11(12), 2010.
+
+11
+
+A Appendix
+
+A.1 Proof for Equation 12
+
+From Equation 10, we get by implicit differentiation that
+
+f (t) = ψ(t, 0) = exp
+
+(cid:18)(cid:90) t
+
+0
+
+(cid:19)
+
+fsde(u)du
+
+⇒f (cid:48)(t) = exp
+
+(cid:18)(cid:90) t
+
+0
+
+fsde(u)du
+
+(cid:19) d
+dt
+
+(cid:90) t
+
+0
+
+fsde(u)du = f (t)fsde(t)
+
+⇒fsde(t) =
+
+f (cid:48)(t)
+f (t)
+
+Similarly as above and also using the fact that ψ(t, s) = ψ(t,0)
+ψ(s,0) ,
+
+g(t)2 =
+
+(cid:90) t
+
+0
+
+ψ(t, u)2gsde(u)2du =
+
+(cid:90) t
+
+0
+
+⇒2g(t)g(cid:48)(t) = 2f (t)f (cid:48)(t)
+
+f (t)2 + f (t)2 d
+dt
+⇒gsde(t) = (cid:112)2(g(t)g(cid:48)(t) − fsde(t)g(t)2).
+
+g(t)2
+
+(cid:90) t
+
+f (t)2
+f (u)2 gsde(u)2du = f (t)2
+gsde(u)2
+f (u)2 du = 2fsde(t)g(t)2 + gsde(t)2
+
+gsde(u)2
+f (u)2 du
+
+(cid:90) t
+
+0
+
+0
+
+A.2 Proof for Equations 13 and 14
+
+From Equation 10 and ψ(t, s) = ψ(t,0)
+g2
+ts is the variance of q(xt|xs), Equation 10 implies that
+
+ψ(s,0) it is immediate that fts is the mean of q(xt|xs). To show that
+
+Var[xt|xs] =
+
+=
+
+(cid:90) t
+
+s
+(cid:90) t
+
+0
+
+ψ(t, u)2gsde(u)2du
+
+ψ(t, u)2gsde(u)2du −
+
+(cid:90) s
+
+0
+
+ψ(t, u)2gsde(u)2du
+
+(cid:90) s
+
+0
+(cid:90) s
+
+0
+
+ψ(s, u)2
+
+ψ(s, u)2ψ(u, 0)2 gsde(u)2du
+ψ(s, u)2
+ψ(s, 0)2 gsde(u)2du
+
+= g(t)2 − ψ(t, 0)2
+
+= g(t)2 − ψ(t, 0)2
+
+= g(t)2 − ψ(t, s)2g(s)2
+= g(t)2 − ftsg(s)2.
+
+The mean of q(xs|xt, x0) is given by the Gaussian conjugate prior formula (where all the distributions
+are conditioned on x0). Let µ = ftsxs, so we have a prior over µ given by
+
+xs|x0 ∼ N (fs0x0, g2
+
+s0Id) ⇒ µ|x0 ∼ N (fs0ftsx0, f 2
+
+tsg2
+
+s0Id) ∼ N (ft0x0, f 2
+
+tsg2
+
+s0Id),
+
+and a likelihood with mean µ
+
+xt|xs, x0 ∼ xt|xs ∼ N (ftsxs, g2
+
+tsId) ⇒ xt|µ, x0 ∼ xt|µ ∼ N (µ, g2
+
+tsId).
+
+Then it follows by the formula that µ|xt, x0 has variance
+
+Var[µ|xt, x0] =
+
+(cid:18) 1
+tsg2
+f 2
+s0
+1
+f 2
+ts
+
+(cid:19)−1
+
++
+
+1
+g2
+ts
+
+=
+
+(cid:18) g2
+
+tsg2
+ts + f 2
+s0
+s0g2
+tsg2
+f 2
+ts
+g2
+s0g2
+ts
+tsg2
+ts + f 2
+g2
+s0
+
+=
+
+(cid:19)−1
+
+=
+
+s0g2
+tsg2
+f 2
+ts
+tsg2
+ts + f 2
+g2
+s0
+
+s0g2
+g2
+ts
+g2
+t0
+
+= ˜g2
+ts
+
+⇒Var[xs|xt, x0] =
+
+Var[µ|xt, x0] =
+
+12
+
+and mean
+
+E[µ|xt, x0] =
+
+(cid:18) 1
+tsg2
+f 2
+s0
+
++
+
+1
+g2
+ts
+
+(cid:19)−1 (cid:18) ft0x0
+tsg2
+f 2
+s0
+
++
+
+xt
+g2
+ts
+
+(cid:19)
+
+=
+
+tsx0 + f 2
+ft0g2
+tsg2
+ts + f 2
+g2
+s0
+
+tsg2
+
+s0xt
+
+=
+
+ft0g2
+
+tsx0 + f 2
+g2
+t0
+
+tsg2
+
+s0xt
+
+fs0g2
+
+tsx0 + ftsg2
+g2
+t0
+
+s0xt
+
+= ˜fts(xt, x0).
+
+⇒E[xs|xt, x0] =
+
+1
+fts
+
+E[µ|xt, x0] =
+
+ft0
+fts
+
+tsx0 + ftsg2
+g2
+
+s0xt
+
+g2
+t0
+
+=
+
+13
+
+

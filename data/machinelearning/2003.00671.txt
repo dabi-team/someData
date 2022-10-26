@@ -1,0 +1,1622 @@
+AUTOPHASE: JUGGLING HLS PHASE ORDERINGS IN RANDOM FORESTS
+WITH DEEP REINFORCEMENT LEARNING
+
+0
+2
+0
+2
+
+r
+a
+
+M
+4
+
+]
+
+C
+D
+.
+s
+c
+[
+
+2
+v
+1
+7
+6
+0
+0
+.
+3
+0
+0
+2
+:
+v
+i
+X
+r
+a
+
+Qijing Huang * 1 Ameer Haj-Ali * 1 William Moses 2 John Xiang 1 Krste Asanovic 1 John Wawrzynek 1
+Ion Stoica 1
+ABSTRACT
+The performance of the code a compiler generates depends on the order in which it applies the optimization
+passes. Choosing a good order–often referred to as the phase-ordering problem, is an NP-hard problem. As a
+result, existing solutions rely on a variety of heuristics. In this paper, we evaluate a new technique to address the
+phase-ordering problem: deep reinforcement learning. To this end, we implement AutoPhase3: a framework that
+takes a program and uses deep reinforcement learning to ﬁnd a sequence of compilation passes that minimizes its
+execution time. Without loss of generality, we construct this framework in the context of the LLVM compiler
+toolchain and target high-level synthesis programs. We use random forests to quantify the correlation between
+the effectiveness of a given pass and the program’s features. This helps us reduce the search space by avoiding
+phase orderings that are unlikely to improve the performance of a given program. We compare the performance of
+AutoPhase to state-of-the-art algorithms that address the phase-ordering problem. In our evaluation, we show that
+AutoPhase improves circuit performance by 28% when compared to using the -O3 compiler ﬂag, and achieves
+competitive results compared to the state-of-the-art solutions, while requiring fewer samples. Furthermore, unlike
+existing state-of-the-art solutions, our deep reinforcement learning solution shows promising result in generalizing
+to real benchmarks and 12,874 different randomly generated programs, after training on a hundred randomly
+generated programs.
+
+1
+
+INTRODUCTION
+
+and the hand-optimized one produced by experts.
+
+High-Level Synthesis (HLS) automates the process of cre-
+ating digital hardware circuits from algorithms written in
+high-level languages. Modern HLS tools (Xilinx, 2019; In-
+tel, 2019; Canis et al., 2013) use the same front-end as the
+traditional software compilers. They rely on traditional soft-
+ware compiler techniques to optimize the input program’s
+intermediate representation (IR) and produce circuits in the
+form of RTL code. Thus, the quality of compiler front-end
+optimizations directly impacts the performance of HLS-
+generated circuit.
+
+Program optimization is a notoriously difﬁcult task. A pro-
+gram must be just in ”the right form” for a compiler to
+recognize the optimization opportunities. This is a task a
+programmer might be able to perform easily, but is often
+difﬁcult for a compiler. Despite a decade of research on
+developing sophisticated optimization algorithms, there is
+still a performance gap between the HLS generated code
+
+*Equal contribution.
+
+1University of California, Berkeley
+2Massachusetts Institute of Technology. Correspondence to:
+Qijing Huang <qijing.huang@berkeley.edu>, Ameer Haj-Ali
+3 https://github.com/
+<ameerh@berkeley.edu>.
+ucb-bar/autophase.
+
+Proceedings of the 3 rd MLSys Conference, Austin, TX, USA,
+2020. Copyright 2020 by the author(s).
+
+In this paper, we build off the LLVM compiler (Lattner &
+Adve, 2004). However, our techniques, can be broadly ap-
+plicable to any compiler that uses a series of optimization
+passes. In this case, the optimization of an HLS program
+consists of applying a sequence of analysis and optimiza-
+tion phases, where each phase in this sequence consumes
+the output of the previous phase, and generates a modiﬁed
+version of the program for the next phase. Unfortunately,
+these phases are not commutative which makes the order in
+which these phases are applied critical to the performance
+of the output.
+
+Consider the program in Figure 1, which normalizes a vec-
+tor. Without any optimizations, the norm function will take
+Θ(n2) to normalize a vector. However, a smart compiler will
+implement the loop invariant code motion (LICM) (Much-
+nick, 1997) optimization, which allows it to move the call to
+mag above the loop, resulting in the code on the left column
+in Figure 2. This optimization brings the runtime down to
+Θ(n)—a big speedup improvement. Another optimization
+the compiler could perform is (function) inlining (Muchnick,
+1997). With inlining, a call to a function is simply replaced
+with the body of the function, reducing the overhead of the
+function call. Applying inlining to the code will result in
+the code in the right column of Figure 2.
+
+ 
+ 
+ 
+ 
+ 
+ 
+AutoPhase: Juggling HLS Phase Orderings in Random Forests with Deep Reinforcement Learning
+
+__attribute__((const))
+double mag(int n, const double *A) {
+
+double sum = 0;
+for(int i=0; i<n; i++){
+sum += A[i] * A[i];
+
+}
+return sqrt(sum);
+
+}
+void norm(int n, double *restrict out,
+const double *restrict in) {
+
+for(int i=0; i<n; i++) {
+
+out[i] = in[i] / mag(n, in);
+
+}
+
+}
+
+Figure 1. A simple program to normalize a vector.
+
+Now, consider applying these optimization passes in the
+opposite order: ﬁrst inlining then LICM. After inlining,
+we get the code on the left of Figure 3. Once again we
+get a modest speedup, having eliminated n function calls,
+though our runtime is still Θ(n2). If the compiler afterwards
+attempted to apply LICM, we would ﬁnd the code on the
+right of Figure 3. LICM was able to successfully move the
+allocation of sum outside the loop. However, it was unable
+to move the instruction setting sum=0 outside the loop, as
+doing so would mean that all iterations excluding the ﬁrst
+one would end up with a garbage value for sum. Thus, the
+internal loop will not be moved out.
+
+As this simple example illustrates, the order in which the
+optimization phases are applied can be the difference be-
+tween the program running in Θ(n2) versus Θ(n). It is thus
+crucial to determine the optimal phase ordering to maximize
+the circuit speeds. Unfortunately, not only is this a difﬁcult
+task, but the optimal phase ordering may vary from program
+to program. Furthermore, it turns out that ﬁnding the opti-
+mal sequence of optimization phases is an NP-hard problem,
+and exhaustively evaluating all possible sequences is infea-
+sible in practice. In this work, for example, the search space
+extends to more than 2247 phase orderings.
+
+The goal of this paper is to provide a mechanism for automat-
+ically determining good phase orderings for HLS programs
+to optimize for the circuit speed. To this end, we aim to
+leverage recent advancements in deep reinforcement learn-
+ing (RL) (Sutton & Barto, 1998; Haj-Ali et al., 2019b) to
+address the phase ordering problem. With RL, a software
+agent continuously interacts with the environment by taking
+actions. Each action can change the state of the environ-
+ment and generate a ”reward”. The goal of RL is to learn
+a policy—that is, a mapping between the observed states
+of the environment and a set of actions—to maximize the
+cumulative reward. An RL algorithm that uses a deep neu-
+ral network to approximate the policy is referred to as a
+deep RL algorithm. In our case, the observation from the
+
+environment could be the program and/or the optimization
+passes applied so far. The action is the optimization pass to
+apply next, and the reward is the improvement in the circuit
+performance after applying this pass. The particular framing
+of the problem as an RL problem has a signiﬁcant impact
+on the solution’s effectiveness. Signiﬁcant challenges ex-
+ist in understanding how to formulate the phase ordering
+optimization problem in an RL framework.
+
+In this paper, we consider three approaches to represent the
+environment’s state. The ﬁrst approach is to directly use
+salient features from the program. The second approach is
+to derive the features from the sequence of optimizations
+we applied while ignoring the program’s features. The third
+approach combines the ﬁrst two approaches. We evaluate
+these approaches by implementing a framework that takes
+a group of programs as input and quickly ﬁnds a phase
+ordering that competes with state-of-the-art solutions. Our
+main contributions are:
+
+• Extend a previous work (Huang et al., 2019) and lever-
+age deep RL to address the phase-ordering problem.
+
+• An importance analysis on the features using random
+forests to signiﬁcantly reduce the state and action
+spaces.
+
+• AutoPhase: a framework that integrates the current
+HLS compiler infrastructure with the deep RL algo-
+rithms.
+
+• We show that AutoPhase gets a 28% improvement over
+-O3 for nine real benchmarks. Unlike all state-of-the-
+art approaches, deep RL demonstrates the potential
+to generalize to thousands of different programs after
+training on a hundred programs.
+
+2 BACKGROUND
+
+2.1 Compiler Phase-ordering
+
+Compilers execute optimization passes to transform pro-
+grams into more efﬁcient forms to run on various hardware
+targets. Groups of optimizations are often packaged into
+“optimization levels” , such as -O0 and -O3, for ease. While
+these optimization levels offer a simple set of choices for de-
+velopers, they are handpicked by the compiler-designers and
+often most beneﬁt certain groups of benchmark programs.
+The compiler community has attempted to address the issue
+by selecting a particular set of compiler optimizations on a
+per-program or per-target basis for software (Triantafyllis
+et al., 2003; Almagor et al., 2004; Pan & Eigenmann, 2006;
+Ansel et al., 2014).
+
+Since the search space of phase-ordering is too large for
+an exhaustive search, many heuristics have been proposed
+to explore the space by using machine learning. Huang et
+al.
+tried to address this challenge for HLS applications
+
+AutoPhase: Juggling HLS Phase Orderings in Random Forests with Deep Reinforcement Learning
+
+void norm(int n, double *restrict out,
+const double *restrict in) {
+
+double precompute = mag(n, in);
+for(int i=0; i<n; i++) {
+
+out[i] = in[i] / precompute;
+
+}
+
+}
+
+void norm(int n, double *restrict out,
+const double *restrict in) {
+
+double precompute, sum = 0;
+for(int i=0; i<n; i++){
+sum += A[i] * A[i];
+
+}
+precompute = sqrt(sum);
+for(int i=0; i<n; i++) {
+
+out[i] = in[i] / precompute;
+
+}
+
+}
+
+Figure 2. Progressively applying LICM (left) then inlining (right) to the code in Figure 1.
+
+void norm(int n, double *restrict out,
+const double *restrict in) {
+
+for(int i=0; i<n; i++) {
+double sum = 0;
+for(int j=0; j<n; j++){
+sum += A[j] * A[j];
+
+}
+out[i] = in[i] / sqrt(sum);
+
+}
+
+}
+
+void norm(int n, double *restrict out,
+const double *restrict in) {
+
+double sum;
+for(int i=0; i<n; i++) {
+
+sum = 0;
+for(int j=0; j<n; j++){
+sum += A[j] * A[j];
+
+}
+out[i] = in[i] / sqrt(sum);
+
+}
+
+}
+
+Figure 3. Progressively applying inlining (left) then LICM (right) to the code in Figure 1.
+
+by using modiﬁed greedy algorithms (Huang et al., 2013;
+2015). It achieved 16% improvement vs -O3 on the CHstone
+benchmarks (Hara et al., 2008), which we used in this paper.
+In (Agakov et al., 2006) both independent and Markov mod-
+els were applied to automatically target an optimized search
+space for iterative methods to improve the search results.
+In (Stephenson et al., 2003), genetic algorithms were used
+to tune heuristic priority functions for three compiler opti-
+mization passes. Milepost GCC (Fursin et al., 2011) used
+machine learning to determine the set of passes to apply to
+a given program, based on a static analysis of its features. It
+achieved an 11% execution time improvement over -O3, for
+the ARC reconﬁgurable processor on the MiBench program
+suite1. In (Kulkarni & Cavazos, 2012) the challenge was for-
+mulated as a Markov process and supervised learning was
+used to predict the next optimization, based on the current
+program state. OpenTuner (Ansel et al., 2014) autotunes
+a program using an AUC-Bandit-meta-technique-directed
+ensemble selection of algorithms. Its current mechanism
+for selecting the compiler optimization passes does not con-
+sider the order or support repeated optimizations. Wang
+et al. (Wang & OBoyle, 2018), provided a survey for us-
+ing machine learning in compiler optimization where they
+also described that using program features might be helpful.
+NeuroVectorizer (Haj-Ali et al., 2020; 2019a) used deep RL
+for automatically tuning compiler pragmas such as vector-
+ization and interleaving factors. NeuroVectorizer achieves
+97% of the oracle performance (brute-force search) on a
+wide range of benchmarks.
+
+2.2 Reinforcement Learning Algorithms
+
+Reinforcement learning (RL) is a machine learning approach
+in which an agent continually interacts with the environ-
+ment (Kaelbling et al., 1996). In particular, the agent ob-
+serves the state of the environment, and based on this ob-
+servation takes an action. The goal of the RL agent is then
+to compute a policy–a mapping between the environment
+states and actions–that maximizes a long term reward.
+
+RL can be viewed as a stochastic optimization solution
+for solving Markov Decision Processes (MDPs) (Bellman,
+1957), when the MDP is not known. An MDP is deﬁned by
+a tuple with four elements: S, A, P (s, a), r(s, a) where S
+is the set of states of the environment, A describes the set of
+actions or transitions between states, s(cid:48)∼P (s, a) describes
+the probability distribution of next states given the current
+state and action and r(s, a) : S × A → R is the reward of
+taking action a in state s. Given an MDP, the goal of the
+agent is to gain the largest possible aggregate reward. The
+objective of an RL algorithm associated with an MDP is to
+ﬁnd a decision policy π∗(a|s) : s → A that achieves this
+goal for that MDP:
+
+π∗ = arg max
+
+π
+
+Eτ ∼π(τ )
+
+(cid:35)
+
+r(st, at)
+
+=
+
+(cid:34)
+
+(cid:88)
+
+t
+
+arg max
+π
+
+T
+(cid:88)
+
+t=1
+
+E(st,at)∼π(st,at) [r(st, at)] .
+
+(1)
+
+Deep RL leverages a neural network to learn the policy (and
+
+AutoPhase: Juggling HLS Phase Orderings in Random Forests with Deep Reinforcement Learning
+
+sometimes the reward function). Policy Gradient (PG) (Sut-
+ton et al., 2000), for example, updates the policy directly by
+differentiating the aggregate reward E in Equation 1:
+
+∇θJ =
+(cid:34)
+N
+(cid:88)
+
+1
+N
+
+(cid:88)
+(
+
+∇θlogπθ(ai,t|si,t))(
+
+(cid:88)
+
+(cid:35)
+
+r(si,t, ai,t))
+
+(2)
+
+i=1
+
+t
+
+t
+
+and updating the network parameters (weights) in the direc-
+tion of the gradient:
+
+θ ← θ + α∇θJ,
+
+(3)
+
+Note that PG is an on-policy method in that it uses decisions
+made directly by the current policy to compute the new
+policy.
+
+Over the past couple of years, a plethora of new deep RL
+techniques have been proposed (Mnih et al., 2016; Ross
+et al., 2011). In this paper, we mainly focus on Proximal
+Policy Optimization (PPO) (Schulman et al., 2017), Asyn-
+chronous Advantage Actor-critic (A3C) (Mnih et al., 2016).
+
+PPO is a variant of PG that enables multiple epochs of mini-
+batch updates to improve the sample complexity. Vanilla
+PG performs one gradient update per data sample while
+PPO uses a novel surrogate objective function to enable
+multiple epochs of minibatch updates. It alternates between
+sampling data through interaction with the environment and
+optimizing the surrogate objective function using stochastic
+gradient ascent. It performs updates that maximizes the
+reward function while ensuring the deviation from the previ-
+ous policy is small by using a surrogate objective function.
+The loss function of PPO is deﬁned as:
+
+LCLIP (θ) = ˆEt[min(rt(θ) ˆAt, clip(rt(θ), 1−ε, 1+ε) ˆAt)]
+(4)
+where rt(θ) is deﬁned as a probability ratio πθ(at|st)
+πθold (at|st) so
+r(θold) = 1. This term penalizes policy update that move
+rt(θ) from r(θold). ˆAt denotes the estimated advantage that
+approximates how good at is compared to the average. The
+second term in the min function acts as a disincentive for
+moving rt outside of [1 − ε, 1 + ε] where ε is a hyperparam-
+eter.
+
+A3C uses an actor (usually a neural network) that interacts
+with the critic, which is another network that evaluates the
+action by computing the value function. The critic tells
+the actor how good its action was and how it should ad-
+just. The update performed by the algorithm can be seen as
+∇θlogπθ(ai,t|si,t) ˆAt.
+
+2.3 Evolutionary Algorithms
+
+Evolutionary algorithms are another technique that can be
+used to search for the best compiler pass ordering. It con-
+
+tains a family of population-based meta-heuristic optimiza-
+tion algorithms inspired by natural selection. The main idea
+of these algorithms is to sample a population of solutions
+and use the good ones to direct the distribution of future gen-
+erations. Two commonly used Evolutionary Algorithms are
+Genetic Algorithms (GA) (Goldberg, 2006) and Evolution
+Strategies (ES) (Conti et al., 2018).
+
+GA generally requires a genetic representation of the search
+space where the solutions are coded as integer vectors. The
+algorithm starts with a pool of candidates, then iteratively
+evolves the pool to include solutions with higher ﬁtness by
+the three following strategies: selection, crossover, and mu-
+tation. Selection keeps a subset of solutions with the highest
+ﬁtness values. These selected solutions act as parents for
+the next generation. Crossover merges pairs from the parent
+solutions to produce new offsprings. Mutation perturbs the
+offspring solutions with a low probability. The process re-
+peats until a solution that reaches the goal ﬁtness is found
+or after a certain number of generations.
+
+ES works similarly to GA. However, the solutions are coded
+as real numbers in ES. In addition, ES is self-adapting.
+The hyperparameters, such as the step size or the mutation
+probability, are different for different solutions. They are
+encoded in each solution, so good settings get to the next
+generation with good solutions. Recent work (Salimans
+et al., 2017) has used ES to update policy weights for RL and
+showed it is a good alternative for gradient-based methods.
+
+3 AUTOPHASE FRAMEWORK FOR
+AUTOMATIC PHASE ORDERING
+
+We leverage an existing open-source HLS framework called
+LegUp (Canis et al., 2013) that compiles a C program into a
+hardware RTL design. In (Huang et al., 2013), an approach
+is devised to quickly determine the number of hardware ex-
+ecution cycles without requiring time-consuming logic sim-
+ulation. We develop our RL simulator environment based
+on the existing harness provided by LegUp and validate our
+ﬁnal results by going through the time-consuming logic sim-
+ulation. AutoPhase takes a program (or multiple programs)
+and intelligently explores the space of possible passes to
+ﬁgure out an optimal pass sequence to apply. Table 1 lists all
+the passes used in AutoPhase. The workﬂow of AutoPhase
+is illustrated in Figure 4.
+
+3.1 HLS Compiler
+
+AutoPhase takes a set of programs as input and compiles
+them to a hardware-independent intermediate representa-
+tion (IR) using the Clang front-end of the LLVM compiler.
+Optimization and analysis passes act as transformations on
+the IR, taking a program as input and emitting a new IR as
+output. The HLS tool LegUp is invoked after the compiler
+
+AutoPhase: Juggling HLS Phase Orderings in Random Forests with Deep Reinforcement Learning
+
+certain optimizations. Table 2 lists all the features used.
+
+3.4 Random Program Generator
+
+As a data-driven approach, RL generalizes better if we train
+the agent on more programs. However, there are a lim-
+ited number of open-source HLS examples online. There-
+fore, we expand our training set by automatically generating
+synthetic HLS benchmarks. We ﬁrst generate standard C
+programs using CSmith (Yang et al., 2011), a random C pro-
+gram generator, which is originally designed to generate test
+cases for ﬁnding compiler bugs. Then, we develop scripts to
+ﬁlter out programs that take more than ﬁve minutes to run
+on CPU or fail the HLS compilation.
+
+3.5 Overall Flow of AutoPhase
+
+We integrate the compilation utilities into a simulation
+environment in Python with APIs similar to an OpenAI
+gym (Brockman et al., 2016). The overall ﬂow works as
+follows:
+
+1. The input program is compiled into LLVM IR using
+
+the Clang/LLVM.
+
+2. The IR Feature Extractor is run to extract salient pro-
+
+gram features.
+
+3. LegUp compiles the LLVM IR into hardware RTL.
+
+4. The Clock-cycle Proﬁler estimates a clock-cycle count
+
+for the generated circuit.
+
+5. The RL agent takes the program features or the his-
+togram of previously applied passes and the improve-
+ment in clock-cycle count as input data to train on.
+
+6. The RL agent predicts the next best optimization passes
+
+to apply.
+
+7. New LLVM IR is generated after the new optimization
+
+sequence is applied.
+
+8. The machine learning algorithm iterates through steps
+
+(2)–(7) until convergence.
+
+Note that AutoPhase uses the LLVM compiler and the
+passes used are listed in Table 2. However, adding sup-
+port for any compiler or optimization passes in AutoPhase
+is very easy and straightforward. The action and state deﬁ-
+nitions must be speciﬁed again.
+
+4 CORRELATION OF PASSES AND
+
+PROGRAM FEATURES
+
+Similar to the case with many deep learning approaches,
+explainability is one of the major challenges we face when
+applying deep RL to the phase-ordering challenge. To ana-
+lyze and understand the correlation of passes and program
+
+Figure 4. The block diagram of AutoPhase. The input programs
+are compiled to an LLVM IR using Clang/LLVM. The feature
+extractor and clock-cycle proﬁler are used to generate the input
+features (state) and the runtime improvement (reward), respectively
+from the IR. The input features and runtime improvement are
+fed to the deep RL agent as in input data to train on. The RL
+agent predicts the next best optimization passes to apply. After
+convergence, the HLS compiler is used to compile the LLVM IR
+to hardware RTL.
+
+optimization as a back-end pass, which transforms LLVM
+IR into hardware modules.
+
+3.2 Clock-cycle Proﬁler
+
+Once the hardware RTL is generated, one could run a hard-
+ware simulation to gather the cycle count results of the
+synthesized circuit. This process is quite time-consuming,
+hindering RL and all other optimization approaches. There-
+fore, we approximate cycle count using the proﬁler in
+LegUp (Huang et al., 2013), which leverages the software
+traces and runs 20× faster than hardware simulation. In
+LegUp, the frequency of the generated circuits is set as a
+compiler constraint that directs the HLS scheduling algo-
+rithm. In other words, HLS tool will always try to generate
+hardware that can run at a certain frequency. In our exper-
+iment setting, without loss of generality, we set the target
+frequency of all generated hardware to 200MHz. We ex-
+perimented with lower frequencies too; the improvements
+were similar but the cycle counts the different algorithms
+achieved were better as more logic could be ﬁtted in a single
+cycle.
+
+3.3
+
+IR Feature Extractor
+
+Wang et al. (Wang & OBoyle, 2018) proposed to convert a
+program into an observation by extracting all the features
+from the program. Similarly, in addition to the LegUp
+backend tools, we developed analysis passes to extract 56
+static features from the program, such as the number of
+basic blocks, branches, and instructions of various types.
+We use these features as partially observable states for the
+RL learning and hope the neural network can capture the
+correlation of certain combinations of these features and
+
+Feature Extractor Cycle Proﬁler Learning Agent LLVM  IROptimization PassesHLS Compiler Hardware(State)(Reward)GradientNew Compiler Pass  (Action)RuntimeFeaturesProgram Generator Real  BenchmarksInput ProgramsAutoPhase: Juggling HLS Phase Orderings in Random Forests with Deep Reinforcement Learning
+
+0
+-correlated-propagation
+
+1
+-scalarrepl
+
+12
+-loop-reduce
+
+2
+-lowerinvoke
+13
+-break-crit-edges
+
+Table 1. LLVM Transform Passes.
+3
+-strip
+14
+-loop-deletion
+
+5
+-sccp
+16
+-lcssa
+
+4
+-strip-nondebug
+
+6
+-globalopt
+
+17
+-codegenprepare
+
+23
+-loop-rotate
+35
+-tailcallelim
+
+24
+-partial-inliner
+36
+-licm
+
+37
+-sink
+
+25
+-inline
+
+26
+-early-cse
+
+38
+-mem2reg
+
+39
+-prune-eh
+
+28
+-adce
+40
+-functionattrs
+
+29
+-loop-simplify
+41
+-ipsccp
+
+11
+-scalarrepl-ssa
+22
+-constmerge
+
+34
+-lower-expect
+
+15
+-reassociate
+27
+-indvars
+
+7
+-gvn
+
+8
+-jump-threading
+
+9
+-globaldce
+
+10
+-loop-unswitch
+
+18
+-memcpyopt
+30
+-instcombine
+42
+-deadargelim
+
+43
+-sroa
+
+19
+-functionattrs
+31
+-simplifycfg
+44
+-loweratomic
+
+32
+-dse
+
+20
+-loop-idiom
+
+21
+-lowerswitch
+
+33
+-loop-unroll
+
+45
+-terminate
+
+Table 2. Program Features.
+
+0
+1
+2
+3
+4
+5
+6
+7
+8
+9
+10
+11
+12
+13
+14
+15
+16
+17
+18
+19
+20
+21
+22
+23
+24
+25
+26
+27
+
+Number of BB where total args for phi nodes >5
+Number of BB where total args for phi nodes is [1,5]
+Number of BB’s with 1 predecessor
+Number of BB’s with 1 predecessor and 1 successor
+Number of BB’s with 1 predecessor and 2 successors
+Number of BB’s with 1 successor
+Number of BB’s with 2 predecessors
+Number of BB’s with 2 predecessors and 1 successor
+Number of BB’s with 2 predecessors and successors
+Number of BB’s with 2 successors
+Number of BB’s with >2 predecessors
+Number of BB’s with Phi node # in range (0,3]
+Number of BB’s with more than 3 Phi nodes
+Number of BB’s with no Phi nodes
+Number of Phi-nodes at beginning of BB
+Number of branches
+Number of calls that return an int
+Number of critical edges
+Number of edges
+Number of occurrences of 32-bit integer constants
+Number of occurrences of 64-bit integer constants
+Number of occurrences of constant 0
+Number of occurrences of constant 1
+Number of unconditional branches
+Number of Binary operations with a constant operand
+Number of AShr insts
+Number of Add insts
+Number of Alloca insts
+
+28
+29
+30
+31
+32
+33
+34
+35
+36
+37
+38
+39
+40
+41
+42
+43
+44
+45
+46
+47
+48
+49
+50
+51
+52
+53
+54
+55
+
+Number of And insts
+Number of BB’s with instructions between [15,500]
+Number of BB’s with less than 15 instructions
+Number of BitCast insts
+Number of Br insts
+Number of Call insts
+Number of GetElementPtr insts
+Number of ICmp insts
+Number of LShr insts
+Number of Load insts
+Number of Mul insts
+Number of Or insts
+Number of PHI insts
+Number of Ret insts
+Number of SExt insts
+Number of Select insts
+Number of Shl insts
+Number of Store insts
+Number of Sub insts
+Number of Trunc insts
+Number of Xor insts
+Number of ZExt insts
+Number of basic blocks
+Number of instructions (of all types)
+Number of memory instructions
+Number of non-external functions
+Total arguments to Phi nodes
+Number of Unary operations
+
+features, we use random forests (Breiman, 2001) to learn
+the importance of different features. Random forest is an
+ensemble of multiple decision trees. The prediction made by
+each tree could be explained by tracing the decisions made
+at each node and calculating the importance of different
+features on making the decisions at each node. This helps
+us to identify the effective features and passes to use and
+show whether our algorithms learn informative patterns on
+data.
+
+For each pass, we build two random forests to predict
+whether applying it would improve the circuit performance.
+The ﬁrst forest takes the program features as inputs while the
+second takes a histogram of previously applied passes. To
+gather the training data for the forests, we run PPO with high
+exploration parameter on 100 randomly generated programs
+to generate feature–action–reward tuples. The algorithm
+assigns higher importance to the input features that affect
+the ﬁnal prediction more.
+
+4.1
+
+Importance of Program Features
+
+The heat map in Figure 5 shows the importance of different
+features on whether a pass should be applied. The higher
+
+the value is, the more important the feature is (the sum of
+the values in each row is one). The random forest is trained
+with 150,000 samples generated from the random programs.
+The index mapping of features and passes can be found in
+Tables 1 and 2. For example, the yellow pixel corresponding
+to feature index 17 and pass index 23 reﬂects that number-
+of-critical-edges affects the decision on whether to apply
+-loop-rotate greatly. A critical edge in control ﬂow graph is
+an edge that is neither the only edge leaving its source block,
+nor the only edge entering its destination block. The critical
+edges can be commonly seen in a loop as a back edge so
+the number of critical edges might roughly represent the
+number of loops in a program. The transform pass -loop-
+rotate detects a loop and transforms a while loop to a do-
+while loop to eliminate one branch instruction in the loop
+body. Applying the pass results in better circuit performance
+as it reduces the total number of FSM states in a loop.
+
+Other expected behaviors are also observed in this ﬁgure.
+For instance, the correlation between number of branches
+and the transform passes -loop-simplify, -tailcallelism
+(which transforms calls of the current function i.e., self re-
+cursion, followed by a return instruction with a branch to the
+entry of the function, creating a loop), -lowerswitch (which
+
+AutoPhase: Juggling HLS Phase Orderings in Random Forests with Deep Reinforcement Learning
+
+Figure 5. Heat map illustrating the importance of feature and pass
+indices.
+
+Figure 6. Heat map illustrating the importance of indices of previ-
+ously applied passes and the new pass to apply.
+
+rewrites switch instructions with a sequence of branches).
+Other interesting behaviors are also captured. For example,
+in the correlation between binary operations with a constant
+operand and -functionattrs, which marks different operands
+of a function as read-only (constant). Some correlations
+are harder to explain, for example, number of BitCast in-
+structions and -instcombine, which combines instructions
+into fewer simpler instructions. This is actually a result of
+-instcombine reducing the loads and stores that call bitcast
+instructions for casting pointer types. Another example is
+number of memory instructions and -sink, where -sink basi-
+cally moves memory instructions into successor blocks and
+delays the execution of memory until needed. Intuitively,
+whether to apply -sink should be dependent on whether
+there is any memory instruction in the program. Our last
+example to show is number of occurrences of constant 0
+and -deadargelim, where -deadargelim helped eliminate
+dead/unused constant zero arguments.
+
+Overall, we observe that all the passes are correlated to some
+features and are able to affect the ﬁnal circuit performance.
+We also observe that multiple features are not effective at
+directing decisions and training with them could increase
+the variance that would result in lower prediction accuracy
+of our results. For example, the total number of instructions
+did not give a direct indication of whether applying a pass
+would be helpful or not. This is because sometimes more in-
+structions could improve the performance (for example, due
+to loop unrolling) and eliminating unnecessary code could
+also improve the performance. In addition, the importance
+of features varies among different benchmarks depending
+on the tasks they perform.
+
+4.2
+
+Importance of Previously Applied Passes
+
+Figure 6 illustrates the impact of previously applied passes
+on the new pass to apply. The higher the value is, the more
+important having the old pass is. From this ﬁgure, we learn
+that for the programs we trained on passes -scalarrepl, -gvn,
+
+-scalarrepl-ssa, -loop-reduce, -loop-deletion, -reassociate,
+-loop-rotate, -partial-inliner, -early-cse, -adce, -instcombine,
+-simplifycfg, -dse, -loop-unroll, -mem2reg, and -sroa, are
+more impactful on the performance compared to the rest of
+the passes regardless of their order in the trajectory. Point
+(23,23) has the highest importance in which implies that pass
+-loop-rotate is very helpful and should be included if not
+applied before. By examining thousands of the programs,
+we ﬁnd that -loop-rotate indeed reduces the cycle count
+signiﬁcantly. Interestingly, applying this pass twice is not
+harmful if the passes were given consecutively. However,
+giving this pass twice with some other passes between them
+is sometimes very harmful. Another interesting behavior
+our heat map captured is the fact that applying pass 33
+(-loop-unroll) after (not necessarily consecutive) pass 23
+(-loop-rotate) was much more useful compared to applying
+these two passes in the opposite order.
+
+5 PROBLEM FORMULATION
+
+5.1 The RL Environment Deﬁnition
+
+Assume the optimal number of passes to apply is N and
+there are K transform passes to select from in total, our
+search space S for the phase-ordering problem is [0, K N ).
+Given M program features and the history of already ap-
+plied passes, the goal of deep RL is to learn the next best
+optimization pass a to apply that minimizes the long term
+cycle count of the generated hardware circuit. Note that the
+optimization state s is partially observable in this case as the
+M program features cannot fully capture all the properties
+of a program.
+Action Space – we deﬁne our action space A as {a ∈ Z :
+a ∈ [0, K)} where K is the total number of transform
+passes.
+
+Observation Space – two types of input features were con-
+sidered in our evaluation: 1(cid:13) program features of ∈ ZM
+
+AutoPhase: Juggling HLS Phase Orderings in Random Forests with Deep Reinforcement Learning
+
+listed in Table 2 and 2(cid:13) action history which is a histogram
+of previously applied passes oa ∈ ZK. After each RL step
+where the pass i is applied, we call the feature extractor in
+our environment to return new of , and update the action
+histogram element oai to oai + 1.
+
+Reward – the cycle count of the generated circuit is re-
+ported by the clock-cycle proﬁler at each RL iteration. Our
+reward is deﬁned as R = cprev − ccur, where cprev and
+ccur represent the previous and the current cycle count of
+the generated circuit respectively. It is possible to deﬁne a
+different reward for different objectives. For example, the
+reward could be deﬁned as the negative of the area and thus
+the RL agent will optimize for the area. It is also possi-
+ble to co-optimize multiple objectives (e.g., area, execution
+time, power, etc.) by deﬁning a combination of different
+objectives.
+
+5.2 Applying Multiple Passes per Action
+
+An alternative to the action formulation above is to evaluate
+a complete sequence of passes with length N instead of
+a single action a at each RL iteration. Upon the start of
+training a new episode, the RL agent resets all pass indices
+p ∈ ZN to the index value K
+2 . For pass pi at index i, the
+next action to take is either to change to a new pass or
+not. By allowing positive and negative index update for
+each p, we reduced the total steps required to traverse all
+possible pass indices. The sub-action space ai for each
+pass is thus deﬁned as [−1, 0, 1]. The total action space
+A is deﬁned as [−1, 0, 1]N . At each step, the RL agent
+predicts the updates [a1, a2, ..., aN ] to N passes, and the
+current optimization sequence [p1, p2, ..., pN ] is updated to
+[p1 + a1, p2 + a2, ..., pN + aN ].
+
+5.3 Normalization Techniques
+
+In order for the trained RL agent to work on new programs,
+we need to properly normalize the program features and
+rewards so they represent a meaningful state among dif-
+ferent programs. In this work, we experiment with two
+techniques: 1(cid:13) taking the logarithm of program features
+or rewards and, 2(cid:13) normalizing to a parameter from the
+original input program that roughly depicts the problem
+size. For technique 1(cid:13), note that taking the logarithm of the
+program features not only reduces their magnitude, it also
+correlates them in a different manner in the neural network.
+Since, w1 log(of1) + w2 log(of2) = log(ow1
+), the neu-
+f1
+ral network is learning to correlate the products of features
+instead of a linear combination of them. For technique 2(cid:13),
+we normalize the program features to the total number of
+instructions in the input program (of norm = of
+), which
+of51
+is feature #51 in Table 2.
+
+ow2
+f2
+
+6 EVALUATION
+
+To run our deep RL algorithms we use RLlib (Liang et al.,
+2017), an open-source library for reinforcement learning
+that offers both high scalability and a uniﬁed API for a va-
+riety of applications. RLlib is built on top of Ray (Moritz
+et al., 2018), a high-performance distributed execution
+framework targeted at large-scale machine learning and rein-
+forcement learning applications. We ran the framework on
+a four-core Intel i7-4765T CPUwith a Tesla K20c GPUfor
+training and inference.
+
+We set our frequency constraint in HLS to 200MHz and use
+the number of clock cycles reported by the HLS proﬁler
+as the circuit performance metric. In (Huang et al., 2013),
+results showed a one-to-one correspondence between the
+clock cycle count and the actual hardware execution time
+under certain frequency constraint. Therefore, better clock
+cycle count will lead to better hardware performance.
+
+6.1 Performance
+
+To evaluate the effectiveness of various algorithms for tack-
+ling the phase-ordering problem, we run them on nine
+real HLS benchmarks and compare the results based on
+the ﬁnal HLS circuit performance and the sample efﬁ-
+ciency against state-of-the-art approaches for overcoming
+the phase ordering, which include random search, Greedy
+Algorithms (Huang et al., 2013), OpenTuner (Ansel et al.,
+2014), and Genetic Algorithms (Fortin et al., 2012). These
+benchmarks are adapted from CHStone (Hara et al., 2008)
+and LegUp examples. They are: adpcm, aes, blowﬁsh,
+dhrystone, gsm, matmul, mpeg2, qsort, and sha. For this
+evaluation, the input features/rewards were not normalized,
+the pass length was set to 45, and each algorithm was run on
+a per-program basis. Table 3 lists the action and observation
+spaces used in all the deep RL algorithms.
+
+The bar chart in Figure 7 shows the percentage improvement
+of the circuit performance compared to -O3 results on the
+nine real benchmarks from CHStone. The dots on the blue
+line in Figure 7 show the total number of samples for each
+program, which is the number of times the algorithm calls
+the simulator to gather the cycle count. -O0 and -O3 are
+the default compiler optimization levels. RL-PPO1 is a
+PPO explorer where we set all the rewards to 0 to test if
+the rewards are meaningful. RL-PPO2 is the PPO agent
+that learns the next pass based on a histogram of applied
+passes. RL-A3C is the A3C agent that learns based on
+the program features. Greedy performs the greedy algo-
+rithm, which always inserts the pass that achieves the highest
+speedup at the best position (out of all possible positions it
+can be inserted to) in the current sequence. RL-PPO3 uses
+a PPO agent and the program features but with the action
+space described in Section 5.2. explained in Section 5.2.
+OpenTuner runs an ensemble of six algorithms, which
+
+AutoPhase: Juggling HLS Phase Orderings in Random Forests with Deep Reinforcement Learning
+
+Table 3. The observation and action spaces used in the different deep RL algorithms.
+
+Deep RL Algorithm
+Observation Space
+Action Space
+
+RL-PPO1
+PPO
+Program Features
+Single-Action
+
+RL-PPO2
+PPO
+Action History
+Single-Action
+
+RL-PPO3
+PPO
+Action History + Program Features
+Multiple-Action
+
+RL-A3C
+A3C
+Program Features
+Single-Action
+
+RL-ES
+ES
+Program Features
+Single-Action
+
+should be transferable from one program to another. For ex-
+ample, as discussed in section 4 applying pass -loop-rotate
+is always beneﬁcial, and -loop-unroll should be applied af-
+ter -loop-rotate. Note that the black-box search algorithms,
+such as OpenTuner, GA, and greedy algorithms, cannot gen-
+eralize. For these algorithms, rerunning a new search with
+many compilations is necessary for every new program, as
+they do not learn any patterns from the programs to direct
+the search and can be viewed as a smart random search.
+
+To evaluate how generalizable deep RL could be with dif-
+ferent programs and whether any prior knowledge could
+be useful, we train on 100 randomly-generated programs
+using PPO. Random programs are used for transfer learning
+due to lack of sufﬁcient benchmarks and because it is the
+worst-case scenario, i.e., they are very different from the
+programs that we use for inference. The improvement can
+be higher if we train on programs that are similar to the
+ones we inference on. We train a network with 256 × 256
+fully connected layers and use the histogram of previously
+applied passes concatenated to the program features as the
+observation and passes as actions.
+
+As described in Section 5.3, we experiment with two nor-
+malization techniques for the program features: 1(cid:13) taking
+the logarithm of all the program features and 2(cid:13) normaliz-
+ing the program features to the total number of instruc-
+tions in the program.
+In each pass sequence, the inter-
+mediate reward was deﬁned as the logarithm of the im-
+provement in cycle count after applying each pass. The
+logarithm was chosen so that the RL agent will not give
+much larger weights to big rewards from programs with
+longer execution time. Three approaches were evaluated:
+filtered-norm1 uses the ﬁltered (based on the analysis
+in Section 4 where we only keep the important features and
+passes) program features and passes from Section with nor-
+malization technique 1(cid:13), original-norm2 uses all the
+program features and passes with normalization technique
+2(cid:13), and filtered-norm2 uses the ﬁltered program fea-
+tures and passes from Section 4 with normalization tech-
+nique 2(cid:13). Filtering the features and passes might not be
+ideal, especially when different programs have different
+feature characteristics and impactful passes. However, re-
+ducing the number of features and passes helps to reduce
+variance among all programs and signiﬁcantly narrow the
+search space.
+
+Figure 8 shows the episode reward mean as a function
+of the step for the three approaches. We observe that
+
+Figure 7. Circuit Speedup and Sample Size Comparison.
+
+includes two families of algorithms: particle swarm opti-
+mization (Kennedy, 2010) and GA, each with three different
+crossover settings. RL-ES is similar to A3C agent that
+learns based on the program features, but updates the policy
+network using the evolution strategy instead of backpropa-
+gation. Genetic-DEAP (Fortin et al., 2012) is a genetic
+algorithm implementation. random randomly generates
+a sequence of 45 passes at once instead of sampling them
+one-by-one.
+
+From Greedy, we see that always adding the pass in the
+current sequence that achieves the highest reward leads to
+sub-optimal circuit performance. RL-PPO2 achieves higher
+performance than RL-PPO1, which shows that the deep RL
+captures useful information during training. Using the his-
+togram of applied passes results in better sample efﬁciency,
+but using the program features with more samples results
+in a slightly higher speedup. RL-PPO2, for example, at the
+minor cost of 4% lower speedup, achieves 50× more sample
+efﬁciency than OpenTuner. Using ES to update the policy
+is supposed to be more sample efﬁcient for problems with
+sparse rewards like ours, however, our experiments did not
+beneﬁt from that. Furthermore, RL-PPO3 with multiple
+action updates achieves a higher speedup than the other
+deep RL algorithms with a single action. One reason for
+that is the ability of RL-PPO3 to explore more passes per
+compilation as it applies multiple passes simultaneously in
+between every compilation. On the other hand, the other
+deep RL algorithms apply a single pass at a time.
+
+6.2 Generalization
+
+With deep RL, the search should beneﬁt from prior knowl-
+edge learned from other different programs. This knowledge
+
+ -O0 -O3RL-PPO1RL-PPO2RL-A3CGreedyRL-PPO3OpenTunerRL-ESGenetic-DEAPRandom 0.20.10.00.10.20.3Improvement over -O3-0.230.00.090.240.250.030.280.280.260.270.070200040006000800010000Samples / Program1188882484351040004384608067898400AutoPhase: Juggling HLS Phase Orderings in Random Forests with Deep Reinforcement Learning
+
+Figure 8. Episode reward mean as a function of step for the original
+approach where we use all the program features and passes and for
+the ﬁltered approach where we ﬁlter the passes and features (with
+different normalization techniques). Higher values indicate faster
+circuit speed.
+
+filtered-norm2 and filtered-norm1 converge
+much faster and achieve a higher episode reward mean
+than original-norm2, which uses all the features and
+passes. At roughly 8,000 steps the filtered-norm2 and
+filter-norm1 already achieve a very high episode re-
+ward mean, with minor improvements in later steps. Further-
+more, the episode reward mean of the ﬁltered approaches
+is still higher than that of original-norm2 even when
+we allowed it to train for 20 times more steps (i.e., 160,000
+steps). This indicates that ﬁltering the features and passes
+signiﬁcantly improved the learning process. All three ap-
+proaches learned to always apply pass -loop-rotate, and
+-loop-unroll after -loop-rotate. Another useful pass that the
+three approaches learned to apply is -loop-simplify, which
+performs several transformations to transform natural loops
+into a simpler form that enables subsequent analyses and
+transformations.
+
+the
+
+results
+
+generalization
+
+now compare
+
+We
+of
+filtered-norm2 and filtered-norm1 with
+the other black-box algorithms. We use 100 randomly-
+generated programs as the training set and nine real
+benchmarks from CHStone as the testing set for the deep
+RL-based methods. With the state-of-the-art black-box
+algorithms, we ﬁrst search for the best pass sequences that
+achieved the lowest aggregated hardware cycle counts for
+the 100 random programs and then directly apply them to
+the nine test set programs. In Figure 9, the bar chart shows
+the percentage improvement of the circuit performance
+compared to -O3 on the nine real benchmarks, the dots
+on the blue line show the total number of samples each
+inference takes for one new program.
+
+Figure 9. Circuit Speedup and Sample Size Comparison for deep
+RL Generalization.
+
+ﬁtted to the random programs can cause poor performance
+in unseen programs (e.g., -24% for Genetic-DEAP). Be-
+sides, normalization technique 2(cid:13) works better compared
+to normalization technique 1(cid:13) for deep RL generalization
+(4% vs 3% speedup). This indicates that normalizing the
+different instructions to the total number of instructions i.e.,
+the distribution of the different instructions in Technique 2(cid:13)
+represents more universal characteristics across different
+programs, while taking the log in Technique 1(cid:13) only sup-
+presses the value ranges of different program features. Fur-
+thermore, when we use other 12,874 randomly generated
+programs as the testing set with filtered-norm2, the
+speedup is 6% compared to -O3.
+
+7 CONCLUSIONS
+
+In this paper, we propose an approach based on deep RL
+to improve the performance of HLS designs by optimizing
+the order in which the compiler applies optimization phases.
+We use random forests to analyze the relationship between
+program features and optimization passes. We then leverage
+this relationship to reduce the search space by identifying
+the most likely optimization phases to improve the perfor-
+mance, given the program features. Our RL based approach
+achieves 28% better performance than compiling with the
+-O3 ﬂag after training for a few minutes, and a 24% improve-
+ment after training for less than a minute. Furthermore, we
+show that unlike prior work, our solution shows potential to
+generalize to a variety of programs. While in this paper we
+have applied deep RL to HLS, we believe that the same ap-
+proach can be successfully applied to software compilation
+and optimization. Going forward, we envision using deep
+RL techniques to optimize a wide range of programs and
+systems.
+
+This evaluation shows that the deep RL-based inference
+achieves higher speedup than the predetermined sequences
+produced by the state-of-the-art black-box algorithms for
+new programs. The predetermined sequences that are over-
+
+ACKNOWLEDGEMENT
+
+This research is supported in part by NSF CISE Expedi-
+tions Award CCF-1730628, the Defense Advanced Research
+
+ -O0 -O3Genetic-DEAPOpenTunerGreedyRL-filtered-norm1RL-filtered-norm20.20.10.0Improvement over -O3-0.230.0-0.24-0.020.020.030.040102030Samples / Program1111111AutoPhase: Juggling HLS Phase Orderings in Random Forests with Deep Reinforcement Learning
+
+Projects Agency (DARPA) through the Circuit Realiza-
+tion at Faster Timescales (CRAFT) Program under Grant
+HR0011-16-C0052, the Computing On Network Infras-
+tructure for Pervasive Perception, Cognition and Action
+(CONIX) Research Center, NSF Grant 1533644, LANL
+Grant 531711, and DOE Grant DE-SC0019323, and gifts
+from Alibaba, Amazon Web Services, Ant Financial, Cap-
+italOne, Ericsson, Facebook, Futurewei, Google, IBM, In-
+tel, Microsoft, Nvidia, Scotiabank, Splunk, VMware, and
+ADEPT Lab industrial sponsors and afﬁliates. The views
+and opinions of authors expressed herein do not necessarily
+state or reﬂect those of the United States Government or any
+agency thereof.
+
+REFERENCES
+
+Agakov, F., Bonilla, E., Cavazos, J., Franke, B., Fursin,
+G., O’Boyle, M. F., Thomson, J., Toussaint, M., and
+Williams, C. K. Using machine learning to focus iterative
+optimization. In Proceedings of the International Sympo-
+sium on Code Generation and Optimization, pp. 295–305.
+IEEE Computer Society, 2006.
+
+Almagor, L., Cooper, K. D., Grosul, A., Harvey, T. J.,
+Reeves, S. W., Subramanian, D., Torczon, L., and Water-
+man, T. Finding effective compilation sequences. ACM
+SIGPLAN Notices, 39(7):231–239, 2004.
+
+Ansel, J., Kamil, S., Veeramachaneni, K., Ragan-Kelley,
+J., Bosboom, J., O’Reilly, U.-M., and Amarasinghe, S.
+Opentuner: An extensible framework for program auto-
+In Proceedings of the 23rd international con-
+tuning.
+ference on Parallel architectures and compilation, pp.
+303–316. ACM, 2014.
+
+Bellman, R. A markovian decision process. In Journal of
+
+Mathematics and Mechanics, pp. 679–684, 1957.
+
+Breiman, L. Random forests. Machine learning, 45(1):
+
+5–32, 2001.
+
+Brockman, G., Cheung, V., Pettersson, L., Schneider, J.,
+Schulman, J., Tang, J., and Zaremba, W. Openai gym,
+2016.
+
+Canis, A., Choi, J., Aldham, M., Zhang, V., Kammoona, A.,
+Czajkowski, T., Brown, S. D., and Anderson, J. H. Legup:
+An open-source high-level synthesis tool for fpga-based
+processor/accelerator systems. ACM Transactions on
+Embedded Computing Systems (TECS), 13(2):24, 2013.
+
+Conti, E., Madhavan, V., Such, F. P., Lehman, J., Stanley,
+Improving exploration in evolution
+K., and Clune, J.
+strategies for deep reinforcement learning via a popula-
+tion of novelty-seeking agents. In Advances in Neural
+Information Processing Systems, pp. 5032–5043, 2018.
+
+Fortin, F.-A., De Rainville, F.-M., Gardner, M.-A., Parizeau,
+M., and Gagn´e, C. DEAP: Evolutionary algorithms made
+easy. Journal of Machine Learning Research, 13:2171–
+2175, jul 2012.
+
+Fursin, G., Kashnikov, Y., Memon, A. W., Chamski, Z.,
+Temam, O., Namolaru, M., Yom-Tov, E., Mendelson, B.,
+Zaks, A., Courtois, E., et al. Milepost gcc: Machine learn-
+ing enabled self-tuning compiler. International journal
+of parallel programming, 39(3):296–327, 2011.
+
+Goldberg, D. E. Genetic algorithms. Pearson Education
+
+India, 2006.
+
+Haj-Ali, A., Ahmed, N. K., Willke, T., Shao, S., Asanovic,
+K., and Stoica, I. Learning to vectorize using deep rein-
+forcement learning. In Workshop on ML for Systems at
+NeurIPS, December 2019a.
+
+Haj-Ali, A., K. Ahmed, N., Willke, T., Gonzalez, J.,
+Asanovic, K., and Stoica, I. A view on deep reinforce-
+ment learning in system optimization. arXiv preprint
+arXiv:1908.01275, 2019b.
+
+Haj-Ali, A., Ahmed, N. K., Willke, T., Shao, S., Asanovic,
+K., and Stoica, I. Neurovectorizer: End-to-end vectoriza-
+tion with deep reinforcement learning. International Sym-
+posium on Code Generation and Optimization (CGO),
+February 2020.
+
+Hara, Y., Tomiyama, H., Honda, S., Takada, H., and Ishii,
+K. CHstone: A benchmark program suite for practical
+c-based high-level synthesis. In Circuits and Systems,
+2008. ISCAS 2008. IEEE International Symposium on,
+pp. 1192–1195, 2008.
+
+Huang, Q., Lian, R., Canis, A., Choi, J., Xi, R., Brown, S.,
+and Anderson, J. The effect of compiler optimizations on
+high-level synthesis for fpgas. In Field-Programmable
+Custom Computing Machines (FCCM), 2013 IEEE 21st
+Annual International Symposium on, pp. 89–96. IEEE,
+2013.
+
+Huang, Q., Lian, R., Canis, A., Choi, J., Xi, R., Calagar,
+N., Brown, S., and Anderson, J. The effect of compiler
+optimizations on high-level synthesis-generated hardware.
+ACM Transactions on Reconﬁgurable Technology and
+Systems (TRETS), 8(3):14, 2015.
+
+Huang, Q., Haj-Ali, A., Moses, W., Xiang, J., Stoica, I.,
+Asanovic, K., and Wawrzynek, J. Autophase: Compiler
+phase-ordering for hls with deep reinforcement learn-
+ing. In 2019 IEEE 27th Annual International Symposium
+on Field-Programmable Custom Computing Machines
+(FCCM), pp. 308–308. IEEE, 2019.
+
+AutoPhase: Juggling HLS Phase Orderings in Random Forests with Deep Reinforcement Learning
+
+Intel.
+
+Intel High-Level Synthesis Compiler, 2019.
+https://www.intel.com/content/
+
+URL
+www/us/en/software/programmable/
+quartus-prime/hls-compiler.html.
+
+Salimans, T., Ho, J., Chen, X., Sidor, S., and Sutskever,
+I. Evolution strategies as a scalable alternative to rein-
+forcement learning. arXiv preprint arXiv:1703.03864,
+2017.
+
+Kaelbling, L. P., Littman, M. L., and Moore, A. W. Rein-
+forcement learning: A survey. In Reinforcement learning:
+A survey, volume 4, pp. 237–285, 1996.
+
+Schulman, J., Wolski, F., Dhariwal, P., Radford, A., and
+Klimov, O. Proximal policy optimization algorithms.
+arXiv preprint arXiv:1707.06347, 2017.
+
+Stephenson, M., Amarasinghe, S., Martin, M., and O’Reilly,
+U.-M. Meta optimization: Improving compiler heuris-
+tics with machine learning. In Proceedings of the ACM
+SIGPLAN 2003 Conference on Programming Language
+Design and Implementation, PLDI ’03, 2003.
+
+Sutton, R. S. and Barto, A. G. Introduction to reinforcement
+learning, volume 135. MIT press Cambridge, 1998.
+
+Sutton, R. S., McAllester, D. A., Singh, S. P., and Mansour,
+Y. Policy gradient methods for reinforcement learning
+with function approximation. In Advances in neural in-
+formation processing systems, pp. 1057–1063, 2000.
+
+Triantafyllis, S., Vachharajani, M., Vachharajani, N., and
+August, D. I. Compiler optimization-space exploration.
+In Proceedings of the international symposium on Code
+generation and optimization: feedback-directed and run-
+time optimization, pp. 204–215. IEEE Computer Society,
+2003.
+
+Wang, Z. and OBoyle, M. Machine learning in compiler
+optimization. In Machine Learning in Compiler Opti-
+mization, volume 106, pp. 1879–1901, Nov 2018.
+
+Xilinx. Vivado High-Level Synthesis, 2019. URL
+
+https://www.xilinx.com/products/
+design-tools/vivado/integration/
+esl-design.html.
+
+Yang, X., Chen, Y., Eide, E., and Regehr, J. Finding and
+understanding bugs in c compilers. In ACM SIGPLAN
+Notices, volume 46, pp. 283–294. ACM, 2011.
+
+Kennedy, J. Particle swarm optimization. Encyclopedia of
+
+machine learning, pp. 760–766, 2010.
+
+Kulkarni, S. and Cavazos, J. Mitigating the compiler opti-
+mization phase-ordering problem using machine learning.
+In Proceedings of the ACM International Conference on
+Object Oriented Programming Systems Languages and
+Applications, OOPSLA ’12, 2012.
+
+Lattner, C. and Adve, V. Llvm: A compilation framework
+for lifelong program analysis & transformation. In Inter-
+national Symposium on Code Generation and Optimiza-
+tion, 2004. CGO 2004., pp. 75–86. IEEE, 2004.
+
+Liang, E., Liaw, R., Moritz, P., Nishihara, R., Fox, R., Gold-
+berg, K., Gonzalez, J. E., Jordan, M. I., and Stoica, I.
+Rllib: Abstractions for distributed reinforcement learning.
+arXiv preprint arXiv:1712.09381, 2017.
+
+Mnih, V., Badia, A. P., Mirza, M., Graves, A., Lillicrap,
+T., Harley, T., Silver, D., and Kavukcuoglu, K. Asyn-
+chronous methods for deep reinforcement learning. In
+International conference on machine learning, pp. 1928–
+1937, 2016.
+
+Moritz, P., Nishihara, R., Wang, S., Tumanov, A., Liaw,
+R., Liang, E., Elibol, M., Yang, Z., Paul, W., Jordan,
+M. I., et al. Ray: A distributed framework for emerging
+{AI} applications. In 13th {USENIX} Symposium on
+Operating Systems Design and Implementation ({OSDI}
+18), pp. 561–577, 2018.
+
+Muchnick, S. S. Advanced compiler design and implementa-
+tion. In Advanced Compiler Design and Implementation.
+Morgan Kaufmann, 1997.
+
+Pan, Z. and Eigenmann, R. Fast and effective orchestration
+of compiler optimizations for automatic performance tun-
+ing. In Proceedings of the International Symposium on
+Code Generation and Optimization, pp. 319–332. IEEE
+Computer Society, 2006.
+
+Ross, S., Gordon, G., and Bagnell, D. A reduction of imita-
+tion learning and structured prediction to no-regret online
+learning. In Proceedings of the fourteenth international
+conference on artiﬁcial intelligence and statistics, pp.
+627–635, 2011.
+
+

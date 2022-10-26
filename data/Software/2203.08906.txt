@@ -1,0 +1,2350 @@
+ORCA: A Network and Architecture Co-design
+for Ofﬂoading µs-scale Datacenter Applications
+
+Yifan Yuan1, Jinghan Huang1,Yan Sun1, Tianchen Wang1, Jacob Nelson2, Dan R. K. Ports2,
+Yipeng Wang3, Ren Wang3, Charlie Tai3, Nam Sung Kim1
+1UIUC, 2Microsoft Research, 3Intel Labs
+
+2
+2
+0
+2
+
+t
+c
+O
+7
+1
+
+]
+
+R
+A
+.
+s
+c
+[
+
+2
+v
+6
+0
+9
+8
+0
+.
+3
+0
+2
+2
+:
+v
+i
+X
+r
+a
+
+tax”
+
+“datacenter
+
+Abstract—1 Responding
+to
+the
+and
+for datacenter applications,
+“killer microseconds” problems
+diverse solutions including Smart NIC-based ones have been
+proposed. Nonetheless, they often suffer from high overhead
+of communications over network and/or PCIe links. To tackle
+the limitations of the current solutions, this paper proposes
+ORCA, a holistic network and architecture co-design solution
+that
+leverages current RDMA and emerging cache-coherent
+off-chip interconnect technologies. Speciﬁcally, ORCA consists of
+four hardware and software components: (1) uniﬁed abstraction
+of
+inter- and intra-machine communications managed by
+one-sided RDMA write and cache-coherent memory write; (2)
+efﬁcient notiﬁcation of requests to accelerators assisted by cache
+coherence; (3) cache-coherent accelerator architecture directly
+processing requests received by NIC; and (4) adaptive device-to-
+host data transfer for modern server memory systems consisting
+of both DRAM and NVM exploiting state-of-the-art features in
+CPUs and PCIe. We prototype ORCA with a commercial system
+and evaluate three popular datacenter applications: in-memory
+key-value store, chain replication-based distributed transaction
+system, and deep learning recommendation model
+inference.
+The evaluation shows that ORCA provides 30.1∼69.1% lower
+latency, up to 2.5× higher throughput, and ∼ 3× higher power
+efﬁciency than the current state-of-the-art solutions.
+
+I. INTRODUCTION
+
+The datacenter network has evolved at a fast pace. Currently,
+100 Gbps Ethernet is widely adopted by datacenters, and 400
+Gbps Ethernet is not far on the horizon [121]. At these rates,
+a server may be tasked with processing hundreds of millions
+of packets per second. However, single-thread performance of
+CPUs has remained comparatively stagnant, requiring the CPUs
+to spend more cores and their cycles for network processing
+– a major component of the “datacenter tax” [79]. Besides, as
+identiﬁed in the “killer microsecond” problem [12, 112], it is
+not suitable to ofﬂoad these applications to conventional accel-
+erators such as GPU as they are not efﬁcient to process many
+small, µs-scale tasks which are common in modern datacenter
+applications [152]. This makes ofﬂoading/acceleration of such
+µs-scale datacenter applications challenging.
+
+Current solutions for the two problems ofﬂoad network
+and/or application processing from the server CPU using one
+of the three strategies listed in Tab. I. The ﬁrst strategy is kernel-
+bypass networking, including user-space stack [14, 62, 71, 132]
+and two-sided Remote Direct Memory Access (RDMA) [75–
+78, 99, 128]. It reduces the performance overhead imposed by
+1This work has been accepted by a conference. The authoritative version of
+this work “RAMBDA: RDMA-driven Acceleration Framework for Memory-
+intensive us-scale Datacenter Applications” will appear in the Proceedings
+of the 48th IEEE/ACM International Symposium on High-Performance
+Computer Architecture (HPCA-29), 2023.
+
+1
+
+packets going through the kernel space by delivering the data
+directly to the user space. Nonetheless, the server CPU still
+needs to do network processing from the user space (i.e., user-
+space stack) and application processing (i.e., both user-space
+stack and two-sided RDMA) that still demand many CPU cores
+to achieve required performance [75–78, 99, 128]. The second
+strategy is one-sided RDMA. It allows clients to do application
+processing as they can bypass the server CPU and directly read
+from or write to the server memory. However, the limited seman-
+tics of one-sided RDMA operations require multiple network
+round trips to serve a single request from a client. For example,
+Pilaf [113] performs a key-value lookup by reading a remote
+hash table to retrieve a pointer, then placing a second RDMA
+request to read the corresponding data. The third strategy
+addresses this problem by using a Smart NIC that can perform
+more sophisticated remote operations in a single network round
+trip [7, 16, 84, 94, 134, 150, 158]. Nevertheless, such a solution
+sometimes entails lower performance than the the ﬁrst and
+second solutions [7, 118] because of two reasons. First, access-
+ing the server memory is inevitable and expensive when the
+application’s data is not cached in the Smart NIC’s small local
+memory (Sec. II-B). This is common since modern datacenter
+applications typically have large working sets, often requiring
+not only DRAM but even high-capacity byte-addressable NVM
+such as Intel Optane Persistent DIMM [66] in the host memory
+system to cost-effectively provide necessary memory capac-
+ity [10, 17, 85]. Second, the Smart NIC’s specialized accelerator
+or energy-efﬁcient but wimpy CPU may not be powerful enough
+to provide the required end-to-end performance for applications.
+As such,
+it needs to participate the (beefy) server CPU
+for application processing, but it will often require frequent
+communications between the server CPU and the Smart NIC
+over slow PCIe links, which becomes a performance bottleneck.
+The three strategies above pose a dilemma to system
+designers: whether to use expensive and precious CPU cores
+for application processing, or to suffer from the performance
+overhead incurred by multiple round trips over network or
+PCIe links. Tackling the limitations of the current solutions,
+this paper proposes ORCA (Ofﬂoading with RDMA and Cc-
+Accelerator), a holistic modularized solution to cost-effectively
+and efﬁciently serve µs-scale datacenter
+applications.
+Speciﬁcally, ORCA proposes a server with a standard
+RDMA NIC (RNIC) and a cache-coherent accelerator (cc-
+accelerator) [28, 68] connected to an emerging cache-coherent
+off-chip interconnect (cc-interconnect) such as CXL [31]. The
+RNIC, cc-accelerator, and the server CPU work synergistically
+
+ 
+ 
+ 
+ 
+ 
+ 
+TABLE I: Taxonomy of hardware-based µs-scale datacenter applications ofﬂoading/acceleration.
+
+Optimization
+
+Net. Overhead
+
+PCIe Overhead
+
+CPU Overhead
+
+Flexibility
+
+Perf. Stability
+
+Two-sided RDMA/kernel-bypass with multi-core [75–78, 99, 128]
+One-sided/mixed RDMA [25, 37, 113, 114, 120, 164, 165]
+(Smart)NIC ofﬂoading [7, 16, 18, 22, 46, 84, 85, 94, 134, 141, 147, 150, 158]
+ORCA
+
+Low
+High
+Low
+Low
+
+Low
+High
+High
+Low
+
+High
+Low
+Low
+Low
+
+High
+Low
+High
+High
+
+Low
+Low
+Low
+High
+
+in a ﬁne-grained fashion, to efﬁciently ofﬂoad network and
+application processing from the server CPU. ORCA advocates
+a modularized architecture (i.e., cc-accelerator as a separate
+device) instead of a single device integrating RNIC with a
+cc-accelerator (i.e., Smart RNIC), because ORCA desires to
+reuse the standard RNIC and simply replace the cc-accelerator
+with one customized for other applications. As such, ORCA
+can be more cost-effective or efﬁcient for serving a wider range
+of applications than a solution replacing a Smart RNIC with
+another one integrating a different accelerator or providing sub-
+optimal performance with a single Smart RNIC. To our best
+knowledge, ORCA is the ﬁrst work to explore cc-accelerator’s
+role in various end-to-end datacenter applications.
+
+ORCA consists of four software and hardware components
+that are tightly coupled and synergistically interacting with each
+other to cost-effectively and efﬁciently serve datacenter appli-
+cations. Speciﬁcally, we propose: (1) a uniﬁed abstraction for
+inter- and intra-machine communications where lockless ring
+buffers facilitate inter-machine communications with one-sided
+RDMA write and CPU-accelerator communications with load-
+/store; (2) a fast and efﬁcient mechanism for notiﬁcation of
+requests to cc-accelerator exploiting the coherence information
+exposed to the cc-accelerators; (3) a cc-accelerator architecture
+for processing the requests and handling interactions among
+RNIC, CPU and cc-accelerator; and (4) an adaptive device-to-
+host data transfer mechanism for a server with a heterogeneous
+memory system consisting of DRAM and NVM.
+
+We prototype ORCA with a commercial system based on
+an Intel Xeon 6138P CPU that integrates an FPGA device in
+the same package and communicates with the FPGA device
+through a UPI link. Subsequently, we evaluate three popular
+µs-scale datacenter applications: (1) in-memory KVS to show
+a case fully ofﬂoading requests and bypassing the CPU; (2)
+chain replication-based distributed transaction processing
+system to show a case considering a latency-sensitive system
+with NVM; and (3) deep learning recommendation model
+(DLRM) inference to show a case processing application
+requests through collaboration between a server CPU and a cc-
+accelerator. We show that ORCA provides 30.1∼69.1% lower
+latency, up to 2.5× higher throughput, and ∼ 3× higher power
+efﬁciency than the current state-of-the-art solutions. In addition,
+we demonstrate that a cc-accelerator with its local memory as
+part of a server’s uniﬁed memory space can further improve
+the latency and throughput by 11.2% and 62.1×, respectively.
+
+II. BACKGROUND AND MOTIVATION
+
+A. RDMA Primer
+
+RDMA is an advanced kernel-bypass network concept that
+allows machines to access the memory of remote machines at
+high bandwidth and low latency. RDMA has now been widely
+deployed by datacenters [48, 53, 54, 171, 182] and used to
+build various research and production systems. RDMA ofﬂoads
+the network transport stack and link-layer operations to RNIC
+hardware and supports one- and two-sided operations that can
+be accessed directly from the user space. One-sided RDMA op-
+erations (e.g., read/write/atomics) completely bypass the remote
+server’s CPU for remote memory accesses. Meanwhile, two-
+sided RDMA operations (e.g., send/receive) are similar to con-
+ventional network communications (e.g., TCP/UDP) as they in-
+volve the CPUs of both clients and servers for data transmission.
+The key data structures in RDMA programming are queue
+pair (QP) and completion queue (CQ), shared between the
+host (user space) and the RNIC. A QP consists of two work
+queues (WQs): a send queue (SQ) and a receive queue (RQ),
+both of which are ring buffers in the host memory. To post
+an RDMA operation, the user writes to a work queue entry
+(WQE) at the tail of the WQ with a pre-deﬁned device-speciﬁc
+format and rings the RNIC’s doorbell register using an MMIO
+write. Upon completion of the RDMA operation, the RNIC
+(optionally) writes to a completion queue entry (CQE) at
+the tail of the CQ (also a ring buffer in the host memory)
+associated with the QP. By polling the CQ, the host can be
+aware of the completion of operations.
+
+B. Memory Capacity vs. Communication Overhead over PCIe:
+
+Dilemma of Using Smart NIC
+
+Recent Smart NICs integrate either FPGA or customized low-
+proﬁle CPU with NICs. Prior work has shown that Smart NICs
+running datacenter applications can offer higher performance
+and energy efﬁciency than host CPUs [85, 94]. However, Smart
+NICs have limited memory capacity (O(10 GB) [101]) under
+cost, power, and form factor constraints. As such, they often
+need to access the host memory when running applications
+with large working sets. Unfortunately, such host memory
+accesses are not cheap, primarily because they must go through
+PCIe links. Speciﬁcally, the PCIe links add non-trivial latency
+(e.g., at least 1µs) to the access latency of the host memory and
+can incur performance bottlenecks [118], especially when the
+Smart NIC needs to frequently synchronize its local memory
+with or retrieve data from the host memory. This has been
+identiﬁed by multiple system designs [18, 85, 94, 118, 147],
+and we also observe the same phenomenon on a BlueField-2
+Smart NIC; for a Smart NIC application accessing both its
+
+2
+
+A. Inter- and Intra-machine Communication
+
+in a server
+
+ORCA proposes a communication abstraction to (1) accomplish
+fast and efﬁcient communications not only between a server
+and clients (i.e.,
+inter-machine communications) but also
+(i.e.,
+between a CPU and a cc-accelerator
+intra-machine communications) and (2) unify the programming
+model for both inter- and intra-machine communications, based
+on lock-free ring buffers. For each client-server connection
+we establish a pair of a request ring buffer (in the server
+memory) and a response ring buffer (in the client memory) for
+inter-machine RDMA communications. For example, buffer-1
+on server-A and buffer-A on client-1 form a request-response
+buffer pair for a connection between client-1 and server-A in
+Fig. 1. Besides, for each accelerator in a server, we establish
+one request-response ring buffer pair in the server memory
+for intra-machine communications. One-sided RDMA write
+is used by both servers and clients for high-performance
+inter-machine communications through message passing where
+all the underlying network transport processing is ofﬂoaded
+to the RNIC [37, 158]. For the intra-machine communications,
+leveraging the shared coherence domain, the server CPU or
+cc-accelerator directly writes to or reads from the ring buffers.
+Note that we do not share the ring buffers (and the
+underlying RDMA QPs for the inter-machine communications)
+across different client-server connections, to avoid performance
+overheads with atomic updates or consistency issues at the
+head/tail of the buffer without atomic updates. However,
+we do allow sharing the ring buffers (and the RDMA QPs)
+across threads on the same machine for better scalability, as
+a software layer/library can manage cross-thread contentions
+with slight performance overheads [26, 115, 159]. Speciﬁcally,
+we employs the Flock’s method [115], i.e., one dedicated
+thread on the client for request synchronization and dispatch,
+so that there is only one request-response buffer pair (and
+QP) per client-server pair per application and observe no
+performance loss compared to native RDMA primitives.
+
+The client is responsible for tracking the tail of the request
+buffer in the server memory and the head of the response
+buffer in its local memory, similar to the credit-based ﬂow
+control [87]. Whenever it writes a message to the request
+buffer, it will update its local record of the request buffer’s
+tail; whenever it receives a message in the response buffer (by
+polling), it will update its local record of the response buffer’s
+head and reset the buffer entry to “0”. Only if the request
+buffer’s tail is behind the response buffer’s head can the client
+issue a request. Otherwise, it knows that the buffer is full of on-
+the-ﬂy requests and should not send more requests. A similar
+mechanism is applied to the server for request buffer’s head
+and response buffer’s tail. This guarantees that any message
+can be passed by only one network trip without any conﬂict.
+
+B. Coherence-assisted Accelerator Notiﬁcation
+
+Since a client and a server CPU directly write messages to
+inter- and intra-machine communication request buffers in
+the server memory, respectively, the ORCA cc-accelerator
+the message from the request
+needs to proactively get
+
+Fig. 1: ORCA’s high-level system architecture; only the
+snapshot of client-1 and server-A are demonstrated.
+
+local on-board memory and host memory, the latency increases
+and throughput decreases linearly with higher percentage of
+memory accesses to the host. Consequently, the Smart NIC
+is only well suited for applications with working sets that are
+either small enough to ﬁt in the Smart NIC’s local on-board
+memory or effective for caching (i.e., sufﬁcient spatial locality
+or skewed distributions of memory accesses).
+
+C. Cache-coherent Interconnects and Accelerators
+
+Originally, cc-interconnects were developed for NUMA systems
+where CPUs share the memory space in a cache coherent
+manner. Recent such cc-interconnects include UPI
+[69],
+Inﬁnity Fabric [167], and ECI [140]. Lately, with emergence
+of accelerators and need for ﬁne-grained data sharing between
+CPUs and accelerators, diverse cc-interconnects such as
+CXL [31], CAPI [153], and CCIX [23] built atop standard
+chip-to-chip physical links such as PCIe have been proposed.
+Accelerators built on such cc-interconnects are referred to
+as cc-accelerators. As cc-interconnects facilitate cheaper
+host-accelerator communications for sharing a small amount
+of data, cc-accelerators can be more efﬁcient than conventional
+accelerators connected to PCIe. This makes cc-accelerators
+suitable for µs-scale acceleration/ofﬂoading. Currently, some
+cc-accelerators are commercially available [27, 28, 68]
+and more commercial cc-accelerators will emerge as the
+next-generation Intel Xeon CPUs begins to support CXL [127].
+
+III. ORCA SYSTEM ARCHITECTURE
+
+We depict a high-level system architecture of ORCA in
+Fig. 1. ORCA envisions a system comprising an emerging cc-
+accelerator, a standard RNIC and a conventional powerful server
+CPU, each of which plays indispensable roles for efﬁcient
+network and application processing. Speciﬁcally, (1) the cc-
+accelerator not only ofﬂoads accelerator-friendly part of appli-
+cation processing from the server CPU but also directly commu-
+nicates with clients through the RNIC, i.e., receiving requests
+and sending responses from/to clients without involving the
+server CPU; (2) the standard RNIC handles network processing;
+and (3) the server CPU tackles accelerator-unfriendly (irregular
+and branch-rich) part of application processing in addition to
+initialization, control, and management of hardware resources,
+applications and network connections. The synergistic orches-
+trations among (1) – (3) are facilitated by the ORCA’s four
+software and hardware components described in this section.
+
+3
+
+cc-intconServer A, B, C, …Client 1, 2, 3, …Request (RDMA Write)Response (RDMA Write)CPUShared Coherent Memory Space12……MemoryABRNICCPUcc-accRNICFig. 2: A cpoll region for cc-accelerator notiﬁcation.
+
+buffers. Typically, a spin-polling mechanism can be deployed.
+the bandwidth of the cc-interconnect and the
+However,
+is precious. Frequently polling the
+coherence controller
+request buffers,
+the cc-accelerator has little bandwidth
+left for application processing, i.e., accessing the server’s
+memory to serve requests. Besides, polling has high power
+consumption [13, 42, 51, 98], fast transistor aging [124], and
+poor scalability with many queues [51]. Hence, we propose
+a coherence-assisted notiﬁcation mechanism, called cpoll.
+
+Conceptually and semantically, cpoll is similar to MWAIT
+in the x86 architecture [64], QWAIT in HyperPlane [111],
+and PCIe’s lightweight notiﬁcation (LN) proposal [50, 136].
+Nonetheless, cpoll differs from them because it is designed
+to be portable and platform/CPU-agnostic for off-chip devices.
+Speciﬁcally, we insert a cpoll checker in the datapath of the
+coherence controller’s port connected to the cc-interconnect.
+During initialization, we ﬁrst allocate the inter- and intra-
+machine communication request buffers (Sec. III-A) in a
+contiguous address region of the server memory (i.e., cpoll
+region), and register this region to the cc-accelerator’s cpoll
+checker for snooping, as depicted in Fig. 2(a). Then, when
+the cc-accelerator’s coherence controller receives a coherence
+signal from the registered address region (e.g., Modified →
+Invalid), it will notify the cc-accelerator of arrival of a request.
+The cpoll checker will only need to monitor a single address
+region illustrated in Fig. 2(a). If the address of a coherence
+signal falls into this region, the cpoll checker can identify
+which request buffer (associated with a speciﬁc client or the
+server CPU) that received a new request by determining the
+address offset from the starting address of the region as the size
+of buffers is ﬁxed after the initialization. Hence, there will be no
+scalability concern for the cpoll mechanism. Even if the buffers
+are not allocated consecutively in the memory, the overhead
+of address lookup should not be a concern as well (to O(1K)
+level buffers at least), as demonstrated by HyperPlane [111].
+the cpoll mechanism, we propose two
+approaches. First, we allocate the cpoll region to the
+memory attached to the CPU, and then pin the region on
+the cc-accelerator’s local cache. Note that the cc-accelerator
+resets the request buffer entry associated with a cpoll signal
+after it completes processing the request. This makes the
+cc-accelerator’s local cache always own the cpoll region from
+the cache coherence viewpoint, and any change to the cpoll
+region by clients or the server CPU trigger a coherence signal.
+Alternatively, we allocate the cpoll region to the memory
+attached to the cc-accelerator. As such, any request from
+
+To implement
+
+Fig. 3: ORCA cc-accelerator architecture.
+
+the RNIC to the request buffers in the server memory space
+(consisting of CPU and cc-accelerator memory regions) will
+go through the cc-interconnect. Subsequently, they will be
+delivered to the cc-accelerator’s coherence controller that is
+responsible for monitoring any change to the cpoll region.
+
+The ﬁrst approach is feasible with our prototype platform
+(Sec. V), but the size of request buffers is constrained by
+the cc-accelerator’s local cache size, limiting its scalability
+at the moment. When the scale of the system is large (i.e.,
+many request buffers) or each request itself is large (i.e., large
+buffers), we cannot pin the entire cpoll region on the cc-
+accelerator’s cache. To tackle this scalability issue in our setup,
+we introduce a data structure called pointer buffer where each
+4-byte entry corresponds to each inter- or intra-machine request
+buffer and stores a pointer (or index) to an entry in the request
+buffer, as depicted in Fig. 2(b). Subsequently, we register the
+pointer buffer allocated to a contiguous address space as the
+cpoll region. When writing a new request to a request buffer
+in the server memory, a client or the server CPU will also
+increment the value of the pointer buffer entry corresponding to
+the request buffer such that the pointer buffer entry points to the
+request buffer tail. For a remote client, this can be efﬁciently
+done by posting two contiguous WQEs (only the second
+one is signaled) with a batched doorbell to the RNIC [77]
+or remapping/interleaving the two buffers with user-mode
+memory registration (UMR) [123] and only posting one WQE.
+Note that one additional small PCIe write to the server
+side is inevitable in both ways. However, since ORCA has
+already reduced the PCIe trafﬁc and mainly leverages the
+coherence trafﬁc, such overhead will not notably hurt the
+overall performance, which is conﬁrmed by our experiments
+in Sec. VI. In addition, as a 4-byte pointer buffer entry covers
+an entire request buffer, which can be as large as several MBs
+for some applications such as the one described in Sec. IV-B,
+it can substantially reduce the memory space requirement for
+the cpoll region. Finally, coherence signals are not guaranteed
+to come in the order of actual data writes. However, this does
+not affect the correctness of cpoll because it is designed to
+be used with a ring buffer, and leverages the semantics of the
+ring buffer, i.e., request buffer entries are written in order.
+
+C. ORCA cc-accelerator Architecture
+
+We depict ORCA cc-accelerator architecture in Fig. 3. The
+coherence controller handles all the coherence trafﬁc (both
+
+4
+
+SOSP’17,October28,2017,Shanghai,ChinaX.Jinetal.ClientsKey-Value CacheQuery StatisticsHigh-performance Storage ServersKey-Value Storage RackControllerL2/L3 RoutingToRSwitch Data plane(a)NetCachearchitecture.ETHIPTCP/UDPOPKEYVALUEExisting Protocols NetCacheProtocolget,put,delete,etc.reservedport#L2/L3 RoutingSEQ(b)NetCachepacketformat.Figure2:NetCacheoverview.TraditionalswitchASICsare￿xedfunction,soaddinganewfeaturerequiresdesigningandmanufacturinganewASIC,whichincurshugecapitalandengineeringcosts.How-ever,new-generationprogrammableswitchASICslikeBare-footTo￿no[4]andCaviumXPliant[9]makein-networkcachingviableandimmediatelydeployable.Theyallowuserstoprogramtheswitchpacket-processingpipelinewithoutreplacingtheswitchASICs.Speci￿cally,weareableto(i)programtheswitchparsertoidentifycustompacketformats(e.g.,containingcustom￿eldsforkeysandvalues),(ii)pro-gramtheon-chipmemorytostorecustomstate(e.g.,storehotitemsandquerystatistics),and(iii)programtheswitchtablestoperformcustomactions(e.g.,copyvaluesfromon-chipmemorytopacketsanddetectheavyhitters).Thegoalofthispaperistoleverageprogrammableswitchestomakein-networkcachingareality.3NETCACHEOVERVIEWNetCacheisanewrack-scalekey-valuestorearchitecturethatleveragesin-networkcachingtoprovidedynamicloadbalancingacrossallstorageservers.Weassumetherackisdedicatedforkey-valuestorageandthekey-valueitemsarehash-partitionedtothestorageservers.WeusetheToRswitchthatisdirectlyconnectedtotheserversasaload-balancingcache.Figure2(a)showsthearchitectureoverviewofaNetCachestoragerack,whichconsistsofaToRswitch,acontroller,andstorageservers.Switch.TheswitchisthecorecomponentofNetCache.Itisresponsibleforimplementingon-pathcachingforkey-valueitemsandroutingpacketsusingstandardL2/L3protocols.WereserveanL4porttodistinguishNetCachepackets(Fig-ure2(b))fromotherpackets(§4.1).OnlyNetCachepack-etsareprocessedbyNetCachemodulesintheswitch.ThismakesNetCachefullycompatiblewithothernetworkproto-colsandfunctions.Thekey-valuecachemodulestoresthehottestitems.Readqueriesarehandleddirectlybytheswitchwhilewritequeriesareforwardedtothestorageservers(§4.2).Cachecoherenceisguaranteedwithalight-weightwrite-throughmechanism(§4.3).Weleveragematch-actiontablesandregisterarraystoindex,store,andservekey-valueitems(§4.4.2).Thequerystatisticsmoduleprovideskey-accessstatisticstothecontrollerforcacheupdates(§4.4.3).ThisiscriticalforenablingNetCachetohandledynamicworkloadswherethepopularityofeachkeychangesovertime.Itcontains(i)per-keycountersforthecacheditemsand(ii)aheavyhitter(HH)detectortoidentifyhotkeysnotpresentinthecache.TheHHdetectorusesaCount-MinsketchtoreportHHsandaBloom￿ltertoremoveduplicateHHreports,bothofwhicharespace-e￿cientdatastructuresandcanbeimplementedinprogrammableswitcheswithminimalhardwareresources.Sincetheswitchisareadcache,iftheswitchfails,opera-torscansimplyreboottheswitchwithanemptycacheoruseabackupToRswitch.Theswitchonlycacheshotitemsandcomputeskeyaccessstatistics;itdoesnotmaintainanycriticalsystemstate.BecauseNetCachecachesaresmall,theywillre￿llrapidlyafterareboot.Controller.Thecontrollerisprimarilyresponsibleforup-datingthecachewithhotitems(§4.3).ItreceivesHHreportsfromtheswitchdataplane,andcomparesthemwithper-keycountersoftheitemsalreadyinthecache.Itthendecideswhichitemstoinsertintothecacheandwhichonestoevict.NotethattheNetCachecontrollerisdi￿erentfromthenet-workcontrollerinSoftware-De￿nedNetworking(SDN):theNetCachecontrollerdoesnotmanagenetworkprotocolsordistributedroutingstate.Theoperatorusesexistingsystems(whichmaybeanSDNcontrollerornot)tomanageroutingtablesandothernetworkfunctions.TheNetCachecontrollerdoesnotinterferewiththeseexistingsystemsandisonlyresponsibleformanagingitsownstate—i.e.,thekey-valuecacheandthequerystatisticsintheswitchdataplane.ItcanresideasaprocessintheswitchOSoronaremoteserver.ItcommunicateswiththeswitchASICthroughaswitchdriverintheswitchOS.Asallqueriesarehandledbytheswitchandstorageservers,thecontrolleronlyhandlescacheupdatesandthusisnotthebottleneck.Storageservers.NetCacheserversrunasimpleshimthatprovidestwoimportantpiecesoffunctionality:(i)itmapsRequest Buﬀers…SOSP’17,October28,2017,Shanghai,ChinaX.Jinetal.ClientsKey-Value CacheQuery StatisticsHigh-performance Storage ServersKey-Value Storage RackControllerL2/L3 RoutingToRSwitch Data plane(a)NetCachearchitecture.ETHIPTCP/UDPOPKEYVALUEExisting Protocols NetCacheProtocolget,put,delete,etc.reservedport#L2/L3 RoutingSEQ(b)NetCachepacketformat.Figure2:NetCacheoverview.TraditionalswitchASICsare￿xedfunction,soaddinganewfeaturerequiresdesigningandmanufacturinganewASIC,whichincurshugecapitalandengineeringcosts.How-ever,new-generationprogrammableswitchASICslikeBare-footTo￿no[4]andCaviumXPliant[9]makein-networkcachingviableandimmediatelydeployable.Theyallowuserstoprogramtheswitchpacket-processingpipelinewithoutreplacingtheswitchASICs.Speci￿cally,weareableto(i)programtheswitchparsertoidentifycustompacketformats(e.g.,containingcustom￿eldsforkeysandvalues),(ii)pro-gramtheon-chipmemorytostorecustomstate(e.g.,storehotitemsandquerystatistics),and(iii)programtheswitchtablestoperformcustomactions(e.g.,copyvaluesfromon-chipmemorytopacketsanddetectheavyhitters).Thegoalofthispaperistoleverageprogrammableswitchestomakein-networkcachingareality.3NETCACHEOVERVIEWNetCacheisanewrack-scalekey-valuestorearchitecturethatleveragesin-networkcachingtoprovidedynamicloadbalancingacrossallstorageservers.Weassumetherackisdedicatedforkey-valuestorageandthekey-valueitemsarehash-partitionedtothestorageservers.WeusetheToRswitchthatisdirectlyconnectedtotheserversasaload-balancingcache.Figure2(a)showsthearchitectureoverviewofaNetCachestoragerack,whichconsistsofaToRswitch,acontroller,andstorageservers.Switch.TheswitchisthecorecomponentofNetCache.Itisresponsibleforimplementingon-pathcachingforkey-valueitemsandroutingpacketsusingstandardL2/L3protocols.WereserveanL4porttodistinguishNetCachepackets(Fig-ure2(b))fromotherpackets(§4.1).OnlyNetCachepack-etsareprocessedbyNetCachemodulesintheswitch.ThismakesNetCachefullycompatiblewithothernetworkproto-colsandfunctions.Thekey-valuecachemodulestoresthehottestitems.Readqueriesarehandleddirectlybytheswitchwhilewritequeriesareforwardedtothestorageservers(§4.2).Cachecoherenceisguaranteedwithalight-weightwrite-throughmechanism(§4.3).Weleveragematch-actiontablesandregisterarraystoindex,store,andservekey-valueitems(§4.4.2).Thequerystatisticsmoduleprovideskey-accessstatisticstothecontrollerforcacheupdates(§4.4.3).ThisiscriticalforenablingNetCachetohandledynamicworkloadswherethepopularityofeachkeychangesovertime.Itcontains(i)per-keycountersforthecacheditemsand(ii)aheavyhitter(HH)detectortoidentifyhotkeysnotpresentinthecache.TheHHdetectorusesaCount-MinsketchtoreportHHsandaBloom￿ltertoremoveduplicateHHreports,bothofwhicharespace-e￿cientdatastructuresandcanbeimplementedinprogrammableswitcheswithminimalhardwareresources.Sincetheswitchisareadcache,iftheswitchfails,opera-torscansimplyreboottheswitchwithanemptycacheoruseabackupToRswitch.Theswitchonlycacheshotitemsandcomputeskeyaccessstatistics;itdoesnotmaintainanycriticalsystemstate.BecauseNetCachecachesaresmall,theywillre￿llrapidlyafterareboot.Controller.Thecontrollerisprimarilyresponsibleforup-datingthecachewithhotitems(§4.3).ItreceivesHHreportsfromtheswitchdataplane,andcomparesthemwithper-keycountersoftheitemsalreadyinthecache.Itthendecideswhichitemstoinsertintothecacheandwhichonestoevict.NotethattheNetCachecontrollerisdi￿erentfromthenet-workcontrollerinSoftware-De￿nedNetworking(SDN):theNetCachecontrollerdoesnotmanagenetworkprotocolsordistributedroutingstate.Theoperatorusesexistingsystems(whichmaybeanSDNcontrollerornot)tomanageroutingtablesandothernetworkfunctions.TheNetCachecontrollerdoesnotinterferewiththeseexistingsystemsandisonlyresponsibleformanagingitsownstate—i.e.,thekey-valuecacheandthequerystatisticsintheswitchdataplane.ItcanresideasaprocessintheswitchOSoronaremoteserver.ItcommunicateswiththeswitchASICthroughaswitchdriverintheswitchOS.Asallqueriesarehandledbytheswitchandstorageservers,thecontrolleronlyhandlescacheupdatesandthusisnotthebottleneck.Storageservers.NetCacheserversrunasimpleshimthatprovidestwoimportantpiecesoffunctionality:(i)itmapsPointer Buﬀer (cpoll region) Request Buﬀers (cpoll region)+(a) Small Scale/Small Request(b) Large Scale/Large RequestSOSP’17,October28,2017,Shanghai,ChinaX.Jinetal.ClientsKey-Value CacheQuery StatisticsHigh-performance Storage ServersKey-Value Storage RackControllerL2/L3 RoutingToRSwitch Data plane(a)NetCachearchitecture.ETHIPTCP/UDPOPKEYVALUEExisting Protocols NetCacheProtocolget,put,delete,etc.reservedport#L2/L3 RoutingSEQ(b)NetCachepacketformat.Figure2:NetCacheoverview.TraditionalswitchASICsare￿xedfunction,soaddinganewfeaturerequiresdesigningandmanufacturinganewASIC,whichincurshugecapitalandengineeringcosts.How-ever,new-generationprogrammableswitchASICslikeBare-footTo￿no[4]andCaviumXPliant[9]makein-networkcachingviableandimmediatelydeployable.Theyallowuserstoprogramtheswitchpacket-processingpipelinewithoutreplacingtheswitchASICs.Speci￿cally,weareableto(i)programtheswitchparsertoidentifycustompacketformats(e.g.,containingcustom￿eldsforkeysandvalues),(ii)pro-gramtheon-chipmemorytostorecustomstate(e.g.,storehotitemsandquerystatistics),and(iii)programtheswitchtablestoperformcustomactions(e.g.,copyvaluesfromon-chipmemorytopacketsanddetectheavyhitters).Thegoalofthispaperistoleverageprogrammableswitchestomakein-networkcachingareality.3NETCACHEOVERVIEWNetCacheisanewrack-scalekey-valuestorearchitecturethatleveragesin-networkcachingtoprovidedynamicloadbalancingacrossallstorageservers.Weassumetherackisdedicatedforkey-valuestorageandthekey-valueitemsarehash-partitionedtothestorageservers.WeusetheToRswitchthatisdirectlyconnectedtotheserversasaload-balancingcache.Figure2(a)showsthearchitectureoverviewofaNetCachestoragerack,whichconsistsofaToRswitch,acontroller,andstorageservers.Switch.TheswitchisthecorecomponentofNetCache.Itisresponsibleforimplementingon-pathcachingforkey-valueitemsandroutingpacketsusingstandardL2/L3protocols.WereserveanL4porttodistinguishNetCachepackets(Fig-ure2(b))fromotherpackets(§4.1).OnlyNetCachepack-etsareprocessedbyNetCachemodulesintheswitch.ThismakesNetCachefullycompatiblewithothernetworkproto-colsandfunctions.Thekey-valuecachemodulestoresthehottestitems.Readqueriesarehandleddirectlybytheswitchwhilewritequeriesareforwardedtothestorageservers(§4.2).Cachecoherenceisguaranteedwithalight-weightwrite-throughmechanism(§4.3).Weleveragematch-actiontablesandregisterarraystoindex,store,andservekey-valueitems(§4.4.2).Thequerystatisticsmoduleprovideskey-accessstatisticstothecontrollerforcacheupdates(§4.4.3).ThisiscriticalforenablingNetCachetohandledynamicworkloadswherethepopularityofeachkeychangesovertime.Itcontains(i)per-keycountersforthecacheditemsand(ii)aheavyhitter(HH)detectortoidentifyhotkeysnotpresentinthecache.TheHHdetectorusesaCount-MinsketchtoreportHHsandaBloom￿ltertoremoveduplicateHHreports,bothofwhicharespace-e￿cientdatastructuresandcanbeimplementedinprogrammableswitcheswithminimalhardwareresources.Sincetheswitchisareadcache,iftheswitchfails,opera-torscansimplyreboottheswitchwithanemptycacheoruseabackupToRswitch.Theswitchonlycacheshotitemsandcomputeskeyaccessstatistics;itdoesnotmaintainanycriticalsystemstate.BecauseNetCachecachesaresmall,theywillre￿llrapidlyafterareboot.Controller.Thecontrollerisprimarilyresponsibleforup-datingthecachewithhotitems(§4.3).ItreceivesHHreportsfromtheswitchdataplane,andcomparesthemwithper-keycountersoftheitemsalreadyinthecache.Itthendecideswhichitemstoinsertintothecacheandwhichonestoevict.NotethattheNetCachecontrollerisdi￿erentfromthenet-workcontrollerinSoftware-De￿nedNetworking(SDN):theNetCachecontrollerdoesnotmanagenetworkprotocolsordistributedroutingstate.Theoperatorusesexistingsystems(whichmaybeanSDNcontrollerornot)tomanageroutingtablesandothernetworkfunctions.TheNetCachecontrollerdoesnotinterferewiththeseexistingsystemsandisonlyresponsibleformanagingitsownstate—i.e.,thekey-valuecacheandthequerystatisticsintheswitchdataplane.ItcanresideasaprocessintheswitchOSoronaremoteserver.ItcommunicateswiththeswitchASICthroughaswitchdriverintheswitchOS.Asallqueriesarehandledbytheswitchandstorageservers,thecontrolleronlyhandlescacheupdatesandthusisnotthebottleneck.Storageservers.NetCacheserversrunasimpleshimthatprovidestwoimportantpiecesoffunctionality:(i)itmaps……Application ProcessingUnitRDMASQ HandlerSchedulerLocal Cache cpoll SignalMem Rd/wtcc-interconnectCoherence ControllerConf/mgmtInterface & LogicRing TrackerMem Ctrlerregular read/write and cpoll) to/from the cc-accelerator, as
+well as the virtual-physical address translation (i.e., TLB). The
+local cache is also in the coherence domain and handled by
+the coherence controller. The ORCA cc-accelerator may have
+its own local memory controller and memory [28, 30] that
+constitutes the uniﬁed memory space with the CPU memory.
+In such an architecture, the CPU may allocate application data
+to the cc-accelerator’s local memory, as the NUMA-aware
+memory management does in the modern Linux kernel.
+
+The scheduler fetches cpoll signals associated with different
+request buffers based on a given scheduling algorithm. Due to
+the nature of the coherence implementation, cpoll signals can
+be coalesced. For example, if we update the same entry in the
+pointer buffer twice in a short period, there can be only one
+cpoll signal generated. However, leveraging the semantics of
+the ring buffer, i.e., a pointer value only increments (including
+mod), we introduce a ring tracker to the cc-accelerator to track
+the previous tail of the request buffer. It tells the application
+processing unit (APU) how many new requests are received
+since the last notiﬁcation based on the difference between the
+recorded tail pointer value and the incoming pointer value.
+
+The RDMA SQ handler is responsible for assembling the
+response information into the format of the RNIC’s WQE
+and ring the RNIC’s doorbell register in its PCIe BAR. Since
+polling the CQ is not on the critical datapath, we do not
+process it with the cc-accelerator. Instead, we use a single
+CPU core to handle all the CQs polling and bookkeeping.
+Unsignaled WQE [77] is applied here so that only the selected
+operations will notify the CQ of their completion. This can
+alleviate the overhead of RNIC-CPU communication when
+the CPU is polling multiple CQs. Besides, this helps reduce
+unnecessary trafﬁc on the cc-interconnect.
+
+The APU is the only application-speciﬁc part in the entire
+ORCA architecture, yielding a ﬁne balance between ORCA pro-
+grammability and user implementation complexity. It provides
+the user with standard interfaces for (1) cpoll signal reception,
+(2) coherent data read/write, and (3) RDMA WQE output.
+First, a (de)serializer can be optionally used, if the application
+uses an RPC protocol for inter-machine communications [90].
+Then, to process requests, we typically need a data structure
+walker [52, 86, 105, 173, 176] to ﬁnd the location of the target
+data of the request. To maximize the memory-level parallelism
+and hide the memory access latency, multiple outstanding re-
+quests and out-of-order execution should be supported. Inspired
+by the stateful network function accelerator [137], we employ
+a table-based ﬁnite state machine for this purpose, where the
+outstanding request status is stored in a TCAM or cuckoo hash
+table [179] for fast lookup. Upon the arrival of a new request
+or intermediate result, the corresponding TCAM or hash table
+entry is updated and then the next-step action is issued to a cor-
+responding functional unit (e.g., ALU or coherence controller).
+The APU should invoke the CPU in two scenarios. The ﬁrst
+scenario is when a library call or OS syscall is needed. For ex-
+ample, if the user space memory pool has been pre-allocated by
+the CPU (malloc/mmap), the APU itself can allocate objects for
+new data in the memory pool [94]; if not, malloc is called each
+
+time when a new object is needed. The second scenario is when
+CPU is more suitable than the APU for a certain part of applica-
+tion processing. For example, in a recommender inference sys-
+tem (see Sec. IV-C), while the APU can handle the embedding
+reduction and fully-connected layers, the request preprocessing
+(e.g., transforming a human-readable request to a model input)
+should still run on the CPU due to its irregularity and complex-
+ity. In these scenarios, the cc-accelerator and CPU interact with
+low latency in a ﬁne-grained manner described in Sec. III-A.
+
+D. Optimizing Device-host Data Transfer: Adaptive DDIO
+
+Having the ORCA system design, we ﬁnally consider the
+optimization of device-memory-cache interaction inside a single
+machine, or speciﬁcally, how to choose between the cache
+and memory as the data destination for optimal device-host
+data transfer. Given the data-intensive nature of ORCA’s usage
+scenarios, this optimization is notably important for the entire
+system. As the device I/O speeds increase, Intel introduced
+data-direct I/O (DDIO) [70], a CPU-wide technology,
+to
+allow the device to directly inject data to the CPU’s last level
+cache (LLC) instead of main memory. This reduces memory
+bandwidth consumption and latency required by I/O.
+
+DDIO has been proven to be effective [4, 19, 44, 45, 74, 88,
+107, 135, 146, 157, 166, 175], improving the performance of
+DRAM-based systems [4, 19, 88]. However, it does not always
+improve performance of NVM-based systems [74, 166]. which
+is increasingly deployed by datacenters to cost-effectively
+provide large memory capacity for applications such as
+in-memory database [10, 17]. This is mainly because of two
+reasons. (1) NVM has a larger access granularity than DRAM
+and cache. For example, the access granularity of the Intel
+Optane DIMM is 256 bytes while that of DRAM and cache
+is 64 bytes in Intel-based system [172]. When the DDIO-ed
+data is evicted from LLC to NVM, the write-back to the
+NVM will be randomized because of the cache replacement
+policies. As a result, write ampliﬁcation wastes the bandwidth
+of NVM [74], which is already lower than that of DRAM.
+(2) CPU caches are typically not persistent; Intel eADR [63]
+makes cache as part of the persistency domain but it requires
+a large battery and has high power consumption [6, 15]. As
+such, applications often have to ﬂush data in cache to NVM to
+remain correct in case of a crash, with performance cost [155].
+To tackle the aforementioned limitation, we propose to ex-
+ploit a rarely-discussed ﬁeld in the PCIe packet header, TLP pro-
+cessing hints (TPH). It is the 16th bit in the PCIe header and a
+
+Fig. 4: Memory bandwidth consumption by PCIe-bench’s
+DMA write with different DDIO/TPH settings.
+
+5
+
+DDIO OnTPH OnDDIO OnTPH OffDDIO OffTPH OnDDIO OffTPH Off010203040Memory BandwidthConsumption (MB/s)3515, 3497Memory ReadMemory WriteFig. 5: DDIO/TPH conﬁgurations in the system with NVM.
+
+Fig. 6: Emulated 2-node replication; the DPU ARM in the
+client simply forwards data from port 0 to port 1, and the
+DPU ARM/ORCA accelerator is separated to handle trafﬁc
+from port 0 and 1 independently.
+
+performance feature that allows the CPU to prefetch or keep cer-
+tain PCIe writeback data in LLC for quick consumption by CPU
+cores [125]. To our best knowledge, no current commercial I/O
+device (including SSD and NIC) uses the TPH bit; it is always
+set to 0 as a placeholder in both hardware and device drivers.
+Our experiment conﬁrms that changing the TPH bit allows
+us to control the destination of data to either LLC or memory
+per PCIe packet. Being the ﬁrst to clarify the DDIO-TPH
+relationship with modern server platforms, we perform an
+experiment running PCIe-bench [118] on a Xilinx VC709
+FPGA board [170] in which we implement a module that allows
+an API to set the TPH bit on-the-ﬂy for each PCIe packet.
+The FPGA DMAs (random write) data to the (DRAM-based)
+host at a constant speed of 3.5GB/s. We measure the memory
+bandwidth consumption on the host side in four conﬁgurations
+(DDIO on/off + TPH on/off) in Fig. 4. Only when both DDIO
+and TPH are off, we observe large memory bandwidth consump-
+tion (i.e., ∼3.5GB/s for both read and write), which is aligned
+with the DMA throughput reported by the FPGA. This indicates
+that all DMA data is sent to the main memory. Otherwise, if ei-
+ther DDIO or TPH is on, there will be little memory bandwidth
+consumption, meaning data is sent to the LLC directly.
+
+Since TPH is applicable to each PCIe packet, we propose
+two guidelines for future systems with heterogeneous memory,
+as depicted in Fig. 5. (1) DDIO should be disabled globally
+on the CPU by default. (2) The device should expose the knob
+of changing the TPH bit for the programmer. Taking RNIC
+as an example, one way to do this would be to make it a
+conﬁguration parameter set when registering a memory region
+to the RNIC, specifying whether the registered address range
+belongs to DRAM or NVM. Later, when executing an RDMA
+operation (e.g., write), the RNIC hardware will set the TPH bit
+only for operations in DRAM regions, avoiding DDIO-induced
+write ampliﬁcation on NVM regions. While this requires
+hardware modiﬁcations to the RNIC, our experiment that adds
+this functionality to the original PCIe-bench shows that it
+adds almost no cost to the NIC hardware design. Following
+these two guidelines, we can make DDIO NVM-aware
+independently for each I/O device.
+
+IV. ORCA USE CASES
+
+A. In-Memory Key-Value Store
+
+In-memory key-value store (KVS) is a basic building block of
+many datacenter services. In a KVS, the key-value pairs are
+usually organized in a hash table or B-tree for fast lookup. In
+this paper, we take the hash table based KVS as a use case.
+
+Upon arrival of a request, a hash value is calculated based on
+the requested key. Based on the hash value, a speciﬁc hash
+table entry/bucket is accessed for data retrieval/update/insert. To
+avoid hash collisions, chaining [99] or cuckoo hashing [43] can
+be leveraged, both of which often increase the number of mem-
+ory accesses. In addition to software optimizations, researchers
+have leveraged all the three directions mentioned in Sec. I and
+Tab. I for further KVS acceleration. The major requirements
+of KVS is high memory access parallelism across requests.
+
+An ORCA design for KVS, dubbed ORCA KV aims to
+fully ofﬂoad request processing to the cc-accelerator. At
+the algorithm/data structure level, ORCA KV is similar to
+MICA [99], but ORCA KV follows the architectural description
+of Sec. III-C at the hardware level, including a pipelined hash
+unit for hash value/index calculation. ORCA KV performs a
+GET/UPDATE request by calculating the hashed key value
+and ﬁnding the corresponding entry in the set-associated hash
+table’s bucket. The entry contains a pointer to the actual
+key-value data. For PUT requests, after ﬁnding the address
+where a new key-value pair should be allocated (i.e., an empty
+entry in the bucket), the slab allocator will simply put it in the
+pre-deﬁned memory pool. If the bucket indexed by the hashed
+key is full (i.e., hash collision), another bucket with the same
+format will be allocated and linked to the existing bucket by
+a pointer. Similar to KV-Direct [94] and MICA [99]’s study,
+on average, each GET request requires three memory accesses
+and each PUT request requires four.
+
+B. Distributed Transaction with NVM-based Chain Replication
+
+Distributed transactional systems are widely used by datacenters
+to provide the ACID feature for distributed storage systems.
+To this end, cross-machine protocols for data replication is
+usually needed, and chain replication [5, 8, 11, 21, 40, 49, 110,
+116, 126, 133, 143, 154, 156, 160, 180] is a popular primary-
+backup replication protocol. In chain replication, machines are
+virtually organized into a linear chain. Any change to the data
+will begin at the head of the chain and pass through the chain.
+When the last machine in the chain makes the change in its log,
+it will back-propagate the ACK signal through the chain so that
+each machine can locally commit the transaction. When the
+head of the chain commits the transaction, it sends the ACK
+signal back to the client, marking the end of the transaction.
+The state-of-the-art work, HyperLoop [84], leverages the
+RNIC and NVM to achieve low-latency chain replication with
+little CPU involvement. Speciﬁcally, it proposes and imple-
+ments group-based RDMA primitives, which can be triggered
+
+6
+
+CPUI/O Controller(DDIO Oﬀ)RNICMemory Controller LLCOn-chip InterconnectNVDIMMNVDIMMNVMDRAMDRAMDRAM…Is the address in NVM?TPH bit set in the PCIe packetPort 0Port 1ClientPort 0Port 1Server1234Host CPUDPU ARMDPU ARM/ORCADPU ARM/ORCAautomatically by the RNIC. One key-value pair (addressed
+by the offset in the NVM space) is modiﬁed in the entire
+chain once the client initiates a group-based RDMA operation.
+However, to process multi-value transactions, the client needs
+to sequentially issue RDMA operations for each key-value pair,
+which often leads to long latency in the network and PCIe link.
+An ORCA design for such a distributed transaction system,
+dubbed ORCA TX is similar to ORCA KV with respect to
+request processing, but it additionally implement a concurrency
+control unit in the APU. That is, any single key-value pair can
+only be accessed by one outstanding transaction, and the other
+related transactions will be buffered in the queue in the order
+of arrival. The concurrency control unit is a small hash table,
+and its entries are indexed by the key of the key-value pair.
+Key-value pairs are stored in the NVM and accessed by the
+address offset relative to the starting address, which is the same
+as HyperLoop. Also, it adds the functionality of chain-based
+communication across replica machines. The inter-machine
+communications still
+rely on ring buffers described in
+Sec. III-A, but the ring buffers are allocated in the NVM as the
+redo-log for failure recovery. One log entry (transaction) can
+contain multiple (data, len, offset) tuples, and the ﬁrst byte
+of the log entry indicates the number of tuples. One exception
+is pure read transactions. Similar to HyperLoop, since the
+chain replication protocol already provides data consistency, a
+client can conduct a pure read transaction by directly accessing
+the chain’s head/tail machine with one-sided RDMA read.
+
+C. DLRM Inference
+
+by
+
+have
+
+attention
+
+2 ∼ 3
+
+received much
+
+DLRMs
+Internet
+giants [2, 24, 36, 57, 58, 82, 117] as they can offer
+more revenue and better user experience. In an end-to-end
+recommender system, the most expensive part of serving an
+inference request is the embedding reduction step, consuming
+huge memory capacity [117, 177, 178] and 1
+4 of the
+inference time [38, 58, 60, 82, 92]. The embedding reduction
+operation processes queries on a set of features. It ﬁnds
+a (sparse) embedding vector in the embedding table (a
+high-dimension matrix) and aggregates a value. The values of
+all features are assembled as the result. Also, the embedding
+reduction is bounded by memory bandwidth and exhibits poor
+data locality [82, 92]. Last but not least, it also incorporates
+routines like request parsing and transforming (pre-processing),
+which are irregular and branch-rich. As such it is not suitable for
+hardware accelerators. These characteristics make it unsuitable,
+if not impossible, to be fully ofﬂoaded to any Smart NIC or
+cc-accelerator. In addition to acceleration with specialized hard-
+ware like in-memory processing [9, 82, 89, 131], MERCI [92]
+takes an algorithmic way to memoize sub-query grouped results
+to reduce memory pressure on the commodity server platform.
+Different from ORCA KV and ORCA TX, we design ORCA
+DLRM as an example of CPU-accelerator collaboration for
+request processing. Upon receiving a request from a client,
+the cc-accelerator ﬁrst goes through the RPC stack, and then
+pass the request to the CPU through the ring buffer, where the
+request is parsed and transformed to model-ready input. Now,
+
+TABLE II: ORCA testbed conﬁgurations.
+
+Intel Xeon 6138P CPU@2.0GHz
+
+20 Skylake cores, hyperthreading enabled, running Ubuntu 18
+27.5MB shared LLC
+Six DDR4-2666 channels, 192GB DRAM in total
+
+In-package Intel Arria 10GX FPGA@400MHz
+
+One UPI link to the CPU, 10.4GT/s (20.8GB/s)
+64KB local cache
+Resource usage: 11K (26%) LUT; 130K (8%) registers; 387 (14%) BRAM blocks
+
+NVIDIA BlueField-2 DPU (Smart NIC) SoC
+
+2x25Gbps Ethernet ports, backed by ConnectX-6 Dx controller
+RDMA over converged Ethernet V2 (RoCEv2)
+Eight ARM A72 cores@2.5GHz, running Ubuntu 20
+6MB shared LLC
+16GB on-board DDR4-1600 DRAM
+One-sided RDMA for ARM to access the host memory
+
+the input (request) is passed again to the cc-accelerator’s APU,
+where the full inference, especially embedding reduction, is
+done. Finally, the cc-accelerator sends result (response) back
+to the client through the RNIC. Empirically, we observe that
+one CPU core with 60% usage can already keep up with the
+network and the cc-accelerator processing rate. In DLRM, not
+all memory accesses in a single query need to be serialized.
+Hence, in the APU, we issue 64 memory requests for each
+query’s iteration so that the memory bandwidth can be fully
+utilized and the memory access latency can be hidden. Lastly,
+the ALU is enhanced to support various aggregation operators
+(e.g., max/min/inner product).
+
+V. ORCA IMPLEMENTATION AND EVALUATION SETUP
+
+We prototype ORCA with a commercial system consisting
+of two Intel Xeon Gold 6138P CPUs at 2.0GHz [68] and
+192GB DDR4 memory. The conﬁgurations of the system are
+listed in Tab. II. Speciﬁcally, we use the in-package FPGA
+(Intel Arria 10GX@400MHz [65]) of the CPU to implement
+the cpoll mechanism and a cc-accelerator. The FPGA has
+a 64KB local cache and is connected to the CPU through a
+UPI link, typically used in NUMA systems to connect CPUs.
+The UPI link has one read channel and one write channel,
+each with 10.4GT/s bandwidth. It can also issue sfence signal
+and cpoll message. For intra-machine communication, since
+HyperPlane’s QWAIT and x86’s user space MWAIT is unavailable
+on our platform, we use spin-polling for CPU to fetch requests
+in the request ring buffers from the cc-accelerators.
+
+We implement a round-robin algorithm in the scheduler. The
+APU can support 256 outstanding requests. Each request buffer
+has 1024 entries. We adopt the HERD’s RPC protocol [76, 77]
+for its simplicity, but any advanced RPC stack can also be
+applied [90]. The resource utilization numbers in Tab. II
+reﬂect our ORCA key-value store accelerator (Sec. IV-A). The
+utilization results for the other applications we have built are
+similar, because ∼ 80% of used resource is for the coherence
+controller and the local cache, which are common components.
+The current implementation has two major limitations. The
+ﬁrst one is the performance of the coherence controller. As a
+soft design in the programmable fabric of the FPGA, it suffers
+
+7
+
+from synthesis constraints and can perform at at most 400 MHz,
+incurring limited data access performance, which has also been
+observed by prior work [90]). However, its counterparts on a
+regular server CPU can operate at ∼2 GHz [1]. We expect such
+infrastructural parts can be ﬁxed by hard IPs in the future FPGA,
+offering performance of the accelerator’s coherence controller
+comparable to that of the CPU’s [67]. The second is that the
+FPGA lacks local memory that exists in the same coherence
+domain and has comparable capacity to CPU-attached memory.
+Consequently, most memory requests for application request
+processing will need to go through the cc-interconnect (due
+to the large working set of the target applications), similar
+to cross-NUMA memory access. Besides, the cpoll region
+must be pinned in the cc-accelerator’s local cache. We expect
+that such limitations will be effortlessly tackled when ORCA
+is implemented in CXL-based devices [30] or Enzian [28].
+
+Since the in-package FPGA is not extendable, to explore the
+potential of ORCA’s performance on future platforms, we also
+use a stand-alone Xilinx U280 FPGA card [169] with 32 GB
+DDR4 memory and 8 GB HBM2 to emulate a cc-accelerator
+with local coherent memory [28, 30]. Prior work [162] has
+shown that these two types of memory can achieve ∼36 GB/s
+and ∼425 GB/s throughput, respectively. Speciﬁcally, we adapt
+the APU to the U280 card with either DDR4 or HBM2
+controller. The application data is mapped and initialized in the
+FPGA’s local memory. Rather than interacting with a real RNIC,
+we emulate arrival of RDMA requests by generating requests
+within the FPGA with the RDMA write rate measured on the
+testbed. We believe this emulation methodology offers correct
+and convincing results since coherence (of the application data)
+makes no big difference here after the data has been allocated
+and initialized in the FPGA-attached memory; during request
+processing, most memory trafﬁc does not need to go across
+the cc-interconnect. For throughput experiments, we measure
+requests processed on the FPGA per second. For latency experi-
+ments, we compute the emulated end-to-end latency by combin-
+ing application processing time measured on the U280 with the
+average latency of the rest of the stack. Speciﬁcally, we measure
+the average latency from a request’s generation to its completion
+on the U280, then add the average full-system end-to-end
+latency without an APU – measured on the client machine. Note
+that this approach emulates average latency, so does not apply to
+tail latency measurements. In the following sections, we notate
+the U280 DDR4-based results as “ORCA-LD (local DDR4)”
+and HBM2-based results as “ORCA-LH (local HBM2)”.
+
+Lastly, we use the NVIDIA ConnectX-6-based BlueField-2
+DPU [122] as the RNIC. It also provides eight ARM A72
+cores at 2.5 GHz, which we use to compare against a
+conventional Smart NIC approach.
+
+VI. EVALUATION
+
+A. Notiﬁcation Latency: cpoll vs. Conventional Polling
+
+To demonstrate the advantage of cpoll over conventional
+spin-polling, we perform a local ping-pong test. Speciﬁcally,
+we allocate a 1 KB request buffer shared between the CPU and
+the FPGA. The CPU ﬁrst starts a timer to measure round-trip
+
+latency, writes the buffer’s ﬁrst byte, and then spins to poll
+the buffer’s last byte. After detecting a change in the last
+byte, the CPU stops the timer. The FPGA polls or cpolls the
+buffer’s ﬁrst byte. When it detects any change in the ﬁrst byte,
+it immediately writes the buffer’s last byte. With this setup,
+we test cpoll and polling with different polling intervals in
+FPGA cycles for 60K times. This is to measure notiﬁcation
+latencies perceived by (1) the FPGA when the CPU sends a
+request with both cpoll and polling and (2) the CPU when
+the FPGA sends a request with polling.
+
+We plot the one-direction CPU-to-FPGA latency CDF in
+Fig. 7. First, cpoll always has a better average and tail latency
+than conventional polling, which can be as high as ∼ 30%. Sec-
+ond, cpoll consumes less bandwidth of the interconnect (UPI in
+our case). Take polling-15 (15 FPGA clock cycles per polling)
+as an example: it may generate 64B∗400MHz/15 ≈ 1.6GB/s
+trafﬁc on the UPI link and coherence controller for a single
+request buffer, which affects the normal operations of the
+applications. Note that due to the frequency limitations of the
+FPGA, the latency’s absolute value is not extremely low. Since
+the UPI link may only consumes ∼50ns latency [1, 151], we
+expect that the coherence controller in the FPGA can be a
+hard-IP in future products to achieve higher performance [67].
+
+B. In-Memory Key-Value Store
+
+Due to the limited availability of devices, we run ORCA KV
+on one server and one client;2 see Sec. VII for scalability dis-
+cussion. We compare ORCA with two state-of-the-art baselines:
+open-source two-sided RDMA-RPC (MICA-backed) [76, 77]
+(noted as “CPU”) and Smart NIC [94, 150]. For CPU, we
+use ten threads (cores) on the testbed to maximize the the
+KVS throughput. Each thread is fed with requests by one
+client instance (each with two dedicated Skylake cores) on the
+client machine (also equipped with the BlueField-2 DPU). For
+ORCA, we also use 10 client instances to feed requests that are
+processed on the same ORCA accelerator. For Smart NIC, we
+use DPU’s all eight ARM cores to emulate the behavior of the
+specialized hardware in KV-Direct [94] and StRoM [150]. The
+ARM cores process the request, which is sent from the client In-
+tel CPU by RDMA. Besides, the ARM cores communicate with
+the server host through RDMA (direct verbs) for necessary data
+2Since we use multiple cores (threads) on the client and the network
+bandwidth has been saturated, adding more clients will not affect the results.
+
+Fig. 7: Latency distribution of cpoll and conventional polling
+with different polling intervals (cycles).
+
+8
+
+05001000150020002500Latency (ns)0.00.20.40.60.81.0CDFpolling-15polling-30polling-50polling-100cpollFig. 8: Peak throughput performance of different KVS designs.
+The batch size of 32 is applied.
+
+retrieval. Admittedly, the ARM core is not as efﬁcient as the
+specialized FPGA designs [94, 150] when processing KVS and
+accessing host memory. However, the ARM cores’ frequency is
+∼ 10× higher, alleviating the efﬁciency gap. Also, we use direct
+verbs [142] to minimize the overhead imposed by the RDMA
+software stack. Based on our measurement, when running KVS
+entirely on the Smart NIC’s on-board DRAM, the eight ARM
+cores’ peak throughput is equivalent to six Intel CPU cores.
+We pre-load 100M key-value pairs (64 B size, ∼7 GB
+memory in total) and then access them using uniform and
+Zipﬁan 0.9 distributions. We test two types of workloads:
+read-intensive (100% GET), and write-intensive (50% GET,
+50% PUT). Note that the MICA-based mechanism [76, 77],
+which we use in this experiment, eliminates the concurrency
+issue (i.e., only allowing the “owner core” to read/write
+the data partition). As such, the performance of heavy PUT
+workload does not differ much from the GET only workload,
+which is aligned with the results in prior work [77, 94].
+
+In CPU and ORCA, both the hash table and key-value pairs
+are stored in the host memory; in Smart NIC, we allocate a
+512 MB space on the DPU’s on-board DRAM as the cache
+to store the most recently accessed hash entries and key-value
+pairs. The cache-total ratio (512 MB : 7 GB) is roughly the
+memory capacity ratio (16 GB : 192 GB). We also test the
+impact of batching. In CPU and Smart NIC, batching means
+processing requests in a batch to improve the memory access
+efﬁciency [99]. In ORCA, since the APU can already exploit the
+memory-level parallelism across requests [86, 105, 173, 176],
+there is no need for request batching. Hence, we batch the
+doorbell signals to the RNIC [77] when posting RDMA
+operations for response. These settings and conﬁgurations
+resemble prior work [77, 90, 94, 99].
+
+We ﬁrst show each design’s peak performance (with batch
+size 32). Regrading the throughput in Fig. 8, we ﬁrst ﬁnd
+
+Fig. 9: Latency performance of different KVS designs on
+the 100% GET workload. The batch size of 32 is applied.
+ORCA-LD/LH’s tail latency is inapplicable.
+
+9
+
+Fig. 10: The impact of batch size on throughput and
+latency (100% GET workload, Zipﬁan 0.9 distribution).
+ORCA-LD/LH’s tail latency is inapplicable.
+
+that the request distribution signiﬁcantly affects Smart NIC’s
+performance. Smart NIC’s throughput with uniform distribution
+(i.e., more than 90% memory accesses are to the host via PCIe)
+is 27.2%–28.6% of that with a skewed Zipﬁan distribution (i.e.,
+most memory accesses are local). And even the throughput
+with Zipﬁan distribution is only ∼60% of that with pure
+on-board memory accesses. On the other hand, the distribution
+does not affect CPU and ORCA’s performance, since even with
+the Zipﬁan distribution, the KVS’s memory footprint is still
+larger than the CPU or FPGA’s cache. Second, we observe that
+ORCA’s peak throughput is 2.3%∼8.3% higher than CPU. This
+is because the peak KVS throughput is bounded by the network
+bandwidth now, and ORCA’s one-sided RDMA performs a
+little better than CPU’s two-sided RDMA, which is aligned
+with prior studies [75, 120]. The throughput of ORCA-LD and
+ORCA-LH can prove this as well – extra memory bandwidth
+does not help improve the performance (in fact, the UPI link
+is not saturated), since the network has reached its limit.
+
+Regarding the latency, taking the 100% GET workload as an
+example (Fig. 9), the Smart NIC’s performance is again affected
+by the request distribution, since the PCIe link adds signiﬁcant
+latency, even if the accesses are batched. Meanwhile, we
+observe that ORCA’s average latency is a bit higher than CPU.
+This is mainly because, unlike CPU, ORCA needs to access
+data through the UPI link, adding more time on the request pro-
+cessing critical path. This deﬁciency is overcome with ORCA-
+LD/LH’s accelerator-attached memory – it only goes through
+the UPI to interact with the RNIC. Note that due to HBM’s
+nature, ORCA-LH has a higher average latency than ORCA-
+LD since the workload is not bounded by memory bandwidth
+now. For tail latency, ORCA is 52.0% lower than Smart NIC
+and 30.1% lower than CPU, because it not only signiﬁcantly
+remove the PCIe overhead, but also has more stable behavior
+than the CPU core, whose performance is affected by multiple
+factors like OS scheduling and CPU resource contention.
+
+We also investigate the impact of the batch size on each
+design and demonstrate the results in Fig. 10 (since the
+KVS throughput is now network-bound, we do not include
+ORCA-LD/LH’s throughput as they are the same as ORCA).
+For CPU and Smart NIC, batching can signiﬁcantly improve
+their throughput performance (i.e., ∼ 12×) – by batching
+the data accesses across requests, the memory bandwidth is
+efﬁciently utilized and the memory/PCIe latency is hidden.
+
+100% GET50% GET, 50% PUTUniform Distribution02040Throughput (Mrps)Smart NICCPUORCAORCA-LDORCA-LH100% GET50% GET, 50% PUTZipfian 0.9 Distribution02040Avg99th TailUniform Distribution0510152025Latency (us)Smart NICCPUORCAORCA-LDORCA-LHAvg99th TailZipfian 0.9 Distribution0510152025141632Batch Size010203040Throughput (Mrps)141632Batch Size5678Avg Latency (us)Smart NICCPUORCAORCA-LDORCA-LH141632Batch Size0510152099th Tail Latency (us)TABLE III: Overall power efﬁciency of different KVS
+approaches with GET operations in uniform distribution.
+
+CPU Smart NIC ORCA
+
+Kop/W 130.4
+
+25.2
+
+188.7
+
+ORCA’s throughput also beneﬁts from batching (i.e., ∼ 2×),
+which is because of the reduction of MMIO-based doorbell
+access [3, 47, 77], and MMIO’s surrounding sfence signals
+from the ORCA cc-accelerator, which is relatively expensive.
+On the other hand, unlike CPU and Smart NIC, ORCA’s
+latency sub-linearly increase with the batch size. This is
+because ORCA does not need to wait for the batch size of
+arrived requests to start processing, and the RNIC may execute
+the WQE promptly before the doorbell is rang [108].
+
+Finally, we use Intel RAPL interface [130] (for CPU and
+DIMMs), IPMI tool (for the entire server box), and the
+FPGA’s ﬁrmware (for the FPGA chip) to measure the power
+consumption of the evaluated approaches. Take the case in
+Fig. 8 as an example. We ﬁnd that the CPU and Smart
+NIC’s Intel/ARM CPUs consume ∼90 Watts and ∼15 Watts
+respectively when fully loaded, while ORCA’s FPGA power is
+in the range of 24–27W to achieve the peak throughput. This
+demonstrates ORCA cc-accelerator’s ∼ 3× power efﬁciency
+than the beefy Intel CPU to achieve comparable performance,
+leading to ∼ 38% power consumption reduction of the entire
+server box, as demonstrated in Tab. III.
+
+C. Distributed Transaction with NVM-based Chain Replication
+
+especially in the multi-tenant
+
+According to the HyperLoop paper
+[84], HyperLoop
+mechanism always outperforms CPU-based chain replication
+implementations,
+cloud
+environment, so we compare ORCA only with HyperLoop.
+Same as the HyperLoop paper, we adopt RocksDB [41],
+a persistent key-value database,
+to use the NVM as the
+persistent storage medium and to apply ORCA and HyperLoop.
+Since HyperLoop modiﬁes RNIC’s ﬁrmware, which is not
+open-source, we use the ARM cores on the DPU to emulate
+its behavior. Since the (Skylake) CPU with in-package FPGA
+does not support Intel Optane DIMM, we emulate NVM’s
+behavior by adding latency and throttling memory bandwidth
+in the FPGA and the ARM emulation program. We follow the
+NVM’s characteristics in recent Optane-based studies [74, 172]
+to calibrate our emulation. We disable DDIO on the server.
+
+Having the same device limitation, we run the experiments
+on one client and one server. We make use of the two ports on
+the DPU to have two replica machines (instances) in the same
+physical server, and the transaction will be forwarded across
+the two ports, as shown in Fig. 6. The client’s host CPU will
+initiate a transaction and send it to the server’s port 0 ( 1 ). The
+corresponding processing unit instance (either a DPU ARM
+core or ORCA) will forward the transaction to the client’s DPU
+ARM via port 0, which is attached to a RocksDB instance
+( 2 ). The client’s DPU ARM simply routes the transaction to
+the server’s port 1, where another RocksDB instance (and the
+
+10
+
+Fig. 11: Latency comparison with different key-value pair
+size and transactions with different numbers of (read,write).
+
+corresponding processing unit) serves as the second replica
+machine ( 3 ). Finally, the transaction will be sent back to
+the client’s host CPU ( 4 ). According to our measurement,
+the ARM-based routing will add 2∼3µs overhead, which
+resembles the network latency in the real datacenter.
+
+We initiate the RocksDB instance with 100K key-value
+pairs and issue 100K transactions from the client to measure
+the end-to-end latency. We test two key-value pair sizes (64B
+and 1024B) and two types of transactions with different
+(read, write) counts ((0,1) and (4,2),
+representative in
+real-world transactional systems [78]). Since the ORCA
+Tx and HyperLoop has the same mechanism for pure-read
+transactions, we exclude such transactions from the evaluation.
+We demonstrate the latency results of HyperLoop and ORCA
+in Fig. 11 (note that since the transactions are issued by the
+client one by one, the latency improvement can also reﬂect the
+throughput improvement). For the (0,1) transaction, ORCA’s
+performance does not differ from HyperLoop, since they
+experience the same overhead – one PCIe round-trip per replica
+machine and one round-trip over the 2-machine replication
+chain, and ORCA may even be a bit (less than 3%) slower
+than HyperLoop since it also has the overhead of UPI link.
+However, when the transaction contains multiple operations,
+ORCA begins to show its advantage. Unlike HyperLoop,
+ORCA’s client only needs to issue one combined transaction
+request to the replication chain, and the ORCA accelerator will
+handle the transaction execution and chain replication protocol
+itself in a near-data manner – still one PCIe round-trip per
+machine and one round-trip over the chain. This saves the
+network and PCIe latency, offering a 63.2%∼66.8% reduction
+for average end-to-end latency and 64.5%∼69.1% for 99th
+
+Fig. 12: MERCI-based DLRM inference throughput on the
+Amazon Review dataset.
+
+Avg99th Tail64B (0,1)020406080Latency (us)HyperLoopORCAAvg99th Tail64B (4,2)020406080Latency (us)Avg99th Tail1024B (0,1)020406080Latency (us)Avg99th Tail1024B (4,2)020406080Latency (us)Electro.ClothingHome.BooksSports.Office.Dataset102103104Throughput (Krps)CPU (1-core)CPU (8-core)ORCAORCA-LDORCA-LHtail latency. Note that ORCA’s latency can be further reduced
+with accelerator (FPGA) that can directly attach NVM [67].
+
+D. DLRM Inference
+
+We follow MERCI [92] and facebook’s DLRM model [117] to
+build our test program. Since their open-source implementations
+only include single-machine version, we extend them to
+a RDMA-based end-to-end datacenter application (the
+networking part is similar to the optimized HERD [77]) to
+reﬂect the real datacenter environment. The client send the
+query request to the server for inference.
+
+[59]
+
+We follow the conﬁgurations in the MERCI paper [92] to
+perform the evaluation. We compare ORCA’s performance
+with the CPU-based software version on the popular Amazon
+Review dataset
+(electronics, clothing-shoe-jewelry,
+home-kitchen, books, sports-outdoors, and ofﬁce-products).
+Both the native embedding reduction and MERCI reduction
+are evaluated. The data is clustered and loaded into embedding
+tables and memoization tables by the CPU in MERCI’s way.
+The embedding dimension is set to the default value of 64; for
+MERCI reduction, we build memoization tables with 0.25×
+the size of the original embedding tables.
+
+Since each query’s length (number of features) in a dataset is
+diverse, it is unfair to measure the per-query latency, so we only
+measure the throughput. For brevity, we only show the results
+of inference with MERCI reduction in Fig. 12 because the ones
+with native reduction show the same trend. For CPU-based ver-
+sion, MERCI scales linearly until eight cores (threads), which is
+bounded by the host memory bandwidth. For ORCA, however,
+we ﬁnd poor throughput performance over all the datasets – only
+19.7%∼31.3% throughput of a single CPU core. After further
+analysis, we ﬁnd this phenomenon is because (1) unlike KVS,
+the nature of the embedding reduction in DLRM (i.e., pure and
+dense memory accesses within nested “for” loops, few branches,
+thousands of memory accesses per query) makes it relatively
+efﬁcient on the CPU core – the instruction window and the load-
+store queue can be fully utilized; (2) the CPU core can leverage
+the entire bandwidth of the memory channels (i.e., ∼120GB/s
+on our testbed) with good parallelism, while the ORCA cc-
+accelerator can only leverage the cc-interconnect’s bandwidth,
+and the memory requests have to be issued serially from the
+FPGA’s wimpy coherence controller; (3) the compute-intensive
+fully connected layer is relatively lightweight in the model, mak-
+ing ORCA’s hardware acceleration only a small portion in the
+end-to-end inference. Hence, with higher frequency and mem-
+ory bandwidth, CPU outperforms the ORCA cc-accelerator. This
+deﬁciency can be solved by ORCA-LD and ORCA-LH. Fully uti-
+lizing the two DDR4 channels (∼ 1
+3 of the CPU memory chan-
+nels’ bandwidth), ORCA-LD is able to achieve 52.8%∼95.3%
+throughput of the eight CPU cores. Furthermore, the 32-channel
+HBM2 eliminates the memory bandwidth bottleneck in the
+reduction, leading to ORCA-LH’s 1.6× ∼ 3.1× throughput
+improvement over the CPU, and the RDMA network becomes
+the limiting factor for higher end-to-end throughput. Note that,
+CPU with integrated HBM2 [29] in the near future may also
+achieve similar throughput compared to ORCA-LH; but similar
+
+to KVS (see Sec. VI-B), even with the same memory bandwidth
+(and thus the inference throughput), ORCA cc-accelerator shows
+better power efﬁciency over the CPU-based reduction.
+
+VII. DISCUSSION
+
+Scalability with faster network. As the speed of network is
+growing fast, a critical question is whether ORCA will keep
+up with the speed of future network (e.g., 400Gbps). First,
+as mentioned before, the UPI’s bandwidth is not saturated in
+ORCA KV and ORCA TX. Furthermore, as demonstrated by
+ORCA DLRM, accelerator-attached memory with comparable
+capacity to the CPU [28, 30, 67] will further librate the
+bandwidth of the cc-interconnect from application-related
+memory requests. Hence, the cc-interconnect can better serve
+the RNIC/CPU-cc-accelerator interaction. This means ORCA
+will be bottlenecked by the network bandwidth and can achieve
+higher performance with newer network technologies (also
+note that the cc-interconnect performance will evolve as well).
+Scalability with larger cluster. Prior work has stated that
+one-sided RDMA operations, relying on reliable connection,
+cannot scale well to hundreds of machines [75, 77, 78]. This
+is mainly due to the limited size of on-chip cache of the
+RNIC, which stores the necessary connection information.
+this has been alleviated with the advance in
+However,
+technologies [120]. For instance, as the latest NIC product,
+the blueField-2 DPU has ∼10MB cache for its 8-core
+ARM system on the SoC [122], which also integrates the
+ConnectX-6 controller. We expect that the ConnectX-6 part
+on the SoC has comparable cache size (e.g., 5∼10MB) for
+connections. Based on the previous calculation [75], such
+on-chip cache can support more than 10K connections without
+performance loss by cache miss, which is enough for most
+clusters in modern datacenters. Also note that, ORCA design
+itself does not worsen the RDMA’s scalability problem.
+
+VIII. RELATED WORK
+
+Accelerating µs-scale datacenter applications with emerg-
+ing devices. In modern datacenters, commodity networking
+devices, especially programmable switches and Smart NICs,
+have been leveraged to accelerate datacenter applications.
+Such approaches include caching [73, 94, 102, 148], compute
+ofﬂoading [7, 16, 56, 93, 94, 109, 144, 145, 150], protocol
+ofﬂoading [34, 35, 72, 84, 91, 95–97, 138, 147, 161, 174, 181],
+load balancing [81, 104], etc. However, due to the limited
+memory capacity of such devices (e.g., O(10MB) of on-chip
+SRAM for programmable switches [1, 83] and O(10GB) of
+on-board DRAM for Smart NICs [101, 122]), they may fall
+short of efﬁciently handling datacenter applications requiring
+large memory footprints. To tackle such a challenge, TEA [83]
+proposes to let the switch retrieve data from the afﬁliated servers
+by low-latency RDMA read. TEA uses algorithm design (i.e.,
+linear probe in its hash table) to reduce the required network
+round-trips to get the desired data, but it cannot always do so for
+all applications/data structures (e.g., B-tree based KVS [163]).
+To alleviate the interconnect (PCIe) overhead, a line of
+research integrates the entire NIC or accelerator to/near the
+
+11
+
+CPU package [3, 32, 33, 55, 61, 80, 100, 119, 139]. Enjoying
+the beneﬁt of fast NIC-core interaction, this approach has (1)
+high cost of designing and manufacturing them and (2) low
+ﬂexibility of usage and maintaining. For example, a typical NIC
+ASIC’s die area can be more than 60mm2 [1], which is roughly
+the area of four server CPU cores [168]. Also, to upgrade the
+datacenter network infrastructure, the entire server CPU needs
+to be replaced, leading to high total cost of ownership (TCO).
+Dagger [90] also leverages cc-accelerator for NIC design, but
+it still involves the server CPU for request processing, and
+only uses the cc-interconnect for its lower latency over PCIe.
+Compared to these works, ORCA takes a modularized design
+with low TCO, while still leveraging cache coherence feature
+to more efﬁciently handle applications with irregular/uniform
+memory access patterns. Besides, for workloads with highly-
+skewed access patterns, ORCA only adds one PCIe round-trip
+to the end-to-end latency than its counterparts. They are
+complementary and thus they can work together.
+
+There is prior effort on accelerating applications in
+datacenter with cc-accelerator [20, 60, 90, 106, 129, 149], but
+they either accelerate single-machine applications/operations
+or a speciﬁc routine/layer in the system. ORCA takes a
+holistic cross-stack approach to achieve end-to-end datacenter
+application ofﬂoading at µs-scale.
+NIC-host co-design framework. With the growing popularity
+of the Smart NIC, researchers have developed frameworks to
+schedule/ofﬂoad datacenter applications to the Smart NIC’s
+processors [101, 103, 134]. However, they are still constrained
+to separate the Smart NIC and host’s memory to two domains
+and suffer from a high cost of communications over PCIe links
+when memory-intensive code segments are ofﬂoaded. ORCA
+tackles these challenges with its unique near-data processing
+capability, while keeping the networking part ofﬂoaded on the
+RNIC for low cost and ﬂexibility. ORCA can also be included
+to these co-design frameworks as another compute resource.
+Lynx [158] proposes Smart NIC-based communication
+ofﬂoading for accelerator-rich systems, and FlexDriver [39]
+proposes PCIe-based NIC control by accelerator. ORCA takes
+one step further to let the client directly communicate with
+the accelerators, which also controls the NIC more efﬁciently
+in the coherence domain.
+
+IX. CONCLUSION
+
+We present ORCA, a holistic system design to ofﬂoad modern
+leverages the RDMA
+µs-scale datacenter applications. It
+and cc-accelerator technologies to achieve high throughput
+and low latency performance with the CPU’s involvement
+only when necessary. We apply ORCA to three representative
+datacenter applications, each with its unique characteristics.
+Our evaluation on a real system shows that, compared to the
+CPU-based software solutions and the (Smart) NIC ofﬂoading
+solutions, ORCA is able to achieve better and more stable
+performance with higher power efﬁciency.
+
+12
+
+REFERENCES
+
+[1] “Private communication with Intel,” 2021.
+[2] B. Acun, M. Murphy, X. Wang, J. Nie, C.-J. Wu, and K. Hazelwood,
+“Understanding training efﬁciency of deep learning recommendation
+models at scale,” in Proceedings of the 2021 IEEE International
+Symposium on High-Performance Computer Architecture (HPCA’21),
+Virtual Event, Feb. 2021.
+
+[3] M. Alian and N. S. Kim, “NetDIMM: Low-latency near-memory
+network interface architecture,” in Proceedings of the 52nd Annual
+IEEE/ACM International Symposium on Microarchitecture (MICRO’19),
+Columbus, OH, Oct. 2019.
+
+[4] M. Alian, Y. Yuan, J. Zhang, R. Wang, M. Jung, and N. S. Kim,
+“Data direct I/O characterization for future I/O system exploration,” in
+Proceedings of the 2020 IEEE International Symposium on Performance
+Analysis of Systems and Software (ISPASS’20), Virtual Event, Aug. 2020.
+[5] S. Almeida, J. a. Leitão, and L. Rodrigues, “Chainreaction: A causal+
+consistent datastore based on chain replication,” in Proceedings of the
+8th ACM European Conference on Computer Systems (EuroSys’13),
+Prague, Czech Republic, Apr. 2013.
+
+[6] M. Alshboul, P. Ramrakhyani, W. Wang, J. Tuck, and Y. Solihin,
+“BBB: Simplifying persistent programming using battery-backed
+buffers,” in Proceedings of the 2021 IEEE International Symposium on
+High-Performance Computer Architecture (HPCA’21), Virtual Event,
+Feb. 2021.
+
+[7] E. Amaro, Z. Luo, A. Ousterhout, A. Krishnamurthy, A. Panda,
+S. Ratnasamy, and S. Shenker, “Remote memory calls,” in Proceedings
+of the 19th ACM Workshop on Hot Topics in Networks (HotNets’20),
+Virtual Event, Nov. 2020.
+
+[8] D. G. Andersen, J. Franklin, M. Kaminsky, A. Phanishayee, L. Tan, and
+V. Vasudevan, “FAWN: A fast array of wimpy nodes,” in Proceedings
+of the ACM SIGOPS 22nd Symposium on Operating Systems Principles
+(SOSP’09), Big Sky, MT, Oct. 2009.
+
+[9] B. Asgari, R. Hadidi, J. Cao, D. E. Shim, S.-K. Lim, and H. Kim,
+“FAFNIR: Accelerating sparse gathering by using efﬁcient near-memory
+intelligent reduction,” in Proceedings of the 2021 IEEE International
+Symposium on High-Performance Computer Architecture (HPCA’21),
+Virtual Event, Feb. 2021.
+
+[10] G. Bablani, “Introducing new product innovations for SAP HANA,
+
+expanded AI collaboration with SAP and more,”
+https://azure.microsoft.com/en-us/blog/introducing-new-product-
+innovations-for-sap-hana-expanded-ai-collaboration-with-sap-and-
+more/, 2019.
+
+[11] M. Balakrishnan, D. Malkhi, V. Prabhakaran, T. Wobbler, M. Wei,
+and J. D. Davis, “CORFU: A shared log design for ﬂash clusters,”
+in Proceedings of the 9th USENIX Symposium on Networked Systems
+Design and Implementation (NSDI’12), San Jose, CA, Apr. 2012.
+[12] L. Barroso, M. Marty, D. Patterson, and P. Ranganathan, “Attack of the
+killer microseconds,” Communications of the ACM, vol. 60, no. 4, 2017.
+[13] L. A. Barroso and U. Hölzle, “The case for energy-proportional
+
+computing,” Computer, vol. 40, no. 12, 2007.
+
+[14] A. Belay, G. Prekas, A. Klimovic, S. Grossman, C. Kozyrakis, and
+E. Bugnion, “IX: A protected dataplane operating system for high
+throughput and low latency,” in Proceedings of the 11th USENIX
+Symposium on Operating Systems Design and Implementation
+(OSDI’14), Broomﬁeld, Oct. 2014.
+
+[15] S. Blanas, “From FLOPS to IOPS: The new bottlenecks of scientiﬁc
+
+computing,”
+https://www.sigarch.org/from-ﬂops-to-iops-the-new-bottlenecks-of-
+scientiﬁc-computing/, 2020.
+
+[16] M. Blott, K. Karras, L. Liu, K. Vissers, J. Bär, and Z. István, “Achieving
+10Gbps line-rate key-value stores with FPGAs,” in Proceedings of
+the 5th USENIX Workshop on Hot Topics in Cloud Computing
+(HotCloud’13), San Jose, CA, Jun. 2013.
+
+[17] N. Boden, “Available ﬁrst on Google Cloud: Intel Optane DC persistent
+
+memory,”
+https://cloud.google.com/blog/topics/partners/available-ﬁrst-on-
+google-cloud-intel-optane-dc-persistent-memory, 2018.
+
+[18] M. Burke, S. Dharanipragada, S. Joyner, A. Szekeres, J. Nelson, I. Zhang,
+and D. R. K. Ports, “PRISM: Rethinking the RDMA interface for dis-
+tributed systems,” in Proceedings of the ACM SIGOPS 28th Symposium
+on Operating Systems Principles (SOSP’21), Virtual Event, Oct. 2021.
+[19] Q. Cai, S. Chaudhary, M. Vuppalapati, J. Hwang, and R. Agarwal, “Un-
+derstanding host network stack overheads,” in Proceedings of the 2021
+
+ACM SIGCOMM conference (SIGCOMM’21), Virtual Event, Aug. 2021.
+[20] I. Calciu, M. T. Imran, I. Puddu, S. Kashyap, H. A. Maruf, O. Mutlu,
+and A. Kolli, “Rethinking software runtimes for disaggregated
+memory,” in Proceedings of the 26th International Conference on
+Architectural Support for Programming Languages and Operating
+Systems (ASPLOS’21), Virtual Event, Apr. 2021.
+
+[21] B. Calder, J. Wang, A. Ogus, N. Nilakantan, A. Skjolsvold, S. McKelvie,
+Y. Xu, S. Srivastav, J. Wu, H. Simitci, J. Haridas, C. Uddaraju, H. Khatri,
+A. Edwards, V. Bedekar, S. Mainali, R. Abbasi, A. Agarwal, M. F. u.
+Haq, M. I. u. Haq, D. Bhardwaj, S. Dayanand, A. Adusumilli,
+M. McNett, S. Sankaran, K. Manivannan, and L. Rigas, “Windows
+Azure storage: A highly available cloud storage service with strong
+consistency,” in Proceedings of the 23rd ACM Symposium on Operating
+Systems Principles (SOSP’11), Cascais, Portugal, Oct. 2011.
+
+[22] A. M. Caulﬁeld, E. S. Chung, A. Putnam, H. Angepat, J. Fowers,
+M. Haselman, S. Heil, M. Humphrey, P. Kaur, J.-Y. Kim, D. Lo,
+T. Massengill, K. Ovtcharov, M. Papamichael, L. Woods, S. Lanka,
+D. Chiou, and D. Burger, “A cloud-scale acceleration architecture,”
+in Proceedings of the 49th IEEE/ACM International Symposium on
+Microarchitecture (MICRO’16), Taipei, Taiwan, Oct. 2016.
+
+[23] CCIX Consortium, “CCIX,”
+
+https://www.ccixconsortium.com, accessed in 2021.
+
+[24] S. J. Chen, Z. Qin, Z. Wilson, B. Calaci, M. Rose, R. Evans,
+S. Abraham, D. Metzler, S. Tata, and M. Colagrosso, “Improving
+recommendation quality in Google Drive,” in Proceedings of the 26th
+ACM SIGKDD International Conference on Knowledge Discovery and
+Data Mining (KDD’20), Virtual Event, 2020.
+
+[25] Y. Chen, X. Wei, J. Shi, R. Chen, and H. Chen, “Fast and general
+distributed transactions using RDMA and HTM,” in Proceedings of
+the 11th European Conference on Computer Systems (EuroSys’16),
+London, United Kingdom, Apr. 2016.
+
+[26] Y. Chen, Y. Lu, and J. Shu, “Scalable RDMA RPC on reliable
+connection with efﬁcient resource sharing,” in Proceedings of the 14th
+EuroSys Conference (EuroSys’19), Dresden, Germany, Mar. 2019.
+[27] Y.-K. Choi, J. Cong, Z. Fang, Y. Hao, G. Reinman, and P. Wei,
+“In-depth analysis on microarchitectures of modern heterogeneous CPU-
+FPGA platforms,” ACM Transactions on Reconﬁgurable Technology
+Systems, vol. 12, no. 1, Feb. 2019.
+
+[28] D. Cock, A. Ramdas, D. Schwyn, M. Giardino, A. Turowski, Z. He,
+N. Hossle, D. Korolija, M. Licciardello, K. Martsenko, R. Achermann,
+G. Alonso, and T. Roscoe, “Enzian: An open, general, CPU/FPGA plat-
+form for systems software research,” in Proceedings of the 27th Interna-
+tional Conference on Architectural Support for Programming Languages
+and Operating Systems (ASPLOS’22), Lausanne, Switzerland, Feb. 2022.
+[29] I. Cutress, “Intel to Launch Next-Gen Sapphire Rapids Xeon with
+
+High Bandwidth Memory,”
+https://www.anandtech.com/show/16795/intel-to-launch-next-gen-
+sapphire-rapids-xeon-with-high-bandwidth-memory, 2021.
+
+[30] I. Cutress, “Using a PCIe slot to install DRAM: New Samsung
+
+CXL.mem expansion module,”
+https://www.anandtech.com/show/16670/using-a-pcie-slot-to-install-
+dram-new-samsung-cxlmem-expansion-module, 2021.
+
+[31] CXL Consortium, “Compute express link (CXL),”
+
+https://www.computeexpresslink.org, accessed in 2021.
+
+[32] A. Daglis, S. Novakovi´c, E. Bugnion, B. Falsaﬁ, and B. Grot,
+“Manycore network interfaces for in-memory rack-scale computing,” in
+Proceedings of the 42nd Annual International Symposium on Computer
+Architecture (ISCA’15), Portland, OR, Jun. 2015.
+
+[33] A. Daglis, M. Sutherland, and B. Falsaﬁ, “RPCValet: NI-driven tail-
+aware balancing of µs-scale RPCs,” in Proceedings of the 24th Interna-
+tional Conference on Architectural Support for Programming Languages
+and Operating Systems (ASPLOS’19), Providence, RI, Apr. 2019.
+[34] H. T. Dang, P. Bressana, H. Wang, K. S. Lee, H. Weatherspoon,
+M. Canini, F. Pedone, and R. Soulé, “Network hardware-accelerated
+consensus,” Università della Svizzera italiana, Tech. Rep. USI-INF-
+TR-2016-03, May 2016.
+
+[35] H. T. Dang, P. Bressana, H. Wang, K. S. Lee, H. Weatherspoon,
+M. Canini, N. Zilberman, F. Pedone, and R. Soulé, “P4xos: Consensus
+as a network service,” Università della Svizzera italiana, Tech. Rep.
+USI-INF-TR-2018-01, May 2018.
+
+[36] J. Dean, D. Patterson, and C. Young, “A new golden age in computer
+architecture: Empowering the machine-learning revolution,” IEEE
+Micro, vol. 38, 2018.
+
+[37] A. Dragojevi´c, D. Narayanan, M. Castro, and O. Hodson, “FaRM:
+
+13
+
+Fast remote memory,” in Proceedings of the 11th USENIX Symposium
+on Networked Systems Design and Implementation (NSDI’14), Seattle,
+WA, Apr. 2014.
+
+[38] A. Eisenman, M. Naumov, D. Gardner, M. Smelyanskiy, S. Pupyrev,
+K. Hazelwood, A. Cidon, and S. Katti, “Bandana: Using non-volatile
+memory for storing deep learning models,” in Proceedings of the 2nd
+SysML Conference (SysML’19), Palo Alto, CA, Mar. 2019.
+
+[39] H. Eran, M. Fudim, G. Malka, G. Shalom, N. Cohen, A. Hermony,
+D. Levi, L. Liss, and M. Silberstein, “FlexDriver: A network driver
+for your accelerator,” in Proceedings of the 27th ACM International
+Conference on Architectural Support for Programming Languages and
+Operating Systems (ASPLOS’22), Lausanne, Switzerland, Feb. 2022.
+
+[40] R. Escriva, B. Wong, and E. G. Sirer, “HyperDex: A distributed,
+searchable key-value store,” in Proceedings of the ACM SIGCOMM
+2012 Conference (SIGCOMM’12), Helsinki, Finland, Aug. 2012.
+[41] Facebook, “RocksDB: A persistent key-value store for fast storage
+
+environments,”
+https://rocksdb.org, accessed in 2021.
+
+[42] B. Falsaﬁ, R. Guerraoui, J. Picorel, and V. Trigonakis, “Unlocking
+the 2016 USENIX Annual Technical
+
+energy,” in Proceedings of
+Conference (ATC’16), Denver, CO, Jun. 2016.
+
+[43] B. Fan, D. G. Andersen, and M. Kaminsky, “MemC3: Compact and
+concurrent MemCache with dumber caching and smarter hashing,” in
+Proceedings of the 10th USENIX Symposium on Networked Systems
+Design and Implementation (NSDI’10), Lombard, IL, Apr. 2013.
+[44] A. Farshin, A. Roozbeh, G. Q. Maguire Jr., and D. Kosti´c, “Make
+the most out of last level cache in Intel processors,” in Proceedings
+of the 14th European Conference on Computer Systems (EuroSys’19),
+Dresden, Germany, Mar. 2019.
+
+[45] A. Farshin, A. Roozbeh, G. Q. Maguire Jr., and D. Kosti´c, “Reexamining
+direct cache access to optimize I/O intensive applications for multi-
+hundred-gigabit networks,” in Proceedings of 2020 USENIX Annual
+Technical Conference (ATC’20), Virtual Event, Jul. 2020.
+
+[46] D. Firestone, A. Putnam, S. Mundkur, D. Chiou, A. Dabagh,
+M. Andrewartha, H. Angepat, V. Bhanu, A. Caulﬁeld, E. Chung, H. K.
+Chandrappa, S. Chaturmohta, M. Humphrey, L. Jack, L. Norman, F. Liu,
+K. Ovtcharov, J. Padhye, G. Popuri, S. Raindel, T. Sapre, M. Shaw,
+M. Silva, Ganriel nd Sivakumar, N. Srivastava, A. Verma, Q. Zuhair,
+D. Bansal, D. Burger, K. Vaid, D. A. Maltz, and A. Greenberg, “Azure
+accelerated networking: SmartNICs in the public cloud,” in Proceedings
+of the 15th USENIX Symposium on Networked Systems Design and
+Implementation (NSDI’18), Renton, WA, Apr. 2018.
+
+[47] M. Flajslik and M. Rosenblum, “Network interface design for low
+latency request-response protocols,” in Proceedings of the 2013 USENIX
+Annual Technical Conference (ATC’13), San Jose, CA, Jun. 2013.
+[48] Y. Gao, Q. Li, L. Tang, Y. Xi, P. Zhang, W. Peng, B. Li, Y. Wu,
+S. Liu, L. Yan, F. Feng, Y. Zhuang, F. Liu, P. Liu, X. Liu, Z. Wu,
+J. Wu, Z. Cao, C. Tian, J. Wu, J. Zhu, H. Wang, D. Cai, and J. Wu,
+“When cloud storage meets RDMA,” in Proceedings of the 18th
+USENIX Symposium on Networked Systems Design and Implementation
+(NSDI’21), Virtual Event, Apr. 2021.
+
+[49] S. Ghemawat, H. Gobioff, and S.-T. Leung, “The Google ﬁle system,”
+in Proceedings of the 19th ACM Symposium on Operating Systems
+Principles (SOSP’03), Bolton Landing, NY, Oct. 2003.
+
+[50] S. D. Glasser and M. D. Hummel, “Methods and apparatus for
+implementing PCI express lightweight notiﬁcation protocols in a
+CPU/memory complex,” Jul. 2013, US Patent 20130173837A1.
+[51] H. Golestani, A. Mirhosseini, and T. F. Wenisch, “Software data planes:
+You can’t always spin to win,” in Proceedings of the 2019 ACM Sym-
+posium on Cloud Computing (SoCC’19), Santa Cruz, CA, Nov. 2019.
+[52] D. Gope, D. J. Schlais, and M. H. Lipasti, “Architectural support for
+server-side PHP processing,” in Proceedings of the 44th IEEE/ACM
+International Symposium on Computer Architecture (ISCA’17), Toronto,
+Canada, Jun. 2017.
+
+[53] C. Guo, “RDMA in Data Centers: Looking Back and Looking Forward,”
+
+Keynote at APNet, 2017.
+
+[54] C. Guo, H. Wu, Z. Deng, G. Soni, J. Ye, J. Padhye, and M. Lipshteyn,
+“RDMA over commodity Ethernet at scale,” in Proceedings of the 2016
+ACM SIGCOMM Conference (SIGCOMM’16), Florianopolis, Brazil,
+Aug. 2016.
+
+[55] Z. Guo, Y. Shan, X. Luo, Y. Huang, and Y. Zhang, “Clio: A hardware-
+software co-designed disaggregated memory system,” in Proceedings
+of the 27th International Conference on Architectural Support for
+Programming Languages and Operating Systems (ASPLOS’22),
+
+Lausanne, Switzerland, Feb. 2022.
+
+[56] A. Gupta, R. Harrison, M. Canini, N. Feamster, J. Rexford, and
+W. Willinger, “Sonata: Query-driven streaming network telemetry,” in
+Proceedings of the 2018 ACM SIGCOMM Conference (SIGCOMM’18),
+Budapest, Hungary, Aug. 2018.
+
+[57] U. Gupta, S. Hsia, V. Saraph, X. Wang, B. Reagen, G.-Y. Wei, H.-H. S.
+Lee, D. Brooks, and C.-J. Wu, “DeepRecSys: A system for optimizing
+end-to-end at-scale neural recommendation inference,” in Proceedings
+of the ACM/IEEE 47th Annual International Symposium on Computer
+Architecture (ISCA’20), Virtual Event, May 2020.
+
+[58] U. Gupta, C.-J. Wu, X. Wang, M. Naumov, B. Reagen, D. Brooks,
+B. Cottel, K. Hazelwood, M. Hempstead, B. Jia, H.-H. S. Lee,
+A. Malevich, D. Mudigere, M. Smelyanskiy, L. Xiong, and X. Zhang,
+“The architectural implications of Facebook’s DNN-based personalized
+recommendation,” in Proceedings of the 2020 IEEE International
+Symposium on High-Performance Computer Architecture (HPCA’20),
+San Diego, CA, Feb. 2020.
+
+[59] R. He and J. McAuley, “Ups and downs: Modeling the visual evolution
+of fashion trends with one-class collaborative ﬁltering,” in Proceedings
+of the 25th International Conference on World Wide Web (WWW’16),
+Montréal, Québec, Canada, Apr. 2016.
+
+[60] R. Hwang, T. Kim, Y. Kwon, and M. Rhu, “Centaur: A chiplet-based,
+hybrid sparse-dense accelerator for personalized recommendations,” in
+Proceedings of the ACM/IEEE 47th Annual International Symposium
+on Computer Architecture (ISCA’20), Virtual Event, May 2020.
+[61] S. Ibanez, A. Mallery, S. Arslan, T. Jepsen, M. Shahbaz, C. Kim, and
+N. McKeown, “The nanoPU: A nanosecond network stack for datacen-
+ters,” in Proceedings of the 15th USENIX Symposium on Operating
+Systems Design and Implementation (OSDI’21), Virtual Event, Jul. 2021.
+
+[62] Intel Corporation, “Data plane development kit (DPDK),”
+
+https://www.dpdk.org, accessed in 2021.
+
+[63] Intel Corporation, “eADR: New opportunities for persistent memory
+
+applications,”
+https://software.intel.com/content/www/us/en/develop/articles/eadr-
+new-opportunities-for-persistent-memory-applications.html, accessed
+in 2021.
+
+[64] Intel Corporation, “Intel 64 and IA-32 architectures software developer’s
+
+manual volume 2: Instruction set reference,”
+https://software.intel.com/content/www/us/en/develop/download/intel-
+64-and-ia-32-architectures-sdm-combined-volumes-2a-2b-2c-and-2d-
+instruction-set-reference-a-z.html, accessed in 2021.
+[65] Intel Corporation, “Intel Arria 10 GX 1150 FPGA,”
+
+https://ark.intel.com/content/www/us/en/ark/products/210381/intel-
+arria-10-gx-1150-fpga.html, accessed in 2021.
+[66] Intel Corporation, “Intel Optane Persistent Memory,”
+
+https://www.intel.com/content/www/us/en/architecture-and-
+technology/optane-dc-persistent-memory.html, accessed in 2021.
+
+[67] Intel Corporation, “Intel Stratix 10 DX FPGAs,”
+
+https://www.intel.com/content/www/us/en/products/details/fpga/
+stratix/10/dx.html, accessed in 2021.
+
+[68] Intel Corporation, “Intel Xeon Gold 6138P Processor,”
+
+https://ark.intel.com/content/www/us/en/ark/products/139940/intel-
+xeon-gold-6138p-processor-27-5m-cache-2-00-ghz.html, accessed in
+2021.
+
+[69] Intel Corporation, “Intel Xeon processor scalable family technical
+
+overview,”
+https://www.intel.com/content/www/us/en/developer/articles/technical/
+xeon-processor-scalable-family-technical-overview.html, accessed in
+2021.
+
+[70] Intel Corporation, “Intel® data direct I/O (DDIO),”
+
+https://www.intel.com/content/www/us/en/io/data-direct-i-o-
+technology.html, accessed in 2021.
+
+[71] E. Jeong, S. Woo, M. A. Jamshed, H. Jeong, S. Ihm, D. Han, and
+K. Park, “mTCP: A highly scalable user-level TCP stack for multicore
+systems,” in Proceedings of the 11th USENIX Symposium on Networked
+Systems Design and Implementation (NSDI’14), Seattle, WA, apr 2014.
+[72] X. Jin, X. Li, H. Zhang, N. Foster, J. Lee, R. Soulé, C. Kim, and
+I. Stoica, “NetChain: Scale-free sub-RTT coordination,” in Proceedings
+of the 15th USENIX Symposium on Networked Systems Design and
+Implementation (NSDI’18), Renton, WA, Apr. 2018.
+
+[73] X. Jin, X. Li, H. Zhang, R. Soulé, J. Lee, N. Foster, C. Kim, and
+I. Stoica, “NetCache: Balancing key-value stores with fast in-network
+caching,” in Proceedings of the 26th ACM Symposium on Operating
+Systems Principles (SOSP’17), Shanghai, China, Oct. 2017.
+
+14
+
+[74] A. Kalia, D. Andersen, and M. Kaminsky, “Challenges and solutions for
+fast remote persistent memory access,” in Proceedings of the 11th ACM
+Symposium on Cloud Computing (SoCC’20), Virtual Event, Oct. 2020.
+[75] A. Kalia, M. Kaminsky, and D. Andersen, “Datacenter RPCs can be
+general and fast,” in Proceedings of the 16th USENIX Symposium on
+Networked Systems Design and Implementation (NSDI’19), Boston,
+MA, Feb. 2019.
+
+[76] A. Kalia, M. Kaminsky, and D. G. Andersen, “Using RDMA efﬁciently
+for key-value services,” in Proceedings of the 2014 ACM SIGCOMM
+Conference (SIGCOMM’14), Chicago, IL, Aug. 2014.
+
+[77] A. Kalia, M. Kaminsky, and D. G. Andersen, “Design guidelines for
+high performance RDMA systems,” in Proceedings of the 2016 USENIX
+Annual Technical Conference (ATC’16), Denver, CO, Jun. 2016.
+[78] A. Kalia, M. Kaminsky, and D. G. Andersen, “FaSST: Fast, scalable and
+simple distributed transactions with two-sided (RDMA) datagram RPCs,”
+in Proceedings of the 12th USENIX Symposium on Operating Systems
+Design and Implementation (OSDI’16), Savannah, GA, Nov. 2016.
+[79] S. Kanev, J. P. Darago, K. Hazelwood, P. Ranganathan, T. Moseley,
+G.-Y. Wei, and D. Brooks, “Proﬁling a warehouse-scale computer,”
+in Proceedings of the 42nd IEEE/ACM International Symposium on
+Computer Architecture (ISCA’15), Portland, OR, Jun. 2015.
+
+[80] S. Karandikar, C. Leary, C. Kennelly, J. Zhao, D. Parimi, B. Nikolic,
+K. Asanovic, and P. Ranganathan, “A hardware accelerator for protocol
+buffers,” in Proceedings of the 54th Annual IEEE/ACM International
+Symposium on Microarchitecture (MICRO’21), Virtual Event, Oct. 2021.
+and
+A. Krishnamurthy, “High performance packet processing with
+FlexNIC,” in Proceedings of the 21st International Conference on
+Architectural Support for Programming Languages and Operating
+Systems (ASPLOS’16), Atlanta, GA, 2016.
+
+[81] A. Kaufmann, S. Peter, N. K. Sharma, T. Anderson,
+
+[82] L. Ke, U. Gupta, B. Y. Cho, D. Brooks, V. Chandra, U. Diril,
+A. Firoozshahian, K. Hazelwood, B. Jia, H.-H. S. Lee, M. Li, B. Maher,
+D. Mudigere, M. Naumov, M. Schatz, M. Smelyanskiy, X. Wang,
+B. Reagen, C.-J. Wu, M. Hempstead, and X. Zhang, “RecNMP: Ac-
+celerating personalized recommendation with near-memory processing,”
+in Proceedings of the ACM/IEEE 47th Annual International Symposium
+on Computer Architecture (ISCA’20), Virtual Event, May 2020.
+[83] D. Kim, Z. Liu, Y. Zhu, C. Kim, J. Lee, V. Sekar, and S. Seshan,
+“TEA: Enabling state-intensive network functions on programmable
+switches,” in Proceedings of the 2020 ACM SIGCOMM Conference
+(SIGCOMM’20), Virtual Event, Aug. 2020.
+
+[84] D. Kim, A. Memaripour, A. Badam, Y. Zhu, H. H. Liu, J. Padhye,
+S. Raindel, S. Swanson, V. Sekar, and S. Seshan, “HyperLoop:
+Group-based NIC-ofﬂoading to accelerate replicated transactions
+in multi-tenant storage systems,” in Proceedings of the 2018 ACM
+SIGCOMM conference (SIGCOMM’18), Budapest, Hungary, Aug. 2018.
+[85] J. Kim, I. Jang, W. Reda, J. Im, M. Canini, D. Kosti´c, Y. Kwon,
+S. Peter, and E. Witchel, “LineFS: Efﬁcient SmartNIC ofﬂoad of a
+distributed ﬁle system with pipeline parallelism,” in Proceedings of
+the ACM SIGOPS 28th Symposium on Operating Systems Principles
+(SOSP’21), Virtual Event, Oct. 2021.
+
+[86] O. Kocberber, B. Grot, J. Picorel, B. Falsaﬁ, K. Lim, and P. Ranganathan,
+the walkers: Accelerating index traversals for in-memory
+“Meet
+the 46th IEEE/ACM International
+databases,” in Proceedings of
+Symposium on Microarchitecture (MICRO’13), Davis, CA, Dec. 2013.
+[87] H. T. Kung, T. Blackwell, and A. Chapman, “Credit-based ﬂow control
+for ATM networks: Credit update protocol, adaptive credit allocation and
+statistical multiplexing,” in Proceedings of the 1994 ACM SIGCOMM
+Conference (SIGCOMM’94), London, United Kingdom, Oct. 1994.
+[88] M. Kurth, B. Gras, D. Andriesse, C. Giuffrida, H. Bos, and K. Razavi,
+“NetCAT: Practical cache attacks from the network,” in Proceedings
+of the 41st IEEE Symposium on Security and Privacy (Oakland’20),
+Virtual Event, May 2020.
+
+[89] Y. Kwon, Y. Lee, and M. Rhu, “TensorDIMM: A practical near-memory
+processing architecture for embeddings and tensor operations in deep
+learning,” in Proceedings of the 52nd Annual IEEE/ACM International
+Symposium on Microarchitecture (MICRO’19), Columbus, OH, Oct.
+2019.
+
+[90] N. Lazarev, S. Xiang, N. Adit, Z. Zhang, and C. Delimitrou, “Dagger:
+Efﬁcient and fast RPCs in cloud microservices with near-memory
+the 26th International
+reconﬁgurable NICs,” in Proceedings of
+Conference on Architectural Support for Programming Languages and
+Operating Systems (ASPLOS’21), Virtual Event, Apr. 2021.
+
+[91] S.-s. Lee, Y. Yu, Y. Tang, A. Khandelwal, L. Zhong, and A. Bhat-
+
+tacharjee, “MIND: In-network memory management for disaggregated
+data centers,” in Proceedings of the ACM SIGOPS 28th Symposium
+on Operating Systems Principles (SOSP’21), Virtual Event, Oct. 2021.
+[92] Y. Lee, S. H. Seo, H. Choi, H. U. Sul, S. Kim, J. W. Lee, and T. J.
+Ham, “MERCI: Efﬁcient embedding reduction on commodity hardware
+via sub-query memoization,” in Proceedings of the 26th International
+Conference on Architectural Support for Programming Languages and
+Operating Systems (ASPLOS’21), Virtual Event, Apr. 2021.
+
+[93] A. Lerner, R. Hussein, and P. Cudre-Mauroux, “The case for network
+accelerated query processing,” in Proceedings of the 9th Biennial
+Conference on Innovative Data Systems Research (CIDR’19), Asilomar,
+CA, Jan. 2019.
+
+[94] B. Li, Z. Ruan, W. Xiao, Y. Lu, Y. Xiong, A. Putnam, E. Chen, and
+L. Zhang, “KV-Direct: High-performance in-memory key-value store
+with programmable NIC,” in Proceedings of the 26th Symposium on
+Operating Systems Principles (SOSP’17), Shanghai, China, Oct. 2017.
+[95] J. Li, E. Michael, and D. R. K. Ports, “Eris: Coordination-free
+transactions using in-network concurrency control,” in
+the 26th ACM Symposium on Operating Systems
+
+consistent
+Proceedings of
+Principles (SOSP’17), Shanghai, China, Oct. 2017.
+
+[96] J. Li, E. Michael, A. Szekeres, N. K. Sharma, and D. R. K. Ports, “Just
+say NO to Paxos overhead: Replacing consensus with network ordering,”
+in Proceedings of the 12th USENIX Symposium on Operating Systems
+Design and Implementation (OSDI’16), Savannah, GA, Nov. 2016.
+[97] J. Li, J. Nelson, E. Michael, X. Jin, and D. R. K. Ports, “Pegasus:
+Tolerating skewed workloads in distributed storage with in-network
+coherence directories,” in Proceedings of the 14th USENIX Symposium
+on Operating Systems Design and Implementation (OSDI’20), Virtual
+Event, Nov. 2020.
+
+[98] X. Li, W. Cheng, T. Zhang, J. Xie, F. Ren, and B. Yang, “Power efﬁcient
+high performance packet I/O,” in Proceedings of the 47th International
+Conference on Parallel Processing (ICCP’18), Eugene, OR, Aug. 2018.
+[99] H. Lim, D. Han, D. G. Andersen, and M. Kaminsky, “MICA: A
+holistic approach to fast in-memory key-value storage,” in Proceedings
+of the 11th USENIX Symposium on Networked Systems Design and
+Implementation (NSDI’14), Seattle, WA, Apr. 2014.
+
+[100] K. Lim, D. Meisner, A. G. Saidi, P. Ranganathan, and T. F. Wenisch,
+“Thin servers with smart pipes: Designing SoC accelerators for Mem-
+cached,” in Proceedings of the 40th Annual International Symposium
+on Computer Architecture (ISCA’13), Tel-Aviv, Israel, Jun. 2013.
+[101] M. Liu, T. Cui, H. Schuh, A. Krishnamurthy, S. Peter, and K. Gupta,
+“Ofﬂoading distributed applications onto SmartNICs using iPipe,” in
+Proceedings of the 2019 ACM SIGCOMM conference (SIGCOMM’19),
+Beijing, China, Aug. 2019.
+
+[102] M. Liu, L. Luo, J. Nelson, L. Ceze, A. Krishnamurthy, and K. Atreya,
+“IncBricks: Toward in-network computation with an in-network
+cache,” in Proceedings of
+the 22nd International Conference on
+Architectural Support for Programming Languages and Operating
+Systems (ASPLOS’17), Xi’an, China, Apr. 2017.
+
+[103] M. Liu, S. Peter, A. Krishnamurthy, and P. M. Phothilimthana, “E3:
+Energy-efﬁcient microservices on SmartNIC-accelerated servers,”
+in Proceedings of the 2019 USENIX Annual Technical Conference
+(ATC’19), Renton, WA, Jul. 2019.
+
+[104] Z. Liu, Z. Bai, Z. Liu, X. Li, C. Kim, V. Braverman, X. Jin, and I. Stoica,
+“DistCache: Provable load balancing for large-scale storage systems with
+distributed caching,” in Proceedings of the 17th USENIX Conference
+on File and Storage Technologies (FAST’19), Boston, MA, Feb. 2019.
+[105] E. Lockerman, A. Feldmann, M. Bakhshalipour, A. Stanescu, S. Gupta,
+D. Sanchez, and N. Beckmann, “Livia: Data-centric computing through-
+out the memory hierarchy,” in Proceedings of the 25th International
+Conference on Architectural Support for Programming Languages and
+Operating Systems (ASPLOS’20), Virtual Event, Mar. 2020.
+
+[106] J. Ma, G. Zuo, K. Loughlin, X. Cheng, Y. Liu, A. M. Eneyew,
+Z. Qi, and B. Kasikci, “A hypervisor for shared-memory FPGA
+platforms,” in Proceedings of the 25th International Conference on
+Architectural Support for Programming Languages and Operating
+Systems (ASPLOS’20), Virtual Event, Mar. 2020.
+
+[107] A. Manousis, R. A. Sharma, V. Sekar, and J. Sherry, “Contention-
+aware performance prediction for virtualized network functions,” in
+Proceedings of the 2020 ACM SIGCOMM Conference (SIGCOMM’20),
+Virtual Event, Aug. 2020.
+
+[108] Mellanox, “Mellanox adapters programmer’s reference manual (PRM),”
+
+https://www.mellanox.com/related-docs/user_manuals/
+Ethernet_Adapters_Programming_Manual.pdf, accessed in 2021.
+
+15
+
+[109] Mellanox, “Mellanox scalable hierarchical aggregation and reduction
+
+protocol (SHARP),”
+http://www.mellanox.com/page/products_dyn?product_family=
+261&mtag=sharp, accessed in 2021.
+
+[110] A. Memaripour, A. Badam, A. Phanishayee, Y. Zhou, R. Alagappan,
+K. Strauss, and S. Swanson, “Atomic in-place updates for non-volatile
+main memories with Kamino-Tx,” in Proceedings of the 12th European
+Conference on Computer Systems (EuroSys’17), Belgrade, Serbia, Apr.
+2017.
+
+[111] A. Mirhosseini, H. Golestani, and T. F. Wenisch, “HyperPlane: A
+scalable low-latency notiﬁcation accelerator for software data planes,”
+in Proceedings of the 53rd IEEE/ACM International Symposium on
+Microarchitecture (MICRO’20), Virtual Event, Oct. 2020.
+
+[112] A. Mirhosseini, A. Sriraman, and T. F. Wenisch, “Enhancing server
+efﬁciency in the face of killer microseconds,” in Proceedings of the
+2019 IEEE International Symposium on High Performance Computer
+Architecture (HPCA’19), Feb. 2019.
+
+[113] C. Mitchell, Y. Geng, and J. Li, “Using one-sided RDMA reads to build a
+fast, CPU-efﬁcient key-value store,” in Proceedings of the 2013 USENIX
+Annual Technical Conference (ATC’13), San Jose, CA, Jun. 2013.
+
+[114] C. Mitchell, K. Montgomery, L. Nelson, S. Sen, and J. Li, “Balancing
+CPU and network in the Cell distributed B-Tree store,” in Proceedings
+of the 2016 USENIX Annual Technical Conference (ATC’16), Denver,
+CO, Jun. 2016.
+
+[115] S. K. Monga, S. Kashyap, and C. Min, “Birds of a feather ﬂock
+together: Scaling RDMA RPCs with Flock,” in Proceedings of the
+ACM SIGOPS 28th Symposium on Operating Systems Principles
+(SOSP’21), Virtual Event, Oct. 2021.
+
+[116] mongoDB, “mongoDB manual: Manage chained replication,”
+https://docs.mongodb.com/manual/tutorial/manage-chained-
+replication/, accessed in 2021.
+
+[117] M. Naumov, D. Mudigere, H. M. Shi, J. Huang, N. Sundaraman, J. Park,
+X. Wang, U. Gupta, C. Wu, A. G. Azzolini, D. Dzhulgakov, A. Malle-
+vich, I. Cherniavskii, Y. Lu, R. Krishnamoorthi, A. Yu, V. Kondratenko,
+S. Pereira, X. Chen, W. Chen, V. Rao, B. Jia, L. Xiong, and M. Smelyan-
+skiy, “Deep learning recommendation model for personalization and
+recommendation systems,” arXiv preprint arXiv:1906.00091, 2019.
+
+[118] R. Neugebauer, G. Antichi, J. F. Zazo, Y. Audzevich, S. López-Buedo,
+and A. W. Moore, “Understanding PCIe performance for end host
+networking,” in Proceedings of the 2018 ACM SIGCOMM Conference
+(SIGCOMM’18), Budapest, Hungary, Aug. 2018.
+
+[119] S. Novakovic, A. Daglis, E. Bugnion, B. Falsaﬁ, and B. Grot, “Scale-out
+NUMA,” in Proceedings of the 19th International Conference on
+Architectural Support for Programming Languages and Operating
+Systems (ASPLOS’14), Salt Lake City, UT, Feb. 2014.
+
+[120] S. Novakovic, Y. Shan, A. Kolli, M. Cui, Y. Zhang, H. Eran,
+B. Pismenny, L. Liss, M. Wei, D. Tsafrir, and M. Aguilera, “Storm: A
+fast transactional dataplane for remote data structures,” in Proceedings
+of the 12th ACM International Conference on Systems and Storage
+(SYSTOR’19), Haifa, Israel, May 2019.
+
+[121] NVIDIA Corporation, “NVIDIA extends data center infrastructure
+
+processing roadmap with BlueField-3,”
+https://nvidianews.nvidia.com/news/nvidia-extends-data-center-
+infrastructure-processing-roadmap-with-blueﬁeld-3, 2021.
+
+[122] NVIDIA Corporation, “NVIDIA BlueField-2 DPU: Data center
+
+infrastructure on a chip,”
+https://www.nvidia.com/content/dam/en-zz/Solutions/Data-Center/
+documents/datasheet-nvidia-blueﬁeld-2-dpu.pdf, accessed in 2021.
+
+[123] NVIDIA Corporation, “RDMA aware networks programming user
+
+manual,”
+https://docs.mellanox.com/display/RDMAAwareProgrammingv17,
+accessed in 2021.
+
+[124] F. Oboril and M. B. Tahoori, “ExtraTime: Modeling and analysis
+of wearout due to transistor aging at microarchitecture-level,” in
+the 2012 IEEE/IFIP International Conference on
+Proceedings of
+Dependable Systems and Networks (DSN’2012), Boston, MA, Jun. 2012.
+
+[125] H. Ohara, “Revisit DCA, PCIe TPH and DDIO,”
+
+https://www.slideshare.net/hisaki/direct-cacheaccess, 2014.
+
+[126] D. Ongaro, S. M. Rumble, R. Stutsman, J. Ousterhout, and
+M. Rosenblum, “Fast crash recovery in RAMCloud,” in Proceedings of
+the 23rd ACM Symposium on Operating Systems Principles (SOSP’11),
+Cascais, Portugal, Oct. 2011.
+
+[127] Optocrypto, “Intel Sapphire Rapids with HBM2E, CXL 1.1, and PCIe
+
+5.0 by end of 2022,”
+
+https://optocrypto.com/intel-sapphire-rapids-with-hbm2e-cxl-1-1-and-
+pcie-5-0-by-end-of-2022/, accessed in 2021.
+
+[128] J. Ousterhout, A. Gopalan, A. Gupta, A. Kejriwal, C. Lee, B. Montazeri,
+D. Ongaro, S. J. Park, H. Qin, M. Rosenblum, S. Rumble, R. Stutsman,
+and S. Yang, “The RAMCloud storage system,” ACM Transactions
+on Computer Systems, vol. 33, no. 3, 2015.
+
+[129] M. Owaida, D. Sidler, K. Kara, and G. Alonso, “Centaur: A framework
+for hybrid CPU-FPGA databases,” in Proceedings of the 2017 IEEE
+25th Annual International Symposium on Field-Programmable Custom
+Computing Machines (FCCM’17), Napa, CA, Jul. 2017.
+[130] S. Pandruvada, “Running average power limit – RAPL,”
+https://01.org/blogs/2014/running-average-power-limit-
+\T1\textendash-rapl, accessed in 2021.
+
+[131] J. Park, B. Kim, S. Yun, E. Lee, M. Rhu, and J. H. Ahn, “TRiM:
+Enhancing processor-memory interfaces with scalable tensor reduction
+in memory,” in Proceedings of the 54th Annual IEEE/ACM International
+Symposium on Microarchitecture (MICRO’21), Virtual Event, Oct. 2021.
+[132] S. Peter, J. Li, I. Zhang, D. R. K. Ports, D. Woos, A. Krishnamurthy,
+T. Anderson, and T. Roscoe, “Arrakis: The operating system is the
+control plane,” ACM Transactions on Computer Systems, vol. 33, no. 4,
+Nov. 2015.
+
+[133] A. Phanishayee, D. G. Andersen, H. Pucha, A. Povzner, and
+W. Belluomini, “Flex-KV: Enabling high-performance and ﬂexible KV
+systems,” in Proceedings of the 2012 Workshop on Management of
+Big Data Systems (MBDS’12), San Jose, CA, Sep. 2012.
+
+[134] P. M. Phothilimthana, M. Liu, A. Kaufmann, S. Peter, R. Bodik, and
+T. Anderson, “Floem: A programming system for NIC-accelerated
+network applications,” in Proceedings of the 13th USENIX Symposium
+on Operating Systems Design and Implementation (OSDI’18), Carlsbad,
+CA, Oct. 2018.
+
+[135] B. Pismenny, L. Liss, A. Morrison, and D. Tsafrir, “The beneﬁts of
+general-purpose on-NIC memory,” in Proceedings of the 27th ACM
+International Conference on Architectural Support for Programming
+Languages and Operating Systems (ASPLOS’22), Lausanne, Switzerland,
+Feb. 2022.
+
+[136] PLDA, “Lightweight Notiﬁcation,”
+
+https://www.plda.com/pcie-glossary/lightweight-notiﬁcation, accessed
+in 2021.
+
+[137] S. Pontarelli, R. Bifulco, M. Bonola, C. Cascone, M. Spaziani,
+V. Bruschi, D. Sanvito, G. Siracusano, A. Capone, M. Honda, F. Huici,
+and G. Siracusano, “FlowBlaze: Stateful packet processing in hardware,”
+in Proceedings of the 16th USENIX Symposium on Networked Systems
+Design and Implementation (NSDI’19), Boston, MA, Feb. 2019.
+[138] D. R. K. Ports, J. Li, V. Liu, N. K. Sharma, and A. Krishnamurthy,
+“Designing distributed systems using approximate synchrony in
+datacenter networks,” in Proceedings of the 12th USENIX Symposium
+on Networked Systems Design and Implementation (NSDI’15), Oakland,
+CA, May 2015.
+
+[139] A. Pourhabibi, M. Sutherland, A. Daglis, and B. Falsaﬁ, “Cerebros:
+Evading the RPC tax in datacenters,” in Proceedings of the 54th
+Annual IEEE/ACM International Symposium on Microarchitecture
+(MICRO’21), Virtual Event, Oct. 2021.
+
+[140] A. Ramdas, D. Cock, T. Roscoe, and G. Alonso, “The Enzian coherent
+interconnect (ECI): Opening a coherence protocol to research and
+applications,” in Proceedings of the 2021 Workshop on Languages,
+Tools, and Techniques for Accelerator Design (LATTE’21), Virtual
+Event, Apr. 2021.
+
+[141] W. Reda, M. Canini, D. Kostic, and S. Peter, “RDMA is Turing
+complete, we just did not know it yet!” in Proceedings of the 19th
+USENIX Symposium on Networked Systems Design and Implementation
+(NSDI’22), Renton, WA, Apr. 2022.
+
+[142] L. Romanovsky, “mlx5dv – Linux manual page,”
+
+https://man7.org/linux/man-pages/man7/mlx5dv.7.html, accessed in
+2021.
+
+[143] SAP, “How to perform system replication for SAP HANA,”
+
+https://www.sap.com/documents/2013/10/26c02b58-5a7c-0010-82c7-
+eda71af511fa.html, 2017.
+
+[144] A. Sapio, I. Abdelaziz, A. Aldilaijan, M. Canini, and P. Kalnis,
+“In-network computation is a dumb idea whose time has come,”
+in Proceedings of the 16th Workshop on Hot Topics in Networks
+(HotNets’17), Palo Alto, CA, Nov. 2017.
+
+[145] A. Sapio, M. Canini, C.-Y. Ho, J. Nelson, P. Kalnis, C. Kim,
+A. Krishnamurthy, M. Moshref, D. R. Ports, and P. Richtárik,
+“Scaling distributed machine learning with in-network aggregation,” in
+
+16
+
+Proceedings of the 18th USENIX Symposium on Networked Systems
+Design and Implementation (NSDI’21), Virtual Event, Apr. 2021.
+[146] A. Sarma, H. Seyedroudbari, H. Gupta, U. Ramachandran, and
+A. Daglis, “NFSlicer: Data movement optimization for shallow network
+functions,” arXiv preprint arXiv:2203.02585, 2022.
+
+[147] H. N. Schuh, W. Liang, M. Liu, J. Nelson, and A. Krishnamurthy,
+“Xenic: SmartNIC-accelerated distributed transactions,” in Proceedings
+of the ACM SIGOPS 28th Symposium on Operating Systems Principles
+(SOSP’21), Virtual Event, Oct. 2021.
+
+[148] K. Seemakhupt, S. Liu, Y. Senevirathne, M. Shahbaz, and S. Khan,
+“PMNet: In-network data persistence,” in Proceedings of the 48th
+IEEE/ACM International Symposium on Computer Architecture
+(ISCA’21), Virtual Event, Jul. 2021.
+
+[149] D. Sidler, Z. István, M. Owaida, and G. Alonso, “Accelerating pattern
+matching queries in hybrid CPU-FPGA architectures,” in Proceedings
+of the 2017 ACM International Conference on Management of Data
+(SIGMOD’17), Chicago, IL, May 2017.
+
+[150] D. Sidler, Z. Wang, M. Chiosa, A. Kulkarni, and G. Alonso, “StRoM:
+Smart remote memory,” in Proceedings of the 15th European Conference
+on Computer Systems (EuroSys’20), Virtual Event, Apr. 2020.
+[151] I. Smolyar, A. Markuze, B. Pismenny, H. Eran, G. Zellweger,
+A. Bolen, L. Liss, A. Morrison, and D. Tsafrir, “IOctopus: Outsmarting
+nonuniform DMA,” in Proceedings of the 25th International Conference
+on Architectural Support for Programming Languages and Operating
+Systems (ASPLOS’20), Virtual Event, Mar. 2020.
+
+[152] A. Sriraman and A. Dhanotia, “Accelerometer: Understanding
+acceleration opportunities for data center overheads at hyperscale,” in
+Proceedings of the 25th International Conference on Architectural
+Support
+for Programming Languages and Operating Systems
+(ASPLOS’20), Virtual Event, Mar. 2020.
+
+[153] J. Stuecheli, B. Blaner, C. R. Johns, and M. S. Siegel, “CAPI: A
+coherent accelerator processor interface,” IBM Journal of Research
+and Development, vol. 59, no. 1, jan 2015.
+
+[154] A. Tai, M. Wei, M. J. Freedman, I. Abraham, and D. Malkhi, “Replex:
+A scalable, highly available multi-index data store,” in Proceedings
+of the 2016 USENIX Annual Technical Conference (ATC’16), Denver,
+CO, Jun. 2016.
+
+[155] T. Talpey, “RDMA persistent meory extensions,”
+
+https://www.openfabrics.org/wp-content/uploads/209_TTalpey.pdf,
+2019.
+
+[156] J. Terrace and M. J. Freedman, “Object storage on CRAQ: High-
+throughput chain replication for read-mostly workloads,” in Proceedings
+of the 2009 USENIX Annual Technical Conference (ATC’09), San
+Diego, CA, Jun. 2009.
+
+[157] A. Tootoonchian, A. Panda, C. Lan, M. Walls, K. Argyraki, S. Rat-
+nasamy, and S. Shenker, “ResQ: Enabling SLOs in network function vir-
+tualization,” in Proceedings of 15th USENIX Symposium on Networked
+Systems Design and Implementation (NSDI’18), Renton, WA, Apr. 2018.
+[158] M. Tork, L. Maudlej, and M. Silberstein, “Lynx: A SmartNIC-driven
+accelerator-centric architecture for network servers,” in Proceedings
+of the 25th International Conference on Architectural Support for
+Programming Languages and Operating Systems (ASPLOS’20), Virtual
+Event, Mar. 2020.
+
+[159] S.-Y. Tsai and Y. Zhang, “LITE kernel RDMA support for datacenter
+applications,” in Proceedings of the 26th Symposium on Operating
+Systems Principles (SOSP’17), Shanghai, China, Oct. 2017.
+
+[160] R. van Renesse and F. B. Schneider, “Chain replication for supporting
+high throughput and availability,” in Proceedings of the 6th USENIX
+Symposium on Operating Systems Design and Implementation
+(OSDI’04), San Francisco, CA, Dec. 2004.
+
+[161] Q. Wang, Y. Lu, E. Xu, J. Li, Y. Chen, and J. Shu, “Concordia:
+Distributed shared memory with in-network cache coherence,” in
+Proceedings of the 19th USENIX Conference on File and Storage
+Technologies (FAST’21), Virtual Event, Feb. 2021.
+
+[162] Z. Wang, H. Huang, J. Zhang, and G. Alonso, “Shuhai: Benchmarking
+high bandwidth memory on FPGAs,” in Proceedings of the 2020
+IEEE Annual International Symposium on Field-Programmable Custom
+Computing Machines (FCCM’20), Virtual Event, May 2020.
+
+[163] X. Wei, R. Chen, and H. Chen, “Fast RDMA-based ordered key-value
+store using remote learned cache,” in Proceedings of
+the 14th
+USENIX Symposium on Operating Systems Design and Implementation
+[164] X. Wei, Z. Dong, R. Chen, and H. Chen, “Deconstructing RDMA-
+enabled distributed transactions: Hybrid is better!” in Proceedings
+
+(OSDI’20), Virtual Event, Nov. 2020.
+of the 13th USENIX Symposium on Operating Systems Design and
+Implementation (OSDI’18), Carlsbad, CA, Oct. 2018.
+
+[165] X. Wei, J. Shi, Y. Chen, R. Chen, and H. Chen, “Fast in-memory
+transaction processing using RDMA and HTM,” in Proceedings of the
+25th ACM Symposium on Operating Systems Principles (SOSP’15),
+Monterey, CA, Oct. 2015.
+
+[166] X. Wei, X. Xie, R. Chen, H. Chen, and B. Zang, “Characterizing
+and optimizing remote persistent memory with RDMA and NVM,”
+in Proceedings of the 2021 USENIX Annual Technical Conference
+(ATC’21), Virtual Event, Jul. 2021.
+[167] WiKiChip, “Inﬁnity Fabric (IF) - AMD,”
+
+https://en.wikichip.org/wiki/amd/inﬁnity_fabric, accessed in 2021.
+
+[168] WikiChip, “Skylake (server – microarchitectures – intel,”
+
+https://en.wikichip.org/wiki/intel/microarchitectures/skylake_(server),
+accessed in 2021.
+
+[169] Xilinx, “Alveo U280 data center accelerator card,”
+
+https://www.xilinx.com/products/boards-and-kits/alveo/u280.html,
+accessed in 2021.
+
+[170] Xilinx, “Xilinx Virtex-7 FPGA VC709 connectivity kit,”
+
+https://www.xilinx.com/products/boards-and-kits/dk-v7-vc709-g.html,
+accessed in 2021.
+
+[171] J. Xue, M. U. Chaudhry, B. Vamanan, T. N. Vijaykumar, and
+M. Thottethodi, “Dart: Divide and specialize for
+response
+to congestion in RDMA-based datacenter networks,” IEEE/ACM
+Transactions on Networking, vol. 28, no. 1, Feb. 2020.
+
+fast
+
+[172] J. Yang, J. Kim, M. Hoseinzadeh, J. Izraelevitz, and S. Swanson, “An
+empirical guide to the behavior and use of scalable persistent memory,”
+in Proceedings of the 18th USENIX Conference on File and Storage
+Technologies (FAST’20), Santa Clara, CA, Feb. 2020.
+
+[173] C. Ye, Y. Xu, X. Shen, X. Liao, H. Jin, and Y. Solihin, “Hardware-based
+address-centric acceleration of key-value store,” in Proceedings of the
+2021 IEEE International Symposium on High-Performance Computer
+Architecture (HPCA’21), Virtual Event, Feb. 2021.
+
+[174] Z. Yu, Y. Zhang, V. Braverman, M. Chowdhury, and X. Jin, “NetLock:
+Fast, centralized lock management using programmable switches,” in
+Proceedings of the 2020 ACM SIGCOMM Conference (SIGCOMM’20),
+Virtual Event, Aug. 2020.
+
+[175] Y. Yuan, M. Alian, Y. Wang, R. Wang, I. Kurakin, C. Tai, and
+N. S. Kim, “Don’t forget the I/O when allocating your LLC,” in
+Proceedings of
+the 48th IEEE/ACM International Symposium on
+Computer Architecture (ISCA’21), Virtual Event, Jul. 2021.
+
+[176] Y. Yuan, Y. Wang, R. Wang, R. B. R. Chowhury, C. Tai, and N. S.
+Kim, “QEI: Query acceleration can be generic and efﬁcient in the
+cloud,” in Proceedings of the 2021 IEEE International Symposium on
+High-Performance Computer Architecture (HPCA’21), Virtual Event,
+Feb. 2021.
+
+[177] W. Zhao, D. Xie, R. Jia, Y. Qian, R. Ding, M. Sun, and P. Li,
+“Distributed hierarchical GPU parameter server for massive scale
+deep learning ads systems,” in Proceedings of the 3rd Conference on
+Machine Learning ans Systems (MLSys’20), Austin, TX, Mar. 2020.
+
+[178] W. Zhao, J. Zhang, D. Xie, Y. Qian, R. Jia, and P. Li, “AIBox: CTR
+prediction model training on a single node,” in Proceedings of the
+28th ACM International Conference on Information and Knowledge
+Management (CIKM’19), Beijing, China, Nov. 2019.
+
+[179] D. Zhou, B. Fan, H. Lim, M. Kaminsky, and D. G. Andersen, “Scalable,
+high performance Ethernet forwarding with CuckooSwitch,” in Proceed-
+ings of the 9th ACM Conference on Emerging Networking Experiments
+and Technologies (CoNEXT’13), Santa Barbara, CA, Dec. 2013.
+[180] S. Zhou and S. Mu, “Fault-tolerant replication with pull-based
+consensus in MongoDB,” in Proceedings of
+the 18th USENIX
+Symposium on Networked Systems Design and Implementation
+(NSDI’21), Virtual Event, Apr. 2021.
+
+[181] H. Zhu, Z. Bai, J. Li, E. Michael, D. R. K. Ports, I. Stoica, and X. Jin,
+“Harmonia: Near-linear scalability for replicated storage with in-network
+conﬂict detection,” in Proceedings of the 2019 International Conference
+on Very Large Data Bases (VLDB’19), Los Angeles, CA, Nov. 2019.
+[182] Y. Zhu, H. Eran, D. Firestone, C. Guo, M. Lipshteyn, Y. Liron, J. Padhye,
+S. Raindel, M. H. Yahia, and M. Zhang, “Congestion control for large-
+scale RDMA deployments,” in Proceedings of the 2015 ACM SIGCOMM
+Conference (SIGCOMM’15), London, United Kingdom, Aug. 2015.
+
+17
+
+

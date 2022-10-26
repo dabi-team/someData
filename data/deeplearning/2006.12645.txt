@@ -1,0 +1,2118 @@
+Automatic Kernel Generation for Volta Tensor
+Cores
+
+Somashekaracharya G. Bhaskaracharya
+NVIDIA
+sbhaskaracha@nvidia.com
+
+Julien Demouth
+NVIDIA
+jdemouth@nvidia.com
+
+Vinod Grover
+NVIDIA
+vgrover@nvidia.com
+
+0
+2
+0
+2
+
+g
+u
+A
+1
+
+]
+L
+P
+.
+s
+c
+[
+
+3
+v
+5
+4
+6
+2
+1
+.
+6
+0
+0
+2
+:
+v
+i
+X
+r
+a
+
+Abstract—A commonly occurring computation idiom in neural
+networks is to perform some pointwise operations on the result
+of a matrix multiplication. Such a sequence of operations is
+typically represented as a computation graph in deep learning
+compilers. When compiling to a GPU target, these computations
+can be individually mapped to manually tuned implementations
+provided by libraries such as cuBLAS and cuDNN. These
+libraries also provide off-the-shelf support for targeting tensor
+cores in NVIDIA GPUs, which can lead to huge performance
+boosts through their specialized support for mixed-precision
+matrix math. Alternatively, tensor cores can be programmed
+directly using CUDA APIs or inline assembly instructions, which
+opens up the possibility of generating efﬁcient CUDA kernels
+automatically for such computations.
+
+Automatic kernel generation is particularly crucial when it is
+beneﬁcial to generate efﬁcient code for an entire computation
+graph by fusing several operations into a single device function
+instead of invoking a separate kernel for each of them. Poly-
+hedral compilation techniques provide a systematic approach
+for the analysis and transformation of a sequence of afﬁne
+loop-nests. In this paper, we describe a polyhedral approach to
+generate efﬁcient CUDA kernels for matrix multiplication using
+inline assembly instructions for programming tensor cores on
+NVIDIA Volta GPUs. Furthermore, we build on this approach
+to generate fused kernels for computation sequences involving
+matrix multiplication and pointwise operations such as bias
+addition, ReLU activation etc. Experimental evaluation of these
+techniques show that automatically generated kernels can provide
+signiﬁcantly better performance than manually tuned library
+implementations, with speedups ranging up to 2.55×.
+
+Index Terms—matmul, polyhedral compilation, tensor cores
+
+I. INTRODUCTION
+
+Tensor cores in NVIDIA GPUs are processing cores spe-
+cialized for matrix operations. They provide huge boosts
+in throughput and efﬁciency by performing several mixed-
+precision matrix-multiply and accumulate calculations in a
+single operation. Consequently, tensor cores can signiﬁcantly
+speed up generalized matrix-multiply (GEMM) and convolu-
+tions (as implicit GEMMs), both of which are used heavily in
+deep learning systems and other computational applications.
+CUDA libraries such as cuBLAS [1] and Cutlass [2] provide
+off-the-shelf support for leveraging tensor core capabilities
+through manually tuned implementations of GEMM for vari-
+ous input matrix layouts (row-major and column-major). Fur-
+thermore, cuDNN [3] is a widely used GPU-accelerated library
+with extensive support for various deep learning primitives.
+
+Deep learning computations can be modeled as dataﬂow
+graphs where each node represents a speciﬁc computation
+
+such as matmul, convolution, pointwise operations etc. A
+commonly occurring computation idiom in neural networks
+is that of a matmul feeding a bias add, which then drives
+an activation function such as ReLU. These computations can
+be speciﬁed through various deep learning frameworks such
+as TensorFlow [4], PyTorch [5]. A naive approach to map
+these computations onto a GPU would invoke separate kernels
+for each computation node in an execution order dictated by
+the dataﬂow dependences. However, the repeated round-trip
+through global memory is inefﬁcient and can be eliminated
+if multiple operations are fused into the same kernel. So, for
+the above example, the entire computation should be ideally
+mapped to a single kernel that performs matmul as well as
+its downstream pointwise operations, without the overhead of
+writing the intermediate results to global memory. In this con-
+text, it is imperative to explore kernel generation techniques
+not just for matmul but also for matmul with such pointwise
+operations in its epilogue or prologue i.e., downstream or
+upstream to it in the computation graph.
+
+Automatic kernel generation for tensor cores requires direct
+programmatic access to tensor cores. On a Volta GPU, tensor
+cores can be programmed directly using the mma.sync.m8n8k4
+PTX instruction [6] for half-precision ﬂoating point type. The
+operation is deﬁned for each quad-pair, i.e, a group of 8
+threads. The mma.sync.m8n8k4 instruction for half-precision
+ﬂoats (the fp16 data type) on Volta requires each thread in a
+quad pair to own fragments of the input matrix to a matrix
+multiply-and-accumulate operation. Each fragment consists of
+4 half-precision ﬂoats. Consequently, the input fragments from
+all the threads in a quad-pair constitute the two 8×4 and
+4×8 input matrices for the matrix-multiply-and-accumulate
+operation (mma). The resulting 8×8 matrix is distributed
+across the quad-pair’s threads, and each thread owns a piece
+of the accumulator matrix called the accumulator fragment,
+which is of size 1×8.
+
+Another way to program tensor cores is through the wmma
+CUDA APIs [7]. Unlike an mma.sync.m8n8k4 instruction, the
+wmma operation is deﬁned for an entire warp. A wmma
+fragment distribution is opaque, and is target dependent. On
+the other hand, the distribution of mma.sync fragments is pre-
+deﬁned and not target architecture dependent. Furthermore, as
+we shall see later, the m8n8k4 mma operation can be composed
+into higher-order macro-MMA operations in a number of ways
+to take advantage of wider loads and stores at every level
+
+ 
+ 
+ 
+ 
+ 
+ 
+of the memory hierarchy. Due to this low-level control, the
+mma.sync.m8n8k4 instruction lends itself well to implement
+efﬁcient kernels for deep learning graphs, with ample scope
+for kernel fusion.
+
+Our focus is on generating efﬁcient kernels for computation
+graphs that involve matmul and pointwise operations such as
+add, subtract, and activation functions such as ReLU, Sigmoid
+and Tanh. In particular, the scope of this work is restricted to
+the following computation idioms.
+
+• matmul without any epilogue or prologue
+• matmul with pointwise operations in its prologue
+• matmul with pointwise operations in its epilogue
+• matmuls of the same shape feeding a pointwise operation
+These operations can be expressed as afﬁne loop-nests.
+Polyhedral frameworks have proven to be effective for ana-
+lyzing and transforming a sequence of afﬁne loop-nests [8]–
+[10]. Several deep learning compiler frameworks [11]–[13]
+support polyhedral compilation techniques in conjunction with
+other analysis tools and intermediate representations. In this
+paper, we describe a polyhedral approach to automatically
+generate efﬁcient kernels for Volta tensor cores given a high-
+level computation DAG where each node represents a matmul
+or a pointwise operation such as add, subtract, ReLU, Sigmoid,
+Tanh. To summarize, our contributions are as follows.
+
+• We describe polyhedral techniques to automatically gen-
+erate efﬁcient kernels that implement matmul using the
+mma.m8n8k4 PTX instruction on a Volta GPU, by com-
+posing the m8n8k4 mma tile into higher-order macro-
+MMA operations of shapes m16n16k8 and m32n32k8 for
+realizing a warp-level MMA.
+
+• We then build on the above approach to automatically
+perform kernel fusion for some commonly occurring
+computation idioms involving matmul and pointwise op-
+erations.
+
+• We implement and evaluate our approach for these com-
+putation idioms on various problem sizes and demonstrate
+signiﬁcant speedups over manually-tuned implementa-
+tions provided by standard libraries such as cuBLAS and
+cuDNN.
+
+Section II provides the necessary background and intro-
+duces the notation use in later sections. Sections IV, V and
+VI describe the compute decomposition and data movement
+required for mapping a matmul computation to Volta tensor
+cores. Kernel fusion using similar decompositions is discussed
+in Section VII. Experimental evaluation of these techniques is
+provided in Section VIII. Related work and conclusions are
+presented in Sections IX and X respectively.
+
+II. BACKGROUND
+
+This section provides the notation and background for the
+
+techniques we present in the rest of this paper.
+
+A. Programming Tensor Cores
+
+The GPU compute hierarchy consists of blocks of threads
+which are organized into warps. Each warp consists of 32
+
+3
+.
+.
+0
+,
+0
+B
+
+3
+.
+.
+0
+,
+1
+B
+
+3
+.
+.
+0
+,
+2
+B
+
+3
+.
+.
+0
+,
+3
+B
+
+3
+.
+.
+0
+,
+4
+B
+
+3
+.
+.
+0
+,
+5
+B
+
+3
+.
+.
+0
+,
+6
+B
+
+3
+.
+.
+0
+,
+7
+B
+
+0
+T
+
+1
+T
+
+2
+T
+
+3
+T
+
+6
+1
+T
+
+7
+1
+T
+
+8
+1
+T
+
+9
+1
+T
+
+A0,0..3 T0
+A1,0..3 T1
+A2,0..3 T2
+A3,0..3 T3
+A4,0..3 T16
+A5,0..3 T17
+A6,0..3 T18
+A7,0..3 T19
+
+0 0 2 2 0 0 2 2
+1 1 3 3 1 1 3 3
+0 0 2 2 0 0 2 2
+1 1 3 3 1 1 3 3
+16 16 18 18 16 16 18 18
+17 17 19 19 17 17 19 19
+16 16 17 17 16 16 17 17
+17 17 19 19 17 17 19 19
+
+1:
+
+The
+
+Fig.
+for
+and
+mma.sync.m8n8k4.row.col operation. Matrix A is
+major while matrix B is column major.
+
+distribution
+
+shape
+
+data
+
+an
+row
+
+threads. These threads can be further partitioned into 8 quads,
+i.e., threads 0−3, 4−7, 8−11, 12−15, 16−19, 20−23, 24−27,
+28 − 31 respectively. A Volta mma.sync.m8n8k4 instruction is
+executed by a pair of quads. For example, threads 0 − 3 and
+16 − 19 constitute quad-pair QP0; threads 4 − 7, 20 − 23
+constitute quad-pair QP1 and so on.
+
+i.e.,
+
+As shown in Figure 1, each mma operation is of shape
+m8n8k4,
+input matrices of shape 8×4 and 4×8 are
+multiplied and added to an accumulator matrix of shape 8×8.
+The elements in the input matrices are half-precision ﬂoats
+(fp16 type) whereas the accumulator matrix elements are of
+type fp32 (a version of mma.m8n8k4 with fp16 accumulators
+also exists on Volta, although we consider the fp32 version in
+this paper). The input matrices can be in either row or column
+major format with different specializations of the instruction
+provided for different layout combinations. Each thread in a
+quad pair owns an input data fragment, which is nothing but
+4 half-precision ﬂoating point values. As shown in Figure 1,
+thread 0 owns 4 contiguous fp16 values from the ﬁrst row and
+column of the input matrices A and B respectively; thread
+1 owns the second row and column and so on. Furthermore,
+each thread owns an accumulator fragment, which consists
+of 8 elements from the accumulator matrix. In Figure 1, the
+thread indices speciﬁed in the cells of the 8×8 accumulator
+matrix indicate the distribution of the data elements among
+the different threads.
+
+Finally, with each quad-pair performing a single mma
+operation, an entire warp can perform 4 mma operations,
+each of shape m8n8k4. More details on the mma.sync.m8n8k4
+instruction in Volta can be found in the CUDA toolkit docu-
+mentation [6].
+
+B. Polyhedral Model
+
+Polyhedral model is a mathematical representation of afﬁne
+loop-nests, where the loop bounds and array access expres-
+sions are afﬁne combinations of enclosing loop iterators and
+program parameters. In the polyhedral representation each
+execution instance of a statement S is represented as an
+
+2
+
+integer point within a polyhedron. The faces of the polyhedron
+correspond to the bounds on the enclosing loops and the
+dimensionality of the polyhedron is nothing but the number
+of enclosing loops. The integer points within the polyhedron
+capture the iteration domain IS of the statement. Each state-
+ment may access arrays whose dataspaces can also be similarly
+deﬁned as polyhedra. Consequently, an access relation IS → A
+mapping an iteration domain IS to a dataspace A can be used
+to specify accesses to array A performed by a statement S.
+Similarly, relations between iteration spaces represent RAW,
+the execution
+WAR and WAW dependences. Furthermore,
+schedule of the statement instances is speciﬁed by mapping the
+execution instances to multi-dimensional logical timestamps,
+whose lexicographic ordering gives the execution order.
+
+The Integer Set Library (ISL) [14] can be used to represent
+and manipulate such a polyhedral representation. Given the
+polyhedral representation of a loop-nest or a sequence of loop-
+nests, the polyhedral scheduler in ISL can be used to determine
+a valid schedule, such that all dependences are satisﬁed. ISL
+also provides facility for manipulating a schedule through its
+schedule tree representation [15].
+
+III. PROBLEM STATEMENT
+
+Our focus is on automatic kernel generation for computation
+DAGs where the nodes represent matmul or pointwise opera-
+tions. Since each of these operations can be speciﬁed as afﬁne
+loop-nests, each node also encapsulates its corresponding poly-
+hedral representation – the iteration space, data space, access
+relations as well as the dependence relations. Such a computa-
+tion DAG serves as the input to our kernel generation problem.
+DSLs such as Halide [16], Tensor Comprehensions [11] can
+be used to derive such a DAG.
+
+for(j = 0; j < N; ++j)
+
+for(k = 0; k < K; ++k)
+
+1 for(i = 0; i < M; ++i)
+2
+3
+4 /*S1*/ C[i, j] = mul_acc(C[i, j], A[i, k], B[k, j]);
+5
+6 for(i = 0; i < M; ++i)
+7
+8 /*S2*/ E[i, j] = relu_add(C[i, j], bias[i, j]);
+
+for(j = 0; j < N; ++j)
+
+Listing 1: Matmul + Bias + ReLU
+
+Listing 1 shows an example where the matmul result is
+fed to pointwise operations – bias add followed by the ReLU
+activation function. Each loop-nest maps to a separate node
+in the computation DAG. Now, the polyhedral model would
+consist of the following.
+
+• The iteration domains, I1 and I2, for the statements S1
+
+and S2.
+
+• Dataspaces, MC and ME, written to by S1 and S2
+
+respectively.
+
+• Write access relations, I1 → MC and I2 → ME,
+specifying write accesses performed on MC and ME
+respectively.
+
+• Read access relations, {I1 → MC, I1 → MA, I1 →
+MB, I2 → Mbias, I2 → MC}, specifying the read
+accesses performed on the dataspaces MC, MA, MB and
+Mbias respectively.
+
+3
+
+• RAW dependences, which consist of both intra-node and
+
+inter-node dependences.
+
+Additionally, to facilitate code generation, the following
+attributes about each statement are tagged on to its iteration
+space.
+
+• Expression Tree. The operations that are to be performed
+as part of the statement are encoded in the form of
+an expression tree. Each internal node in the expression
+tree corresponds to an operation. The result of the root
+operation is written to the output dataspace. In Listing 1,
+statement S2 performs a bias add and ReLU activation,
+represented by the compound operation relu_add. Its
+expression tree consists of two operations – ReLU and
+add, with ReLU as the root operation.
+
+• Write and read access relations: These are the leaves
+of the expression tree and are used to determine the
+data accesses performed by a statement instance, thereby
+providing the operands for the parent operation nodes in
+the tree.
+
+In the following sections, we ﬁrst discuss the problem of
+generating efﬁcient Volta kernels for matmul and then build on
+this approach to generate fused kernels for longer computation
+sequences.
+
+IV. MATMUL COMPUTE DECOMPOSITION
+
+The ISL scheduler gives an outer-parallel schedule, which
+is a good starting point for mapping the computation to a
+GPU. The matmul loop in Listing 1 has such a schedule. We
+now describe the compute decomposition for mapping this 3-d
+loop nest to the GPU compute hierarchy of blocks, warps and
+threads in order to target tensor cores.
+
+A. Macro-MMA
+
+MMA operations with the shape m8n8k4 are deﬁned for a
+quad-pair. But they can be composed into higher-order macro-
+MMA operations that are performed by an entire warp. Two
+such macro-MMA compositions that we employ are of shapes
+16×16×8 and 32×32×8.
+
+Consider Figure 2 which illustrates the 16×16×8 macro-
+MMA where each warp performs a 16×16×8 matrix multiply-
+and-accumulate operation. The input matrices A and B are
+of size 16×8 and 8×16 respectively. The accumulator matrix
+is of size 16×16. As with mma.m8n8k4, the input matrices
+may be in row or column major layout, which determines how
+the input matrices are distributed across the threads. Figure 2
+shows the distribution for a scenario where the input matrix A
+is row-major and matrix B is column-major. We refer to the
+subset of data elements owned by a given thread as a macro-
+MMA fragment. Each input macro-MMA fragment consists of
+8 fp16 values – for example, thread 0 owns the 8 elements
+in the ﬁrst row of matrix A as well as the 8 elements in the
+ﬁrst column of B (note that these elements are also owned
+by threads 8 and 4 respectively). The accumulator fragment
+consists of 8 fp32 values. In Figure 2, the numbers inside the
+cells indicate the threads that own the corresponding elements
+in the output matrix. For example, thread 0 owns the ﬁrst two
+
+T4..7 T20..23 T12..15 T28..31
+T0..3 T16..19 T8..11 T24..27
+
+7
+.
+.
+0
+,
+0
+B
+
+7
+.
+.
+0
+,
+1
+B
+
+7
+.
+.
+0
+,
+2
+B
+
+7
+.
+.
+0
+,
+3
+B
+
+7
+.
+.
+0
+,
+4
+B
+
+7
+.
+.
+0
+,
+5
+B
+
+7
+.
+.
+0
+,
+6
+B
+
+7
+.
+.
+0
+,
+7
+B
+
+7
+.
+.
+0
+,
+8
+B
+
+7
+.
+.
+0
+,
+9
+B
+
+7
+.
+.
+0
+,
+0
+1
+B
+
+7
+.
+.
+0
+,
+1
+1
+B
+
+7
+.
+.
+0
+,
+2
+1
+B
+
+7
+.
+.
+0
+,
+3
+1
+B
+
+7
+.
+.
+0
+,
+4
+1
+B
+
+7
+.
+.
+0
+,
+5
+1
+B
+
+T8..
+T11
+T12..
+T15
+T24..
+T27
+T28..
+T31
+
+T0..
+T3
+T4..
+T7
+T16..
+T19
+T20..
+T23
+
+A0,0..7
+A1,0..7
+A2,0..7
+A3,0..7
+A4,0..7
+A5,0..7
+A6,0..7
+A7,0..7
+A8,0..7
+A9,0..7
+A10,0..7
+A11,0..7
+A12,0..7
+A13,0..7
+A14,0..7
+A15,0..7
+
+8
+9
+8
+9
+
+2
+3
+2
+3
+6
+7
+6
+7
+
+2
+3
+2
+3
+6
+7
+6
+7
+
+0
+1
+0
+1
+4
+5
+4
+5
+
+10
+11
+10
+11
+
+8
+10
+0
+9
+11
+1
+8
+10
+0
+9
+11
+1
+12 14 12 14
+4
+13 15 13 15
+5
+12 14 12 14
+4
+5
+13 15 13 15
+16 18 16 18 24 26 24 26
+17 19 17 19 25 27 25 27
+16 18 16 18 24 26 24 26
+17 19 17 19 25 27 25 27
+20 22 28 30 20 22 28 30
+21 23 29 31 21 23 29 31
+20 22 28 30 20 22 28 30
+21 23 29 31 21 23 29 31
+
+Fig. 2: 16×16×8 macro-MMA for row-major matrix A and column-
+major matrix B.
+
+elements in the ﬁrst row as well as 3 other pairs of adjacent
+elements, all of which make up its accumulator fragment.
+The 4 different colours represent the 4 quad-pairs, thereby
+indicating the thread-to-data mapping for all the matrices.
+Regardless of the layout of the input matrices, the distribution
+of the accumulator matrix for the macro-MMA remains the
+same.
+
+In case of 32×32×8 macro-MMA an accumulator matrix
+of size 32×32 is computed using input matrices of size 32×8
+and 8×32. An input macro-MMA fragment for a 32×32×8
+macro-MMA contains 16 f p16 values, and 32 f p32 values
+in its accumulator fragment. Both of these macro-MMA
+compositions along with wide loads and stores can lead to
+performance comparable with that of hand-tuned kernels. In
+the following sections, without any loss of generality, we
+discuss our approach using 16×16×8 macro-MMA as the
+reference. A similar approach holds good for 32×32×8 macro-
+MMA as well.
+
+B. Tiling for Blocks and Warps
+
+The outer-parallel schedule obtained using ISL is shown
+in the schedule tree form. It corresponds to
+in Figure 3,
+a 3-d loop-nest and consists of a single permutable band
+with 3 schedule dimensions. Only the innermost dimension
+is sequential.
+
+Suppose we distribute the loop-nest across a 2-d grid of
+size b1 × b2 with each thread block having a 2-d w1 × w2
+arrangement of warps. Furthermore, suppose the sequential
+loop is to be strip-mined with a strip size of bs. This can be
+achieved by successively tiling the loop-nest, ﬁrst with tile
+sizes b1 × b2 × bs and then with tile sizes w1 × w2 × bs. We
+refer to the former as the block tile and the latter as the warp
+tile. Clearly, the block tile sizes along every dimension must
+
+4
+
+exceed or equal the warp tile sizes along the corresponding
+dimension. Also, they must be integer multiples of the macro-
+MMA sizes chosen – 16×16×8 or 32×32×8. The problem
+sizes are assumed to be multiples of the block tile sizes. For
+other problem sizes, we can either pad the input matrices
+with zeroes to make them so or generate specialized code for
+the partial tiles and then combine the results of the full-tile
+computed using macro-MMA and the results of the partial-
+tiles.
+
+Figure 4 shows the block and warp-level tiling transforma-
+tion on the schedule tree using tile sizes 128×128×32 and
+64×64×32 respectively. Note that in all three band nodes of
+the resulting schedule tree, only the innermost dimension is
+sequential. Clearly, the parallel dimensions of the outermost
+band correspond to the block indices, blockIdx.y and block-
+Idx.x. Similarly, the middle band essentially iterates over the
+warp tiles. So, its parallel dimensions correspond to warp
+indices, warpIdx y and warpIdx x, which can be derived from
+other kernel parameters such as thread indices. Figure 5 shows
+the schedule tree after these schedule parameters have been
+introduced.
+
+C. Strip Mining the Warp-Level MMA
+
+The innermost band in Figure 5, which performs a
+warp-level MMA operation, processes a warp tile of size
+64×64×32. As shown in Figure 6, the sequential dimension
+in the innermost band can be strip-mined further using a strip
+size of 8, which corresponds to the macro-MMA size along
+the k dimension. Such a restructuring essentially expresses
+the warp-level MMA as an outer product, which exposes more
+instruction-level parallelism than an inner product formulation.
+This helps cover the latency from instructions and the memory
+load at a low occupancy.
+
+D. Schedule Domain Contraction
+
+At this stage, the innermost band in Figure 6 speciﬁes a
+3-d loop nest around the statement S, each instance of which
+performs a scalar matrix-multiply and accumulate operation.
+To target tensor cores, each statement instance must instead
+perform a macro-MMA operation (of shape 16×16×8 or
+32×32×8). This is done by constraining the schedule domain
+as shown in Figure 7, where an entire subset of integer points
+corresponding to a 16×16×8 macro-MMA is mapped to a
+single integer point. The root operation in the expression
+tree associated with the statement S is then altered to one
+that performs a 16×16×8 macro-MMA. This means that the
+innermost band of the schedule tree would then specify the
+schedule for a loop iterating over 16×16×8 macro-MMA
+instances instead of scalar multiply-accumulate operations. In
+effect, this distributes the warp-level iteration space across all
+the threads of the warp. Note that the updated operation type
+can be of four different types – one for each of the macro-
+MMA layout specializations.
+
+At this stage, we assume that the macro-MMA fragments
+owned by each thread are somehow available for the macro-
+
+DOMAIN : S[i, j, k] : 0 ≤ i < M ∧ 0 ≤ j < N ∧ 0 ≤ k < K
+
+BAND: S[i, j, k] → [i, j, k]
+
+Fig. 3: Initial schedule for matmul in schedule tree form.
+
+DOMAIN: S[i, j, k] : 0 ≤ i < M ∧ 0 ≤ j < N ∧ 0 ≤ k < K
+
+BAND: S[i, j, k] → [(cid:98)i/128(cid:99), (cid:98)j/128(cid:99), (cid:98)k/32(cid:99)]
+
+BAND: S[i, j, k] → [(cid:98)i/64(cid:99) − 2(cid:98)i/128(cid:99), (cid:98)j/64(cid:99) − 2(cid:98)j/128(cid:99), 0]
+
+BAND: S[i, j, k] → [i − 64(cid:98)i/64(cid:99), j − 64(cid:98)j/64(cid:99), k − 32(cid:98)k/32(cid:99)]
+
+Fig. 4: Tiling with block tile size of 128×128×32 and warp-level
+tile size of 64×64×32.
+
+DOMAIN: S[i, j, k] : 0 ≤ i < M ∧ 0 ≤ j < N ∧ 0 ≤ k < K
+
+BAND: S[i, j, k] → [blockIdx.y, blockIdx.x, (cid:98)k/32(cid:99)]
+BAND: S[i, j, k] → [warpIdx y, warpIdx x, 0]
+
+BAND: S[i, j, k] → [i − 64(cid:98)i/64(cid:99), j − 64(cid:98)j/64(cid:99), k − 32(cid:98)k/32(cid:99)]
+Fig. 5: Introducing kernel parameters – blockIdx.y, blockIdx.x,
+warpIdx y, warpIdx x.
+
+DOMAIN: S[i, j, k] : 0 ≤ i < M ∧ 0 ≤ j < N ∧ 0 ≤ k < K
+BAND: S[i, j, k] → [blockIdx.y, blockIdx.x, (cid:98)k/32(cid:99)]
+BAND: S[i, j, k] → [warpIdx y, warpIdx x, 0]
+
+BAND: S[i, j, k] → [0, 0, (cid:98)k/8(cid:99) − 4(cid:98)k/32(cid:99)]
+
+BAND: S[i, j, k] → [i−64(cid:98)i/64(cid:99), j −64(cid:98)j/64(cid:99), k −8(cid:98)k/8(cid:99)]
+
+Fig. 6: Strip-mining along the k dimension with strip-size 8.
+
+DOMAIN: S[i, j, k] : 0 ≤ i < M ∧ 0 ≤ j < N ∧ 0 ≤ k < K ∧
+16(cid:98)i/16(cid:99) = i ∧ 16(cid:98)j/16(cid:99) = j ∧ 8(cid:98)k/8(cid:99) = k
+
+BAND: S[i, j, k] → [blockIdx.y, blockIdx.x, (cid:98)k/32(cid:99)]
+BAND: S[i, j, k] → [warpIdx y, warpIdx x, 0]
+BAND: S[i, j, k] → [0, 0, (cid:98)k/8(cid:99) − 4(cid:98)k/32(cid:99)]
+
+BAND: S[i, j, k] → [i − 64(cid:98)i/64(cid:99), j − 64(cid:98)j/64(cid:99), k − 8(cid:98)k/8(cid:99)]
+Fig. 7: Constraining the schedule domain so that each macro-MMA
+instance is mapped to a single integer point.
+
+Fig. 8: Schedule tree transformations for matmul.
+
+MMA operation. In later sections, we discuss how these
+fragments can be created and loaded with the required data.
+
+E. Split-K
+
+The compute decomposition described so far parallelizes
+the matmul computation only along the parallel dimensions,
+i.e., the i and j loops. While the k dimension is sequential,
+it is reasonable to parallelize along the k dimension as well
+when targeting tensor cores. We refer to such a paralleliza-
+tion as split-K. A 2-way intra-thread-block split-K splits the
+computation into 2 parts and assigns them to concurrent warps
+along the z axis of the GPU compute hierarchy. The partial
+results computed by corresponding warps along the z axis
+then need to be summed up to obtain the ﬁnal result for the
+matmul computation. More generally, it is possible to extend
+this arrangement to a p-way intra-thread-block split-K, where
+p is a power of 2.
+
+1) Tiling for Intra-Thread-Block Split-K: For a p-way split-
+K, the block tiles need to be bigger by a factor p along the k
+dimension, while the warp tiles are of the same size as before.
+So, the compute decomposition for a p-way split-K involves
+tiling the loop-nest, ﬁrst with tile sizes b1 × b2 × p ∗ bs and
+then with w1 × w2 × bs. This creates p rows of warp tiles
+along the z axis of the GPU compute hierarchy. Figure 9
+illustrates this approach for a 2-way intra-thread-block split-
+K. Clearly, the resulting schedule in the middle band is for
+a loop-nest that iterates over warp tiles along the y, x and
+z dimensions respectively. So, on introducing these derived
+kernel parameters, along with the block indices, the schedule
+tree would be as shown in Figure 10.
+
+The above tilings are followed up with strip-mining and
+schedule domain contraction as shown earlier in Figures 6
+and 7 to complete the compute decomposition for a p-way
+split-K.
+
+V. DATA MOVEMENT ACROSS MEMORY HIERARCHY
+
+In order to obtain good performance on a GPU,
+
+is
+important to optimize the movement of data across global
+
+it
+
+5
+
+memory, shared memory and registers. In this section, we
+explain how copy statements that move the data across this
+memory hierarchy are introduced by inserting their associated
+copy schedule nodes to the transformed schedule tree obtained
+after compute decomposition.
+
+The read maps, I → MA and I → MB cap-
+ture the read access relation from the iteration domain of
+the matmul statement S to the dataspaces MA and MB,
+which are only read. The schedule tree transformation de-
+scribed in the previous section effectively maps the iteration
+space I to the schedule space I (cid:48) with the schedule vec-
+tor (by, bx, c0, wy, wx, c1, c2, c3, c4, c5, c6, c7). The dimensions
+by, bx, c0 correspond to the schedule dimensions of the outer-
+most band in Figure 7; wy, wx, c1 correspond to the schedule
+dimensions of the band immediately below it and so on.
+
+1) Global, Shared and Register Data Tiles: Using the
+transformation I → I (cid:48), we can derive the mappings I (cid:48) → MA,
+I (cid:48) → MB and likewise, the write mapping I (cid:48) → MC, which
+describe the read and the write access relations from the sched-
+ule space I (cid:48) to the input and output dataspaces respectively.
+The basic idea is to infer tiles in the global memory that are
+accessed at block-level and warp-level. Global data tiles that
+are reused can then be promoted to shared memory data tiles
+and register tiles, i.e., copied to shared memory or register
+ﬁles and then reused. For each memory promotion, a new
+statement is introduced to perform this data copy. Furthermore,
+the access maps can be analyzed to determine the access depth
+as well as the dimensions of these data tiles. The iteration
+domain of the copy statement can be derived from the data
+space of the corresponding data tile. At the inferred access
+depth, a new schedule node deﬁning a schedule for the copy
+statement is inserted into the schedule tree. As explained later,
+in some cases, the copy operation may not be a simple data
+assignment and may involve a call to helper functions.
+
+A. Global to Shared Memory
+Block-level read maps I (cid:48)
+
+block → MB can
+be derived from the read access relations I (cid:48) → MA and I (cid:48) →
+
+block → MA and I (cid:48)
+
+DOMAIN: S[i, j, k] : 0 ≤ i < M ∧ 0 ≤ j < N ∧ 0 ≤ k < K
+BAND: S[i, j, k] → [(cid:98)i/128(cid:99), (cid:98)j/128(cid:99), (cid:98)k/64(cid:99)]
+
+BAND: S[i, j, k] → [(cid:98)i/64(cid:99) − 2(cid:98)i/128(cid:99), (cid:98)j/64(cid:99) − 2(cid:98)j/128(cid:99),
+
+(cid:98)k/32(cid:99) − 2(cid:98)k/64(cid:99)]
+
+BAND: S[i, j, k] → [i − 64(cid:98)i/64(cid:99), j − 64(cid:98)j/64(cid:99), k − 32(cid:98)k/32(cid:99)]
+
+Fig. 9: Tiling initial schedule in Figure 3 with block tile size of
+128×128×64 instead of 128×128×32 for 2-way split-K. Warp tile
+size remains the same – 64×64×32.
+
+DOMAIN: S[i, j, k] : 0 ≤ i < M ∧ 0 ≤ j < N ∧ 0 ≤ k < K
+
+BAND: S[i, j, k] → [blockIdx.y, blockIdx.x, (cid:98)k/64(cid:99)]
+
+BAND: S[i, j, k] → [warpIdx y, warpIdx x, warpIdx z]
+
+BAND: S[i, j, k] → [i − 64(cid:98)i/64(cid:99), j − 64(cid:98)j/64(cid:99), k − 32(cid:98)k/32(cid:99)]
+Fig. 10: On introducing kernel parameters – blockIdx.y, blockIdx.x,
+warpIdx y, warpIdx x, warpIdx z.
+
+Fig. 11: Schedule tree transformations for matmul with 2-way intra-thread-block split-K.
+
+MB respectively, by projecting out all the dimensions other
+than those in the outer schedule band, namely, (by, bx, c0). The
+ranges of these maps determine the data tiles that are accessed
+by the compute tile (by, bx, c0). Since this data tile is reused
+by threads within the block with block indices (by, bx), it can
+be promoted to shared memory.
+
+Furthermore, we separate out the global-to-shared copy by
+splitting it into a global-to-register copy followed by a register-
+to-shared copy loop. The global-to-register copy loop is set
+up in such a way that each thread performs 128-bit accesses
+(8 contiguous fp16 elements) to global memory. Furthermore,
+this loop to copy data from global memory to registers using
+vectorized loads is cyclically distributed across all the threads
+in a thread block. Such a distribution also ensures that global
+accesses are coalesced.
+
+1) Swizzled Shared Memory: In order to ensure that there
+are no bank conﬂicts when reading and writing data to and
+from the shared memory, the data elements in the shared
+memory tile need to be permuted or swizzled. So, unlike the
+copy from global memory to registers, which is a straightfor-
+ward copy of an 8-wide vector of fp16 data values, the copy
+from registers to shared memory involves the application of a
+swizzle function. In essence, the 8-wide vector data is stored
+to a shared memory buffer where the data ordering is different
+from that in the corresponding global data tile.
+
+The swizzle function, used to compute the offset in the
+swizzled shared memory allocation, provides a one-to-one
+mapping from the unswizzled data tile to the swizzled tile in
+shared memory. Essentially, it maps the offsets of contiguous
+blocks of 8 fp16 data values in the unswizzled data tile to
+an offset in the shared memory allocation for that data tile.
+The exact implementation of the swizzle function depends on
+the number of elements per row and column in the swizzled
+shared array. We also use different helper functions to copy
+the data to shared memory for each of the 4 combinations –
+A or B in row or column major layout.
+
+B. Shared Memory to Register Fragments
+
+warp → MB, I (cid:48)
+
+The access maps I (cid:48)
+
+warp → MA, I (cid:48)
+warp →
+MC are obtained by projecting out the dimensions (c5, c6, c7)
+from I (cid:48) → MA, I (cid:48) → MB, I (cid:48) → MC respectively. The ranges
+of these warp-level access maps determine the input and output
+data tiles for the warp-level macro-MMA. For the schedule
+tree in Figure 7, these data tiles would be of size 64×8, 8×64
+and 64×64 respectively.
+
+1) Macro-MMA Register Fragments: Each thread need not
+own the entire data tile. Recall the schedule domain contrac-
+tion in Figure 7 which abstracted away the inner point loops.
+Similarly, these tiles can be contracted to obtain an array of
+register fragments. For a 16×16×8 macro-MMA, the sizes of
+the array of macro-MMA fragments can be found as follows.
+• The 2-d input data tile of MA is contracted by factors
+16×8 if it is row major, and by factors 8×16 if it is
+column major. For example, a given tile of size 64×8 can
+contracted down to a 4×1 array of register fragments.
+• The input data tile of MB is contracted by factors 8×16
+if it is row major and by sizes 16×8 if it is column major.
+• The output data tile for MC is contracted by factors
+16×16 to obtain the array of accumulator fragments.
+Each 16×16×8 macro-MMA fragment contains 8 fp16
+
+elements.
+
+2) Loading Register Fragments: In order to load the regis-
+ter fragments, a polyhedral schedule can be created for moving
+the data from shared memory to register fragments. Each
+register fragment load involves loading 8 fp16 values from
+shared memory. The swizzled storage ensures that there are
+no bank conﬂicts due to the read accesses to it. The same
+swizzling function that is used for storing to shared memory
+is used to obtain the swizzled offset from which to fetch the
+data vector in the swizzled storage. Again, the data copy is
+done using vectorized accesses. The macro-MMA thread-to-
+data mappings for inputs A and B are different. Furthermore,
+it is different for different layouts – row or column major.
+Also, different load fragment helper functions are needed for
+each of the 4 possibilities – A or B in row or column major
+layout.
+
+C. Macro-MMA on Register Fragments
+
+As described in the previous subsection, the register frag-
+ments are inferred from the access maps I (cid:48)
+warp → MA,
+I (cid:48)
+warp → MB, I (cid:48)
+warp → MC. Consequently, a mapping from
+the global dataspace to the data space of register fragments
+can be inferred. Using these mappings, all accesses to global
+memory in the statement S can be altered to access register
+fragments instead.
+
+D. Store to Global Memory
+
+The result of a macro-MMA computation goes into an
+accumulator fragment, which resides in registers. So, a copy
+of the data from accumulator fragments to global memory is
+required.
+
+6
+
+2
+3
+4
+5
+6
+
+7
+
+8
+9
+10
+11
+
+12
+
+13
+14
+15
+16
+
+17
+18
+19
+20
+21
+22
+23
+24
+25
+26
+
+27 }
+
+1 extern "C" __global__ void __launch_bounds__(256) kern0(int M, int N, int K, const half * __restrict__ M_0, int ldM_0,
+
+const half * __restrict__ M_1, int ldM_1, half * __restrict__ M_3, int ldM_3) {
+
+...
+for (int c2 = -1; c2 < K / 64; c2 += 1) // 2-way split-K
+
+if (K >= 64 * c2 + 128) // prefetch data from global memory
+
+#pragma unroll for (int c5 = 0; c5 <= 3; c5 += 1) {
+
+(half8&)(private_M_1[(8 * c5)]) = ((half8&)(M_0[(128 * blockIdx.y + 32 * c5 + linearId / 8) * K + (8 * (linearId
+
+% 8) + 64 * c2 + 64) * 1])); // copy data from global memory to registers
+
+(half8&)(private_M_3[(8 * c5)]) = ((half8&)(M_1[(128 * blockIdx.x + 32 * c5 + linearId / 8) * K + (8 * (linearId
+
+% 8) + 64 * c2 + 64) * 1]));} // copy data from global memory to registers
+
+if (c2 >= 0) // overlap computation with data movement from global memory to registers
+
+#pragma unroll for (int c8 = 0; c8 <= 3; c8 += 1){ // strip-mine the warp-level macro-MMA
+
+#pragma unroll for (int c11 = 0; c11 <= 3; c11 += 1){
+
+hmma_load_b_col_swizzled(&hmma_M_5[(c11)][(0)][0][0], &shared_mma_M_2[0], (64 * warpIdx_x + 16 * c11), (32 *
+
+warpIdx_z + 8 * c8), 64); // copy data from swizzled shared buffers to register fragments
+
+hmma_load_a_row_swizzled(&hmma_M_4[(c11)][(0)][0][0], &shared_mma_M_0[0], (64 * warpIdx_y + 16 * c11), (32 *
+
+warpIdx_z + 8 * c8), 64);} // copy data from swizzled shared buffers to register fragments
+
+// iterate over the macro-MMAs
+#pragma unroll for (int c9 = 0; c9 <= 63; c9 += 16){
+
+#pragma unroll for (int c10 = 0; c10 <= 63; c10 += 16){ // perform macro-MMA (A is row & B is col-major)
+
+hmma_row_col(&hmma_M_6[(c9 / 16)][(c10 / 16)][0][0], &hmma_M_4[(c9 / 16)][(0)][0][0], &hmma_M_5[(c10 / 16)
+
+][(0)][0][0], &hmma_M_6[(c9 / 16)][(c10 / 16)][0][0]);}}}
+
+if (K >= 64 * c2 + 128) // prefetch data from shared memory
+
+__syncthreads();
+#pragma unroll for (int c5 = 0; c5 <= 3; c5 += 1) { // copy data from registers to swizzled shared buffers
+
+hmma_store_shared_b_col_swizzled(&shared_mma_M_2[0], ((half8&)(private_M_3[(8 * c5)])), (8 * c5));
+hmma_store_shared_a_row_swizzled(&shared_mma_M_0[0], ((half8&)(private_M_1[(8 * c5)])), (8 * c5));}
+
+__syncthreads();
+
+if (K >= 64) // iterate over accumulator fragments and store results to global mem, rearrange through shared mem
+
+#pragma unroll for (int c4 = 0; c4 <= 3; c4 += 1)
+
+#pragma unroll for (int c5 = 0; c5 <= 3; c5 += 1)
+
+hmma_store_global_after_reordering(&M_3[(64 * warpIdx_y + 128 * blockIdx.y + 16 * c4) * N + (64 * warpIdx_x + 128
+
+* blockIdx.x + 16 * c5) * 1], &hmma_M_6[(c4)][(c5)][0][0], ldM_3, &sharedBuffer[0]);
+
+Listing 2: Skeleton code for the matmul kernel generated with block tile size 128×128×32 and warp tile size 64×64×32.
+
+1) Reordering through Shared Memory: The 8 fp32 data
+values making up an accumulator fragment do not map to
+a contiguous block of 8 elements (please refer Figure 2).
+Furthermore, it is necessary to convert these data values from
+the fp32 accumulator type to the fp16 output type. So, this
+precludes a straightforward 8-wide vectorized store to global
+memory. In order to achieve that, the overall strategy is to
+move the data from the accumulator fragments to global
+memory, via shared memory. Essentially, shared memory is
+used as a temporary buffer to exchange and rearrange the
+accumulator data in registers so that each thread can ﬁnally
+move a contiguous block of 8 fp16 values to global memory.
+For example, as shown in Figure 2, thread 0 owns the ﬁrst two
+elements C0,0..1 in the ﬁrst row of the accumulator matrix, as
+well as the elements C0,4..5. Likewise, thread 2 owns C0,2..3
+and C0,6..7. Thread 0 packs the 4 elements that it owns into
+a 4-wide vector of f p16 values (after converting them from
+fp32 to fp16), and copies them to a contiguous block in shared
+memory. Now, if thread 2 does the same and copies its packed
+data to the adjacent contiguous block of shared memory, thread
+0 can then copy back the entire contiguous block of 8 fp16
+values to registers and rearrange them to obtain the correct
+data order. A similar procedure is employed for all the threads
+to make sure that the threads own data elements that form
+contiguous blocks in the global array. Again, the accesses to
+shared memory are modeled to avoid bank conﬂicts and to
+exploit wide loads and stores.
+
+2) Split-K Reduction: In case of a split-K schedule, the
+partial results computed by corresponding warps along the
+
+z axis must be summed up. This is done by adding the
+partial results once they are stored to shared memory for the
+reordering described above. The reduction is performed only
+by the threads in warps with warp z equal to 0. Furthermore,
+this means that the rest of the threads do not perform any store
+to global memory.
+
+Reordering involves carefully chosen non-afﬁne access pat-
+terns. So, all these details, including data conversion and split-
+K reduction, are hidden behind a helper function that copies
+data from an accumulator fragment to global memory through
+the above steps.
+
+E. Prefetching and Hiding Latency
+
+As explained earlier, the input data for the macro-MMA
+computation is obtained by copying the data from global
+memory to shared memory and then from the latter to the
+register fragments. A prefetching schedule can be obtained by
+shifting the schedule bands associated with the corresponding
+copy schedule nodes accordingly. The schedule is further
+modiﬁed so that the global memory access latency is hidden
+by overlapping it with the macro-MMA computation.
+
+VI. CODE GENERATION
+
+The AST generation facility provided by ISL is used to
+emit CUDA code from the schedule tree that results from the
+compute and data decomposition discussed in the previous
+sections. Kernel launch parameters, i.e., the grid and block
+sizes are inferred through the constraints on the corresponding
+schedule dimensions in the schedule tree. Listing 2 provides
+a skeleton of the kernel generated using our approach for
+
+7
+
+for(j = 0; j < N; ++j) {
+for(k = 0; k < K; ++k)
+
+1 for(i = 0; i < M; ++i)
+2
+3
+4
+5
+6
+
+}
+
+C[i, j] = mul_acc(C[i, j], A[i, k], B[k, j]);//S1
+
+E[i, j] = relu_add(C[i, j], bias[i, j]);//S2
+
+Listing 3: Matmul + Bias + ReLU
+
+DOMAIN : S1[i, j, k] : 0 ≤ i < M ∧ 0 ≤ j < N ∧ 0 ≤ k < K;
+
+S2[i, j] : 0 ≤ i < M ∧ 0 ≤ j < N
+
+BAND: S1[i, j, k] → [i, j, k]; S2[i, j] → [i, j, K];
+SEQUENCE
+
+FILTER: S1[i, j, k]
+FILTER: S2[i, j]
+
+Fig. 12: Initial schedule tree for matmul+bias+ReLU
+
+DOMAIN : S1[i, j, k] : 0 ≤ i < M ∧ 0 ≤ j < N ∧ 0 ≤ k < K;
+
+S2[i, j] : 0 ≤ i < M ∧ 0 ≤ j < N
+
+BAND: S1[i, j, k] → [(cid:98)i/128(cid:99), (cid:98)j/128(cid:99), (cid:98)k/32(cid:99)];
+S2[i, j] → [(cid:98)i/128(cid:99), (cid:98)j/128(cid:99), (cid:98)K/32(cid:99)]
+
+BAND: S1[i, j, k] → [i−128(cid:98)i/128(cid:99), j−128(cid:98)j/128(cid:99), k−32(cid:98)k/32(cid:99)];
+
+S2[i, j] → [i − 128(cid:98)i/128(cid:99), j − 128(cid:98)j/128(cid:99), K − 32(cid:98)K/32(cid:99)]
+
+SEQUENCE
+FILTER: S1[i, j, k]
+FILTER: S2[i, j]
+
+Fig. 13: Tiling with block tile size of 128×128×32.
+
+DOMAIN : S1[i, j, k] : 0 ≤ i < M ∧ 0 ≤ j < N ∧ 0 ≤ k < K;
+
+S2[i, j] : 0 ≤ i < M ∧ 0 ≤ j < N
+
+BAND: S1[i, j, k]
+[(cid:98)i/128(cid:99), (cid:98)j/128(cid:99)]
+
+→
+
+[(cid:98)i/128(cid:99), (cid:98)j/128(cid:99)]; S2[i, j]
+
+→
+
+SEQUENCE
+FILTER: S1[i, j, k]
+BAND: S1[i, j, k] → [(cid:98)k/32(cid:99)]
+BAND: S1[i, j, k] → [i − 128(cid:98)i/128(cid:99), j − 128(cid:98)j/128(cid:99), k −
+
+32(cid:98)k/32(cid:99)]
+
+FILTER: S2[i, j]
+BAND: S2[i, j] → [(cid:98)K/32(cid:99)]
+BAND:S2[i, j] → [i − 128(cid:98)i/128(cid:99), j − 128(cid:98)j/128(cid:99), K −
+
+32(cid:98)K/32(cid:99)]
+
+Fig. 14: Sequence hoisting for inter-statement dependence.
+
+DOMAIN : S1[i, j, k] : 0 ≤ i < M ∧ 0 ≤ j < N ∧ 0 ≤ k < K ∧
+16(cid:98)i/16(cid:99) = i ∧ 16(cid:98)j/16(cid:99) = j ∧ 8(cid:98)k/8(cid:99) = k; S2[i, j] : 0 ≤ i < M ∧ 0 ≤
+j < N ∧ 16(cid:98)i/16(cid:99) = i ∧ 16(cid:98)j/16(cid:99) = j
+
+BAND: S1[i, j, k] → [blockIdx.y, blockIdx.x]; S2[i, j] →
+[blockIdx.y, blockIdx.x]
+
+SEQUENCE
+FILTER: S1[i, j, k]
+BAND: S1[i, j, k] → [(cid:98)k/32(cid:99)]
+
+BAND: S1[i, j, k] → [warpIdx y, warpIdx x, 0];
+BAND: S1[i, j, k] → [0, 0, (cid:98)k/8(cid:99) − 4(cid:98)k/32(cid:99)];
+BAND: S1[i, j, k] → [i − 64(cid:98)i/64(cid:99), j − 64(cid:98)j/64(cid:99), k − 8(cid:98)k/8(cid:99)];
+
+FILTER: S2[i, j]
+BAND: S2[i, j] → [(cid:98)K/32(cid:99)]
+
+BAND: S2[i, j] → [warpIdx y, warpIdx x, 0];
+BAND: S2[i, j] → [0, 0, (cid:98)K/8(cid:99) − 4(cid:98)K/32(cid:99)];
+BAND: S2[i, j] → [i − 64(cid:98)i/64(cid:99), j − 64(cid:98)j/64(cid:99), K − 8(cid:98)K/8(cid:99)];
+Fig. 15: Schedule after tiling innermost bands in both the ﬁlter nodes
+with warp-level tile size of 64×64×32 and then strip-mining the
+sequential dimension with strip-size of 8.
+
+Fig. 16: Schedule tree transformation for Matmul + Bias + ReLU
+
+matmul with block tile sizes 128×128×32 and warp tile sizes
+64×64×32 with a 2-way intra-thread-block split-K, where the
+input matrices M_0 and M_1 are in row-major and column
+major layout respectively. As can be seen the core matmul
+computation is performed on line 16 through the call
+to
+the helper function hmma_row_col, which we implement
+using the mma.sync.m8n8k4 instructions to realize either a
+16×16×8 or a 32×32×8 macro-MMA. Similarly, the data
+copy operations are implemented as calls to helper functions.
+
+VII. KERNEL FUSION
+
+We now discuss how fused kernels can be generated for
+some computation idioms with both matmul and pointwise
+operations.
+
+A. Pointwise Operations in Epilogue
+
+Consider a computation sequence with pointwise operations
+fed by a matmul e.g. matmul followed by a bias add and
+ReLU activation, with only the ﬁnal result being live out.
+Without loss of generality, all the pointwise operations can
+be fused together and represented by a single compound
+operation as in Listing 1. The ISL schedule for this is as
+shown in Figure 12, which corresponds to the loop-nest shown
+in Listing 3. The sequence node speciﬁes the relative ordering
+of the statements that appear in its ﬁlter child nodes. Only
+
+the innermost dimensions of band nodes are sequential. Note
+that unlike in Listing 1, the outer-parallel loops are fused in
+Listing 3.
+
+As in the case of block-level tiling for just matmul, the band
+node can be tiled using tile sizes b1 × b2 × bs. Figure 13 shows
+the result of such a block-tiling. However, given the sequence
+ordering between statements S1 and S2, it is necessary to
+hoist the sequence node further up the schedule tree so that all
+sequential loop dimensions appear only in descendant nodes
+of the hoisted sequence node. This may require splitting the
+band members so that
+loop dimensions
+the outer parallel
+fall
+in a separate band from that of the inner sequential
+dimensions. Figure 14 illustrates this restructuring. Note that
+the parent band node of the sequence node only contains
+parallel loop dimensions. The sequential loop dimensions for
+the two statements are now moved to separate band nodes im-
+mediately under the ﬁlter nodes. Such a restructuring ensures
+that the matmul reduction loop is scheduled before its result
+is consumed by the pointwise operations.
+
+Clearly, the schedule dimensions constituting the outermost
+band in Figure 14 correspond to kernel parameters blockIdx.y
+and blockIdx.x, as shown in Figure 15. Furthermore,
+the
+innermost band under both the ﬁlter nodes in Figure 14 iterate
+over the warp tiles. Consequently, as shown in Figure 15, we
+can perform warp-tiling and strip-mining on both of these ﬁlter
+
+8
+
+nodes similar to the transformations illustrated in Figure 4 and
+6. Schedule domain contraction, as described in Section IV-D
+is then applied for statement S1 so that it performs a 16×16×8
+macro-MMA operation. Similarly, for ease of code generation,
+the schedule domain of the statement S2 is also constrained
+and its operation type updated to one that performs a pointwise
+operation on an entire accumulator fragment computed by the
+macro-MMA operation, effectively distributing the pointwise
+operation across threads.
+
+a) Avoiding Intermediate Writes To Global Memory: The
+schedule space for S1 is similar to that obtained earlier for
+matmul alone (see Figure 7). So, similar memory promotions
+to those described in Section V hold good for this part of the
+schedule tree. However, since the matmul result is not live-
+out, the data in an accumulator fragment need not be stored
+to global memory. Nevertheless, this result is consumed by the
+pointwise operations scheduled in the other ﬁlter node. So, the
+accumulator data needs to be converted to fp16 type and then
+reordered through shared memory, but ﬁnally copied back to
+a register fragment. The reordering ensures that each thread
+holds a contiguous block of 8 fp16 values in every register
+fragment.
+
+b) Register Fragments for Pointwise Operation: The
+register fragments obtained from the accumulator data serve
+as one of the inputs to the downstream pointwise operation.
+For the statement S2, every other data tile accessed by its
+warp-level compute tile is promoted to registers e.g. those
+from access to the bias array. These data tiles are similarly
+distributed across the threads by contracting them by a factor
+16×16 to obtain an array of register fragments, each contain-
+ing 8 fp16 elements. Note that since these fragments have the
+same data distribution as the register fragments obtained from
+the accumulator data, they can be loaded from global memory
+using 128-bit accesses. A copy schedule node is inserted into
+the schedule tree for the register fragment load operations.
+
+c) Storing Live-Out to Global Memory: With all the data
+tiles accessed by a warp-level compute tile of the pointwise
+operation distributed across threads into register fragments, the
+result of the pointwise operation is also in a register fragment.
+Since it is a contiguous block of 8 fp16 values, a ﬁnal copy
+schedule node is inserted after the pointwise operation to
+perform a 128-bit store to global memory for each register
+fragment.
+
+B. Matmuls with Pointwise Epilogue
+
+Consider the scenario where there are two matmuls of the
+same shape whose results are consumed by a downstream
+pointwise operation. The ISL schedule obtained for such an
+example is shown in Figure 17. The corresponding loop-nest
+is shown in Listing 4.
+
+Comparing Figures 12 and Figures 17,
+
+is clear that
+the main structural difference between the schedule trees is
+that there are three statements involved in the latter and so,
+three corresponding ﬁlter nodes in sequence. Consequently,
+the same schedule transformations can be applied to obtain a
+schedule tree similar to that in Figure 15, except that it would
+
+it
+
+DOMAIN : S1[i, j, k] : 0 ≤ i < M ∧ 0 ≤ j < N ∧ 0 ≤ k < K;
+S2[i, j, k] : 0 ≤ i < M ∧ 0 ≤ j < N ∧ 0 ≤ k < K;
+S3[i, j] : 0 ≤ i < M ∧ 0 ≤ j < N
+
+BAND: S1[i, j, k] → [i, j, k]; S2[i, j, k] → [i, j, k]; S3[i, j] → [i, j, K];
+SEQUENCE
+
+FILTER: S1[i, j, k]
+FILTER: S2[i, j, k]
+FILTER: S3[i, j]
+
+Fig. 17: Initial schedule tree for two matmuls feeding an addition.
+
+for(k = 0; k < K; ++k) {
+
+for(j = 0; j < N; ++j) {
+
+1 for(i = 0; i < M; ++i)
+2
+3
+4
+5
+6
+7
+8
+
+}
+
+C[i, j] = mul_acc(C[i, j], A[i, k], B[k, j]);//S1
+R[i, j] = mul_acc(R[i, j], P[i, k], Q[k, j]);//S2
+
+}
+Z[i, j] = add(C[i, j], R[i, j]); /*S3*/
+
+Listing 4: Sum of Matmuls
+
+have three ﬁlter nodes – the ﬁrst two for the two matmuls and
+the last one for the pointwise operations, i.e., at the thread-
+level all of these operations are performed in sequence with no
+interleaving. Memory promotion presents no additional issues
+and is handled similarly by avoiding writes of intermediate
+results to global memory with only the live-out data being
+stored to it.
+
+In this example, the input matrices to both the matmuls
+have the same shape. However, the overall approach of tiling
+for blocks with sequence hoisting to ensure that there is no
+interleaving of the operations, can be applied even when the
+input matrices are of different shapes so long as the matmul
+outputs are of the same shape.
+
+C. Pointwise Operations in Prologue
+
+Consider the scenario where the matmul inputs are results
+of pointwise operations as shown in Listing 5. Since each
+statement is tagged with a speciﬁcation of its expression tree,
+the compound operation of ReLU on an input followed by
+matmul can be represented by a single statement, with matmul
+as the root in the expression tree.
+
+for(j = 0; j < N; ++j)
+
+1 for(i = 0; i < M; ++i)
+2
+3
+4 /*S1*/C[i,j] = mul_acc(C[i, j], relu(A[i, k]), B[k,j]);
+
+for(k = 0; k < K; ++k)
+
+Listing 5: ReLU + Matmul
+
+The initial schedule tree for this loop-nest is structurally
+similar to that in Figure 3. So, all the schedule transformations
+discussed in Section IV can be applied. This is followed up
+with memory promotion as discussed in Section V with one
+crucial difference. Recall that the global-to-shared memory
+copy is split
+into a global-to-register copy followed by a
+register-to-shared copy (see Section V-A). So, all the data
+that is reused at the block level is ﬁrst moved to registers.
+Therefore, when we have pointwise operations in the matmul
+prologue, instead of moving all this data to shared memory for
+
+9
+
+reuse, the pointwise operations can be performed on these data
+values and the result can instead be stored to shared memory
+for reuse. In effect, even though the compound operation
+in statement S1 could have multiple input dataspaces, the
+shared memory footprint remains the same as that for a
+matmul without pointwise operations in its prologue. With
+the pointwise operations being performed during the data
+movement, the statement S1 only needs to perform a macro-
+MMA using two input fragments and an accumulator fragment
+as in case of a single matmul with no prologue. For the
+example in Listing 5, the kernel generated would be the same
+as Listing 2, except that on lines 20 and 21, the result obtained
+by applying a pointwise ReLu on the 8 fp16 values which are
+held in registers, would then be stored to shared memory.
+
+VIII. EXPERIMENTAL EVALUATION
+
+In this section, we provide an experimental evaluation of the
+techniques described in the previous sections We implemented
+these techniques in the Diesel DSL framework [17]. Diesel
+provides a basic front-end for specifying tensor expressions
+and to extract their polyhedral representation. Input to the
+compiler backend included various code generation options,
+namely, block tile sizes, warp tile sizes, choice of macro-MMA
+(16×16×8 or 32×32×8).
+
+Automatic tile size selection is beyond the scope of this
+work. So, for every benchmark, we generated CUDA kernels
+using our compiler backend for various tile size choices and
+for both the macro-MMA options. All tile sizes experimented
+were powers of 2, with 16 being the smallest tile size and 128
+being the biggest. The split-K schedule was exercised up to a
+4-way split. The average performance of each of these kernels
+over 100 runs was obtained using nvprof for 100 problem
+sizes that were randomly generated, with problem sizes being
+multiples of 128 (the largest tile size) upto a size of 4096. For
+every problem size, we present the best performance obtained
+using our auto-generated kernels.
+
+of
+
+the
+
+versions
+
+Baseline
+
+benchmarks
+
+were
+implemented using cuBLAS 10.1 and cuDNN 7.0. The
+CUBLAS GEMM DFALT TENSOR OP algorithm was chosen
+to target the tensor cores whereas the pointwise operations
+for bias addition and ReLU activation were implemented
+and cudnnActivationForward
+using the
+APIs exposed by cuDNN. The experimental evaluation was
+performed on an NVIDIA Quadro GV100 GPU with the
+Volta microarchitecture. The nvcc v10.1 compiler was used to
+compile all the benchmarks with the options: -O3 -std=c++11
+-use fast math
+-code=sm 70
+-ccbin
+-expt-relaxed-constexpr.
+
+cudnnAddTensor
+
+-arch=compute 70
+
+g++
+
+a) GEMM: Figure 18 shows a performance plot of
+the speedups obtained using the auto-generated kernels for
+GEMM over the cublasGemmEx performance. In one in three
+cases (32%), the auto-generated kernels were able to match or
+outperform the baseline version. The peak speedup obtained
+was 1.75× while it was 0.78× in the worst case. For 60 of
+the 100 problem sizes, the speedup was 0.9× or higher and
+the geometric mean speedup was 0.985×.
+
+10
+
+Fig. 18: Performance for GEMM.
+
+Fig. 19: Performance of prologue fusion: (ReLU + GEMM).
+
+b) ReLU + GEMM: In this benchmark, a ReLU point-
+wise activation function is applied on an input matrix to
+GEMM. The auto-generated kernel fuses the ReLU in the
+GEMM prologue and the matmul operation into the same
+device function. Figure 19 shows a performance plot of
+the speedups obtained using the auto-generated kernels for
+GEMM over the baseline, which uses cublasGemmEx for
+performing the GEMM and cudnnActivationForward. For 61
+problem sizes, the auto-generated kernels performed at least
+as well as the baseline version. The peak speedup obtained
+was 2.36× with 0.80× in the worst case. The geometric mean
+speedup was 1.113×. Since the fused kernel is similar to that
+for GEMM, except that the ReLU operation is performed
+on registers during the data transfer from global to shared
+memory, the best tile sizes for the fused kernel correlated with
+that for GEMM.
+
+c) GEMM + Bias + ReLU: A performance plot of the
+speedups obtained using the fused kernels that were auto-
+generated for Gemm + Bias + ReLU are shown in Figure 20.
+Compared to Figure 18, clearly, kernel fusion moves most of
+the speedups over the baseline, with the auto-generated kernels
+outperforming the baseline in 94 out of 100 cases. The peak
+speedup obtained was 2.55× with 0.89× being the worst case
+speedup, with a mean speedup of 1.29×.
+
+d) Add(GEMM, GEMM): In this benchmark, the results
+of two GEMMs of the same shape were fed to an add
+
+contractions, pointwise operations with support for pointwise
+operator fusion.
+
+Polyhedral compilation has been a topic of active research
+for several decades [19], [20]. With a large suite of tools and
+libraries [21]–[25], it has gradually been incorporated into pro-
+duction compilers such as RStream [26], GCC/Graphite [27],
+LLVM/Polly [28].
+
+Domain speciﬁc languages such as Polymage [29] exploit
+the sophisticated transformation and code generation capabil-
+ities of the polyhedral framework to automatically generate
+high performance implementations of image processing ap-
+plications. Our work is based on the Diesel DSL compiler
+framework developed by Elango et al [17], who also tackled
+the problem of efﬁcient CUDA kernel generation for matmul
+and some epilog fusion scenarios. However, their focus was
+traditional
+more on generating efﬁcient kernels that
+CUDA cores. We build on their work to not only target
+tensor cores but also cover a wider range of computation se-
+quences. Other DSL compiler frameworks such as Halide [16],
+TVM [30], which are non-polyhedral, separate the notion of
+the tensor computation from that of its schedule. Tiramisu [31],
+a polyhedral framework to generate high performance code
+for GPUs also features a scheduling language to provide low-
+the
+level control over the schedule to the user. However,
+schedule primitives for exploiting tensor cores are limited or
+primarily rely on the CUDA wmma API for programming
+them directly [32].
+
+target
+
+et
+
+al
+
+Vasilache
+
+developed Tensor Comprehensions
+(TC) [33], [34], which leverages the Halide compiler [16]
+in conjunction with polyhedral compilation to automatically
+generate CUDA kernels given a mathematical speciﬁcation of
+a deep learning graph. It uses a modiﬁed version of the PPCG
+compiler developed by Verdoolaege et al [9] with support for
+operator fusion. While TC handles a larger class of afﬁne
+loop-nests, we deal with kernel generation for tensor cores
+with a focus on a few common computation idioms. Zerrell
+et al [35] developed Stripe, a nested polyhedral intermediate
+representation used in the PlaidML [36] compiler with the
+facility to fuse tensor contractions. MLIR [12] is an ongoing
+project which aims to unify the compiler infrastructure for
+machine learning by providing the ability to embed multiple
+IR dialects in it e.g. linear algebra dialect or an afﬁne dialect,
+with a progressive lowering and transformation of IR dialects.
+Overall, we believe our work is complementary and could
+be integrated with many of these frameworks as a library for
+targeting tensor cores.
+
+X. CONCLUSION
+
+We tackled the problem of automatic generation of efﬁcient
+CUDA kernels for computation sequences involving matmul
+and pointwise operations. To the best of our knowledge,
+this is the ﬁrst work to leverage polyhedral compilation
+techniques for exploiting tensor core capabilities on a Volta
+GPU. In particular, we relied upon macro-MMA composi-
+tions of size 16×16×8 and 32×32×8 implemented using the
+mma.sync.m8n8k4 PTX instruction for targeting tensor cores.
+
+11
+
+Fig. 20: Epilogue fusion performance: GEMM + Bias + Relu.
+
+Fig. 21: Kernel fusion performance for Add(GEMM, GEMM).
+
+operation. Figure 21 shows a plot of the speedups obtained
+through a fused kernel over a baseline that used cuBLAS for
+gemm and cuDNN for the add operation. For 33 out of the 100
+problem sizes, the fused kernel matches or beats the baseline
+with 2.13× peak speedup. The worst case speedup is 0.73×.
+Overall, with multiple matmuls being fused into the kernel,
+we noticed there was greater register pressure compared to
+the other fused kernels, necessitating the use of smaller tiles
+which while decreasing register pressure were not necessarily
+optimal for the matmul computation in the fused kernel.
+
+IX. RELATED WORK
+
+CUDA libraries such as cuBLAS [1] and cuDNN [3] pro-
+vide highly tuned GPU-accelerated implementations of stan-
+dard basic linear algebra routines and deep learning primitives.
+Cutlass [2] is a CUDA C++ template library which provides
+performance that is comparable to cuBLAS. It features var-
+ious compute decomposition and data movement strategies
+for implementing GEMM, with mixed-precision computation
+support for Volta tensor cores. The tensor core operations
+in Cutlass are also implemented using the mma instruction.
+cuTensor [18] is a recent high-performance CUDA library
+for GPUs with compute capability greater than or equal
+to 70. It supports various tensor operations such as tensor
+
+Furthermore, we demonstrated that these techniques can lead
+to signiﬁcant speedups for a wide range of problem sizes.
+In the future, we intend to augment this approach with cost
+models for automatic tile size selection as well as generalize
+it for subsequent GPU micro-architectures such as Turing.
+
+ACKNOWLEDGMENT
+
+We thank all contributors to the Diesel compiler – Venmugil
+Elango, Mahesh Ravishankar, Norm Rubin, for creating the
+framework in which we could try out the ideas described in
+this paper. We also thank Bastian Hagedorn for his comments
+on leveraging the mma instructions for targeting Volta tensor
+cores.
+
+REFERENCES
+
+[1] NVIDIA, “cublas,” 2019,
+
+https://docs.nvidia.com/cuda/cublas/index.html.
+
+[2] ——, “Cuda templates for linear algebra subroutines,” 2019,
+
+https://github.com/NVIDIA/cutlass.
+
+[3] S. Chetlur, C. Woolley, P. Vandermersch,
+
+J. Tran,
+B. Catanzaro, and E. Shelhamer, “cudnn: Efﬁcient primitives for
+deep learning,” CoRR, vol. abs/1410.0759, 2014. [Online]. Available:
+http://arxiv.org/abs/1410.0759
+
+J. Cohen,
+
+[4] M. Abadi, P. Barham, J. Chen, Z. Chen, A. Davis, J. Dean, M. Devin,
+S. Ghemawat, G. Irving, M. Isard, M. Kudlur, J. Levenberg, R. Monga,
+S. Moore, D. G. Murray, B. Steiner, P. A. Tucker, V. Vasudevan,
+P. Warden, M. Wicke, Y. Yu, and X. Zheng, “Tensorﬂow: A system
+for large-scale machine learning,” in 12th USENIX Symposium on
+Operating Systems Design and Implementation, OSDI 2016, Savannah,
+GA, USA, November 2-4, 2016, 2016, pp. 265–283.
+[Online].
+Available: https://www.usenix.org/conference/osdi16/technical-sessions/
+presentation/abadi
+
+[5] A. Paszke, S. Gross, F. Massa, A. Lerer, J. Bradbury, G. Chanan,
+T. Killeen, Z. Lin, N. Gimelshein, L. Antiga, A. Desmaison,
+A. K¨opf, E. Yang, Z. DeVito, M. Raison, A. Tejani, S. Chilamkurthy,
+“Pytorch: An
+B. Steiner, L. Fang,
+imperative
+in
+library,”
+Information Processing Systems 32: Annual
+Advances in Neural
+Conference
+2019,
+NeurIPS 2019, 8-14 December 2019, Vancouver, BC, Canada,
+2019, pp. 8024–8035. [Online]. Available: http://papers.nips.cc/paper/
+9015-pytorch-an-imperative-style-high-performance-deep-learning-library
+
+J. Bai,
+high-performance
+
+Information Processing
+
+and S. Chintala,
+
+on Neural
+
+learning
+
+Systems
+
+style,
+
+deep
+
+[6] NVIDIA, “Cuda toolkit documentation,” 2019,
+
+https://docs.nvidia.com/cuda/parallel-thread-execution/index.html#warp-
+level-matrix-fragment-mma-884.
+
+[7] ——, “Programming tensor cores in cuda 9,” 2017,
+
+https://devblogs.nvidia.com/programming-tensor-cores-cuda-9/.
+
+[8] U. Bondhugula, A. Hartono, J. Ramanujam, and P. Sadayappan, “A
+practical automatic polyhedral program optimization system,” in PLDI,
+Jun 2008.
+
+[9] S. Verdoolaege, J. C. Juega, A. Cohen, J. I. G´omez, C. Tenllado,
+and F. Catthoor, “Polyhedral parallel code generation for CUDA,”
+TACO, vol. 9, no. 4, pp. 54:1–54:23, 2013.
+[Online]. Available:
+https://doi.org/10.1145/2400682.2400713
+
+[10] M. Baskaran, U. Bondhugula, S. Krishnamoorthy, J. Ramanujam,
+A. Rountev, and P. Sadayappan, “A Compiler Framework for Optimiza-
+tion of Afﬁne Loop Nests for GPGPUs,” in ACM Intl. conference on
+Supercomputing (ICS), Jun. 2008.
+
+[11] N. Vasilache, O. Zinenko, T. Theodoridis, P. Goyal, Z. DeVito,
+W. S. Moses, S. Verdoolaege, A. Adams, and A. Cohen, “Tensor
+comprehensions:
+high-performance machine
+learning abstractions,” CoRR, vol. abs/1802.04730, 2018. [Online].
+Available: http://arxiv.org/abs/1802.04730
+
+Framework-agnostic
+
+[12] C. Lattner, J. A. Pienaar, M. Amini, U. Bondhugula, R. Riddle,
+A. Cohen, T. Shpeisman, A. Davis, N. Vasilache, and O. Zinenko,
+“MLIR: A compiler infrastructure for the end of moore’s law,” 2020.
+[Online]. Available: https://arxiv.org/abs/2002.11054
+
+[13] S. V. M. K. R. Schreiber and H. Kamepalli, “Generating simd instruc-
+tions for cerebras cs-1 using polyhedral compilation techniques,” 2020.
+
+12
+
+[14] S. Verdoolaege, “isl: An integer
+
+the polyhedral
+model,” in Mathematical Software - ICMS 2010, Third International
+Congress on Mathematical Software, Kobe, Japan, September 13-
+17, 2010. Proceedings, 2010, pp. 299–302.
+[Online]. Available:
+https://doi.org/10.1007/978-3-642-15582-6 49
+
+library for
+
+set
+
+[15] S. Verdoolaege, S. Guelton, T. Grosser, and A. Cohen, “Schedule trees,”
+
+in IMPACT, 01 2014.
+
+[16] J. Ragan-Kelley, C. Barnes, A. Adams, S. Paris, F. Durand, and
+S. P. Amarasinghe, “Halide: a language and compiler for optimizing
+parallelism, locality, and recomputation in image processing pipelines,”
+in ACM SIGPLAN symposium on Programming Languages Design and
+Implementation, 2013, pp. 519–530.
+
+[17] V. Elango, N. Rubin, M. Ravishankar, H. Sandanagobalane, and
+V. Grover, “Diesel: DSL for linear algebra and neural net computations
+the 2nd ACM SIGPLAN International
+on gpus,” in Proceedings of
+Workshop on Machine Learning and Programming Languages,
+MAPL@PLDI 2018, Philadelphia, PA, USA, June 18-22, 2018, 2018, pp.
+42–51. [Online]. Available: https://doi.org/10.1145/3211346.3211354
+
+[18] NVIDIA, “cutensor: A high-performance cuda library for tensor primi-
+
+tives,” 2019,
+https://docs.nvidia.com/cuda/cutensor/index.html.
+
+[19] P. Feautrier, “Some efﬁcient solutions to the afﬁne scheduling problem:
+Part I, one-dimensional time,” Intl. Journal of Parallel Programming,
+vol. 21, no. 5, pp. 313–348, 1992.
+
+[20] ——, “Some efﬁcient solutions to the afﬁne scheduling problem: Part II,
+multidimensional time,” Intl. Journal of Parallel Programming, vol. 21,
+no. 6, pp. 389–420, 1992.
+
+[21] “PLUTO: An automatic polyhedral parallelizer and locality optimizer
+
+for multicores,” http://pluto-compiler.sourceforge.net.
+
+[22] “POCC: Polyhedral compiler collection,” http://pocc.sourceforge.net.
+[23] “CLooG: The Chunky Loop Generator,” http://www.cloog.org.
+[24] “PIP:
+
+Programming
+
+Parametric
+
+Integer
+
+Library,”
+
+The
+http://www.piplib.org.
+
+[25] “The LooPo Project - Loop parallelization in the polytope model,”
+
+[26] “RSTREAM -
+
+http://www.fmi.uni-passau.de/loopo.
+Level
+
+High
+http://www.reservoir.com.
+
+Compiler,
+
+Reservoir
+
+Labs,”
+
+[27] S. Pop, A. Cohen, C. Bastoul, S. Girbal, G. Silber, and N. Vasilache,
+“Graphite: Loop optimizations based on the polyhedral model for gcc,”
+2006.
+
+[28] T. Grosser, H. Zheng, R. Aloor, A. Simbrger, A. Grolinger, and L.-N.
+Pouchet, “Polly: Polyhedral optimization in LLVM,” in IMPACT, 2011.
+[29] R. T. Mullapudi, V. Vasista, and U. Bondhugula, “Polymage: Automatic
+optimization for image processing pipelines,” in Intl. Conference on Ar-
+chitectural Support for Programming Languages and Operating Systems,
+ser. ASPLOS ’15, 2015, pp. 429–443.
+
+[30] T. Chen, T. Moreau, Z. Jiang, L. Zheng, E. Q. Yan, H. Shen, M. Cowan,
+L. Wang, Y. Hu, L. Ceze, C. Guestrin, and A. Krishnamurthy,
+“TVM: an automated end-to-end optimizing compiler
+for deep
+in 13th USENIX Symposium on Operating Systems
+learning,”
+Design and Implementation, OSDI 2018, Carlsbad, CA, USA,
+October 8-10, 2018, 2018, pp. 578–594.
+[Online]. Available:
+https://www.usenix.org/conference/osdi18/presentation/chen
+
+[31] R. Baghdadi, J. Ray, M. B. Romdhane, E. D. Sozzo, A. Akkas, Y. Zhang,
+P. Suriana, S. Kamil, and S. P. Amarasinghe, “Tiramisu: A polyhedral
+for expressing fast and portable code,” in IEEE/ACM
+compiler
+International Symposium on Code Generation and Optimization, CGO
+2019, Washington, DC, USA, February 16-20, 2019, 2019, pp. 193–205.
+[Online]. Available: https://doi.org/10.1109/CGO.2019.8661197
+
+[32] “How to optimize convolution using tensorcores,” 2018,
+
+https://docs.tvm.ai/tutorials/optimize/opt conv tensorcore.html.
+
+[33] N. Vasilache, O. Zinenko, T. Theodoridis, P. Goyal, Z. DeVito,
+W. S. Moses, S. Verdoolaege, A. Adams, and A. Cohen, “The next
+700 accelerated layers: From mathematical expressions of network
+to accelerated GPU kernels, automatically,”
+computation graphs
+TACO, vol. 16, no. 4, pp. 38:1–38:26, 2020. [Online]. Available:
+https://doi.org/10.1145/3355606
+
+[34] ——, “Tensor comprehensions: Framework-agnostic high-performance
+machine learning abstractions,” CoRR, vol. abs/1802.04730, 2018.
+[Online]. Available: http://arxiv.org/abs/1802.04730
+
+[35] T. Zerrell and J. Bruestle, “Stripe: Tensor compilation via the
+nested polyhedral model,” CoRR, vol. abs/1903.06498, 2019. [Online].
+Available: http://arxiv.org/abs/1903.06498
+
+[36] Intel, “Plaidml,” 2019,
+
+https://www.intel.ai/plaidml.
+
+13
+
+

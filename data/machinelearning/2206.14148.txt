@@ -1,0 +1,1253 @@
+Memory Safe Computations with XLA Compiler
+
+Artem Artemev1,2, Tilman Roeder1, and Mark van der Wilk1
+
+{a.artemev20, tilman.roeder17, m.vdwilk}@imperial.ac.uk
+1Imperial College London
+2Secondmind
+
+2
+2
+0
+2
+
+n
+u
+J
+
+8
+2
+
+]
+
+G
+L
+.
+s
+c
+[
+
+1
+v
+8
+4
+1
+4
+1
+.
+6
+0
+2
+2
+:
+v
+i
+X
+r
+a
+
+Abstract
+
+Software packages like TensorFlow and PyTorch are designed to support linear algebra operations, and
+their speed and usability determine their success. However, by prioritising speed, they often neglect memory
+requirements. As a consequence, the implementations of memory-intensive algorithms that are convenient
+in terms of software design can often not be run for large problems due to memory overﬂows. Memory-
+eﬃcient solutions require complex programming approaches with signiﬁcant logic outside the computational
+framework. This impairs the adoption and use of such algorithms. To address this, we developed an XLA
+compiler extension1 that adjusts the computational data-ﬂow representation of an algorithm according to
+a user-speciﬁed memory limit. We show that k-nearest neighbour and sparse Gaussian process regression
+methods can be run at a much larger scale on a single device, where standard implementations would have
+failed. Our approach leads to better use of hardware resources. We believe that further focus on removing
+memory constraints at a compiler level will widen the range of machine learning methods that can be
+developed in the future.
+
+1
+
+Introduction
+
+Progress in science is inextricably linked with advances in scientiﬁc computing, in terms of both software and
+hardware. This is particularly noticeable in machine learning through the huge impact of numerical software
+packages supporting automatic diﬀerentiation (Baydin et al., 2018). Packages such as TensorFlow (Abadi et al.,
+2016), PyTorch (Paszke et al., 2019), or JAX (Bradbury et al., 2018) greatly accelerated 1) the implementation of
+gradient-based optimisation procedures by eliminating error-prone manual diﬀerentiation, and 2) the execution of
+code by leveraging modern and heterogeneous hardware (e.g. GPU, TPU or IPU). A large portion of this impact
+is attributable to the accessible and user-friendly form that these features were delivered in. This contributed to
+the growth in the machine learning community, in terms of methodological researchers, as well as the wider
+scientiﬁc audience and practitioners.
+
+The aforementioned software frameworks work by chaining together eﬃcient implementations of mathematical
+operations (known as kernels). By providing implementations that are tailored to various types of hardware, a
+speed-optimised implementation can be obtained. While speed is certainly important to pursue, many algorithms
+face a diﬀerent challenge: hardware memory constraints. Often, these have a larger impact, as memory constraint
+violations can lead to the execution terminating before an answer is obtained. This make-or-break property
+is particularly noticeable on GPUs, where allocating more memory than is physically available leads to an
+immediate termination of execution, and larger amounts of physical memory comes at a signiﬁcant cost.
+
+Now that numerical computation frameworks are widely used, they strongly inﬂuence what machine learning
+algorithms are adopted. This happens through hard limitations, as well as usability considerations through
+what is easily implementable. Currently, the emphasis on optimising runtime causes many algorithms to be
+severely memory limited, or too cumbersome to implement. This is particularly noticeable in methods that rely
+heavily on matrix and linear algebra computations, e.g. kernel methods (e.g. Titsias, 2009) or nearest neighbour
+methods for geometric deep learning (Bronstein et al., 2017).
+
+In this work, we aim to remove these limitations, by developing a tool that optimises code to be more
+memory eﬃcient, with a particular focus on linear algebra operations. This optimisation is transparent to the
+user, and therefore allows many algorithms to be run at scales that were previously impossible, while leaving
+implementations as simple as before. This allows a wider range of algorithms to take advantage of “the bitter
+lesson”—“General methods that leverage computation are ultimately the most eﬀective” (Sutton, 2019)—while
+making them more accessible to the wider community, as computational frameworks have sought to do all along.
+Our method is implemented as an extension to the XLA compiler (Leary and Wang, 2017), which we chose
+due to its wide use and support for optimising computations speciﬁed in TensorFlow and JAX. We demonstrate
+
+1The code is available at https://github.com/awav/tensorflow
+
+1
+
+ 
+ 
+ 
+ 
+ 
+ 
+the beneﬁts of our method by scaling algorithms where simple implementations do not scale due to memory
+bottlenecks, such as k-nearest-neighbours, and sparse Gaussian process regression (Titsias, 2009). With our
+extensions, these methods scale to far larger problems, without changing a single line of their implementation in
+Python. Our Gaussian process experiment shows that simply scaling up a 13 year old method can outperform
+much more recent methods, indicating that older methods may be undervalued in recent literature.
+
+2 Motivation: Memory-Constrained Machine Learning
+
+Since memory overﬂows cause the execution of code to be immediately halted without producing any result,
+memory constraints form the key obstacle for scaling many machine learning algorithms. In addition, memory
+is a scarce resource that comes at a considerable cost, particularly in GPUs. This causes memory to be a
+key limiting factor for researchers and practitioners using machine learning tools at scale. This is particularly
+noticeable in algorithms where minibatching is undesirable and that rely on pairwise distances, like k-Nearest
+Neighbours (kNN) or Gaussian processes (Rasmussen and Williams, 2006) (which we particularly focus on in
+this work). Even in modern deep learning, memory constraints cause problems by limiting batch sizes, layer
+widths, or sizes of attention mechanisms (Vaswani et al., 2017). In all of these examples, matrix and linear
+algebra operations cause the bottleneck. For kNN, kernel/GP methods, and transformers the root of the problem
+is a pairwise matrix needs to be computed between inputs, giving a quadratic memory cost.
+
+Often, more memory eﬃcient implementations can be programmed at the cost of increased software complexity.
+This ranges from minor annoyances, for example accumulating minibatch gradients in an outer loop for large-batch
+training, to complex engineering eﬀorts that have been published as scientiﬁc contributions in their own right,
+for example in scaling Gaussian processes to > 105 datapoints (Gal et al., 2014; Wang et al., 2019a; Meanti
+et al., 2020).
+
+Our goal is to provide a tool that ﬁnds memory-eﬃcient ways to execute algorithms, without the need for
+increasing software complexity. This will allow scientists and practitioners to access the beneﬁts of scale in
+existing methods more easily, and without incurring the cost of expensive large-memory hardware. For the
+main demonstration of our approach, we will automatically obtain a memory-eﬃcient implementation of sparse
+Gaussian process regression (Titsias, 2009), which was previously implemented with considerable diﬃculty (Gal
+et al., 2014). The increase in scale makes the method competitive in comparisons where it was previously
+dismissed as not scalable enough (Wang et al., 2019a), showing the value of reducing the barriers to scaling.
+
+3 Related Work
+
+A popular approach to address memory issues is distributing computation across multiple resources like a group
+of GPUs or a computer cluster with network protocol connectivity between machines (Buyya, 1999; Dean and
+Ghemawat, 2008). More speciﬁcally, sharding allows large tensors to be split up and distributed across multiple
+devices, which increases the total amount of memory available for an algorithm, but comes at the cost of requiring
+more hardware resources. Most computational frameworks2 (Abadi et al., 2016; Shazeer et al., 2018; Bradbury
+et al., 2018; Paszke et al., 2019) support sharding, although some manual speciﬁcation of how to distribute
+computation is required. This complicates an implementation and requires the user to have a wide engineering
+skill set. An automatic sharding tool such as Tofu (Wang et al., 2019b) eases user implementation experience.
+Although, Tofu does require the user to specify their computations through a custom interface, which requires
+modifying code. While sharding approach does allow scaling of certain implementations, it remains wasteful for
+algorithms that can be implemented in a more memory-eﬃcient way, but where it is simply cumbersome to do
+so.
+
+Compilers have been introduced to allow humans to express programs in an elegant way, while generating
+programs that actually run well on speciﬁc hardware Aho et al. (2006). Our goal of obtaining memory-eﬃcient
+implementations, while keeping code convenient for humans, is therefore suited to be addressed by adding
+memory optimisations to a compiler. Compilers are already being used to optimise computational graphs,
+notably in JAX, TensorFlow and PyTorch by XLA (Leary and Wang, 2017), TVM (Chen et al., 2018), Glow
+(Rotem et al., 2018) for PyTorch only. TVM performs similar optimisations to XLA, but unlike XLA, it is not
+seamlessly integrated into popular frameworks and requires additional user eﬀort.
+
+The optimisations in XLA mainly focus on increasing code speed, for example through common sub-expression
+elimination (CSE), dead code elimination (DCE), operations fusion, and other more speciﬁc modiﬁcations. The
+main advantage of XLA is that it optimises computations in a way that is completely transparent to the user
+who speciﬁes the computational graph. Although XLA and TVM implement low-level memory optimisations,
+they do not adapt code handling large tensors to satisfy memory constraints. For the matrix and linear algebra
+tasks that we consider, KeOps (Feydy et al., 2020; Charlier et al., 2021) currently provides the most eﬃcient
+
+2Published under permissive open-source licenses, like Apache or BSD.
+
+2
+
+Listing 1 Chain multiplication example C = ABv for A, B ∈ Rn×n, and v ∈ Rn.
+@jax.jit
+def matrix_matrix_vector_mul(A, B, v):
+
+C = A @ B @ v
+return C
+
+memory management. To achieve any beneﬁts, a user must specify a series of computations using KeOps classes,
+which form a layer above the PyTorch framework. KeOps works similarly to a compiler, by ﬁrst building a
+symbolic representation of the computation, which allows the computation to be broken into memory-eﬃcient
+sections, that are then run with custom CUDA kernels.
+
+In terms of prior work, KeOps is closest in aim and achievement to ours. We aim to address three of
+its limitations. Firstly, KeOps requires users to reimplement their algorithms using KeOps classes. While
+the programming interface is elegant, needing to mix KeOps and other computational frameworks does add
+complexity. Secondly, for KeOps to be able to optimise an operation, it has to be reimplemented within KeOps,
+which signiﬁcantly duplicates eﬀort. Finally, because of the former drawback, KeOps does not inherit the support
+for a wide range of hardware from e.g. JAX/TensorFlow.
+
+4 Memory Eﬃcient Matrix and Linear Algebra Operations in XLA
+
+Compilers are a highly promising way for improving runtime properties of code, without requiring user intervention
+and while leaving code elegant. The speciﬁc matrix and linear algebra optimisations that we consider have
+not yet been implemented in any of the frameworks discussed above. However, they could be implemented in
+any of TVM, KeOps, or XLA. We choose to extend XLA over TVM, because of XLA’s better integration with
+common computational frameworks. In addition, we choose to extend XLA over KeOps, because it 1) does
+not require algorithms to be rewritten in a separate framework, 2) can optimise computational graphs in their
+entirety, rather than just what is implemented in the separate framework, and 3) can take advantage of the full
+capabilities that already exist in JAX/TensorFlow.
+
+We introduce several optimisation strategies (known as optimisation passes in the XLA codebase) into the
+XLA optimisation pipeline. We aim to constrain the program’s memory footprint with minimal sacriﬁces in
+the execution speed. The optimisation passes examine the entire computational data-ﬂow graph (High Level
+Optimiser Internal Representation, or HLO IR), search for weak spots, and try to eliminate them. Abstractions
+at a similar level to HLO IR have been shown to be convenient for optimising linear algebra operations (Barthels
+et al., 2021). We add match-and-replace operations, e.g. to introduce a more eﬃcient distance computation,
+reshuﬄing operations for expressions that are invariant to evaluation order, and splitting with large tensors to
+reduce memory usage.
+
+4.1 Match and replace
+
+The match and replace optimisation pass searches for expressions in a data-ﬂow graph for which we know
+in advance that an equivalent and more eﬃcient version exists. For example, we search for expressions that
+compute Euclidean distance in naive form between vectors of length n and m with a dimension d. The naive
+Euclidean distance computation uses broadcasting over the dimension d and creates a temporary tensor with
+entries (xnd − ymd)2 of size n × m × d. This can be replaced with (cid:80)
+md − 2xndymd, where the largest
+tensor has size n × m.
+
+nd + y2
+
+d x2
+
+Replacing sub-parts of the graph is a standard procedure in compilers like XLA, although many linear algebra
+tricks have been missing. While the Euclidean distance is the only match-and-replace optimisation we implement,
+other operations can easily be added, for example, eﬃciently adding diagonals to matrices without allocating a
+dense square tensor where only the diagonal is non-zero.
+
+4.2 Reordering
+
+A computational data-ﬂow graph is an ordered sequence of operations, with the order of operations inﬂuencing
+the memory usage. In some cases, reordering sub-parts of the data-ﬂow graph can lead to reductions in the
+memory footprint. The classical example of reordering is the optimisation of matrix chain multiplications. For
+example, consider the matrix expression C = ABv for matrices A, B ∈ Rn×n, and v ∈ Rn. In the listing 1, the
+order of operations determines that the matrix multiplications are performed from left to right, i.e. C = (AB)v,
+which gives the most ineﬃcient execution order with runtime complexity O(n3) and memory complexity O(n2).
+Changing the order to C = A(Bv) improves time complexity to O(n2) and practical memory complexity because
+the intermediate multiplication result of Bv is a vector not a matrix as in the case of AB multiplication.
+
+3
+
+The optimisation of matrix chain multiplication is possible due to the associativity of matrix multiplication,
+such that the result of the matrix multiplication chain does not depend on where parentheses are placed. There
+are many eﬃcient and sophisticated algorithms for addressing this task (Chin, 1978; Czumaj, 1996; Barthels
+et al., 2018; Schwartz and Weiss, 2019). We implement a simpliﬁed procedure for reordering matrix vector chain
+multiplications that detects ineﬃcient matrix multiplication chains, which are guaranteed to reduce in size at
+the end of the chain.
+
+4.3 Data-ﬂow graph splitting
+
+Algorithm 1 High-level description of the depth-ﬁrst search visitor-handler that splits the data-ﬂow graph up
+to the reduction dot operation. Symbol (cid:32) denotes a directed computational path in the data-ﬂow graph. Steps
+9–12 are done recursively traversing back visited operations in the data-ﬂow graph.
+1: procedure HandleDot(dot: HloInstruction)
+2:
+3:
+
+Exit and continue traversing succeeding operations in the data-ﬂow graph and search for size-reducing
+operation for the output tensor of dot.
+
+if output_size(dot) ≥ tensor_size_threshold, i.e. dot is splittable then
+
+4:
+5:
+6:
+7:
+
+8:
+
+9:
+10:
+11:
+12:
+
+13:
+14:
+15:
+16:
+17:
+18:
+
+19:
+20:
+21:
+22:
+23:
+
+if dot.rhs is not splittable and dot.lhs is not splittable then
+
+Exit and continue traversing the data-ﬂow graph.
+
+if dot.rhs (cid:54)= dot.lhs and both operands are splittable then
+
+Exit and continue traversing the data-ﬂow graph.
+
+Let operand_to_split = dot.rhs or operand_to_split = dot.lhs depending on previous splittability
+conditions.
+Let split_dims = {d1, . . . , dn}, split_producers = {op1, . . . , opm}, s.t.
+◦ ∀op ∈ split_producers exists a path op (cid:32) operand_to_split
+◦ ∀op ∈ split_producers, input_size(op) ≤ tensor_size_threshold
+◦ ∀op ∈ split_producers, ∃d ∈ split_dims which is splittable on the path op (cid:32) operand_to_split
+
+if split_dims = ∅ or split_producers = ∅ then
+Exit and continue traversing the data-ﬂow graph.
+
+Let best_split_dim = d ∈ split_dims, and ops ⊆ split_producers, s.t.
+
+◦ mind∈split_dims(cid:98)d ÷ split_size(operand_to_split, tensor_split_size)(cid:99)
+◦ ∀op ∈ ops, the path op (cid:32) operand_to_split is splittable on best_split_dim
+
+Let split_size = (cid:98)best_split_dim ÷ split_size(operand_to_split, tensor_split_size)(cid:99)
+Create while loop HloInstruction, s.t.
+
+◦ The loop iterates splits of size split_size at best_split_dim of paths ops (cid:32) operand_to_split
+◦ The loop applies dot reduction operation on the slice of operand_to_split
+◦ The slice result of the dot reduction operation is put into the replica of the original dot.result
+
+Replace ops (cid:32) dot.result instructions with created while loop.
+
+Often, a part of a computational data-ﬂow graph can be divided into multiple independent copies, such that
+each copy of the data-ﬂow graph or its part act on a slice of the input tensor, and the results are combined
+afterwards in some fashion. This splitting approach is also known as a MapReduce technique (Dean and
+Ghemawat, 2008), where a computation is divided into smaller and less expensive parts (map) and then combined
+into the ﬁnal result (reduce). The splitting technique is common for distributing the computational load. The
+focus of existing solutions is on exploiting hardware parallelism or utilising multiple devices. Instead, we use the
+same techniques for reducing total memory consumption, which is possible because the memory for individual
+map operations can be freed before the whole result is computed.
+
+An optimisation pass starts by running a depth-ﬁrst search from the ﬁnal result of the computation. The
+operations dot or reduce_* are special, as they often indicate that a computation involving a large tensor can
+give a smaller result. Once a dot or reduce_* operation is marked as fully traversed, we recursively search the
+traversed paths for operands that are impractically large tensors, until we reach operands that are deemed small
+enough. Along the way, we keep track of which operations are applied, and along which axes they are trivially
+parallelisable. The result is a collection of sub-graphs, that start at operations that produce large tensors, and
+end at operations that reduce them again, together with candidate axes that they can be split across. According
+to some heuristics which ensure appropriate sizes for intermediate results, we then turn this entire computation
+into a while loop, where each iteration computes a manageable part of the ﬁnal result (ﬁg. 1).
+
+Checking if the axis is splittable is necessary as not all operations act independently on each dimension. For
+example, element-wise operations can be split on any axis, whereas the triangular solve operation can be split on
+“batching” dimensions only. Next, the data-ﬂow graph splitting procedure selects the dimension of the largest
+size which contributes the most to memory.
+
+4
+
+I[a]
+
+G
+
+I[a]
+
+loop
+
+S
+
+A[..., a, ...]
+
+I’[i:j]
+
+R
+
+O[...]
+
+G’
+
+A’[..., i:j, ...]
+
+R’
+
+O’[...]
+
+Figure 1: The scheme demonstrates transformation of the data-ﬂow graph on the left to the data-ﬂow graph
+on the right. The graph on the left consists of G and R blocks which are generator and reducer operations
+respectively, I is the tensor input of G, A is the tensor output of G and O is the tensor output of R. The bracket
+notation A[..., a, ...] means that the tensor A has a dimension of size a and A can have other dimensions.
+The i:j is a slicing operation. A (cid:32) R denotes an arbitrary amount of operations in a computational path of the
+data-ﬂow graph between a tensor A and an operation R. The eXLA splitting optimisation procedure converts the
+left graph into the loop of independent iterations performing the same chain of operations on a small slice i:j.
+
+As we discussed earlier, the decision about where to split the graph depends on the tensor size. We oﬀer two
+XLA options to the user for out-of-memory mitigation: tensor size threshold and tensor split size upper bound.
+Tensor size threshold is a criterion designed for detecting which operations should be marked as candidates for
+splitting. Tensor split size upper bound serves as a threshold on the largest allowed chunk size for splitting.
+These options are set equal by default. The command-line snippet at listing 2 shows how a user would use these
+options by passing them via an environment variable, and the snippet is indiﬀerent to the machine learning
+framework used by the script. Minimal user eﬀort is required for using our XLA compiler extension. The user is
+involved only in deﬁning what the suitable threshold and splitting sizes are.
+
+One strong beneﬁt of our compiler-based solution, is that the computational graph represents the whole
+pipeline of computations, including forward and backward propagation. Our splitting procedure will be applied
+automatically, regardless of how many derivatives need to be computed. In addition, our procedure encompasses
+two splitting schemes that the machine laerning literature distinguishes: model-based and data-based splitting
+schemes of the data-ﬂow graph. The model-based splitting scheme involves partitioning the model over its
+parameters, whereas the data-based splitting scheme batches over inputs and, therefore, an algorithm. The
+proposed splitting approach is suited for supporting both schemes out of the box.
+
+4.4 XLA limitations
+
+While we still believe that XLA is the right framework for our extensions, several limitations came to light during
+implementation.
+
+One limitation that is shared with all current frameworks, is that they only have a weak linear algebra
+type system, where matrices are represented as arrays without additional properties. Solutions that support
+stronger type systems (Bezanson et al., 2017; Barthels et al., 2021) may be able to implement a wider variety of
+match-and-replace optimisations.
+
+Another limitation comes from the default memory allocation manager not being aware of memory limits. Its
+current behaviour is to execute nodes in the computational graph, and therefore allocate any required memory,
+as soon as the required inputs have been computed. This means that even if tensors are split to manageable
+sizes, memory overﬂows can still occur if several are executed simultaneously. To prevent this from happening,
+
+Listing 2 Example of how a user can set options for the extended XLA using the environment variable.
+XLA_FLAGS="--xla_tensor_size_threshold=1GB --xla_tensor_split_size=500MB" \
+python train.py
+
+5
+
+Figure 2: GPU memory consumption and elapsed time of n × n squared exponential kernel matrix-vector
+multiplication.
+
+we had to use memory limits that were smaller than our total GPU memory.
+
+5 Experiments
+
+This section shows how existing software packages take advantage of our extension to XLA (eXLA). We
+demonstrate our optimisations on non-parametric k-nearest neighbours (kNN) and sparse Gaussian process
+regression (SGPR) models.
+
+5.1 Matrix-Vector Multiplication
+
+We start by demonstrating the improved eﬃciency that eXLA oﬀers to large-scale matrix-vector multiplications
+of the form y = Kv, where K is an n × n kernel matrix, and y, v ∈ Rn. Such computations are common in
+Conjugate-Gradients-based Gaussian process approximations (Gibbs and Mackay, 1997; Wang et al., 2019a;
+Artemev et al., 2021), where Kij = k(xi, yj) and k is some kernel function. We choose the common Squared
+Exponential.
+
+We implement this equation using GPﬂow (Matthews et al., 2017), a TensorFlow-based package that provides
+a convenient software interface for Gaussian processes and kernel functions. Without eXLA, the entire K would
+be stored in memory, leading to a n2 memory cost. This makes running on large datasets infeasible, where
+e.g. n = 106 would lead to a memory requirement of 8TB, which is impractical even for the largest of modern
+GPUs with 40GB of memory. A memory eﬃcient split/implicit implementation is necessary to scale to large
+datasets, as was impressively done by Wang et al. (2019a), but is cumbersome.
+
+We ran our implementation with eXLA enabled, which allows a user to control the memory of an algorithm.
+We evaluated the expression in double precision on a Tesla V100 GPU with 32 GB of memory, and applied a
+range of memory limits. In ﬁg. 2 we report the peak memory consumption and execution time of evaluating the
+kernel matrix-vector product for diﬀerent sizes, with diﬀerent memory limits applied. We see that the memory
+constraints are not violated, and that dataset sizes are used that are far beyond the 32 GB memory capacity.
+
+5.2 K-Nearest Neighbours
+
+K-nearest neighbours is a fundamental machine learning algorithm, with a similar large memory cost. A kNN
+query selects k closest data points in the dataset to each query point. Brute-force implementations compute
+pairwise distances between m query points and n data points, resulting in the distance matrix of size m × n.
+This is followed by a topk operation, which is often naively implemented using column-wise sort operation on
+the distance matrix. Our benchmarks show that eXLA scales the brute-force approach and does not fail for
+large problems, i.e. large n and m.
+
+We compare TensorFlow and JAX implementations with and without eXLA optimisations, and a KeOps
+implementation. We use randomly generated data, common benchmarks like MNIST and Fashion-MNIST, and
+Glove-50, Glove-100 and Glove-200 from the ANN-benchmark toolkit Aumüller et al. (2020). We use m = 1e4
+query points in all benchmarks.
+
+Our results are listed in table 3 (see the appendix for a full table that reproduces Feydy et al. (2020, table
+3)). In all benchmarks, we set the tensor size threshold for eXLA to 100MB for simplicity, even though this may
+not be optimal for performance. We observe that eXLA prevents memory overﬂows in JAX and TensorFlow. In
+addition, performance is comparable or higher. We acknowledge that KeOps performs signiﬁcantly better than
+any JAX or TensorFlow implementation. This is explained by 1) JAX/TF not having eﬃcient implementations
+
+6
+
+0.00.10.20.30.40.50.60.70.80.91.0Size, n1e60.00.51.01.52.02.5Memory, bytes1e100.00.10.20.30.40.50.60.70.80.91.0Size, n1e6020406080Elapsed time, seconds25GB20GB15GB10GB5GB1GB100MBDataset
+
+Distance
+
+n
+
+d
+
+KeOps
+
+eJAX
+
+eTF
+
+JAX
+
+TF
+
+Random
+Random
+Random
+Random
+
+MNIST
+MNIST
+
+Fashion
+Fashion
+
+L2
+L2
+L2
+L2
+
+L2
+L1
+
+L2
+L1
+
+1e4
+1e4
+1e6
+1e6
+
+6e4
+6e4
+
+6e4
+6e4
+
+Glove-50
+Cosine
+Glove-100 Cosine
+Glove-200 Cosine
+
+1.18e6
+1.18e6
+1.18e6
+
+100
+3
+100
+3
+
+784
+784
+
+784
+784
+
+50
+100
+200
+
+983263
+3662188
+24367
+123765
+
+277364
+292804
+2433
+2512
+
+284777
+294971
+2530
+2605
+
+41084
+40697
+
+40399
+40982
+
+3464257
+631420
+398293
+
+32290
+2356
+
+32382
+2357
+
+2103
+2053
+1967
+
+33455
+2985
+
+33428
+2984
+
+1929
+1871
+1724
+
+281695
+288098
+∅
+∅
+
+25544
+2498
+
+25558
+2498
+
+∅
+∅
+∅
+
+280826
+294776
+∅
+∅
+
+26138
+2988
+
+26128
+2989
+
+∅
+∅
+∅
+
+Table 1: Query processing rates (queries per second) for kNN. n and d are the number of data points and the
+data dimension respectively. Runs which failed due to memory overﬂow are denoted by ∅. Runs with eXLA are
+denoted eJAX and eTF respectively.
+
+for certain functions (e.g. topk runs a full sorting algorithm), and 2) KeOps having implemented additional
+optimisations, which could also be added to XLA. However, we note that we also achieved our goal of improving
+the memory and time performance of a JAX/TensorFlow implementation without changing the code.
+
+5.3 Sparse Gaussian Process Regression
+
+Gaussian processes (Rasmussen and Williams, 2006) are considered the gold standard method for performing
+regression with uncertainty estimates. A straightforward implementation requires taking a matrix decomposition
+of an n × n kernel matrix (like those considered in section 5.1), which leads to an O(n3) time cost, and an O(n2)
+memory cost. Scaling Gaussian process is challenging, which is often attributed to the time cost. In reality
+however, large datasets cause memory overﬂows far before long runtimes become an obstacle.
+
+Approximate methods have been introduced to deal with both the time and space issues. While there are
+many variants (Quiñonero-Candela and Rasmussen, 2005), we consider the sparse variational approximation
+(Titsias, 2009) for which a naive implementation has O(nm2 + m3) time cost, and O(nm + m2) memory cost.
+Here, m denotes the number of inducing variables, which controls the quality of the approximation. Under certain
+conditions, the method provides reliable hyperparameter selection (Bauer et al., 2016), and very accurate posterior
+approximations (Burt et al., 2019, 2020) while using m (cid:28) n. In practice, these standard implementations
+may still have their performance limited by how large m can become before a memory overﬂow occurs. A
+more memory-eﬃcient implementation with a memory cost of O(m2) does exist (Gal et al., 2014), but is so
+cumbersome to implement that it is not widely used or compared against.
+
+Fortunately, the splitting optimisation we implemented in eXLA can discover the same procedure that was
+engineered by Gal et al. (2014). Moreover, since eXLA operates on the entire computation graph, it optimises
+gradients as well as the optimisation objective function with no additional eﬀort, while Gal et al. (2014) needed
+
+Figure 3: Root mean squared error (RMSE) and negative log predictive density (NLPD) performance test metrics
+of SGPR for 3droad dataset as the number of inducing points is increased. The red shaded region emphasizes
+the capacity of the SGPR model which user can run using standard GPﬂow and TensorFlow release packages.
+
+7
+
+0200040006000800010000Number of inducing points0.200.250.300.350.400.450.50RMSETF-eXLATF-eXLA (trainable ips)TFTF (trainable ips)0200040006000800010000Number of inducing points0.30.20.10.00.10.20.30.40.50.60.7NLPDTF-eXLATF-eXLA (trainable ips)TFTF (trainable ips)to implement gradients manually. We demonstrate the utility of eXLA by scaling the GPﬂow (Matthews et al.,
+2017, 2.3.1 release version) implementation of Sparse Gaussian process regression (SGPR, Titsias, 2009), without
+any modiﬁcations of the code.
+
+With our eXLA optimisations, SGPR was able to scale to much larger datasets, with more inducing points.
+We conduct experiments on a Tesla V100 GPU with 32 GB of memory, and run on two of the largest UCI
+datasets that are commonly considered in Gaussian process research: 3droad and houseelectric. We primarily
+compare to Wang et al. (2019a), who use a Conjugate Gradients approximation (Gibbs and Mackay, 1997)
+to achieve the most impressive scaling of a Gaussian process approximation to date, using an impressively
+engineered implementation that manually splits and distributes parts of the computation.
+
+In ﬁg. 3 we compare GPﬂow’s SGPR implementation with and without eXLA as we increase the number of
+inducing points. We see that until about 800 inducing points, the normal and eXLA runs result in the same
+predictive metrics, as desired. After 800 inducing points, runs without XLA fail with an “out of memory” error,
+while with eXLA we scaled to 104 inducing points. Simply scaling the method in this way leads to signiﬁcant
+performance improvements.
+
+We now compare predictive accuracies directly with the scalable Conjugate Gradients implementation of
+Wang et al. (2019a). In that paper, SGPR was discussed as a method that would not scale, probably due to
+the diﬃculty of implementing it in a memory-eﬃcient way as in Gal et al. (2014). Table 2 shows that using
+eXLA to scale SGPR can improve predictive performance to such a degree that it can outperform the Conjugate
+Gradients implementation of Wang et al. (2019a), without needing additional hardware.
+
+6 Discussion
+
+We showed that our additional XLA compiler optimisation passes (eXLA) could manage memory overﬂows
+algorithms with large tensor or linear algebra operations. The developed compiler extension automatically
+adjusts computational data-ﬂow graphs to control memory utilisation. As demonstrated in the experiments
+section, we successfully ran machine learning models compiled with eXLA on a greater scale, whereas their
+out-of-the-box implementations failed with Out of Memory errors. Crucially, we used existing software packages
+without modifying any code.
+
+In addition to showing that our compiler extensions work as intended, our experiments also provide directly
+useful empirical results for Gaussian processes. We managed to run an “old” method (SGPR, Titsias, 2009), with
+unchanged code, to obtain empirical results that outperformed a state-of-the art method (Wang et al., 2019a).
+This corrects earlier observations in the literature that these methods are inaccurate, and shows that—if the
+methods can be scaled—they may behave according to theory that shows that they should provide very accurate
+solutions (Burt et al., 2020).
+
+The exciting possiblity of eXLA is that it opens up the possibility to probe behaviour of machine learning
+models in regimes that were previously infeasible, and on cheap hardware. For example, one could train very
+wide neural networks, to empirically compare to behaviour predicted by NTK theory (Lee et al., 2018; Matthews
+et al., 2018; Jacot et al., 2018; Novak et al., 2020). In addition, transformers (Vaswani et al., 2017) are notoriously
+memory hungry, and eXLA could help with running them on cheaper hardware, or distributing them across
+GPUs, without increasing software complexity.
+
+Dataset
+
+Model
+
+RMSE
+
+NLPD
+
+Time (hours) GPUs
+
+houseelectric
+
+3droad
+
+SGPR-1000
+SGPR-2000
+SGPR-3000
+SGPR-4000
+Iterative GP*
+Iterative GP**
+
+SGPR-1000
+SGPR-5000
+SGPR-8000
+SGPR-10000
+Iterative GP*
+Iterative GP**
+
+0.048 ± 2e−4 −1.602 ± 3e−3
+0.046 ± 1e−4 −1.651 ± 3e−3
+0.044 ± 1e−4 −1.696 ± 5e−3
+0.043 ± 1e−4 −1.717 ± 5e−3
+0.054 ± 0.000 −0.207 ± 0.001
+
+0.050
+
+∅
+
+0.285 ± 0.002 −0.173 ± 0.004
+0.190 ± 0.002 −0.228 ± 0.002
+0.176 ± 0.001 −0.302 ± 0.004
+0.170 ± 0.001 −0.322 ± 0.002
+0.110 ± 0.017
+0.106
+
+1.239 ± 0.025
+∅
+
+5.01 ± 0.06
+18.03 ± 0.09
+38.68 ± 0.14
+50.00 ± 0.10
+1.55 ± 0.02
+79.96
+
+1.11 ± 0.01
+11.33 ± 0.03
+28.21 ± 0.05
+41.83 ± 0.03
+1.00 ± 2e−3
+7.06
+
+1
+1
+1
+1
+8
+8
+
+1
+1
+1
+1
+8
+8
+
+Table 2: SGPR performance on houseelectric and 3droad dataset. Iterative GP* and Iterative GP** are
+trained with lengthscale per dimension and shared lengthscale across dimensions respectively. Iterative GP
+values are from Wang et al. (2019a), with unreported metrics denoted as ∅.
+
+8
+
+The current implementation of eXLA is still only a demonstration of what compiler optimisations could
+achieve, and many more optimisations can be added. We believe that increasing the capability of compilers
+like XLA will greatly increase the eﬃciency of researchers and practitioners. We hope that community-driven
+compiler projects will contribute to the community in a similar way to how existing numerical frameworks
+already do.
+
+7 Acknowledgements
+
+Thanks to David R. Burt and Sebastian W. Ober for the feedback on the draft of this paper. We also would like
+to thank Lev Walkin and Renat Idrisov for discussions about compilers in the beginning of this project.
+
+References
+
+Abadi, M., Barham, P., Chen, J., Chen, Z., Davis, A., Dean, J., Devin, M., Ghemawat, S., Irving, G., Isard,
+M., et al. (2016). Tensorﬂow: A system for large-scale machine learning. In 12th USENIX symposium on
+operating systems design and implementation (OSDI 16). 1, 2
+
+Aho, A. V., Lam, M. S., Sethi, R., and Ullman, J. D. (2006). Compilers: Principles, Techniques, and Tools (2nd
+
+Edition). Addison-Wesley Longman Publishing Co., Inc. 2
+
+Artemev, A., Burt, D. R., and Van Der Wilk, M. (2021). Tighter bounds on the log marginal likelihood of
+Gaussian process regression using conjugate gradients. In Proceedings of the 38th International Conference on
+Machine Learning (ICML), volume 139. 6
+
+Aumüller, M., Bernhardsson, E., and Faithfull, A. (2020). ANN-Benchmarks: A benchmarking tool for
+
+approximate nearest neighbor algorithms. Information Systems, 87. 6
+
+Barthels, H., Copik, M., and Bientinesi, P. (2018). The generalized matrix chain algorithm. In Proceedings of
+
+the 2018 International Symposium on Code Generation and Optimization. 4
+
+Barthels, H., Psarras, C., and Bientinesi, P. (2021). Linnea: Automatic generation of eﬃcient linear algebra
+
+programs. ACM Transactions on Mathematical Software (TOMS), 47. 3, 5
+
+Bauer, M., van der Wilk, M., and Rasmussen, C. E. (2016). Understanding probabilistic sparse gaussian process
+
+approximations. In Advances in Neural Information Processing Systems, volume 29. 7
+
+Baydin, A. G., Pearlmutter, B. A., Radul, A. A., and Siskind, J. M. (2018). Automatic diﬀerentiation in machine
+
+learning: a survey. Journal of Marchine Learning Research, 18. 1
+
+Bezanson, J., Edelman, A., Karpinski, S., and Shah, V. B. (2017). Julia: A fresh approach to numerical
+
+computing. SIAM review, 59. 5
+
+Bradbury, J., Frostig, R., Hawkins, P., Johnson, M. J., Leary, C., Maclaurin, D., Necula, G., Paszke, A., Vander-
+Plas, J., Wanderman-Milne, S., and Zhang, Q. (2018). JAX: composable transformations of Python+NumPy
+programs. 1, 2
+
+Bronstein, M. M., Bruna, J., LeCun, Y., Szlam, A., and Vandergheynst, P. (2017). Geometric deep learning:
+
+going beyond euclidean data. IEEE Signal Processing Magazine, 34. 1
+
+Burt, D., Rasmussen, C. E., and van der Wilk, M. (2019). Rates of Convergence for Sparse Variational Gaussian
+In Proceedings of the 36th International Conference on Machine Learning (ICML),
+
+Process Regression.
+volume 97. 7
+
+Burt, D. R., Rasmussen, C. E., and van der Wilk, M. (2020). Convergence of sparse variational inference in
+
+Gaussian processes regression. Journal of Machine Learning Research, 21. 7, 8
+
+Buyya, R. (1999). High performance cluster computing. New Jersey: F’rentice. 2
+
+Charlier, B., Feydy, J., Glaunès, J. A., Collin, F.-D., and Durif, G. (2021). Kernel operations on the GPU, with
+
+autodiﬀ, without memory overﬂows. Journal of Machine Learning Research, 22. 2
+
+Chen, T., Moreau, T., Jiang, Z., Zheng, L., Yan, E., Shen, H., Cowan, M., Wang, L., Hu, Y., Ceze, L., et al.
+(2018). TVM: An automated end-to-end optimizing compiler for deep learning. In 13th USENIX Symposium
+on Operating Systems Design and Implementation (OSDI 18). 2
+
+9
+
+Chin, F. Y. (1978). An O(n) algorithm for determining a near-optimal computation order of matrix chain
+
+products. Communications of the ACM, 21. 4
+
+Czumaj, A. (1996). Very fast approximation of the matrix chain product problem. Journal of Algorithms, 21. 4
+
+Dean, J. and Ghemawat, S. (2008). Mapreduce: simpliﬁed data processing on large clusters. Communications of
+
+the ACM, 51. 2, 4
+
+Feydy, J., Glaunès, J., Charlier, B., and Bronstein, M. (2020). Fast geometric learning with symbolic matrices.
+
+Advances in Neural Information Processing Systems, 33. 2, 6
+
+Gal, Y., Van Der Wilk, M., and Rasmussen, C. E. (2014). Distributed variational inference in sparse Gaussian
+process regression and latent variable models. In Advances in Neural Information Processing Systems, volume 27.
+2, 7, 8
+
+Gibbs, M. and Mackay, D. (1997). Eﬃcient implementation of Gaussian processes. Technical report, Cavendish
+
+Laboratory, University of Cambridge. 6, 8
+
+Jacot, A., Gabriel, F., and Hongler, C. (2018). Neural Tangent Kernel: Convergence and Generalization in
+
+Neural Networks. In Advances in Neural Information Processing Systems, volume 31. 8
+
+Leary, C. and Wang, T. (2017). XLA: Tensorﬂow, compiled. TensorFlow Dev Summit. 1, 2
+
+Lee, J., Sohl-dickstein, J., Pennington, J., Novak, R., Schoenholz, S., and Bahri, Y. (2018). Deep neural networks
+
+as Gaussian processes. In International Conference on Learning Representations. 8
+
+Matthews, A. G. d. G., Hron, J., Rowland, M., Turner, R. E., and Ghahramani, Z. (2018). Gaussian process
+
+behaviour in wide deep neural networks. In International Conference on Learning Representations. 8
+
+Matthews, A. G. d. G., van der Wilk, M., Nickson, T., Fujii, K., Boukouvalas, A., León-Villagrá, P., Ghahramani,
+Z., and Hensman, J. (2017). GPﬂow: A Gaussian process library using TensorFlow. Journal of Machine
+Learning Research, 18. 6, 8, 11
+
+Meanti, G., Carratino, L., Rosasco, L., and Rudi, A. (2020). Kernel methods through the roof: Handling billions
+
+of points eﬃciently. In Advances in Neural Information Processing Systems, volume 33. 2
+
+Novak, R., Xiao, L., Hron, J., Lee, J., Alemi, A. A., Sohl-Dickstein, J., and Schoenholz, S. S. (2020). Neural
+In International Conference on Learning
+
+tangents: Fast and easy inﬁnite neural networks in python.
+Representations. 8
+
+Paszke, A., Gross, S., Massa, F., Lerer, A., Bradbury, J., Chanan, G., Killeen, T., Lin, Z., Gimelshein, N.,
+Antiga, L., et al. (2019). Pytorch: An imperative style, high-performance deep learning library. In Advances
+in Neural Information Processing Systems, volume 32. 1, 2
+
+Quiñonero-Candela, J. and Rasmussen, C. E. (2005). A unifying view of sparse approximate gaussian process
+
+regression. Journal of Machine Learning Research, 6. 7
+
+Rasmussen, C. E. and Williams, C. K. (2006). Gaussian processes for machine learning. Gaussian Processes for
+
+Machine Learning. 2, 7
+
+Rotem, N., Fix, J., Abdulrasool, S., Catron, G., Deng, S., Dzhabarov, R., Gibson, N., Hegeman, J., Lele, M.,
+Levenstein, R., et al. (2018). Glow: Graph lowering compiler techniques for neural networks. arXiv preprint
+arXiv:1805.00907. 2
+
+Schwartz, O. and Weiss, E. (2019). Revisiting “Computation of Matrix Chain Products”. SIAM Journal on
+
+Computing, 48. 4
+
+Shazeer, N., Cheng, Y., Parmar, N., Tran, D., Vaswani, A., Koanantakool, P., Hawkins, P., Lee, H., Hong,
+M., Young, C., et al. (2018). Mesh-tensorﬂow: Deep learning for supercomputers. In Advances in Neural
+Information Processing Systems, volume 31. 2
+
+Sutton, R. (2019). The bitter lesson. Incomplete Ideas (blog), 13. 1
+
+Titsias, M. (2009). Variational learning of inducing variables in sparse Gaussian processes. In Proceedings of the
+
+12th International Conference on Artiﬁcial Intelligence and Statistics, volume 5. 1, 2, 7, 8
+
+Vaswani, A., Shazeer, N., Parmar, N., Uszkoreit, J., Jones, L., Gomez, A. N., Kaiser, L. u., and Polosukhin, I.
+(2017). Attention is all you need. In Advances in Neural Information Processing Systems, volume 30. 2, 8
+
+10
+
+Wang, K., Pleiss, G., Gardner, J., Tyree, S., Weinberger, K. Q., and Wilson, A. G. (2019a). Exact Gaussian
+processes on a million data points. In Advances in Neural Information Processing Systems, volume 32. 2, 6, 8
+
+Wang, M., Huang, C.-c., and Li, J. (2019b). Supporting very large models using automatic dataﬂow graph
+
+partitioning. In Proceedings of the 14th EuroSys Conference 2019. 2
+
+A Appendix
+
+A.1 Code
+
+The code for benchmarks and experiments is available at https://github.com/awav/gambit, and the fork of
+TensorFlow repository with extension to XLA compiler (eXLA) is available at https://github.com/awav/
+tensorflow.
+
+A.2 Additional experiments
+
+Dataset
+
+Distance
+
+n
+
+d
+
+KeOps
+
+eJAX
+
+eTF
+
+JAX
+
+TF
+
+Random
+Random
+Random
+Random
+Random
+Random
+Random
+Random
+Random
+
+Random
+Random
+
+Random
+Random
+
+MNIST
+MNIST
+
+Fashion
+Fashion
+
+L2
+L2
+L2
+L2
+L2
+L2
+L2
+L2
+L2
+
+L1
+L1
+
+Cosine
+Cosine
+
+L2
+L1
+
+L2
+L1
+
+10000
+10000
+10000
+1000000
+1000000
+1000000
+10000000
+10000000
+10000000
+
+1000000
+1000000
+
+1000000
+1000000
+
+60000
+60000
+
+60000
+60000
+
+Glove-50
+Cosine
+Glove-100 Cosine
+Glove-200 Cosine
+
+1183514
+1183514
+1183514
+
+100
+10
+3
+100
+10
+3
+100
+10
+3
+
+100
+10
+
+100
+10
+
+784
+784
+
+784
+784
+
+50
+100
+200
+
+983263
+2587001
+3662188
+24367
+106726
+123765
+2461
+11546
+13192
+
+24307
+108739
+
+32520
+106876
+
+41084
+40697
+
+40399
+40982
+
+3464257
+631420
+398293
+
+277364
+291751
+292804
+2433
+2505
+2512
+243
+251
+251
+
+517
+2494
+
+2434
+2507
+
+32290
+2356
+
+32382
+2357
+
+2103
+2053
+1967
+
+284777
+295029
+294971
+2530
+2601
+2605
+253
+261
+261
+
+521
+2590
+
+2515
+2612
+
+33455
+2985
+
+33428
+2984
+
+1929
+1871
+1724
+
+281695
+287958
+288098
+∅
+∅
+∅
+∅
+∅
+∅
+
+∅
+∅
+
+∅
+∅
+
+25544
+2498
+
+25558
+2498
+
+∅
+∅
+∅
+
+280826
+294168
+294776
+∅
+∅
+∅
+∅
+∅
+∅
+
+∅
+∅
+
+∅
+∅
+
+26138
+2988
+
+26128
+2989
+
+∅
+∅
+∅
+
+Table 3: Query processing rates (queries per second) for kNN. n and d are the number of data points and the
+data dimension respectively. Runs which failed due to memory overﬂow are denoted by ∅. Runs with eXLA are
+denoted eJAX and eTF respectively.
+
+Figures 4 and 5 depict XLA HLO graphs for kernel matrix-vector multiplication before and after splitting
+optimisation in eXLA optimisation pipeline (section 4.3), respectively. The same conﬁguration of the kernel is
+used as in section 5.1, i.e. squared exponential kernel from Matthews et al. (2017). By kernel matrix-vector
+−1/2(cid:107)x − y(cid:107)2/l2(cid:17)
+multiplication expression we mean the function g(x, y, v) = k(x, y)v, where k(x, y) = σ2 exp
+is the kernel with σ2 and l hyperparameters. The size of 1-dimensional input vectors v, x and y is 1e−6. In turn,
+the size of the corresponding kernel matrix is 1e−6 × 1e−6, and in double precision would require to allocate
+8TB. The tensor size threshold was set to 1GB, and eXLA splitting optimisation pass divided the expression of
+the kernel matrix-vector multiplication into smaller chunks, such that the maximum tensor size in the graph is
+125 × 1e−6.
+
+(cid:16)
+
+11
+
+Figure 4: XLA HLO graph for kernel matrix-vector multiplication before splitting optimisation pass is applied
+in the XLA optimisation pipeline.
+
+12
+
+Parameter 0parameter_replication={false}f64[1000000,1]{1,0}reshape.6f64[1000000,1]{1,0}Parameter 1parameter_replication={false}f64[1000000,1]{1,0}reshape.7f64[1000000,1]{1,0}Parameter 2parameter_replication={false}f64[1000000,1]{1,0}reshape.8f64[1000000,1]{1,0}Parameter 3parameter_replication={false}f64[]exponential.26f64[]compare.30direction=LTpred[]operand 1 = f64[] -200compare.36direction=GTpred[]0compare.37direction=LTpred[]0exponential.38f64[]select.41f64[]1exponential.43f64[]compare.47direction=LTpred[]operand 1 = f64[] -200compare.53direction=GTpred[]0compare.54direction=LTpred[]0exponential.55f64[]select.58f64[]1Parameter 4parameter_replication={false}f64[]exponential.9f64[]compare.13direction=LTpred[]operand 1 = f64[] -200compare.19direction=GTpred[]0compare.20direction=LTpred[]0exponential.21f64[]select.24f64[]1slice.66slice={[0:1000000], [0:1]}f64[1000000,1]{1,0}slice.88slice={[0:1000000], [0:1]}f64[1000000,1]{1,0}dot.128lhs_contracting_dims={1}, rhs_contracting_dims={0}f64[1000000,1]{1,0}1log-plus-one.10f64[]select.25f64[]10log.16f64[]operand = f64[] 2.2204460492503131e-16add.17f64[]operand 1 = f64[] 20negate.18f64[]110select.23f64[]0log-plus-one.22f64[]1222broadcast.126dimensions={}f64[1000000,1000000]{1,0}log-plus-one.27f64[]select.42f64[]10log.33f64[]operand = f64[] 2.2204460492503131e-16add.34f64[]operand 1 = f64[] 20negate.35f64[]110select.40f64[]0log-plus-one.39f64[]1222broadcast.68dimensions={}f64[1000000,1]{1,0}log-plus-one.44f64[]select.59f64[]10log.50f64[]operand = f64[] 2.2204460492503131e-16add.51f64[]operand 1 = f64[] 20negate.52f64[]110select.57f64[]0log-plus-one.56f64[]1222broadcast.90dimensions={}f64[1000000,1]{1,0}broadcast.61dimensions={}s32[2]operand = s32[] 0broadcast.63dimensions={}s32[2]operand = s32[] 0broadcast.65dimensions={}s32[2]operand = s32[] 1reshape.67f64[1000000,1]{1,0}divide.69f64[1000000,1]{1,0}01multiply.70f64[1000000,1]{1,0}01dot.114lhs_contracting_dims={1}, rhs_contracting_dims={0}f64[1000000,1000000]{1,0}0convert.71f64[1000000,1]{1,0}reduce.78Subcomputation: adddimensions={1}f64[1000000]0convert.73f64[]operand = f64[] 01convert.79f64[1000000]reshape.81f64[1000000,1]{1,0}reshape.104f64[1000000]broadcast.83dimensions={}s32[2]operand = s32[] 0broadcast.85dimensions={}s32[2]operand = s32[] 0broadcast.87dimensions={}s32[2]operand = s32[] 1reshape.89f64[1000000,1]{1,0}divide.91f64[1000000,1]{1,0}01multiply.92f64[1000000,1]{1,0}01transpose.113dimensions={1,0}f64[1,1000000]{0,1}convert.93f64[1000000,1]{1,0}reduce.100Subcomputation: adddimensions={1}f64[1000000]0convert.95f64[]operand = f64[] 01convert.101f64[1000000]reshape.103f64[1,1000000]{1,0}reshape.106f64[1000000]broadcast.105dimensions={0}f64[1000000,1000000]{1,0}add.108f64[1000000,1000000]{1,0}0broadcast.107dimensions={1}f64[1000000,1000000]{1,0}1reshape.111f64[1000000,1000000]{1,0}broadcast.110dimensions={}s32[2]operand = s32[] 1000000add.120f64[1000000,1000000]{1,0}11transpose.115dimensions={0,1}f64[1000000,1000000]{1,0}multiply.119f64[1000000,1000000]{1,0}1broadcast.118dimensions={}f64[1000000,1000000]{1,0}operand = f64[] -200multiply.124f64[1000000,1000000]{1,0}1broadcast.123dimensions={}f64[1000000,1000000]{1,0}operand = f64[] -0.50exponential.125f64[1000000,1000000]{1,0}multiply.127f64[1000000,1000000]{1,0}100transpose.129dimensions={0,1}f64[1000000,1]{1,0}reshape.130f64[1000000,1]{1,0}tuple.131(f64[1000000,1])get-tuple-element.132index=0f64[1000000,1]{1,0}ROOTFigure 5: XLA HLO graph for kernel matrix-vector multiplication after splitting optimisation pass is applied in
+the XLA optimisation pipeline.
+
+13
+
+Subcomputation for whileintermediate_tensor_splitter_dot_bodySubcomputation for whileintermediate_tensor_splitter_dot_condParameter 0parameter_replication={false}f64[1000000,1]{1,0}slice.66slice={[0:1000000], [0:1]}f64[1000000,1]{1,0}Parameter 1parameter_replication={false}f64[1000000,1]{1,0}slice.88slice={[0:1000000], [0:1]}f64[1000000,1]{1,0}Parameter 2parameter_replication={false}f64[1000000,1]{1,0}tuple.1(s64[], f64[], f64[], f64[], f64[1000000,1], /*index=5*/f64[1...operand 0 = s64[] 0operand 2 = f64[] -0.5operand 3 = f64[] -28Parameter 3parameter_replication={false}f64[]exponential.26f64[]compare.30direction=LTpred[]operand 1 = f64[] -200compare.36direction=GTpred[]0compare.37direction=LTpred[]0exponential.38f64[]select.41f64[]1exponential.43f64[]compare.47direction=LTpred[]operand 1 = f64[] -200compare.53direction=GTpred[]0compare.54direction=LTpred[]0exponential.55f64[]select.58f64[]1Parameter 4parameter_replication={false}f64[]exponential.9f64[]compare.13direction=LTpred[]operand 1 = f64[] -200compare.19direction=GTpred[]0compare.20direction=LTpred[]0exponential.21f64[]select.24f64[]1log-plus-one.10f64[]select.25f64[]10log.16f64[]operand = f64[] 2.2204460492503131e-16add.17f64[]operand 1 = f64[] 20negate.18f64[]110select.23f64[]0log-plus-one.22f64[]12221log-plus-one.27f64[]select.42f64[]10log.33f64[]operand = f64[] 2.2204460492503131e-16add.34f64[]operand 1 = f64[] 20negate.35f64[]110select.40f64[]0log-plus-one.39f64[]1222broadcast.68dimensions={}f64[1000000,1]{1,0}log-plus-one.44f64[]select.59f64[]10log.50f64[]operand = f64[] 2.2204460492503131e-16add.51f64[]operand 1 = f64[] 20negate.52f64[]110select.57f64[]0log-plus-one.56f64[]1222broadcast.90dimensions={}f64[1000000,1]{1,0}divide.69f64[1000000,1]{1,0}01multiply.70f64[1000000,1]{1,0}014reshape.104f64[1000000]divide.91f64[1000000,1]{1,0}01multiply.92f64[1000000,1]{1,0}01transpose.113dimensions={1,0}f64[1,1000000]{0,1}reduce.100Subcomputation: adddimensions={1}f64[1000000]operand 1 = f64[] 00765broadcastdimensions={}f64[1000000,1]{1,0}operand = f64[] 09while(s64[], f64[], f64[], f64[], f64[1000000,1]{1,0}, /*index=5*/...broadcast.1dimensions={}f64[125,1000000]{1,0}operand = tuple-element 1 of loop_parammultiply.2f64[125,1000000]{1,0}0broadcast.2dimensions={}f64[125,1000000]{1,0}operand = tuple-element 2 of loop_parammultiply.1f64[125,1000000]{1,0}0broadcast.3dimensions={}f64[125,1000000]{1,0}operand = tuple-element 3 of loop_parammultiplyf64[125,1000000]{1,0}0dynamic-slicedynamic_slice_sizes={125,1}f64[125,1]{1,0}operand 0 = tuple-element 4 of loop_paramoperand 1 = tuple-element 0 of loop_paramoperand 2 = s64[] 0dotlhs_contracting_dims={1}, rhs_contracting_dims={0}f64[125,1000000]{1,0}operand 1 = tuple-element 5 of loop_param01add.1f64[125,1000000]{1,0}0dynamic-slice.1dynamic_slice_sizes={125}f64[125]operand 0 = tuple-element 6 of loop_paramoperand 1 = tuple-element 0 of loop_parambroadcast.4dimensions={0}f64[125,1000000]{1,0}addf64[125,1000000]{1,0}0broadcast.5dimensions={1}f64[125,1000000]{1,0}operand = tuple-element 7 of loop_param111exponentialf64[125,1000000]{1,0}1dot.1lhs_contracting_dims={1}, rhs_contracting_dims={0}f64[125,1]{1,0}operand 1 = tuple-element 8 of loop_param0dynamic-update-slicef64[1000000,1]{1,0}operand 0 = tuple-element 9 of loop_paramoperand 2 = tuple-element 0 of loop_paramoperand 3 = s64[] 01tuple(s64[], f64[], f64[], f64[], f64[1000000,1], /*index=5*/f64[1...operand 1 = tuple-element 1 of loop_paramoperand 2 = tuple-element 2 of loop_paramoperand 3 = tuple-element 3 of loop_paramoperand 4 = tuple-element 4 of loop_paramoperand 5 = tuple-element 5 of loop_paramoperand 6 = tuple-element 6 of loop_paramoperand 7 = tuple-element 7 of loop_paramoperand 8 = tuple-element 8 of loop_param9add.2s64[]operand 0 = tuple-element 0 of loop_paramoperand 1 = s64[] 1250Parameter 0(s64[], f64[], f64[], f64[], f64[1000000,1]{1,0}, /*index=5*/...comparedirection=LTpred[]operand 0 = tuple-element 0 of loop_param.1operand 1 = s64[] 10000000get-tuple-element.19index=9f64[1000000,1]{1,0}ROOT

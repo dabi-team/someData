@@ -1,0 +1,2125 @@
+2
+2
+0
+2
+
+r
+a
+
+M
+3
+2
+
+]
+L
+P
+.
+s
+c
+[
+
+1
+v
+2
+1
+7
+2
+1
+.
+3
+0
+2
+2
+:
+v
+i
+X
+r
+a
+
+OJXPerf: Featherlight Object Replica Detection for Java
+Programs
+
+Bolun Li
+North Carolina State University
+Raleigh, North Carolina, USA
+bli35@ncsu.edu
+
+Pengfei Su
+University of California, Merced
+Merced, California, USA
+psu9@ucmerced.edu
+
+Hao Xu
+College of William and Mary
+Williamsburg, Virginia, USA
+hxu07@email.wm.edu
+
+Milind Chabbi
+Scalable Machines Research
+milind@scalablemachines.org
+
+Xu Liu
+North Carolina State University
+Raleigh, North Carolina, USA
+xliu88@ncsu.edu
+
+Qidong Zhao
+North Carolina State University
+Raleigh, North Carolina, USA
+qzhao24@ncsu.edu
+
+Shuyin Jiao
+North Carolina State University
+Raleigh, North Carolina, USA
+sjiao2@ncsu.edu
+
+Abstract
+Memory bloat is an important source of inefficiency in complex
+production software, especially in software written in managed lan-
+guages such as Java. Prior approaches to this problem have focused
+on identifying objects that outlive their life span. Few studies have,
+however, looked into whether and to what extent myriad objects of
+the same type are identical. A quantitative assessment of identical
+objects with code-level attribution can assist developers in refac-
+toring code to eliminate object bloat, and favor reuse of existing
+object(s). The result is reduced memory pressure, reduced alloca-
+tion and garbage collection, enhanced data locality, and reduced
+re-computation, all of which result in superior performance.
+
+We develop OJXPerf, a lightweight sampling-based profiler,
+which probabilistically identifies identical objects. OJXPerf em-
+ploys hardware performance monitoring units (PMU) in conjunc-
+tion with hardware debug registers to sample and compare field
+values of different objects of the same type allocated at the same
+calling context but potentially accessed at different program points.
+The result is a lightweight measurement — a combination of ob-
+ject allocation contexts and usage contexts ordered by duplication
+frequency. This class of duplicated objects is relatively easier to
+optimize. OJXPerf incurs 9% runtime and 6% memory overheads
+on average. We empirically show the benefit of OJXPerf by using
+its profiles to instruct us to optimize a number of Java programs, in-
+cluding well-known benchmarks and real-world applications. The
+results show a noticeable reduction in memory usage (up to 11%)
+and a significant speedup (up to 25%).
+
+Permission to make digital or hard copies of all or part of this work for personal or
+classroom use is granted without fee provided that copies are not made or distributed
+for profit or commercial advantage and that copies bear this notice and the full citation
+on the first page. Copyrights for components of this work owned by others than the
+author(s) must be honored. Abstracting with credit is permitted. To copy otherwise, or
+republish, to post on servers or to redistribute to lists, requires prior specific permission
+and/or a fee. Request permissions from permissions@acm.org.
+ICSE ’22, May 21–29, 2022, Pittsburgh, PA, USA
+© 2022 Copyright held by the owner/author(s). Publication rights licensed to ACM.
+ACM ISBN 978-1-4503-9221-1/22/05. . . $15.00
+https://doi.org/10.1145/3510003.3510083
+
+ACM Reference Format:
+Bolun Li, Hao Xu, Qidong Zhao, Pengfei Su, Milind Chabbi, Shuyin Jiao,
+and Xu Liu. 2022. OJXPerf: Featherlight Object Replica Detection for Java
+Programs. In 44th International Conference on Software Engineering (ICSE ’22),
+May 21–29, 2022, Pittsburgh, PA, USA. ACM, New York, NY, USA, 13 pages.
+https://doi.org/10.1145/3510003.3510083
+
+1 Introduction
+Memory bloat is a common problem in managed languages, such as
+Java and C#. The problem is particularly severe in large, production
+software, which employs layers of abstractions, third-party libraries,
+and evolves over time into complex systems not comprehendible by
+any single developer. Furthermore, these programs run for a long
+time (several months at a time), giving them an opportunity to grow
+their memory footprint and become a source of major problems in
+production environments often shared by several other programs.
+An object that is not reclaimed by the garbage collector (GC)
+but neither read nor written any more is considered to be “leaked”.
+A memory leak happens in managed languages because useless
+objects remain unreclaimed by the GC because of unnecessary
+references to them. Additionally, memory spikes occur in managed
+languages because of accumulated objects that are yet to be garbage
+collected. Memory bloat (whether due to leaks or GC) results in
+high memory pressure and poor performance. A lot of prior work
+exits to detect object leaks [21, 38, 57, 59–62, 64, 65] and improve
+GC [5, 10, 27, 36, 49, 66].
+
+However, there is another cause of memory bloat and inefficiency
+that has hardly been studied — replica objects — which is the focus
+of this paper. Two objects are replicas if their contents are identical.
+Two objects are shallow replicas if their fields are bitwise identical;
+and deep replicas if the transitive closure of the constituent objects
+and their respective fields values are bitwise identical. When two
+objects are bitwise identical (shallow replicas), their transitive clo-
+sures are also the same. However, when two objects are not bitwise
+identical and the difference occurs on one or more fields that are
+object references, it becomes necessary to chase those references to
+disprove that the contents of those objects are not identical. After
+
+ 
+ 
+ 
+ 
+ 
+ 
+ICSE ’22, May 21–29, 2022, Pittsburgh, PA, USA
+
+Bolun Li, Hao Xu, Qidong Zhao, Pengfei Su, Milind Chabbi, Shuyin Jiao, and Xu Liu
+
+chasing all object references, if we can prove that their contents
+are identical, then such two objects are deep replicas.
+
+There is a temporal aspect to replica objects: one may regard two
+objects as replicas either because they were identical at the time (or
+a window) of observation or for their entire lifetime. Two objects are
+mutable replicas if they are identical to each other, but they may
+independently evolve during their lifetimes; whereas two objects
+are immutable replicas if they are identical to each other and are
+also immutable during their lifetimes.
+
+There are two performance dimensions to replica objects: total
+memory consumption and total number of memory accesses. On
+the one hand, an object may be large in size and replicated only
+a few times, and such replicas still contribute to the overall mem-
+ory bloat; also, an object may be small in size but replicated many
+times, which also contributes to memory bloat; both these cases
+are worth optimizing to remove the replicas. On the other hand,
+an object may be small in size and replicated only a few times, but
+the program may be accessing these few replicated objects a lot
+of times; although this situation is not memory bloat, it can still
+have a significant consequence to the overall performance since
+it increases the memory footprint at the CPU cache level, squan-
+ders potential memory reuse [6], and often results in redundant
+re-computations [38, 54].
+
+Having described the landscape of object replication (deep vs.
+shallow, some time window vs. full lifespan, mutable vs. immutable,
+and memory size vs. access counts), we now scope this problem to
+a tractable subset driven by pragmatic tool-development factors.
+First, instrumenting every allocation and memory access to identify
+object replicas leads to excessive runtime overheads; we seek for
+a lightweight tool that can collect profiles in production rather
+than in test-only environments; we guarantee the analysis accuracy
+with the theoretical bounds of a sampling technique we use. Second,
+deep replica comparison is unachievable without running some-
+thing analogous to the garbage collector, which can introduce high
+overheads and require runtime modifications, making it less adapt-
+able; hence we restrict our tool to only shallow object comparison.
+Third, if two objects are not replicas for their entire life span, they
+are not easy to optimize, and hence we consider only those objects
+that are replicas for their entire duration. We do not enforce objects
+to be immutable for replica detection. Finally, our tool regards two
+or more objects as replicas only if they were allocated in the same
+calling context; the observation drives this restriction that it is sig-
+nificantly easy to refactor such code to optimize compared with
+optimizing replica objects allocated from myriad code locations. We
+emphasize that we want to be able to monitor replicas and prioritize
+them by their access frequency.
+
+OJXPerf, developed to meet these factors, monitors object allo-
+cations and accesses at runtime via statistical sampling. The key
+differentiating aspect of OJXPerf, compared to a large class of ex-
+isting profilers, is its ability to detect object replicas with minimal
+byte code instrumentation and no prior knowledge of programs
+makes it applicable in the production environment. A thorough eval-
+uation of several real-world applications shows that pinpointing
+object replicas offers new avenues to understanding performance
+losses; aggregating replica objects into one or a few objects reduces
+the memory footprint, eliminates redundant computations, and
+enhances performance.
+
+1.1 Observation
+With the help of OJXPerf, Figure 1 quantifies the ratio of object
+replicas over the total number of objects in several real applica-
+tions listed at [32] and two popular Java benchmark suites—Dacapo
+9.12 [2] and Renaissance [44], showing that replicated objects are
+pervasive in modern Java software packages. Based on many case
+studies investigated in this paper, we observe that object replication
+is the symptom of the following kinds of inefficiencies.
+
+Input-sensitive Inefficiencies. Repeatedly using the same in-
+put to instantiate a Java class shows up as repeatedly creating ob-
+jects with the same content. Listing 1 shows a problematic method
+readNext from Parquet-MR [29], which contains the Java imple-
+mentation of the Parquet format. This method is invoked in a loop,
+and in each invocation, it creates a new object bytes, shown on
+line 93, and initializes this object via input stream “in”, as shown on
+line 94. We run Parquet-MR using Parquet-Column as its input. The
+Parquet-Column input is a columnar storage format for Hadoop;
+this format provides efficient storage and encoding of data. As line
+94 in Listing 1 shows, each time the readNext method is invoked, it
+creates a copy of input contents (variable “in”), and uses this copy
+to initialize many objects “bytes” (object replication). None of the
+existing profilers, such as JXPerf [51] and LDoctor [50], can identify
+such object replicas since they are designed only to recognize the
+redundancies happening at the same memory location. Instead,
+objects bytes are allocated in disjoint memory regions.
+
+Algorithmic Inefficiencies. Suboptimal choices of an algorithm
+often show up as object duplications. As a practical example, Find-
+bugs [45] divides a graph into tiny-size blocks and creates an object
+for each block instead of creating a single object for the whole
+graph. Consequently, most of the created objects have the same
+content due to good value locality among adjacent blocks.
+
+Data Structural Inefficiencies. Like suboptimal algorithms,
+poor data structures can easily introduce object replicas as well.
+For instance, in matrix multiplication, sparse matrices with a dense
+format can yield a high proportion of objects with the same content.
+
+The major lessons that can be learned from this paper:
+
+• Object replicas are not uncommon in real Java applications.
+• Sampling-based measurement based on hardware counters and
+debug registers can provide good insights and incur significant
+low overhead.
+
+• Developing OJXPerf that efficiently interacts with off-the-shelf
+JVM and Linux OS in the production environment requires careful
+design.
+
+• The call path of object allocation and source code attribution
+in a GUI are particularly useful for users to identify actionable
+optimization.
+
+1.2 Paper Contributions
+In this paper, OJXPerf makes the following contributions:
+
+• Develops a novel object-centric profiling technique. It provides
+rich information to guide optimizing object replicas in JVM-based
+programs, such as Java and Scala.
+
+OJXPerf: Featherlight Object Replica Detection for Java Programs
+
+ICSE ’22, May 21–29, 2022, Pittsburgh, PA, USA
+
+Figure 1: Percentage of replicated objects over all the objects in various Java applications.
+
+90 private void readNext () {
+91
+92
+93
+94
+95
+96
+
+...
+currentBuffer = new int [ currentCount ];
+▶ byte [] bytes = new byte [ numGroups * bitWidth ];
+▶ new DataInputStream ( in ) . readFully ( bytes ) ;
+for ( int valueIndex = 0, byteIndex = 0; ...; ...) {
+
+▶ packer . unpack8Values ( bytes , byteIndex , currentBuffer ,
+
+valueIndex );
+
+}
+
+97
+98 }
+
+Listing 1: Object replicas in Parquet MR. The replica object
+bytes is allocated on line 93, initialized on line 94 and used
+on line 96.
+
+• Employs PMU in conjunction with hardware debug registers and
+minimal byte code instrumentation, which typically incurs 9%
+runtime and 6% memory overheads.
+
+• Quantifies the theoretical lower and upper bounds of replication
+
+ratios of OJXPerf’s statistical approach.
+
+• Applies to unmodified Java (and languages based on JVM, e.g.,
+Scala) applications, the off-the-shelf Java virtual machine, and
+Linux operating system, running on commodity CPU processors,
+which can be directly deployed in the production environment.
+• Provides intuitive optimization guidance for developers. We
+evaluate OJXPerf with popular Java benchmarks (Dacapo [35],
+NPB [16], Grande [9], SPECjvm2008 [14], and the most recent Re-
+naissance [44]) and more than 20 real-world applications. Guided
+by OJXPerf, we are able to obtain significant speedups by elim-
+inating object replicas in various Java programs. We have up-
+streamed some of the patches to the software repositories.
+
+1.3 Paper Organization
+The paper is organized as follows. Section 2 covers the related
+work and distinguishes OJXPerf. Section 3 offers some background
+knowledge. Section 4 depicts OJXPerf’s methodology. Section 5 de-
+scribes the implementation details of OJXPerf. Section 6 discusses
+the theoretical guarantee of OJXPerf’s analysis accuracy. Section 7
+evaluates OJXPerf’s accuracy and overhead. Section 8 describes
+case studies of OJXPerf. Section 9 discusses the threats to validity.
+Finally, Section 10 presents our conclusions.
+
+Table 1: Comparing OJXPerf with other state-of-the-art in-
+efficiency analysis tools/approaches.
+
+2 Related Work
+Performance profiling techniques abound in the Java community,
+which fall into two categories: hardware and software approaches.
+Each category can be further classified into hotspot and inefficiency
+analyses. We also compare the related Java tools in table 1.
+
+2.1 Software Approaches
+
+Hotspot Analysis. Netbeans Profiler [42],
+
+JProfiler [19],
+YourKit [24], VisualVM [13], and Oracle Developer Studio Perfor-
+mance Analyzer [11] are hotspot analysis profilers, which identify
+execution hotspots in CPU time or memory usage. They typically
+introduce negligible overhead by leveraging OS timers as the sam-
+pling engines to deliver periodic samples. The hotspot analysis is
+indispensable but fails to tell whether a resource is being used in a
+productive manner and contributes to a program’s overall efficien-
+cies. A hotspot does not need to be an inefficient code region and
+vice versa. Hence, a heavy burden is on users to make a judgment
+on whether the reported hotspots are actionable.
+
+Inefficiency Analysis. Unlike hotspot analysis, inefficiency
+analysis tools identify code regions leading to resource wastage
+instead of resource usage. Cachetor [31] combines value profiling
+and dependence profiling to pinpoint operations that repeatedly
+generate an identical value. MemoizeIt [15] identifies methods that
+repeatedly perform identical computation. JOLT [48] identifies and
+optimizes object churn in a virtual machine. Toddler [39] identifies
+redundant memory load operations in loop nests. The follow-up
+work [50] applies a static-dynamic analysis to reduce Toddler’s over-
+head. However, it identifies inefficiencies within a small number of
+
+Table 1agrona5.4%akarnokd-misc8.3%apache SAMOA21.1%cache2k17.7%cactoos5.6%deeplearning4j12.8%fastutil0%ﬁndbugs26.3%graphchi-java11.1%groovy10.5%hppc3.3%jctools4.3%jfreechart9.3%JGFSerialBench15.9%mallet0%parquet mr22.4%pdfbox2.8%ranklib13.9%reactive-grpc10%roaringbitmap19.5%rxjava6.2%soot28.5%avrora0%batik3.8%eclipse20.9%h25.4%iython0%luindex12.3%lusearch15.4%lusearch-ﬁx13.5%tradebeans5.5%tradesoap9.1%sunﬂow1.1%xalan0%akka-uct0%als3.2%chi-square8.4%db-shootout12.5%dec-tree0%dotty9.2%ﬁnagle-chirper3.3%ﬁnagle-http3.8%fj-kmeans17.2%future-genetic6.5%gauss-mix15.8%log-regression20.3%mnemonics0%movie-lens11.2%naive-bayes3.4%neo4j-analytics0%page-rank18.9%par-mnemonics0%philosophers10.7%reactors2.8%rx-scrabble6.1%scala-doku1.9%scala-kmeans17.1%scala-stm-bench73.7%scrabble3.1%0%7.5%15%22.5%30%agronaakarnokd-miscapache SAMOAcache2kcactoosdeeplearning4jfastutilﬁndbugsgraphchi-javagroovyhppcjctoolsjfreechartJGFSerialBenchmalletparquet mrpdfboxranklibreactive-grpcroaringbitmaprxjavasootavrorabatikeclipseh2iythonluindexlusearchlusearch-ﬁxtradebeanstradesoapsunﬂowxalanakka-uctalschi-squaredb-shootoutdec-treedottyﬁnagle-chirperﬁnagle-httpfj-kmeansfuture-geneticgauss-mixlog-regressionmnemonicsmovie-lensnaive-bayesneo4j-analyticspage-rankpar-mnemonicsphilosophersreactorsrx-scrabblescala-dokuscala-kmeansscala-stm-bench7scrabbleRenaissance Benchmark SuiteDacapo 9.12Java Real ApplicationsRedundancy Ratio of Java applicationsRedundancy detectionCross-objectanalysisProbabilistic analysisSampling withhardware supportRuntime overhead**✓✓✓✓9%✓✓*✕✕202✕✓✕✕✕133✕✓✕✕✕16✕✕✓✓✕3%✓✕✕✕202✕✓✕✕✕5%*OEP identifies mergeability of live objects while OJXPerf pinpoints object replicas regardless of their liveness.Memoizelt [15]**We obtain the average overhead described in the paper of these tools.ToolsJOLT [48]Ldoctor [50]Toddler [39]Cachetor [31]OEP [37]OJXPerfICSE ’22, May 21–29, 2022, Pittsburgh, PA, USA
+
+Bolun Li, Hao Xu, Qidong Zhao, Pengfei Su, Milind Chabbi, Shuyin Jiao, and Xu Liu
+
+suspicious loops instead of the entire program. Xu et al. [58] intro-
+duce copy profiling that optimizes data copies to remove the objects
+that carry copied values, and the method calls that allocate and
+populate these objects. Their follow-up work [63] develops prac-
+tical static and dynamic analyses that identify inefficiently-used
+containers, such as overpopulated containers and underutilized
+containers. They also present a run-time technique [56] to iden-
+tify reusable data structures to avoid frequent object allocations.
+OEP [37] identifies mergeability among live objects, which requires
+the measurement of object reachability. In contrast, OJXPerf an-
+alyzes objects allocated in the same call path regardless of their
+liveness. OEP leverages bytecode instrumentation, which incurs
+orders of magnitude of overhead compared to OJXPerf.
+
+OJXPerf is a profiler but applies a hardware approach to address
+
+a different inefficiency problem — object replication.
+
+2.2 Hardware Approaches
+There are many hardware-assisted profilers. In this paper, we review
+only PMU- or debug register-assisted Java profilers.
+
+Hotspot Analysis. Linux Perf [34], Async-profiler [43], and
+Oprofile [3] employ PMU as the sampling engines to deliver periodic
+samples. PMU-based hotspot profilers offer slightly better intuition
+than the OS timer-based ones since they can classify hotspots ac-
+cording to various forms of performance metrics collected from
+PMU, such as instruction numbers, cache misses, bandwidth, and
+many others. However, they are not panaceas; users still have to
+distinguish inefficient hotspots from efficient ones manually.
+
+Inefficiency Analysis. Sweeney et al. [20] develop a system
+that provides a graphical interface to alleviate the difficulty in inter-
+preting PMU results. Hauswirth et al. [25] present vertical profiling
+that captures and correlates performance problems across multiple
+execution layers (application, VM, OS, and hardware). Georges et
+al. [23] study methods exhibit similar and dissimilar behaviors by
+measuring the execution time for each method invocation using
+PMU. Lau et al. [33] present a technique that allows a VM to deter-
+mine whether an optimization improved or degraded by measuring
+CPU cycles. Remix [18] employs PMU to identify inter-thread false
+sharing on the fly. JXPerf [51] detects redundant memory oper-
+ations by using PMU to sample memory locations accessed by a
+program and using debug registers to monitor subsequent accesses
+to the same location.
+
+Orthogonal to the aforementioned inefficiency analysis profilers,
+OJXPerf addresses a different inefficiency problem with a different
+usage of PMU and debug registers. To the best of our knowledge,
+OJXPerf is the first lightweight sampling-based profiler to pinpoint
+object replicas in Java.
+
+3 Background
+We introduce some essential facilities that OJXPerf leverages based
+on Java virtual machines (JVM) and CPU processors.
+
+Java Virtual Machine Tool Interface (JVMTI). JVMTI, a na-
+tive programming interface of the JVM, is loaded during the ini-
+tialization of the JVM. JVMTI provides a VM interface for the full
+breadth of tools that need access to VM state, including but not
+
+limited to profiling, debugging, monitoring, thread analysis, and
+coverage analysis tools.
+
+Hardware Performance Monitoring Unit (PMU). PMU is
+hardware built inside a processor to measure its performance pa-
+rameters. We can measure parameters like instruction cycles, cache
+hits, cache misses, branch misses, and many others, depending on
+the supported hardware. PMU supports lightweight measurement.
+Intel processors also support Precise Event-Based Sampling
+(PEBS) [30]. PEBS is a profiling mechanism that logs a snapshot
+of the processor state at the time of the event, allowing users to
+attribute performance events to actual instruction pointers (IPs).
+Also, PEBS provides an effective address (EA) at the time of the
+sample when the sample is for a memory load or store instruction.
+In PEBS, the event type may be chosen from an extensive list of
+performance-related events to monitor, e.g., cache misses, remote
+cache hits, branch mispredictions. AMD processors provide similar
+capabilities via instruction-based sampling.
+
+Hardware Debug Register. Modern x86 processors provide de-
+bug facilities for developers in debugging code and monitoring
+system behaviors. Such debug support is accessed using hardware
+debug registers. Hardware debug registers [17, 47] enable trap-
+ping the CPU execution for debugging when the program counter
+(PC) reaches an address (breakpoint) or an instruction accesses a
+designated address (watchpoint). Hardware debug registers allow
+programmers to selectively enable various debug conditions asso-
+ciated with a set of four debug addresses because our current x86
+processors have four debug registers.
+
+4 Methodology
+As previously alluded, we restrict the definition of object replicas
+to those allocated in the same calling context.
+
+Definition 4.1. Object Replicas: 𝑂1 and 𝑂2 are two objects that
+have the same allocation context. If the contents of 𝑂1 and 𝑂2 are
+identical, 𝑂1 is a replica of 𝑂2 and ⟨𝑂1, 𝑂2⟩ is an object replication
+pair.
+
+A straightforward detection approach is monitoring every alloca-
+tion context and comparing all fields of all object instances created
+at that allocation context at any use points. However, performing
+such whole-heap object tracing can introduce a prohibitively high
+overhead (70~300× slowdown reported in [26]).
+
+Instead of exhaustive duplication detection, OJXPerf takes ad-
+vantage of sampling to perform lightweight replica detection. We
+neither compare all objects allocated in the same context nor com-
+pare all fields when comparing two objects. Instead, our algorithm
+chooses random fields (offsets in terms of memory locations) at
+random points.
+
+Example 1 shows an object replica detection example that
+keeps allocating an object 𝑂 inside a while loop. As the while
+loop iterates 4 times, the program allocates a sequence of objects
+{𝑂1, 𝑂2, 𝑂3, 𝑂4}, which have the same allocation context and are
+sorted by the allocation timestamp during program execution. First,
+in each loop iteration, we intercept the allocation of the object on
+line 3. This interception offers two pieces of information: 1) the
+calling context of allocation, and 2) the memory address range oc-
+cupied by each object. We maintain this information for future use.
+
+OJXPerf: Featherlight Object Replica Detection for Java Programs
+
+ICSE ’22, May 21–29, 2022, Pittsburgh, PA, USA
+
+For all objects allocated on line 3 in this example, the context is
+the same but the object addresses can be different1. Second, when
+the program accesses an object (use point), e.g., lines 5 and 7, we
+can obtain the effective address of the access and map the address
+to the object it belongs to; furthermore, we can easily derive the
+relative offset of the access from the start address of the object; this
+relative offset guides us where to monitor another object allocated
+in the same context. Third, when the program accesses an object,
+we can read the contents of the location accessed.
+
+Example 1: Example of Object Replica Detection.
+
+1 i = 0;
+2 while i < 4 do
+3
+
+allocate an object O;
+initialize O;
+use O; //use O for the first time
+update O;
+use O; //use O for the second time
+i++;
+
+4
+
+5
+
+6
+
+7
+
+8
+9 end
+
+Figure 2: Watchpoint scheme for object replica detection.
+Off1 (Off2 ) presents memory offset with value 𝑉1 (𝑉2) for Ob-
+ject 𝑂1 (Object 𝑂3). When a watchpoint trap of memory ac-
+cess happens at offset Off1 (Off2 ), OJXPerf compares their
+corresponding values 𝑉1 and 𝑉 ′
+1
+
+(𝑉2 and 𝑉 ′
+2
+
+).
+
+Given the nature of sampling, let’s assume that memory-access
+samples occur on line 5 in iteration 1 of the loop (while accessing
+object 𝑂1) and line 7 in iteration 3 (while accessing object 𝑂3), as
+shown in Figure 2. Assume, the sample in iteration 1 for 𝑂1 on
+line 5 happens at the relative offset Off1 from the beginning of the
+object and the value at Off1 is 𝑉1; OJXPerf remembers the triple
+— line 5, Off1 , and 𝑉1 — for future use. For the next allocation,
+𝑂2, we probabilistically skip and do nothing. When 𝑂3 starts to
+be accessed, we decide to monitor its contents at offset Off1 , and
+hence arm a watchpoint to trap on access to offset Off1 from the
+beginning of 𝑂3. This watchpoint traps when the program accesses
+𝑂3 on line 5. Let the contents at 𝑂3 + Off1 be 𝑉 ′
+when the trap
+1
+happens. We compare 𝑉1 and 𝑉 ′
+and if they are the same, 𝑂1 and
+1
+𝑂3 contribute towards the number of equivalent objects allocated in
+context line 3; otherwise they contribute towards non-equivalent
+objects allocated in context line 3.
+
+The next sample happens on line 7, for the same object 𝑂3 at
+offset Off2 in iteration 3 of the loop. Let the value at Off2 for
+𝑂3 be 𝑉2. We remember the triple — line 7, Off2 , and 𝑉2 — for
+future use. When 𝑂4 starts to be accessed in iteration 4 of the loop,
+we arm a watchpoint at address Off2 from the beginning of 𝑂4.
+This watchpoint traps when the program accesses 𝑂4 on line 7. Let
+the value at the trapped location be 𝑉 ′
+. As before, depending on
+2
+whether 𝑉2 and 𝑉 ′
+are the same or not, they contribute towards
+2
+equivalent or non-equivalent objects allocated in context line 3.
+Figure 2 shows that 𝑉1 equals to 𝑉 ′
+(the blue star), which means that
+1
+the values stored in an offset Off1 of 𝑂1 and 𝑂3 are the same. Also,
+the red star in Figure 2 shows that the values stored in an offset
+Off2 of 𝑂3 and 𝑂4 are different (𝑉2 doesn’t equal to 𝑉 ′
+), which
+2
+means that 𝑂3 and 𝑂4 must be two objects that have different
+contents.
+
+1two objects of different size, e.g., arrays allocated in the same context are easily ruled
+out of duplication due to size difference
+
+As the program continues, OJXPerf performs the same redun-
+dancy checks for other samples taken from objects {𝑂1, 𝑂2, 𝑂3, 𝑂4}.
+Finally, if most of the comparisons (>60%, obtained from our ex-
+periments) report identical values among all detection pairs, we
+believe objects {𝑂1, 𝑂2, 𝑂3, 𝑂4} suffer from object replicas with a
+high probability, which is quantified with our theoretical analysis
+in Section 6.
+
+5 Implementation
+OJXPerf is a user-space tool with no need for any privileged sys-
+tem permission. OJXPerf requires no modification to hardware,
+OS, JVM, and monitoring applications, making it applicable to the
+production environment. Conceptually, OJXPerf consists of two
+components: data-centric analysis and duplication detection. These
+two components are implemented within two agents: a Java agent
+and a JVMTI agent. Figure 3 overviews the design of these two
+agents. The Java agent instruments Java byte code execution to
+obtain each object’s memory interval and allocation context. The
+JVMTI agent subscribes to Java thread creation to enable PMU.
+Upon each PMU sample, OJXPerf obtains the effective address
+of the monitored memory access and associates it with the Java
+object enclosing this address. Moreover, to identify object repli-
+cas, the JVMTI agent programs the debug registers to subscribe to
+watchpoints.
+
+5.1 Java Agent
+The Java agent monitors object allocation, which leverages
+java.lang.instrument API and ASM framework. The Java agent
+inserts pre- and post-allocation hooks to intercept each object allo-
+cation. Then, a user-defined callback is invoked on each allocation
+to obtain the object information, such as the object pointer, type,
+and size. For a given Java class we want to instrument, the Java
+agent scans the byte code of this class, instruments new, newarray,
+anewarray, and multianewarray, and obtains the memory range
+of every object following an existing technique [1].
+
+...<Off1,V1>...Object O1Object O2Object O3Pair (O3,O4)Pair (O1,O3):  Value Sample:   Watchpoint Trap<Off2,V2><Off1,V1'> V1' == V1......<Off2,V2'> V2' != V2Object O4ICSE ’22, May 21–29, 2022, Pittsburgh, PA, USA
+
+Bolun Li, Hao Xu, Qidong Zhao, Pengfei Su, Milind Chabbi, Shuyin Jiao, and Xu Liu
+
+(a) The workflow of object replica detection: collecting PMU samples
+taken from object 𝑂1.
+
+Figure 3: Overview of OJXPerf’s profiling.
+
+How to present an object allocation is a challenging question.
+We adopt a simple and perhaps the most intuitive approach that
+developers can identify with — the allocation context leading to the
+object allocation. A Java application can often create multiple object
+instances via a single allocation site in a loop. All those objects will
+be represented by a single call path, which naturally aggregates
+numerous objects with similar behavior. OJXPerf leverages the
+AsyncGetCallTrace() [40] API provided by Oracle Hotspot JVM
+to determine the calling contexts at any point during the execution.
+OJXPerf then inserts a ⟨𝑘𝑒𝑦, 𝑣𝑎𝑙𝑢𝑒⟩ pair into a map M, where 𝑘𝑒𝑦
+is the memory range and 𝑣𝑎𝑙𝑢𝑒 is the allocation context.
+
+(b) The workflow of object replica detection: setting up watchpoint at
+object 𝑂2.
+
+5.2 JVMTI Agent
+
+Figure 4: Workflow of object-level redundancy detection.
+
+Implementing Sampling with PMU. The JVMTI agent lever-
+ages PMU to sample memory accesses. It subscribes to MEM_UOPS_
+RETIRED:ALL_LOAD, a PMU precise event to sample memory loads.
+We empirically choose a sampling period to ensure OJXPerf can
+collect 20-200 samples per second per thread, which yields a fair
+tradeoff between runtime overhead and statistical accuracy [52].
+Moreover, the JVMTI agent captures the calling contexts for both
+PMU samples and object allocations described in Section 5.1. To
+minimize synchronization, each thread collects PMU samples in-
+dependently and maintains a thread-local compact calling context
+tree (CCT) [7], which stores the calling contexts of PMU samples
+and merges all the common prefixes of given calling contexts.
+
+Examining Object Contents with Watchpoints. OJXPerf
+leverages debug registers to set up watchpoints, which traps the
+program execution when the designated memory addresses are
+accessed. Assume 𝑂1 and 𝑂2 are two distinct objects that have the
+same allocation context and 𝑂1 is created prior to 𝑂2. Moreover,
+𝑂1 and 𝑂2 have the same accessing context, then 𝑂1 and 𝑂2 form a
+𝑝𝑎𝑖𝑟 (𝑂1, 𝑂2) as object replicas. OJXPerf uses queues 𝑄1 and 𝑄2 to
+store samples taken from objects 𝑂1 and 𝑂2, respectively. Upon a
+sample taken from 𝑂1, OJXPerf uses a tuple ⟨Off , 𝑉 ⟩ to represent
+it and adds this tuple to queue 𝑄1, as shown in Figure 4a. Off is the
+offset between the sampled address (i.e., the address of the PMU
+sample) and the starting address of 𝑂1, and 𝑉 is the value stored
+at the sampled memory address. Upon a sample taken from 𝑂2,
+
+OJXPerf not only adds a tuple ⟨Offm, 𝑉𝑚⟩ to queue 𝑄2, but also
+retrieves a sample (⟨Offn, 𝑉𝑛⟩) from queue 𝑄1 and uses a debug
+register to set up a watchpoint at the offset Offn of 𝑂2, as shown
+in Figure 4b. OJXPerf compares values at the the same offset Offn
+of 𝑂1 and 𝑂2 when the watchpoint is triggered. Watchpoint can
+be removed when it is triggered, and watchpoints are used for a
+single access.
+
+Limited Number of Debug Registers. Hardware offers only a
+small number of debug registers, which becomes a limitation if
+the PMU delivers a new sample, but all watchpoints are armed
+with addresses obtained from prior samples. OJXPerf employs a
+reservoir sampling strategy [46], which uniformly chooses between
+old and new samples with no bias. The basic idea of reservoir sam-
+pling is to assign a probability to each debug register and perform
+a replacement policy based on the probability. Prior work [53, 55]
+has shown that reservoir sampling guarantees the fairness of the
+measurement with a limited number of debug registers.
+
+5.3 Offline Data Analyzer and GUI
+To generate a compact profile, which is essential for analyzing a
+large-scale execution, the offline data analyzer merges profiles from
+different threads. Object allocation call paths coalesce across threads
+in a top-down way if they are identical. All memory accesses with
+
+ObjectMemoryobject1[0x00~0x40]object2[0x40~0x60]……SampleMemorysample1[0x56]sample2[0x32]……JVMTI AgentJava Agentrecord object's memory intervalregister allocation callbackobjects attributionJava Virtual Machinecollect objectscollect perfsamplesMemory IntervalsPerf SamplessubscribewatchpointwatchpointOffsetwatchpoint116watchpoint232……Watchpoints Inforecord perf sampleNameStartingaddrSizeObject10x0040Sample...Off1OffnPMU	Sample<Off1,V1>Queue	Q1PMU	Sample<Offn,Vn>Object	MemoryAccess	Stream...Save	InfoSave	InfoSample...Memory	AccessSample...SampleOffmOffnPMU	SampleQueue	Q2SetWatchpoint...Object	MemoryLayout...Save	InfoOffmTimelineOffn...Object	MemoryLayoutWatchpointTriggerdT1T2Retrieve	InfoSample...SampleQueue	Q1...Memory	AccessDeploy	Debug	ResgisterOJXPerf: Featherlight Object Replica Detection for Java Programs
+
+ICSE ’22, May 21–29, 2022, Pittsburgh, PA, USA
+
+their call paths to the same objects are merged as well. Metrics are
+also summed up when call paths coalesce. The offline procedure
+typically takes less than one minute in our experiments. Further-
+more, OJXPerf integrates its analysis visualization in Microsoft
+Visual Studio Code, which is shown in Figure 6.
+
+5.4 Discussions
+As a sampling-based approach, OJXPerf may introduce false posi-
+tives and false negatives, which are elaborated in Section 7.1. Our
+theoretical analysis to be described in the next section bounds the
+analysis accuracy.
+
+6 Theoretical Analysis
+Since OJXPerf does not exhaustively check every field of an object
+for replication due to the sampling, we compute the lower and
+upper bounds of the analysis to quantify the replication factor.
+
+Definition 6.1. Replication Factor (RF) 𝜽 : For a set of objects
+that suffer from object replication, the replication factor 𝜃 is the proba-
+bility of last accessed object to be bit-wise same as the current accessed
+object. We define 𝜃 as the ratio of the number of times that an object
+accessed is equivalent to another object accessed previously, to the
+total accesses of this set of objects.
+
+𝜃 =
+
+num equivalent access times⟨𝑂𝑏 𝑗𝑒𝑐𝑡 O ⟩
+num equivalent + num different access times⟨𝑂𝑏 𝑗𝑒𝑐𝑡 O ⟩
+
+(1)
+
+Assume 𝑂1 and 𝑂2 are a pair of object under object replica
+detection. If all memory locations sampled from 𝑂2 have the same
+values as the corresponding locations in 𝑂1 (𝑂𝑜 𝑓 𝑓 𝑠𝑒𝑡
+= 𝑂𝑜 𝑓 𝑓 𝑠𝑒𝑡
+),
+1
+it is possible that 𝑂2 and 𝑂1 are two objects that have the same
+contents (𝑂2 ≡ 𝑂1) or the different contents (𝑂2 (cid:46) 𝑂1). Here, we
+have three scenarios and each with a specific probability:
+
+2
+
+• 𝑂𝑜 𝑓 𝑓 𝑠𝑒𝑡
+2
+• 𝑂𝑜 𝑓 𝑓 𝑠𝑒𝑡
+2
+• 𝑂𝑜 𝑓 𝑓 𝑠𝑒𝑡
+2
+
+= 𝑂𝑜 𝑓 𝑓 𝑠𝑒𝑡
+1
+= 𝑂𝑜 𝑓 𝑓 𝑠𝑒𝑡
+1
+≠ 𝑂𝑜 𝑓 𝑓 𝑠𝑒𝑡
+1
+
+and 𝑂2 ≡ 𝑂1, the probability is 𝐴;
+and 𝑂2 (cid:46) 𝑂1, the probability is 𝐵;
+, so 𝑂2 (cid:46) 𝑂1, the probability is 𝐶.
+
+Obviously, we have 𝐴 + 𝐵 + 𝐶 = 1.
+
+Then, the 𝜃 can be rewritten using 𝐴, 𝐵, 𝐶 as:
+
+𝜃 =
+
+𝐴 + 𝐵
+𝐴 + 𝐵 + 𝐶
+
+= 𝐴 + 𝐵
+
+𝑂𝑜 𝑓 𝑓 𝑠𝑒𝑡
+1
+
+when 𝑂2 (cid:46) 𝑂1. Then 𝛼 can be denoted as:
+
+𝛼 =
+
+𝐵
+𝐵 + 𝐶
+
+≥
+
+𝐵
+𝐴 + 𝐵 + 𝐶
+
+= 𝐵
+
+Combine Equation (2) and Inequality (3), we have:
+
+(4)
+
+𝐴 = 𝜃 − 𝐵 ≥ 𝜃 − 𝛼
+Assume there are 𝑋 objects {𝑂1, 𝑂2, ..., 𝑂𝑥 } belonging to the
+same calling context. These 𝑋 objects are divided into 𝑁 groups.
+Inside each group, the objects are identical with each other. Ev-
+ery group contains 𝑋𝑛 objects (1 ≤ 𝑛 ≤ 𝑁 , (cid:205)𝑁
+𝑋𝑛 = 𝑋 ), and
+𝑋1, 𝑋2, ..., 𝑋𝑁 are sorted in an ascending order by group size. Based
+on these 𝑋 objects, there are (cid:0)𝑋
+(cid:1) object pairs. Among these (cid:0)𝑋
+(cid:1)
+2
+2
+(cid:0)𝑋𝑛
+object pairs, there will be (cid:205)𝑁
+(cid:1) identical object pairs. Consid-
+2
+ering we can estimate identical object pairs ratio by
+𝐴+𝐵+𝐶 = 𝐴
+and Inequality (4), we can state:
+
+𝑛=1
+
+𝑛=1
+
+𝐴
+
+(2)
+
+=
+
+(3)
+
+(cid:205)𝑁
+
+𝑛=1
+(cid:0)𝑋
+2
+
+(cid:1)
+
+(cid:0)𝑋𝑛
+2
+
+(cid:1)
+
+= 𝐴 ≥ 𝜃 − 𝛼
+
+can be derived as:
+
+(cid:0)𝑋𝑛
+2
+
+(cid:1)
+
+=
+
+(cid:205)𝑁
+
+𝑛=1
+
+𝑋𝑛 (𝑋𝑛 − 1)
+
+𝑋 (𝑋 − 1)
+
+<
+
+𝑋 2
+𝑛
+
+(cid:205)𝑁
+
+𝑛=1
+𝑋 2
+
+Focusing on (cid:205)𝑁
+
+𝑋𝑛
+𝑋 )2, we can reconstruct it as:
+
+Then,
+
+𝑛=1 (𝑋𝑛
+(cid:205)𝑁
+2 )
+(𝑋
+2)
+(cid:205)𝑁
+
+𝑛=1
+(cid:0)𝑋
+2
+
+(cid:1)
+
+𝑛=1 (
+𝑋𝑛
+𝑋
+
+(
+
+) 2 =
+
+𝑁
+∑︁
+
+𝑛=1
+
+𝑋𝑛
+𝑋
+
+𝑋𝑛
+𝑋
+
+(
+
+(
+
+𝑁 −1
+∑︁
+
+𝑛=1
+𝑁 −1
+∑︁
+
+𝑛=1
+𝑋𝑁
+𝑋
+
+=
+
+=
+
+) 2 +
+
+𝑋𝑁
+𝑋
+
+𝑋𝑁
+𝑋
+
+∗
+
+𝑁 −1
+∑︁
+
+) 2 + (1 −
+
+𝑋𝑛
+𝑋
+
+) ∗
+
+𝑋𝑁
+𝑋
+
+𝑛=1
+𝑋𝑁 − 𝑋𝑛
+𝑋
+
+)
+
+−
+
+𝑁 −1
+∑︁
+
+𝑛=1
+
+𝑋𝑛
+𝑋
+
+(
+
+Since 𝑋𝑁 > 𝑋𝑁 −1 > 𝑋𝑁 −2 > ... > 𝑋1, we have
+𝑁 −1
+∑︁
+
+𝑋𝑛
+𝑋
+
+𝑋𝑁 − 𝑋𝑛
+𝑋
+
+(
+
+) > 0
+
+𝑛=1
+
+Furthermore, combining (5), (6), (7), (8), we then obtain
+
+𝑋𝑁
+𝑋
+
+≥ 𝜃 − 𝛼 +
+
+𝑁 −1
+∑︁
+
+𝑛=1
+
+𝑋𝑛
+𝑋
+
+𝑋𝑁 − 𝑋𝑛
+𝑋
+
+(
+
+) > 𝜃 − 𝛼,
+
+Because 𝑋𝑁
+𝑋 represents the largest identical objects group size ratio,
+we know that this ratio is lower bounded by 𝜃 − 𝛼. Next we show
+the upper bound of 𝑋𝑁
+𝑋 .
+
+Based on equation 5, we have:
+
+(cid:205)𝑁
+
+(cid:1)
+
+(cid:0)𝑋𝑛
+2
+
+(cid:1)
+
+= 𝐴 >
+
+(cid:1)
+
+(cid:0)𝑋𝑁
+2
+(cid:0)𝑋
+2
+
+(cid:1)
+
+𝑛=1
+(cid:0)𝑋
+2
+
+, we have:
+
+Focusing on (𝑋𝑁
+2 )
+(𝑋
+2)
+𝑋𝑁 (𝑋𝑁 − 1)
+𝑋 (𝑋 − 1)
+
+=
+
+(cid:1)
+
+(cid:1)
+
+(cid:0)𝑋𝑁
+2
+(cid:0)𝑋
+2
+
+=
+
+𝑋𝑁
+𝑋
+
+𝑋𝑁
+𝑋
+
+(
+
++
+
+𝑋𝑁 − 1
+𝑋 − 1
+
+−
+
+𝑋𝑁
+𝑋
+
+=
+
+𝑋𝑁
+𝑋
+
+𝑋𝑁
+𝑋
+
+(
+
+−
+
+𝑋 − 𝑋𝑁
+𝑋 (𝑋 − 1)
+
+)
+
+)
+
+𝑋 − 𝑋𝑁
+𝑋 (𝑋 − 1)
+
+=
+
+1
+𝑋 − 1
+𝑋 = 𝑠 and
+
+−
+
+1
+𝑋 − 1
+
+𝑋𝑁
+𝑋
+
+∗
+
+1
+𝑋 −1 = 𝑡, equation 10 can be
+
+We then denote 𝑋𝑁
+
+rewritten as:
+
+(cid:1)
+
+(cid:0)𝑋𝑁
+2
+(cid:0)𝑋
+2
+
+(cid:1)
+
+= 𝑠 (𝑠 − 𝑡 + 𝑠𝑡)
+
+Combining with equation 9, we have this in-equation:
+
+𝐴 > 𝑠 (𝑠 − 𝑡 + 𝑠𝑡) = (𝑡 + 1)𝑠2 − 𝑠𝑡 > 𝑠2 − 𝑠𝑡
+
+Solving this in-equation, we then have:
+
+𝑡 +
+
+𝑠 <
+
+√
+
+𝑡 2 + 4𝐴
+2
+
+Focusing on 𝐴 in equation 2 and 3, we have:
+
+𝐴 = 𝜃 − 𝐵 = 𝜃 − 𝛼 ∗ (𝐵 + 𝐶) = 𝜃 − 𝛼 ∗ (1 − 𝐴)
+
+(15)
+
+(5)
+
+(6)
+
+(7)
+
+(8)
+
+(9)
+
+(10)
+
+(11)
+
+(12)
+
+(13)
+
+(14)
+
+Furthermore, we define 𝛼 as the probability of 𝑂𝑜 𝑓 𝑓 𝑠𝑒𝑡
+
+2
+
+We also have:
+
+ICSE ’22, May 21–29, 2022, Pittsburgh, PA, USA
+
+Bolun Li, Hao Xu, Qidong Zhao, Pengfei Su, Milind Chabbi, Shuyin Jiao, and Xu Liu
+
+Solving it, we then have:
+
+𝐴 =
+
+𝜃 − 𝛼
+1 − 𝛼
+
+Based on the in-equation 14, we have:
+
+𝑡 +
+
+√︃
+
+𝑡 2 + 4 𝜃 −𝛼
+1−𝛼
+
+2
+
+𝑠 <
+
+√︂
+
+= 𝑡/2 +
+
+𝑡 2/4 +
+
+=
+
+1
+2(𝑋 − 1)
+
++
+
+√︄
+
+1
+4(𝑋 − 1)2
+
++
+
+𝜃 − 𝛼
+1 − 𝛼
+𝜃 − 𝛼
+1 − 𝛼
+
+(16)
+
+(17)
+
+Here, we have both lower bound and upper bound of 𝑋𝑁
+
+√︃ 1
+
+𝑋𝑁
+𝑋 <
+
+1
+2(𝑋 −1) +
+
+4(𝑋 −1) 2 + 𝜃 −𝛼
+1−𝛼
+For real applications, usually we have 𝑋 >> 1, so 1
+1 = 𝜃 .
+
+1−𝛼 < 𝜃
+
+And also we have 𝜃 −𝛼
+
+𝑋 : 𝜃 −𝛼 <
+
+𝑋 −1 → 0.
+
+Definition 6.2. Lower Bound Factor (LBF) 𝝎: 𝜔 is defined as
+𝑋𝑁
+𝑋 ,
+
+the lower bound of the largest identical objects group size ratio
+so we have 𝜔 = 𝜃 − 𝛼.
+
+Definition 6.3. Upper Bound Factor (UBF) 𝜸 : 𝛾 is defined as
+𝑋𝑁
+𝑋 ,
+
+the upper bound of the largest identical objects group size ratio
+so we have 𝛾 =
+
+4(𝑋 −1) 2 + 𝜃 −𝛼
+1−𝛼 .
+We show how the interval of the largest identical objects group
+
+1
+2(𝑋 −1) +
+
+√︃ 1
+
+size ratio 𝑋𝑁
+
+𝑋 guides our optimizations in Section 7.
+
+In the applications we evaluated, we have not seen an applica-
+tion with a very high 𝛼 (we compute 𝛼 for each application via
+exhaustively checking every field of objects), which we further
+discuss here. For an application with inequivalent objects 𝑋1, 𝑋2,
+..., 𝑋𝑁 that belong to the same calling context, high 𝛼 indicates
+that most of the contents of these objects are the same and only a
+few contents are different, which means these objects are partially
+replicated. It is worth noting that partially replicated objects can
+warrant some optimization to move redundant computations, such
+as approximate computing or data compression; however, it is out
+of the scope of this paper.
+
+The theoretical analysis influences the design decisions in two
+aspects: on the one hand, the theoretical bounds guarantee the
+analysis accuracy of OJXPerf’s sampling technique; on the other
+hand, the bounds, as metrics, help users determine whether the
+object replicas are significant for optimization.
+
+7 Evaluation
+We evaluate OJXPerf on a 36-core Intel Xeon E5-2699 v3 (Haswell)
+CPU clocked at 2.3GHz running Linux 4.8.0. The memory hierar-
+chy consists of a private 32KB L1 cache, a private 256KB L2 cache,
+a shared 46MB L3 cache, and 128GB main memory. OJXPerf is
+compatible with JDK 1.5 and any of its successors. We run all appli-
+cations with JDK 1.8.0_161.
+
+Applications and Benchmarks. The lightweight nature of
+OJXPerf allows us to collect profiles from a variety of Java and
+Scala applications obtained from the Awesome Java repository [32],
+such as the Renaissance benchmark suite [44], Soot [41], parquet
+MR [29], Findbugs [45], Eclipse Deeplearning4J [28], JGFSerial-
+Bench [9], RoaringBitmap [8], Apache SAMOA [22], to name a few.
+
+We run these applications with different real inputs released with
+them or the real inputs that we can find to our best knowledge; the
+inputs control the parallelism configuration.
+
+Replication. Figure 1 shows the replication ratios for more than
+50 Java programs obtained from OJXPerf. We can see that several
+Java programs suffer from significant object replications (replication
+ratio > 15%). We optimize some of them, as shown in Section 8 under
+the guidance of OJXPerf. For some Java applications (e.g., gauss-
+mix, log-regression, page-rank, scala-kmeans) with high replication
+ratios, we only obtain trivial speedups because these applications
+do not have any hotspot object replicas. For example, the top five
+object replicas’ accessing times in Renaissance benchmark gauss-
+mix are less than three. In this case, it is reasonable that there is no
+benefit to optimize these replicated objects that are used very few.
+We focus on the hotspot object replicas, which at least are accessed
+dozens of times.
+
+OJXPerf is able to pinpoint many object replicas that are not
+reported by existing profilers and guide optimization choices. Ta-
+ble 2 summarizes the new findings identified by OJXPerf, which
+we further elaborate in Section 8. In Table 2, we report replication
+factor 𝜃 , 𝛼, and lower bound factor 𝜔, which are defined in Section 6.
+Table 2 shows that 𝛼 ranges from 0% to 53% and 𝜃 ranges from
+65% to 100%, respectively. As a result, the lower bound factor 𝜔 is
+usually > 15%, which means that these Java applications at least
+have 15% objects suffering from object replication.
+
+Optimization. It is worth doing the optimization to decrease
+the creations of objects with the same contents. To guarantee opti-
+mization correctness, we ensure the optimized codes do not change
+semantics for any inputs and pass the validation tests. To avoid
+system noises, we run each application 30 times and use a 95%
+confidence interval for the geometric mean speedup to report the
+performance improvement, according to a prior approach [51].
+
+From Table 2, we can see that we are able to obtain nontriv-
+ial speedups by removing object replicas. The performance im-
+provement comes from the reduction of heap memory usage,
+cache misses, and executed instructions, which are measured with
+jmap [12] and perf [34]. We detected the object replicas as shown
+in Table 2 without much effort. Object replicas often concentrate
+around only a few calling contexts making investigation relatively
+simpler; for example, in all of our case studies, we found the top five
+objects (sorted by replication factor) account for ∼37% of whole-
+program object replicas on average.
+
+7.1 False Positives and Negatives
+As a sampling-based tool, OJXPerf can introduce false negatives —
+missing some object replicas. However, the statistics theory guar-
+antees the high probability of capturing object replicas that occur
+frequently. The false negatives do not hurt the insights obtained
+from OJXPerf because optimizing infrequently occurred object
+replicas typically receives trivial speedups.
+
+OJXPerf can also introduce false positives — reporting object
+replicas that are not replicated because OJXPerf uses sampling
+instead of exhaustive checking. The false positives occur when
+most elements of the two objects are the same, with only a few
+different elements not monitored. However, OJXPerf randomly
+
+OJXPerf: Featherlight Object Replica Detection for Java Programs
+
+ICSE ’22, May 21–29, 2022, Pittsburgh, PA, USA
+
+Table 2: Overview of performance optimization guided by OJXPerf.
+
+(a) Runtime overheads.
+
+(b) Memory overheads.
+
+Figure 5: OJXPerf’s runtime and memory overheads in the unit of times (×) on various benchmarks.
+
+Actual
+
+Replicated
+Not Replicated
+
+Replica Detection
+
+Replicated
+8
+3
+
+Not Replicated
+0
+48
+
+Correctness
+False positive rate
+Table 3: Accuracy for OJXPerf’s replica detection.
+
+(48 + 8) / (0 + 8 + 3 + 48) = 94.9%
+3 / (3 + 48) = 5.9%
+
+checks different fields with enough samples to minimize the false
+positives. We exhaustively check every field of the top five objects
+(i.e., objects associated with most samples) of all our investigated
+programs in Table 3. From the table, we can see that OJXPerf incurs
+5.9% false positives.
+
+7.2 Overhead Measurement
+The runtime overhead (memory overhead) is the ratio of the run-
+time (peak memory usage) of the execution monitored by OJXPerf
+to the runtime (peak memory usage) of the native execution. To
+quantify the overhead, we apply OJXPerf to three well-known
+Java benchmark suites: Renaissance [44], Dacapo 9.12 [2], and
+SPECjvm2008 [14]. We run all benchmarks with four threads. We
+run every benchmark 30 times and compute the average and er-
+ror bar. Figure 5 shows the overhead when OJXPerf is enabled at
+a sampling period of 5M. Some Renaissance and Dacapo bench-
+marks have higher time overhead (larger than 30%) because they
+allocate too many objects (e.g., more than 400 million allocations
+for mnemonics, par-mnemonics, scrabble, akka-uct, db-shootout,
+dec-tree, neo4j-analytics).
+
+8 Case Studies
+This section shows how OJXPerf pinpoints object replicas in real
+applications and guides the optimization. Our optimization guar-
+antees the program’s correctness via human inspection, and we
+have evaluated our transformed code with tests to ensure their cor-
+rectness. It is worth noting that existing profilers may identify the
+same object allocation as a hotspot in memory usage; however, they
+do not know whether this allocation point creates multiple object
+replicas for potential optimization. OJXPerf, in contrast, quantifies
+the replication factors for the objects to provide intuitive optimiza-
+tion. We have submitted our optimization patches in several cases
+and gotten them confirmed or upstreamed, e.g., Soot and Findbugs.
+
+8.1 Soot
+Soot is a Java optimization framework, which uses containers ex-
+tensively [41]. We run Soot-3.3.0 using the bytecode of the Da-
+Capo benchmark avrora as input. Figure 6 shows the snapshot of
+OJXPerf’s Flame Graphs GUI in VSCode for intuitive analysis. The
+top pane of the GUI shows the Java source code; the bottom shows
+the flame graphs of object accesses in their full call stacks. In the
+flame graphs, the x-axis shows the accesses with their call stacks to
+object replicas, and the y-axis shows call stack depth, counting from
+zero at the top. Each rectangle represents a stack frame. The wider
+a stack frame is, the higher of replication factor of this stack frame.
+The GUI in Figure 6 shows one problematic object st (highlighted
+in blue), which is accessed on line 84 in method getPhaseOptions
+of class PhaseOptions with many replicas (its replication factor 𝜃
+is 83.9%, as shown in the top pane of the GUI).
+
+Soot’s execution is divided into a number of phases, such as
+Jimple Body Creation (jb) phase, Java To Jimple Body Creation (jj)
+
+Problematic Code⍬ (RF)⍺⍵ (LBF) WS (×)WH (%)WCM (%)WEI (%)PhaseOptions.java (84)83.9%20.8%63.1%1.17±0.027.5%11.2%10.3%ArrrayOptionsHelper.java (59)64.7%47.2%17.5%1.09±0.021.1%5.1%7.9%BasicNDArrayCompressor.java (57)81.3%12.5%68.8%1.15±0.019.5%4.3%6.0%BasicAbstractDataflowAnalysis.java (183)70.3%44.7%25.6%1.25±0.0311.2%21.3%10.7%JavaKMeans.java (220)76.1%39.1%37.0%1.08±0.044.8%2.9%4.1%JGFSerialBench.java (371)68.8%53.6%15.2%1.1±0.033.4%5.7%9.3%MutableRoaringArray.hava (288)100.0%0.0%100.0%1.09±0.019.2%8.2%11.4%SerializeUtils.java (97)93.5%18.1%75.4%1.16±0.018.6%17.7%12.1%WS: Whole-program speedup.   WH: Whole-program heap usage reduction.   WCM: Whole-program L1 cache miss reduction.   WEI: Whole-program executed instructions reductionInefficiencyOptimizationRoaringBitmap [7]Real-world ApplicationsSoot [40]JGFSerialBench [9]Apache SAMOA [22]fj-kmeans [43]FindBugs-3.0.1 [44]Deeplearning4J AlphaGo Zero [4]Deeplearning4J SameDiff [28]Table 1Time OverheadTime Errorakka-uct1.440.12als1.120.05chi-square1.090.02db-shootout1.430.03dec-tree1.590.08dotty10.03ﬁnagle-http1.060.01fj-kmeans1.330.04future-genetic10.04gauss-mix1.090.09log-regression1.050.05mnemonics1.430.02movie-lens1.030.02naive-bayes10.03neo4j-analytics1.250.06page-rank10.02par-mnemonics1.290.04philosophers1.050.03reactors1.030.02rx-scrabble1.010.03scala-doku10.03scala-kmeans10.01scala-stm-bench71.110.06scrabble1.480.1avrora1.130.07batik1.190.05eclipse1.380.12h21.040.01jython1.090.05luindex1.140.06lusearch1.540.09lusearch-ﬁx1.420.08tradebeans1.320.04tradesoap1.220.05sunﬂow1.010.01xalan1.260.03compress10.02derby1.120.02mpegaudioa10.03serial1.440.04sunﬂow10.02scimark.ﬀt.large1.050.03scimark.lu.large10.02scimark.monte_carlo10.01scimark.sor.large1.030.02scimark.sparse.large1.050.04compiler.sunﬂow1.090.03crypto.aes1.030.03crypto.rsa10.01crypto.signverify10.02xml.transform1.10.06xml.validation1.10.07GeoMean1.13Median1.0900.511.52akka-uctalschi-squaredb-shootoutdec-treedottyﬁnagle-httpfj-kmeansfuture-geneticgauss-mixlog-regressionmnemonicsmovie-lensnaive-bayesneo4j-analyticspage-rankpar-mnemonicsphilosophersreactorsrx-scrabblescala-dokuscala-kmeansscala-stm-bench7scrabbleavrorabatikeclipseh2jythonluindexlusearchlusearch-ﬁxtradebeanstradesoapsunﬂowxalancompressderbympegaudioaserialsunﬂowscimark.ﬀtscimark.lumonte_carloscimark.sorscimark.sparsecompiler.sunﬂowcrypto.aescrypto.rsacrypto.signverifyxml.transformxml.validationGeoMeanMedian11.11.2Runtime Overheads on 5M Sampling PeriodSPECjvm2008Dacapo 9.12Renaissance Benchmark Suite 1Table 1Time OverheadTime Errorakka-uct1.10.04als1.070.05chi-square0.850.04db-shootout10.02dec-tree1.010.05dotty1.10.08ﬁnagle-http1.040.02fj-kmeans1.060.06future-genetic1.530.11gauss-mix1.10.07log-regression0.980.05mnemonics1.050.02movie-lens10.01naive-bayes0.950.04neo4j-analytics0.970.05page-rank1.020.03par-mnemonics1.070.02philosophers1.090.06reactors0.910.07rx-scrabble1.060.02scala-doku1.360.09scala-kmeans1.120.05scala-stm-bench70.920.02scrabble1.020.01avrora1.250.1batik1.260.03eclipse0.830.05h20.740.06jython1.060.08luindex1.280.07lusearch1.050.04lusearch-ﬁx1.080.05tradebeans1.070.08tradesoap1.030.07sunﬂow1.060.05xalan0.90.06compress1.160.07derby0.870.02mpegaudioa1.080.02serial1.010.03sunﬂow1.020.01scimark.ﬀt.large1.030.05scimark.lu.large1.070.09scimark.monte_carlo1.140.08scimark.sor.large1.080.11scimark.sparse.large1.180.13compiler.sunﬂow1.030.02crypto.aes1.110.01crypto.rsa1.20.08crypto.signverify1.020.02xml.transform0.720.04xml.validation1.10.06GeoMean1.05Median1.0600.511.52akka-uctalschi-squaredb-shootoutdec-treedottyﬁnagle-httpfj-kmeansfuture-geneticgauss-mixlog-regressionmnemonicsmovie-lensnaive-bayesneo4j-analyticspage-rankpar-mnemonicsphilosophersreactorsrx-scrabblescala-dokuscala-kmeansscala-stm-bench7scrabbleavrorabatikeclipseh2jythonluindexlusearchlusearch-ﬁxtradebeanstradesoapsunﬂowxalancompressderbympegaudioaserialsunﬂowscimark.ﬀtscimark.lumonte_carloscimark.sorscimark.sparsecompiler.sunﬂowcrypto.aescrypto.rsacrypto.signverifyxml.transformxml.validationGeoMeanMedian11.11.2Memory Overheads on 5M Sampling PeriodSPECjvm2008Dacapo 9.12Renaissance Benchmark Suite 1ICSE ’22, May 21–29, 2022, Pittsburgh, PA, USA
+
+Bolun Li, Hao Xu, Qidong Zhao, Pengfei Su, Milind Chabbi, Shuyin Jiao, and Xu Liu
+
+return ArrayType . SPARSE ;
+
+else if ( hasBitSet ( opt , ATYPE_COMPRESSED_BIT ))
+
+▶ val opt = Shape . options ( shapeInfo );
+if ( hasBitSet ( opt , ATYPE_SPARSE_BIT ))
+
+58 public static ArrayType arrayType ( long [] shapeInfo ) {
+59
+60
+61
+62
+63
+64
+65
+66
+67
+68 }
+
+else if ( hasBitSet ( opt , ATYPE_EMPTY_BIT ))
+
+return ArrayType . COMPRESSED ;
+
+return ArrayType . DENSE ;
+
+return ArrayType . EMPTY ;
+
+else
+
+Listing 2: OJXPerf identified the shapeInfo array with repli-
+cas in Deeplearning4J SameDiff.
+
+often have the same shape property due to the good locality among
+adjacent partitions.
+
+To eliminate redundancies, we first check whether the
+shapeInfo in the current iteration has the same value as in the last
+iteration. If the shapeInfo is unchanged, we reuse the shape prop-
+erty memoized from the previous iteration, which saves the call
+to hasBitSet. This yields a (1.09 ± 0.02)× speedup to the entire
+program.
+
+8.3 Eclipse Deeplearning4J – AlphaGo Zero
+We also run Deeplearning4J using AlphaGo Zero model [4], which
+combines a neural network and Monte Carlo Tree Search in an
+elegant policy iteration framework to achieve stable reinforcement
+learning. OJXPerf studies the training stage and reports an object,
+Map<String, NDArrayCompressor> codecs, which is allocated
+on line 53 and accessed on line 57 in method loadCompressors of
+class BasicNDArrayCompressor with many replicas (its replication
+factor 𝜃 is 81.3%), as shown in Listing 3.
+
+The reason for generated replicas is due to constructing the
+computational graph in the AlphaGo Zero model. To initialize the
+computational graph, the AlphaGo Zero model uses an existing
+array parameters for each layer. Given the topological order, the Al-
+phaGo Zero model constructs the computational graph by iterating
+each subset of array parameters. Since the array parameters is in
+compressed status, to obtain the elements of array parameters, the
+program needs to decompress it first. Deeplearning4J framework
+provides several different compression algorithms (compressor)
+based on the data type (e.g., FLOAT16, FLOAT8, INT16, etc). Since
+every subset of array parameters has the same data type, which
+means we don’t need to load the new compressor and store it again
+in map codecs in a loop (line 69 of Listing 3). To avoid the redundant
+loading and storing compressor, we check whether the program is
+processing different subsets in the same array parameters. If so,
+we use the current compressor directly. This optimization yields a
+(1.15 ± 0.01)× speedup to the entire program.
+
+8.4 FindBugs-3.0.1
+FindBugs looks for code instances that are likely to be errors [45].
+We run Find-Bugs on a real input Java chart library 1.0.19 (a widely
+used client-side chart library for Java). OJXPerf reports an ob-
+ject that has many replicas, BasicBlock block (an object with a
+user-defined type), which is accessed on the line 183 in method
+lookupOrCreateFact of class BasicAbstractDataflowAnalysis,
+as shown in Listing 4.
+
+The replicas come from the algorithm of data-flow analysis used
+in FindBugs. Findbugs divides a data-flow graph into tiny-sized
+
+Figure 6: The Flame Graphs GUI of Soot shows a problematic
+object st with its accesses in full call stacks.
+
+phase, Grimp Body Creation (gb) phase, etc. In the jb phase, the
+JimpleBodys are built by a phase called jb, which is itself comprised
+of subphases, such as the aggregation of local variables (jb.a), type
+assigner (jb.tr), dead assignment eliminator (jb.dae), etc. Each of
+these subphases that belong to jb phase has its own default op-
+tion. By investigating the source code, we found that when the
+soot executes these subphases sequentially, the default option for
+different subphases is stored in the reported StringTokenizer st
+object, which keeps unchanged.
+
+To eliminate these replicas, we only read the default option when
+its contents are changed; otherwise, we reuse the default option
+from the prior subphase. This optimization yields a (1.17 ± 0.02)×
+speedup to the entire program.
+
+8.2 Eclipse Deeplearning4J – SameDiff
+Eclipse Deeplearning4J integrates with Hadoop and runs on several
+backends [28]. We run Deeplearning4J using SameDiff, a TensorFlo-
+w/PyTorch-like framework for executing complex graphs. This
+framework is also the lower lever base API for running onnx and
+TensorFlow graphs. OJXPerf investigates the training phase and
+reports that the replication factor 𝜃 of the input array shapeInfo is
+64.7%, indicating high redundancies in the computation on this ar-
+ray in method hasBitSet, which determines array types, as shown
+in Listing 2.
+
+Deeplearning4J SameDiff builds a directed acyclic graph, whose
+nodes are differential functions used to compute gradients. In the
+SameDiffLayer (a base layer used for implementing Deeplearning4J
+layers with SameDiff), Deeplearning4J provides a set of operations
+named "Custom operations" designed for the SameDiff graph. To
+execute the "Custom operations" within graph, these operations are
+stored in a two-dimensional array. Then Deeplearning4J splits this
+two-dimensional array into different small partitions. Each partition
+has its own shape identifier array shapeInfo, which is used to
+determine four shape properties: SPARSE, COMPRESSED, EMPTY, and
+DENSE. We found that the adjacent partitions in the SameDiff graph
+
+OJXPerf: Featherlight Object Replica Detection for Java Programs
+
+ICSE ’22, May 21–29, 2022, Pittsburgh, PA, USA
+
+58 public void init ( INDArray parameters ) {
+59
+60
+61
+
+...
+for ( int vertexIdx : topologicalOrder ) {
+
+paramsViewForVertex [ vertexIdx ] = parameters . get ( NDArrayIndex
+
+. interval (0 ,0 , true )) ;
+
+}
+
+// get method calls loadCompressors to decompress data
+
+62
+63
+64 }
+65 ▶ protected Map < String , NDArrayCompressor > codecs = new
+
+ConcurrentHashMap < >() ;
+66 protected void loadCompressors () {
+67
+68
+69
+70
+71 }
+
+}
+
+...
+for ( NDArrayCompressor compressor : compressors ) {
+
+▶ codecs . put ( compressor . getDescriptor () , compressor ) ;
+
+Listing 3: OJXPerf identified the codecs map with replicas
+in Deeplearning4J AlphaGo Zero.
+
+176 public /* final */ Fact getStartFact ( BasicBlock block ) {
+177
+return lookupOrCreateFact ( startFactMap , block );
+178 }
+179 public /* final */ Fact getResultFact ( BasicBlock block ) {
+180
+return lookupOrCreateFact ( resultFactMap , block );
+181 }
+182 private Fact lookupOrCreateFact ( Map < BasicBlock , Fact > map ,
+
+BasicBlock block ) {
+▶ Fact fact = map . get ( block ) ;
+if ( fact == null ) {
+
+fact = createFact () ;
+map . put ( block , fact ) ;
+
+}
+return fact ;
+
+183
+184
+185
+186
+187
+188
+189 }
+
+Listing 4: The source code highlighed by OJXPerf shows the
+object block with replicas in Findbugs.
+
+blocks and creates an object for each block instead of creating a sin-
+gle object for the whole graph. Consequently, most created objects
+have the same content due to good value locality among adjacent
+blocks. OJXPerf finds that the method lookupOrCreateFact (line
+182 of Listing 4) method is usually invoked with the same input
+BaiscBlock block. OJXPerf reports that the replication factor 𝜃
+of the input block is 70.3%, indicating many replicas of this object.
+To avoid the redundant lookup and creation, we check whether a
+different block is produced in the current iteration. If the block
+is unchanged, we return fact obtained from the last invocation
+directly. This optimization yields a (1.25 ± 0.03)× speedup to the
+entire program.
+
+8.5 fj-kmeans
+fj-kmeans is a benchmark from Renaissance Suite, used to run
+the k-means algorithm [44]. We run fj-kmeans using the fork/join
+framework as input. OJXPerf reports an object that has many
+replicas, array result, which is allocated on line 5 in method
+findNearestCentroid and accessed on line 2 in method compute
+Directly of class JavaKMeans, as shown in Listing 5.
+
+The generated replicas are due to the finding nearest centroid
+algorithm for many different sets of elements. This finding nearest
+centroid algorithm maintains a collection of centroids, and the
+distance between each centroid is significant. Then, during some
+computation periods, because different sets of elements have small
+distance, the program keeps generating the same centroids and put
+the centroids’ indices into an array result (line 12 of Listing 5),
+which is the object with many replicas (the replication factor 𝜃 is
+76.1%) reported by OJXPerf.
+
+▶ return collectClusters ( findNearestCentroid () );
+
+1 protected Map < Double [] , List < Double [] > > computeDirectly () {
+2
+3 }
+4 private int [] findNearestCentroid () {
+5
+6
+7
+8
+9
+10
+
+▶ final int [] result = new int [ taskSize ];
+...
+for (...) {
+final Double [] element = data . get ( dataIndex );
+
+final double distance = distance ( element , centroids . get (
+
+for (...) {
+
+centroidIndex ));
+
+}
+
+...
+result [ dataIndex - fromInclusive ] = centroidIndex ;
+
+11
+12
+13
+14
+15
+16 }
+17 private Map < Double [] , List < Double [] > > collectClusters ( final int []
+
+}
+return result ;
+
+centroidIndices ) {
+
+// computation with input parameter centroidIndices
+
+18
+19 }
+
+Listing 5: OJXPerf pinpoints the result object with many
+replicas in fj-kmeans.
+
+To eliminate efficiencies, we check the values in array result
+produced by findNearestCentroid. If result is unchanged, we
+reuse the return value of method collectClusters memoized
+from the last iteration, which avoids the redundant computation.
+This optimization yields a (1.08 ± 0.04)× speedup to the entire
+program.
+
+9 Threats to Validity
+The threats reside in validating OJXPerf’s optimization guidance.
+The limited scope of replica detection and the sampling strategy
+does not reveal the ground truth of object replication. Any reported
+replication is input and execution specific. Different inputs can re-
+sult in different profiles, and the effects of optimization on unseen
+inputs will remain unknown. In our studies, we use real inputs for
+the applications to ensure the optimization is valid. Finally, our opti-
+mization may sometimes break the program readability by inserting
+conditional checks. Developers need to decide whether to adopt
+our optimization given their priority on software performance.
+
+10 Conclusions
+In this paper, we design and develop OJXPerf, the first lightweight
+profiler to identify object replicas in Java applications. As a unique
+feature, OJXPerf combines the use of performance monitoring
+units, debug registers and lightweight byte code instrumentation
+for statistical object replica detection. With the evaluation of more
+than 50 Java applications, we show OJXPerf minimizes false posi-
+tives and incurs 9% and 6% runtime and memory overheads, respec-
+tively. We further optimize several real-world applications guided
+by OJXPerf that result in a noticeable reduction in heap-memory
+demands and significant runtime speedups. Many optimization
+patches are confirmed or upstreamed by the software developers.
+OJXPerf is open source at https://github.com/Xuhpclab/jxperf.
+
+Acknowledgements
+We thank the anonymous reviewers for their valuable comments.
+This research was supported by NSF 2050007 and a Google gift.
+
+ICSE ’22, May 21–29, 2022, Pittsburgh, PA, USA
+
+Bolun Li, Hao Xu, Qidong Zhao, Pengfei Su, Milind Chabbi, Shuyin Jiao, and Xu Liu
+
+References
+
+[1] 2013. Obtain object address. https://jrebel.com/rebellabs/dangerous-code-how-
+
+to-be-unsafe-with-java-classes-o\bjects-in-memory/4/.
+
+[2] 2018.
+
+DaCapo Benchmark Suite 9.12.
+
+https://sourceforge.net/projects/
+
+dacapobench/files/9.12-bach-MR1/.
+
+[3] 2018. OProfile. http://oprofile.sourceforge.net.
+[4] 2020. AlphaGo Zero. https://deepmind.com/blog/article/alphago-zero-starting-
+
+scratch.
+
+[5] Ali-Reza Adl-Tabatabai, Richard L. Hudson, Mauricio J. Serrano, and Sreenivas
+Subramoney. 2004. Prefetch injection based on hardware monitoring and object
+metadata. SIGPLAN Not. 39, 6, 267–276.
+
+[6] Randy Allen and Ken Kennedy. 2001. Optimizing Compilers for Modern Architec-
+
+tures: A Dependence-based Approach. Morgan Kaufmann.
+
+[7] Matthew Arnold and Peter F. Sweeney. 1999. Approximating the Calling Context
+
+Tree via Sampling. Technical Report 21789. IBM.
+
+[8] RoaringBitmap authors. 2019.
+RoaringBitmap/RoaringBitmap.
+
+RoaringBitmap.
+
+https://github.com/
+
+[9] Mark Bull, Lorna Smith, Martin Westhead, David Henty, and Robert Davey. 2001.
+Java Grande benchmark suite. https://www.epcc.ed.ac.uk/research/computing/
+performance-characterisation-and-benchmarking/java-grande-benchmark-
+suite.
+
+[10] Wen-ke Chen, Sanjay Bhansali, Trishul Chilimbi, Xiaofeng Gao, and Weihaw
+Chuang. 2006. Profile-guided Proactive Garbage Collection for Locality Opti-
+mization. SIGPLAN Not. 41, 6, 332–340.
+
+[11] Oracle Corp. 2017.
+
+Oracle Developer Studio Performance Ana-
+https://www.oracle.com/technetwork/server-storage/solarisstudio/
+
+lyzer.
+documentation/o11-151-perf-analyzer-brief-1405338.pdf.
+
+[12] Oracle Corporation. 2011. jmap Memory Map. https://docs.oracle.com/javase/7/
+
+docs/technotes/tools/share/jmap.html.
+
+[13] Oracle Corporation. 2018. All-in-One Java Troubleshooting Tool.
+
+https:
+
+//visualvm.github.io.
+
+[14] Standard Performance Evaluation Corporation. 2008. SPECjvm2008 benchmark
+
+suite. https://www.spec.org/jvm2008.
+
+[15] Luca Della Toffola, Michael Pradel, and Thomas R. Gross. 2015. Performance
+Problems You Can Fix: A Dynamic Analysis of Memoization Opportunities.
+Proceedings of the 2015 ACM SIGPLAN Interna- tional Conference on Object-
+Oriented Programming, Systems, Languages, and Applications (OOPSLA 2015),
+607–622.
+
+[16] NASA Advanced Supercomputing Division. 2018. NAS Parallel Benchmarks.
+
+https://www.nas.nasa.gov/publications/npb.html.
+
+[17] R. E. McLear, D. M. Scheibelhut, and E. Tammaru. 1982. Guidelines for creating a
+debuggable processor. Proceedings of the first international symposium on Archi-
+tectural support for programming languages and operating systems (ASPLOS),
+100–106.
+
+[18] Ariel Eizenberg, Shiliang Hu, Gilles Pokam, and Joseph Devietti. 2016. Remix:
+Online Detection and Repair of Cache Contention for the JVM. In Proceedings
+of the 37th ACM SIGPLAN Conference on Programming Language Design and
+Implementation (Santa Barbara, CA, USA) (PLDI ’16). ACM, New York, NY, USA,
+251–265. https://doi.org/10.1145/2908080.2908090
+
+[19] ej-technologies GmbH. 2018. THE AWARD-WINNING ALL-IN-ONE JAVA PRO-
+FILER. https://www.ej-technologies.com/products/jprofiler/overview.html.
+[20] Peter F. Sweeney, Matthias Hauswirth, Brendon Cahoon, Perry Cheng, Amer
+Diwan, David Grove, and Michael Hind. 2004. Using hardware performance
+monitors to understand the behavior of Java applications. In Proceedings of the
+3rd Virtual Machine Research and Technology Symposium (VM’04).
+
+[21] Lu Fang, Liang Dou, and Guoqing Xu. 2015. PerfBlower: Quickly Detecting
+Memory-Related Performance Problems via Amplification. In 29th European
+Conference on Object-Oriented Programming (ECOOP 2015) (Leibniz International
+Proceedings in Informatics (LIPIcs)), John Tang Boyland (Ed.), Vol. 37. Schloss
+Dagstuhl–Leibniz-Zentrum fuer Informatik, Dagstuhl, Germany, 296–320. https:
+//doi.org/10.4230/LIPIcs.ECOOP.2015.296
+
+[22] Apache Software Foundation. 2017. Apache SAMOA: Scalable Advanced Massive
+
+Online Analysis. https://samoa.incubator.apache.org.
+
+[23] Andy Georges, Dries Buytaert, Lieven Eeckhout, and Koen De Bosschere. 2004.
+Method-Level Phase Behavior in Java Workloads. Proc. of the ACM SIGPLAN
+Conf. on Object-Oriented Programming, Systems, Languages, and Applications
+(OOPSLA), 270–287.
+
+[24] YourKit GmbH. 2018. The Industry Leader in .NET and Java Profiling. https:
+
+//www.yourkit.com.
+
+[25] Matthias Hauswirth, Peter F. Sweeney, Amer Diwan, and Michael Hind. 2004. Ver-
+tical Profiling: Understanding the Behavior of Object-Oriented Applications. Proc.
+of Conf. on Object-Oriented Programming, Systems, Languages, and Applications
+(OOPSLA), 251–269.
+
+[26] Matthew Hertz, Stephen M. Blackburn, J. Eliot B. Moss, Kathryn S. McKinley,
+and Darko Stefanović. 2006. Generating object lifetime traces with Merlin. ACM
+Transactions on Programming Languages and Systems.
+
+[27] Xianglong Huang, Stephen M. Blackburn, Kathryn S. McKinley, J Eliot B. Moss,
+Zhenlin Wang, and Perry Cheng. 2004. The Garbage Collection Advantage:
+Improving Program Locality. SIGPLAN Not. 39, 10, 69–80.
+
+[28] Skymind Inc. 2019. Deep Learning for Java. https://deeplearning4j.org.
+[29] Twitter Inc. 2019. Parquet MR. https://github.com/apache/parquet-mr.
+[30] Intel Corporation. 2010. Intel 64 and IA-32 Architectures Software Developer’s
+
+Manual, Volume 3B: System Programming Guide, Part 2, Number 253669-032.
+
+[31] Nguyen Khanh and Guoqing Xu. 2013. Cachetor: Detecting Cacheable Data to
+Remove Bloat. ESEC/FSE 2013 Proceedings of the 2013 9th Joint Meeting on
+Foundations of Software Engineering, 268–278.
+
+[32] Andreas Kull. 2020. Awesome Java. https://github.com/akullpp/awesome-java.
+[33] Jeremy Lau, Matthew Arnold, Michael Hind, and Brad Calder. 2006. Online
+performance auditing: Using hot optimizations without getting burned. In Proc.
+Conf. on Programming Language Design and Implementation (PLDI 2006), New
+York, USA, 239–251.
+
+[34] Linux. 2015. Linux Perf Tool. http://www.brendangregg.com/perf.html.
+[35] Stephen M. Blackburn, Robin Garner, Chris Hoffmann, Asjad M. Khang, Kathryn
+S. McKinley, Rotem Bentzur, Amer Diwan, Daniel Feinberg, Daniel Frampton,
+Samuel Z. Guyer, Martin Hirzel, Antony Hosking, Maria Jump, Han Lee, J. Eliot
+B. Moss, Aashish Phansalkar, Darko Stefanović, Thomas VanDrunen, Daniel
+von Dincklage, and Ben Wiedermann. 2006. The DaCapo benchmarks: java
+benchmarking development and analysis. OOPSLA ’06 Proceedings of the 21st
+annual ACM SIGPLAN conference on Object-oriented programming systems,
+languages, and applications, Portland, Oregon, USA, 169–190.
+
+[36] Trishul M. Chilimbi and James R. Larus. 1998. Using Generational Garbage
+Collection to Implement Cache-conscious Data Placement. SIGPLAN Not. 34, 3,
+37–48.
+
+[37] Darko Marinov and Robery O’Callahan. 2003. Object Equality Profiling. ACM
+SIGPLAN International Conference on Object-Oriented Programming, Systems,
+Languages, and Applications (OOPSLA), 313–325.
+
+[38] Khanh Nguyen and Guoqing Xu. 2013. Cachetor: Detecting Cacheable Data
+to Remove Bloat. In Proceedings of the 2013 9th Joint Meeting on Foundations of
+Software Engineering (Saint Petersburg, Russia) (ESEC/FSE 2013). Association for
+Computing Machinery, New York, NY, USA, 268–278. https://doi.org/10.1145/
+2491411.2491416
+
+[39] Adrian Nistor, Linhai Song, Darko Marinov, and Shan Lu. 2013. Toddler: Detecting
+Performance Problems via Similar Memory-access Patterns. In Proceedings of the
+2013 International Conference on Software Engineering (San Francisco, CA, USA)
+(ICSE ’13). IEEE Press, Piscataway, NJ, USA, 562–571.
+
+[40] Nitsan Wakart. 2016. The Pros and Cons of AsyncGetCallTrace Profilers. http:
+
+//psy-lob-saw.blogspot.com/2016/06/the-pros-and-cons-of-agct.html.
+
+[41] Sable Research Group of McGill University. 2019. Soot. https://sable.github.io/
+
+soot/.
+
+[42] Oracle Corp. 2016. NetBeans profiler. https://profiler.netbeans.org.
+[43] Andrei Pangin. 2018. Async-profiler. https://github.com/jvm-profiling-tools/
+
+async-profiler.
+
+[44] Aleksandar Prokopec, Andrea Rosà, David Leopoldseder, Gilles Duboscq, Petr
+Tůma, Martin Studener, Lubomír Bulej, Yudi Zheng, Alex Villazón, Doug Simon,
+Thomas Würthinger, and Walter Binder. 2019. Renaissance: Benchmarking Suite
+for Parallel Applications on the JVM. In Proceedings of the 40th ACM SIGPLAN
+Conference on Programming Language Design and Implementation (Phoenix, AZ,
+USA) (PLDI 2019). ACM, New York, NY, USA, 31–47. https://doi.org/10.1145/
+3314221.3314637
+
+[45] Bill Pugh, Andrey Loskutov, and Keith Lea. 2015. FindBugs. http://findbugs.
+
+sourceforge.net.
+
+[46] Jeffrey S. Vitter. 1985. Random Sampling with a Reservoir. ACM Transactions on
+
+Mathematical Software (TOMS), 37–57.
+
+[47] Mark Scott Johnson. 1982. Some requirements for architectural support of
+software debugging. Proceedings of the first international symposium on Archi-
+tectural support for programming languages and operating systems (ASPLOS),
+140–148.
+
+[48] Ajeet Shankar, Mattew Arnold, and Rastislav Bodik. 2008. JOLT: Lightweight
+Dynamic Analysis and Removal of Object Churn. ACM SIGPLAN International
+Conference on Object-Oriented Programming, Systems, Languages, and Applica-
+tions (OOPSLA), 127–142.
+
+[49] Yefim Shuf, Manish Gupta, Hubertus Franke, Andrew Appel, and Jaswinder
+Pal Singh. 2002. Creating and Preserving Locality of Java Applications at Alloca-
+tion and Garbage Collection Times. SIGPLAN Not. 37, 11, 13–25.
+
+[50] Linhai Song and Shan Lu. 2017. Performance Diagnosis for Inefficient Loops. In
+Proceedings of the 39th International Conference on Software Engineering (Buenos
+Aires, Argentina) (ICSE ’17). IEEE Press, Piscataway, NJ, USA, 370–380.
+
+[51] Pengfei Su, Qingsen Wang, Chabbi Milind, and Xu Liu. 2019. Pinpointing Perfor-
+mance Inefficiencies in Java. The 27th ACM Joint European Software Engineering
+Conference and Symposium on the Foundations of Software Engineering, Tallinn,
+Estonia.
+
+[52] Nathan R. Tallent. 2010. Performance analysis for parallel programs from multicore
+to petascale. Ph.D. thesis. Department of Computer Science, Rice University.
+
+OJXPerf: Featherlight Object Replica Detection for Java Programs
+
+ICSE ’22, May 21–29, 2022, Pittsburgh, PA, USA
+
+[53] Qingsen Wang, Xu Liu, and Milind Chabbi. 2019. Featherlight Reuse-Distance
+Measurement. Proceedings of The 25th IEEE International Symposium on High
+Performance Computer Architecture, 440–453.
+
+[54] Shasha Wen, Milind Chabbi, and Xu Liu. 2017. REDSPY: Exploring Value Locality
+in Software. In Proceedings of the Twenty-Second International Conference on
+Architectural Support for Programming Languages and Operating Systems (Xi’an,
+China) (ASPLOS ’17). Association for Computing Machinery, New York, NY, USA,
+47–61. https://doi.org/10.1145/3037697.3037729
+
+[55] Shasha Wen, Xu Liu, John Byrne, and Milind Chabbi. 2018. Watching for Soft-
+ware Inefficiencies with Witch. Proceedings of the Twenty-Third International
+Conference on Architectural Support for Programming Languages and Operating
+Systems (ASPLOS ’18), 440–453.
+
+[56] Guoqing Xu. 2012. Finding reusable data structures. ACM SIGPLAN Interna-
+tional Conference on Object-Oriented Programming, Systems, Languages, and
+Applications (OOPSLA), 1017–1034.
+
+[57] Guoqing Xu. 2013. Resurrector: A Tunable Object Lifetime Profiling Technique
+for Optimizing Real-World Programs. In Proceedings of the 2013 ACM SIGPLAN
+International Conference on Object Oriented Programming Systems Languages
+and Applications (Indianapolis, Indiana, USA) (OOPSLA ’13). Association for
+Computing Machinery, New York, NY, USA, 111–130. https://doi.org/10.1145/
+2509136.2509512
+
+[58] Guoqing Xu, Matthew Arnold, and Nick Mitchell. 2009. Go with the Flow:
+Profiling Copies To Find Runtime Bloat. Proceedings of the 30th ACM SIGPLAN
+Conference on Programming Language Design and Implementation (PLDI ’09),
+419–430.
+
+[59] Guoqing Xu, Matthew Arnold, Nick Mitchell, Atanas Rountev, and Gary Sevitsky.
+2009. Go with the Flow: Profiling Copies to Find Runtime Bloat. In Proceedings
+of the 30th ACM SIGPLAN Conference on Programming Language Design and Im-
+plementation (Dublin, Ireland) (PLDI ’09). Association for Computing Machinery,
+New York, NY, USA, 419–430. https://doi.org/10.1145/1542476.1542523
+
+[60] Guoqing Xu, Michael D. Bond, Feng Qin, and Atanas Rountev. 2011. LeakChaser:
+Helping Programmers Narrow down Causes of Memory Leaks. In Proceedings of
+the 32nd ACM SIGPLAN Conference on Programming Language Design and Imple-
+mentation (San Jose, California, USA) (PLDI ’11). Association for Computing Ma-
+chinery, New York, NY, USA, 270–282. https://doi.org/10.1145/1993498.1993530
+[61] Guoqing Xu, Nick Mitchell, Matthew Arnold, Atanas Rountev, Edith Schonberg,
+and Gary Sevitsky. 2014. Scalable Runtime Bloat Detection Using Abstract
+Dynamic Slicing. ACM Trans. Softw. Eng. Methodol. 23, 3, Article 23 (June 2014),
+50 pages. https://doi.org/10.1145/2560047
+
+[62] Guoqing Xu and Atanas Rountev. 2010. Detecting Inefficiently-Used Containers
+to Avoid Bloat. In Proceedings of the 31st ACM SIGPLAN Conference on Pro-
+gramming Language Design and Implementation (Toronto, Ontario, Canada)
+(PLDI ’10). Association for Computing Machinery, New York, NY, USA, 160–173.
+https://doi.org/10.1145/1806596.1806616
+
+[63] Guoqing Xu and Atanas Rountev. 2010. Detecting Inefficiently-Used Containers to
+Avoid Bloat. Proceedings of the 31st ACM SIGPLAN Conference on Programming
+Language Design and Implementation (PLDI ’10)., 160–173.
+
+[64] Guoqing Xu, Dacong Yan, and Atanas Rountev. 2012. Static Detection of
+Loop-Invariant Data Structures. In Proceedings of the 26th European Conference
+on Object-Oriented Programming (Beijing, China) (ECOOP’12). Springer-Verlag,
+Berlin, Heidelberg, 738–763. https://doi.org/10.1007/978-3-642-31057-7_32
+[65] Dacong Yan, Guoqing (Harry) Xu, Shengqian Yang, and Atanas Rountev. 2014.
+LeakChecker: Practical Static Memory Leak Detection for Managed Languages.
+In 12th Annual IEEE/ACM International Symposium on Code Generation and Opti-
+mization, CGO 2014, Orlando, FL, USA, February 15-19, 2014, David R. Kaeli and
+Tipp Moseley (Eds.). ACM, 87. https://dl.acm.org/citation.cfm?id=2544151
+[66] Albert Mingkun Yang, Erik Österlund, and Tobias Wrigstad. 2020. Improving
+program locality in the GC using hotness. PLDI 2020: Proceedings of the 41st ACM
+SIGPLAN Conference on Programming Language Design and Implementation,
+New York, NY, 301–313.
+
+

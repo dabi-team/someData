@@ -1,0 +1,2607 @@
+2
+2
+0
+2
+
+r
+p
+A
+8
+2
+
+]
+
+C
+D
+.
+s
+c
+[
+
+1
+v
+1
+6
+5
+3
+1
+.
+4
+0
+2
+2
+:
+v
+i
+X
+r
+a
+
+FuncPipe: A Pipelined Serverless Framework for Fast and Cost-efﬁcient Training
+of Deep Learning Models
+
+Yunzhuo Liu
+Shanghai Jiao Tong University
+
+Bo Jiang
+Shanghai Jiao Tong University
+
+Tian Guo
+Worcester Polytechnic Institute
+
+Zimeng Huang
+Shanghai Jiao Tong University
+
+Wenhao Ma
+Shanghai Jiao Tong University
+
+Xinbing Wang
+Shanghai Jiao Tong University
+
+Chenghu Zhou
+Chinese Academy of Sciences
+
+Abstract
+Training deep learning (DL) models has become a norm.
+With the emergence of serverless computing and its bene-
+ﬁts of true pay-as-you-go pricing and scalability, systems
+researchers have recently started to provide support for
+serverless-based training. However, the ability to train deep
+learning models on serverless platforms is hindered by the in-
+herent limitations of today’s serverless infrastructure and the
+explosive requirement on memory and bandwidth. For exam-
+ple, existing AWS serverless functions have up to 10GB mem-
+ory and 70MB/s bandwidth while training an AmoebaNet-D
+model with batch size 64 can require 45GB memory and
+transfer 900MB data per iteration. The appalling resource
+mismatch between serverless functions and DL models has
+stalled the progress on serverless-based training.
+
+In this paper, we present FUNCPIPE, the ﬁrst pipelined
+serverless framework that enables fast and low-cost training
+of DL models. FUNCPIPE is designed with the key insight
+that model partitioning can be leveraged to bridge both mem-
+ory and bandwidth gaps between the capacity of serverless
+functions and the requirement of DL training. Conceptually
+simple, we have to answer a number of design questions in-
+cluding how to partition the model, how to conﬁgure each
+serverless function, and how to exploit each function’s uplink/-
+downlink bandwidth. We co-optimize model partition and
+resource allocation with a Mixed-Integer Quadratic Program-
+ming formulation and redesign storage-based communica-
+tion for efﬁcient bandwidth usage. We implement FUNCPIPE
+on AWS and AliCloud and show that it achieves up to 77%
+cost savings and 2.2X speedup comparing to state-of-the-art
+serverless-based frameworks.
+
+1 Introduction
+
+Serverless computing has recently been exploited for dis-
+tributed training as an alternative to traditional VM-based
+training [9, 27, 56, 60]. Serverless-based training has many
+attractive properties: it relieves machine learning practition-
+ers from resource management tasks [9, 56]; it exhibits good
+
+(a) LambdaML performance.
+
+(b) Training with three conﬁgurations.
+
+(a) LambdaML encounters communication bot-
+Figure 1:
+tleneck when training an AmoebaNet-D model. (b) There is
+large room for training cost and time improvement with opti-
+mized model partition and serverless resource conﬁguration.
+
+resource elasticity and can auto-scale to many serverless work-
+ers for increased parallelism [53,56]. However, today’s server-
+less infrastructures exhibit inherent limitations on available
+memory and bandwidth that make it difﬁcult to directly uti-
+lize them to train resource-intensive DL models. As such,
+recent serverless-based training frameworks mostly focus on
+systems techniques to enable model training [27, 60], but still
+fall short in supporting fast and cost-efﬁcient training due to
+the following reasons:
+
+• Serverless functions have very limited communication ca-
+pability that does not meet the growing communication de-
+mand for training DL models. The network bandwidth of a
+serverless function is typically very small. For instance, the
+maximum bandwidth of an AWS Lambda function is only
+about 70 MB/s [28,57]. Moreover, serverless functions lack
+the ability of direct inter-function communication, which
+makes recent serverless-based training frameworks resort
+to two-hop communication via intermediary cloud stor-
+age such as Amazon S3 [27, 56]. Compounding with other
+design options such as data parallelism, existing serverless-
+based training frameworks can suffer severe communication
+bottleneck. Fig. 1(a) shows the iteration time for training
+a 900MB AmoebaNet-D with 8 AWS Lambda functions
+using LambdaML [27], a state-of-the-art serverless-based
+training framework. Note that computation takes only 6s
+
+1
+
+Amoebanet-D02040Iteration time (s)6.035.5CompComm304050Iteration time(s)0.10.2Cost (USD)FuncPipeB1B2 
+ 
+ 
+ 
+ 
+ 
+while communication takes nearly 36s.
+
+• Serverless functions are allowed much smaller memory
+footprint than traditional VMs, hindering their ability to
+achieve cost-efﬁcient computation-to-communication ratio.
+The memory consumption during training increases with
+the model size and the activation size, the latter being pro-
+portional to the batch size. Today’s serverless platform, e.g.
+AWS Lambda, offers up to 10GB memory size for a server-
+less function [5], which often falls short for training with a
+large batch size. For example, increasing the computation-
+to-communication ratio of the AmoebaNet-D from 0.17
+in Fig. 1(a) to 0.5 (with local batch size ≈ 32) would re-
+quire about 30GB memory, far above the current memory
+cap of AWS Lambda. Existing serverless-based training
+frameworks provide no solution for this low computation-
+to-communicaiton ratio [9, 27, 56].
+
+Our work aims at improving the speed and cost-efﬁciency
+of training DL models on serverless platforms. We address
+the above challenges through two major approaches, utilizing
+model partition techniques and improving storage-based com-
+munication efﬁciency. Our key insight is that model partition-
+ing is not only good for overcoming the memory limitation,
+but also useful in relieving the communication burden in train-
+ing. More speciﬁcally, to reduce the long communication time
+caused by the small bandwidth, we utilize model partition to
+reduce the amount of gradients of each serverless worker. Al-
+though greatly reduced through partition, the communication
+may still take up a large proportion of training time. We iden-
+tify that the recently proposed storage-based scatter-reduce
+communication scheme [27] fails to simultaneously utilize
+the uplink/downlink bandwidth of serverless functions. To
+further speedup the communication, we redesign the scatter-
+reduce scheme that pipelines the upload and download to
+improve network utilization. Also, we are able to increase
+the computation to communication ratio as partitioned model
+allows a larger training batch size on each serverless function.
+At the core, our work explores pipeline parallelism [14, 21,
+38, 48], a type of parallel structure based on model partition,
+for fast and low-cost serverless-based training. We answer
+two key design questions: (i) how to partition the DL model;
+and (ii) how to allocate resource for each serverless function.
+These two questions pose a more complicated optimization
+question, compared to existing server-based pipelined train-
+ing [14, 38, 51]. Speciﬁcally, those prior work often assume
+static training resources, i.e., a ﬁxed number of workers with
+ﬁxed resources, and with the goal to only maximize training
+throughput. In contrast, our work tackles both model parti-
+tion and resource allocation to workers to optimize for both
+training throughput and cost. Fig. 1(b) compares the perfor-
+mance of training an AmoebaNet-D with the model partition
+and serverless resource allocation conﬁgurations found by
+FUNCPIPE and two existing algorithms (denoted by B1 and
+B2). We can see a large space for improvement: training
+
+with conﬁguration found by FUNCPIPE reduces 52%/70%
+iteration time/cost compared to B1, and reduces cost by 80%
+compared to B2 with only 8% time overhead.
+
+In short, we make the following main contributions.
+
+• We design and implement FUNCPIPE, the ﬁrst pipelined
+serverless framework that enables fast and cost-efﬁcient
+training of DL models. FUNCPIPE provides user-friendly
+Python APIs that require minimal changes to user code.
+
+• We propose a novel pipelined scatter-reduce scheme that
+better utilizes the uplink/downlink bandwidth during model
+synchronization. Our scheme reduces the synchronization
+time by up to 26% and the overall iteration time by up to
+18% compared to the non-pipelined scatter-reduce in [27].
+
+• We formulate a co-optimization problem for model parti-
+tion and resource allocation using Mixed-Integer Quadratic
+Programming (MIQP). Our approach ﬁnds conﬁgurations
+that achieve up to 80% higher training speed and 55% lower
+cost compared to existing approaches [8, 51].
+
+• We conduct extensive evaluation of FUNCPIPE on two
+public serverless platforms with representative DL models.
+FUNCPIPE improves the training speed by up to 2.2X while
+reducing the training cost by 77%, compared to LambdaML,
+the state-of-the-art serverless training framework [27].
+
+2 Background
+
+2.1 Serverless Computing
+
+Serverless computing provides a new paradigm for deploying
+applications. To use serverless computing on major platforms
+such as AWS Lambda [5], users upload their applications
+as stateless serverless functions and need to conﬁgure the
+functions with the proper amount of resources. Serverless
+users can execute the functions and obtain the computation
+results without having to manage the underlying computation
+resources such as VMs. The task of resource conﬁguration in
+today’s serverless platforms amounts to deciding the memory
+allocation; given an memory allocation, other resources like
+CPU and network bandwidth are allocated proportionally. Fur-
+ther, users are charged proportional to the allocated memory
+and the actual runtime of their program.
+
+Serverless computing makes it easy to trigger many in-
+stances of the same serverless function (up to thousands)
+concurrently; each function instance is often ready to run
+within seconds or even milliseconds depending on the cold-
+start [35, 54]. Serverless provides the true pay-as-you-go pric-
+ing models and has garnered high interests from both industry
+and academia [1, 13, 20, 42] to run event-driven workloads
+such as in-memory caching [44, 45, 55] and workloads that
+beneﬁt from high degree of parallelism including distributed
+
+2
+
+training [9,27,56,60]. In this work, we are interested in extend-
+ing serverless computing’s beneﬁts toward fast and low-cost
+distributed training of deep learning models.
+
+centralized synchronous training with the goal to fully exploit
+worker bandwidth and avoid impact on converged accuracy.
+
+2.2 Distributed Training
+
+Distributed training refers to the process of training a machine
+learning model with multiple workers that communicate over
+NVLink or over network [11, 64]. The essence of distributed
+training boils down to determine how to divide tasks among
+workers and how to communicate progress.
+
+Parallelism. The most widely adopted type of parallelism
+is data parallelism [30, 46], where each worker maintains a
+replica of the entire model and a split of the dataset. In a train-
+ing iteration, i.e. the processing of one batch of data, workers
+calculate the gradients on their local data and then exchange
+the gradients with each other and update the model parameters.
+Another type is model parallelism [7, 10, 22] where the model
+is partitioned across workers. Rather than compute the gradi-
+ents for the entire model, each worker will only compute the
+data batch on the assigned partition and then communicate the
+output to the next worker. Consequently, model parallelism
+often leads to reduced memory consumption and communica-
+tion data size on each worker. Data parallelism can be further
+combined with model parallelism by having multiple replicas
+for each model partition [6, 17, 25]. In such case, workers
+working on the same partition need to synchronize gradients
+with each other. Compared with data parallelism, hybrid par-
+allelism reduces worker-to-worker communication as only
+gradients for partitions are exchanged. Our work leverages
+pipeline parallelism where we partition the model and allows
+data parallelism for each partition, as further describe in § 2.3.
+It falls under the general hybrid parallelism.
+
+Synchronization. Today’s distributed training frameworks
+either resort to centralized or decentralized synchronization
+architectures. Parameter Server (PS)-based architecture is a
+typical centralized structure where workers upload their gradi-
+ents to a central server and from whom fetch the latest updated
+model [32, 33]. A recently proposed serverless-based train-
+ing framework Cirrus [9] uses a VM as a parameter server
+and serverless instances as workers. We refer to a mix of
+traditional VMs and serverless workers as hybrid PS struc-
+ture. In decentralized synchronization, workers communicate
+with each other following the steps of the speciﬁc commu-
+nication algorithms, such as all-reduce [40, 41, 43, 52] and
+scatter-reduce [52]. LambdaML [27] proposes the most re-
+cent storage-based scatter-reduce method. Finally, distributed
+training can either use synchronous or asynchronous protocols
+to instruct when workers can proceed to work on the next data
+batch. Synchronous protocol, in essence, allows workers to
+work on the same version of model parameters and therefore
+is not subject to potential accuracy convergence issues faced
+by asynchronous training [34, 63]. In this work, we use de-
+
+3
+
+2.3 Pipeline Training
+
+Pipeline parallelism has been explored as a technique to im-
+prove the resource utilization of traditional server-based dis-
+tributed training [14, 21, 31, 38, 48]. At a high level, pipeline
+parallelism divides a data batch into micro-batches and treats
+each model partition as a stage in the pipeline. During the
+training, micro-batches will be scheduled to go through the
+model partitions in a pipelined fashion to simultaneously
+utilized resources of different stages. As such, pipeline par-
+allelism can address the low resource utilization problem of
+model parallelism by reducing the worker idle time.
+
+One of the key challenges in applying pipeline parallelism
+to distributed training is to ensure training efﬁciency. For ex-
+ample, unoptimized model partition can lead to imbalanced
+stage time or cause long inter-stage communication time,
+hindering the overall training performance. The problem of
+conﬁguring pipeline parallelism often comes down to parti-
+tioning the model and assigning partitions to workers. Prior
+work on server-based training has proposed various model
+partition strategies to improve training throughput [14,38,51];
+however, they often assume static training resources, i.e., a
+ﬁxed number of workers with ﬁxed resources. In serverless
+computing, we are presented with the ﬂexibility to scale up to
+many workers and to easily conﬁgure workers with different
+amount of resources. Such ﬂexibility is a double-edged sword:
+it gives us more knobs to improve the performance and reduce
+the monetary cost, while it also makes the problem of con-
+ﬁguring pipeline parallelism more difﬁcult. In this work, we
+tackle the challenge of effectively conﬁguring pipeline paral-
+lelism in a serverless-based training environment to achieve
+high throughput and incur low cloud bills.
+
+3 FUNCPIPE
+
+In this section, we present FUNCPIPE, a novel pipelined
+serverless framework for efﬁcient training of DL models. § 3.1
+provides an overview of the system architecture and work-
+ﬂow. § 3.2 and § 3.3 give detailed designs of the main train-
+ing pipeline and pipelined scatter-reduce, respectively. § 3.4
+presents our co-optimization approach for model partition and
+resource allocation.
+
+3.1 System Overview
+
+System Architecture. As shown in Fig. 2, FUNCPIPE con-
+sists of three parts, startup components, runtime components
+and client-side APIs. The startup and runtime components
+are displayed in the two gray boxes in the ﬁgure, represented
+by blue and yellow boxes respectively. Those components
+
+Figure 2: FUNCPIPE system architecture and workﬂow. The two gray boxes enclose FUNCPIPE components. The blue blocks
+are the startup components active in the initial worker, and the yellow blocks are the runtime components in a training worker.
+
+run on the serverless platform and interact with cloud storage
+and client-side APIs. The client-side APIs enable the users to
+setup, launch, and monitor the training with minimum effort.
+
+Workﬂow. The workﬂow of FUNCPIPE is shown in Fig. 2.
+The user ﬁrst prepares the training code using FUNCPIPE
+APIs, and then sets up and launches training from the client
+side ( 1(cid:13) and 2(cid:13)). At the beginning, an initial worker with the
+startup components performs the preparation work: 3(cid:13) Model
+Proﬁler proﬁles model layers on serverless functions with dif-
+ferent memory allocations; 4(cid:13) With the gathered layer-wise
+information, e.g., computation time, parameter and activation
+size, Partition/Resource Optimizer ﬁnds the optimal model
+partition and the best resource allocation basing on our MIQP
+formulation (§ 3.4); 5(cid:13) Function Manager launches and con-
+ﬁgures all training workers to start the pipeline.
+
+When the pipeline training starts, micro-batches are sched-
+uled to traverse the pipeline: 6(cid:13) Pipeline Scheduler in each
+worker decides their order in processing the micro-batches.
+7(cid:13) Task Executor handles the processing tasks by interact-
+ing with the underlying storage-based Communication Prim-
+itives and Pytorch. It properly overlaps the communication
+and computation. 8(cid:13) Function Manager on each worker ex-
+changes information during training to ensure the health of
+the pipeline; it checkpoints and restarts the worker at desig-
+nated time interval to deal with serverless function timeout.
+9(cid:13) Monitor Daemon gathers and uploads training information
+that the user can access using client-side API ( 10(cid:13)).
+
+3.2 Main Training Pipeline
+
+We illustrate the pipeline design of FUNCPIPE through the ex-
+ample in Fig. 3. The pipeline performs synchronous training
+that avoids potential accuracy convergence issues. FUNCPIPE
+partitions the model and places each partition on a server-
+less worker. In a training iteration, the data batch is divided as
+micro-batches (the ID of each micro-batch is labeled on its cor-
+responding blocks in Fig. 3) and they are scheduled to traverse
+the partitions in the following order: (i) all micro-batches go
+
+through each partition to perform forward computation; (ii)
+after all forward computation have ﬁnished, the micro-batches
+go in a reversed order for backward computation, i.e. back-
+propagation. Our micro-batch scheduling policy is similar to
+the one in GPipe [21], a pipeline design for server and GPU
+based training. Each worker in our pipeline generally handles
+two types of tasks, computation and communication. Commu-
+nication tasks are further divided into upload, download, and
+sync. The output of the partitions are communicated through
+upload and download to/from the cloud storage; sync is re-
+quired at the end of a training iteration if multiple workers
+are conﬁgured for a partition (i.e., data parallelism). It can
+be performed as soon as the backward computation of the
+partition is completed.
+
+Communication Optimization. A key difference between
+serverless and server-based pipelines is the proportion of
+communication time in the overall training time. In the server-
+based case, communication time is usually negligible as its
+workers can have large bandwidth, e.g., 100Gb RDMA or
+300Gb NVlink. In the serverless case, however, it can take
+up a large proportion as serverless functions have limited
+bandwidth. Both upload and download times can be compa-
+rable to computation time, and sync time can even be signif-
+icantly longer depending on the degree of data parallelism.
+For upload and download, our solution is to treat them as
+independent pipline stages and overlap them with each other
+and the computation tasks. For sync, we design a pipelined
+scatter-reduce scheme in § 3.3.
+
+Discussion on Micro-batch Scheduling. There exist other
+micro-batch scheduling policies [14, 23, 31]. These policies,
+designed for server-based training, aim to reduce memory con-
+sumption. In the serverless case, however, a smaller memory
+allocation is not necessarily desirable. As other resources like
+CPU and bandwidth are allocated proportionally to memory,
+it can slow down computation and communication and hence
+incur a higher cost due to increased training time. Moreover,
+more complicated scheduling also complicates the model par-
+
+4
+
+Profiler functions7. Monitor trainingFuncPipe API10...512MB1024MB3Partition/ResourceOptimizer Function Manager4...Initial worker5Training PipelineCommunicationPrimitives............Stage 0Stage 1Stage 267Cloud storage89ClientTraining iterationCloudMonitor DaemonPipeline SchedulerTask ExecutorFunction ManagerModel ProfilerData LoadingComputationwith Pytorch 1. Code upload and setup1FuncPipe API    LaunchFuncPipe API2UserFigure 3: Main training pipeline of FUNCPIPE.
+
+tition and resource allocation problem in §3.4. We leave it for
+future work to explore different scheduling.
+
+3.3 Pipelined Scatter-reduce
+
+We identify one of the reasons for the low communication ef-
+ﬁciency in existing serverless-based training frameworks [27]
+as that the current storage-based synchronization design fails
+to make efﬁcient use of the network bandwidth. To address
+the problem, we propose a pipelined storage-based scatter-
+reduce method that simultaneously utilizes downlink and up-
+link bandwidth. Fig. 4(a) displays the state-of-the-art storage-
+based scatter-reduce method proposed in LambdaML [27]. It
+utilizes the computation resource of all workers for gradient
+aggregation by dividing the gradients as n splits, where n is
+the number of workers, and each worker is in charge of merg-
+ing one split. The scatter-reduce process can be divided into
+three phases: in phase 1, each worker uploads the n − 1 gradi-
+ent splits that other worker are in charge of to the storage. In
+phase 2, the i-th worker retrieves all the i-th splits uploaded by
+other workers and computes the merged gradients. In phase
+3, each worker uploads its merged split and retrieves all other
+merged splits. The communication time of phase 1 and phase
+n·w + tlat , where sgrad is the size of the gradi-
+2 are both
+ents, w is the bandwidth of a worker and tlat is the latency for
+accessing the storage. The communication time of phase 3 is
+sgrad
+w + 2tlat , and the total synchronization time is
+
+sgrad (n−1)
+
+3 ·
+
+sgrad
+w
+
+−
+
+2sgrad
+n · w
+
++ 4tlat
+
+(1)
+
+As the upload in phase 1 and the download in phase 2 are
+performed in a serial fashion, the network resource is not
+efﬁciently utilized.
+
+Our design further pipelines phase 1 and phase 2 to im-
+prove communication efﬁciency. The pipelined phase in-
+cludes a total of n steps, as shown in Fig. 4(b):
+
+• In step 1: worker i uploads gradient split i + 1 to storage.
+
+• In step k, for 2 ≤ k ≤ n − 1: worker i uploads gradient
+split i + k to storage while downloading split i uploaded by
+worker i − (k − 1).
+
+• In step n: worker i downloads gradient split i uploaded by
+
+worker i + 1.
+
+We use arithmetic modulo n in the above. The communication
+sgrad
+n·w +tlat , and the total time
+time of each of the above steps is
+sgrad
+w + n · tlat . The synchronization time after
+for n steps is
+pipelining is
+
+2 ·
+
+sgrad
+w
+
++ (2 + n)tlat
+
+(2)
+
+n·w to 2
+
+w − 2sgrad
+sgrad
+
+Comparing (2) and (1), the pipelined scatter-reduce can
+achieve noticeable reduction in the transfer time, i.e. from
+sgrad
+3
+w . For example, for an AWS Lambda
+function with 70MB/s bandwidth, the data transfer time in
+synchronizing a 280MB model among 8 workers can be re-
+duced by 27%, from 11s to 8s. Although our design can suffer
+higher latency with the increase of workers, the latency is
+much smaller compared with the data transfer time, e.g. the
+measured tlat is less than 40ms for AWS Lambda.
+
+3.4 Co-optimization of Model Partition and
+
+Resource Allocation
+
+In order to make the training pipeline fast and cost-efﬁcient,
+we need to optimize the partition plan that splits model layers
+into different pipeline stages, and the resource allocation for
+each stage, including the number of workers used for intra-
+stage data parallelism as well as the memory size of each
+worker. A major challenge here is the strong coupling between
+model partitioning and resource allocation, which deﬁes most
+existing solutions that optimize only one aspect [14, 38, 51].
+In this section, we formulate the co-optimization of model
+partition and resource allocation as a mixed-integer quadratic
+program.
+
+3.4.1 Formulation of Optimization Problem
+
+Consider a model with L layers. Let D = {D1, . . . , DK} be
+the set of possible degrees of data parallelism, where D1 = 1,
+meaning no data parallelism. Let M = {M1, . . . , MJ} be the
+set of different memory sizes for serverless workers. We use a
+binary variables xi to indicate whether the model is partitioned
+after layer i. Let d ∈ D be the degree of data parallelism. We
+enforce the same degree of data parallelism for all stages to
+reduce the problem complexity. Let mi ∈ M be the memory
+size of workers holding layer i. We parameterize d and mi
+as d = ∑K
+j=1 zi, jM j with binary variables
+
+k=1 ykDk and mi = ∑J
+
+5
+
+0↑1↑2↑0↑1↑2↑0↑1↑2↑0↑1↑2↑0↑1↑2↑0↑1↑2↑0↑1↑2↑0↑1↑2↑0↓1↓2↓0↓1↓2↓0↓1↓2↓0↓1↓2↓0↓1↓2↓0↓1↓2↓0↓1↓2↓0↓1↓2↓syncsyncsyncx1=1x3=1x2=0layer1layer2layer3layer4partition1partition2partition30ˆt3fct0f∆ftftf+t2bt2btf+t2b+t2st2stitercomputationuploaddownloadFigure 4: Pipelined scatter-reduce. (a) The scatter-reduce in LambdaML [27] has three phases where download and upload are
+performed in a serial fashion. (b) Our pipelined scatter-reduce performs download and upload in duplex in phase 1 and phase 2.
+
+yk and zi, j, where yk = 1 if d = Dk and zi, j = 1 if mi = M j.
+The number of micro-batches per worker given by µ = M
+d =
+∑K
+, where M is the total number of micro-batches.
+Other notations will be introduced as needed; see Appendix
+A for a table of notations.
+
+k=1 yk
+
+M
+Dk
+
+Our goal is to choose (xi), (yk) and (zi, j) to minimize the
+training cost citer and training time titer per iteration. We for-
+mulate it as the nonlinear binary integer program in (3), which
+we explain below.
+
+min α1 · citer + α2 · titer
+s.t. µ ˆai + ˆsi(4 − 2y1) + s0 ≤ mi,
+
+|mi − mi−1| ≤ xi−1 · Mmax,
+K
+J
+∑
+∑
+j=1
+k=1
+xi, yk, zi, j ∈ {0, 1},
+
+zi, j = 1,
+
+yk = 1,
+
+1 ≤ i ≤ L;
+2 ≤ i ≤ L;
+
+(3a)
+
+(3b)
+
+(3c)
+
+1 ≤ i ≤ L;
+
+(3d)
+
+∀i, j, k.
+
+(3e)
+
+The expressions for citer and titer will be given in § 3.4.2.
+Note that we combine the two objectives into a single ob-
+jective in (3a) using the weighted sum method. Each pair
+of weights (α1, α2) yields a Pareto optimal solution. As we
+vary the weights, the solutions will trace out the Pareto Fron-
+tier [39].
+
+To explain the constraints, we ﬁrst introduce the hat opera-
+tor. Given any sequence u1, u2, . . . , uL where ui is a quantity
+associated with layer i, we deﬁne
+
+ˆu1 = u1,
+
+ˆui = ui + ˆui−1(1 − xi−1),
+
+2 ≤ i ≤ L,
+
+(4)
+
+where xi are our decision variables for model partition. Let H
+denote set of the highest layers of the partitions. For i ∈ H ,
+ˆui is the sum of the quantity u j over the partition containing
+layer i. For the example in Fig. 3, H = {1, 3, 4} in Fig. 3 and
+ˆu3 = u2 + u3 is the sum over partition 2.
+
+6
+
+The constraints (3b) specify that the memory consumption
+of each partition does not exceed the allocated memory of
+the corresponding worker. Let si denote the parameter size
+and ai the activation size per micro-batch at layer i. For i ∈
+H , µ ˆai is the memory for activations of µ micro-batches in
+the partition that layer i belongs to; ˆsi(4 − 2y1) comprises
+three parts of memory consumption, ˆsi for parameters, ˆsi for
+gradients, and 2(1 − y1) ˆsi for serialized data during model
+synchronization. Note synchronization is needed only if y1 =
+0. s0 is the basic memory consumption of a serverless worker.
+e.g. memory consumed by the framework. We actually only
+need the constraints for i ∈ H , as the others are redundant.
+
+The constraints (3c) enforce consistency of the memory
+allocation for adjacent layers if they belong to the same parti-
+tion, as they actually share the same workers, i.e. mi = mi−1
+if xi−1 = 0. With Mmax = max1≤ j≤J MJ being the maximum
+memory available, the constraint for i becomes vacuous when
+the model is partitioned after i − 1, i.e. xi−1 = 1.
+
+The constraints (3d) and (3e) specify that we choose ex-
+actly one degree of data parallelism, and exactly one memory
+conﬁguration for each layer.
+
+To solve (3), we convert the formulation into an MIQP
+with common linearization techniques, which can then be
+solved by off-the-shelf solvers, e.g. Gurobi [18]. The details
+for linearization is in Appendix C.
+
+3.4.2 Performance Model
+
+Iteration cost. Recall the memory allocated for layer i
+workers is mi = ∑J
+j=1 zi, jM j. Since layers of the same par-
+tition are assigned to the same workers, we only count the
+layers in L, and the total memory of all workers is
+
+cmem = d ∑
+i∈H
+
+mi = d
+
+(cid:32)L−1
+∑
+i=1
+
+(cid:33)
+
+ximi + mL
+
+(5)
+
+(a)(b)Gradient splits : worker ID : ...1......1......1...Storage states (after each step)......1...1...1...11...1..............................1......1......1...Storage states (after each phase)11...1...............Gradient split ID ......1......1.........11...1...............Merged gradient split Acyclic Graphs (DAGs) and handled by different threads in
+the Task Executor. Tasks of different types are processed in
+parallel; each of them is assigned a unique ID and contains
+a set of IDs representing its dependencies. A task is immedi-
+ately processed once its dependencies are satisﬁed.
+
+Communication Collectives. FUNCPIPE performs storage-
+based communications, including send-and-receive between
+different partitions and scatter-reduce among partition repli-
+cas. The data communicated are serialized with the python
+library pickle and uploaded to the storage bucket as ﬁles. Meta-
+data information is included in the ﬁle name to distinguish
+different pairs and types of communication. Workers periodi-
+cally query the cloud storage bucket to check for download.
+
+MIQP Solution. For models with over a hundred layers, solv-
+ing the MIQP problem can take hours or even days, limiting
+its practical usage. As many model layers can have small
+memory consumption and short computation time, they can
+be merged with other layers to reduce the value of L, i.e. the
+total number of layers in optimization. By merging the layers,
+our method ensures a minute-level solution time. Currently,
+we provide three options for the merging criterion, computa-
+tion time, parameter size, or activation size. For all the tested
+models, merging by balancing the computation time achieves
+better performance and is adopted in our experiments.
+
+FUNCPIPE provides two implementations for Partition/Re-
+source Optimizer. The ﬁrst one solves the MIQP optimization
+using serverless functions. However, off-the-shelf solvers can
+have licence limits that require additional support in order to
+be used in the serverless environment. For example, Gurobi
+requires user to have a Gurobi token server that grants tem-
+porary license [19]. For users that want to avoid such effort,
+we provide a second implementation that solves the MIQP
+optimization at the client side. The information obtained by
+Model Proﬁler is retrieved by the client for optimization and
+the results are uploaded back to the initial worker.
+
+Limitation Discussion. Currently FUNCPIPE does not sup-
+port training models with a large layer that exceeds the maxi-
+mum memory for a serverless function. One way to support
+such models is to further partition at the tensor level, i.e., ten-
+sor parallelism [26, 47, 48]. Extending FUNCPIPE to tensor
+parallelism is left for future work.
+
+5 Evaluation
+
+In this section we ﬁrst evaluate the overall performance of
+FUNCPIPE by comparing it with state-of-the-art serverless-
+based training designs (§ 5.2) and discuss its system scala-
+bility (§ 5.4). We then validate the effectiveness of its de-
+signs with component-wise study, including the performance
+evaluation of our pipelined scatter-reduce (§ 5.5) and co-
+optimization of model partition and resource allocation (§ 5.6).
+Finally, we conclude the evaluation by discussing the effect of
+resource availability on different serverless platforms (§ 5.7).
+
+Figure 5: A FUNCPIPE function example. Minimal changes
+to Pytorch training code are required (highlighted in orange).
+
+The cost of serverless functions is proportional to the product
+of their running time and memory allocation, so the iteration
+cost citer is
+
+citer = P · titer · cmem
+
+(6)
+
+where P is the unit price speciﬁed by the service provider.
+
+Iteration time. As shown in Fig. 3, the iteration time titer
+is given by
+
+titer = t f + max
+1≤i≤L
+
+b + ti
+(ti
+
+s),
+
+(7)
+
+where t f is the forward time. When layer i is the lowest layer
+of a partition (e.g. layer 2 in Fig. 3), ti
+b is the computation
+completion time of that partition, and ti
+s the corresponding
+model synchronization time. For other layers (e.g. layer 3
+in Fig. 3), ti
+b and ti
+s are deﬁned in (11) and (12) without the
+above interpretations; their sum ti
+s will be dominated by
+that of the lowest layer of the same partition (e.g. layer 2), and
+hence their inclusion in (7) does not affect titer. The detailed
+calculation of each term is in Appendix B.
+
+b + ti
+
+4 Implementation
+
+FUNCPIPE is implemented on top of Pytorch with more than
+4000 lines of Python code. As shown in Fig. 5, it provides
+easy-to-use APIs and requires minimal changes (highlighted)
+to legacy training code on the user side. FUNCPIPE currently
+supports two serverless platforms, AWS Lambda and Alibaba
+Cloud Function Compute, and can be easily extended to other
+platforms as the platform API design in FUNCPIPE is decou-
+pled from the underlying SDK implementations, e.g. boto3 for
+AWS Lambda and fc2 for Alibaba Cloud Function Compute.
+
+Pipeline Task Overlap. The different tasks, upload, down-
+load, and computation have internal dependencies and differ-
+ent resource requirements, i.e., downlink bandwidth, uplink
+bandwidth, and CPU. These tasks are organized as Directed
+
+7
+
+#Step1:getinputtrainingconfigurationsbatch_size=int(event['batch_size'])loss_func=......#Step2:builduser-definedmodelanddataloader(Pytorchcode)model=...data_loader=...#Step3:wrapthemodelwithFuncPipeAPIPlatform.use(platformtype)#Chooseserverlessplatformmodel=FuncPipe(model,lossfunc=lossfunc,...)#Configtrainingmodel.init(event)#Initializepipeline#Step4:starttrainingforepoch_idinrange(epochs):forbatch_id,(inputs,targets)inenumerate(data_loader):model.pipelinetrain(inputs,targets)Model name
+
+ResNet101
+AmoebaNet-D18
+AmoebaNet-D36
+BERT-Large
+
+Parameter size
+(MB)
+
+Activation size
+per sample (MB)
+
+170
+476
+900
+1153
+
+198
+432
+697
+263
+
+Table 1: Models used for evaluation. AmoebaNet-D18 and
+AmoebaNet-D36 are two AmoebaNet-D models with 18 and
+36 normal cell layers, respectively. Both have ﬁlter size 256.
+
+5.1 Methodology
+
+Testbed. Our evaluation uses two of the mainstream server-
+less platforms, AWS Lambda [5] and Alibaba Cloud Function
+Compute [2], that provide different resource options. AWS
+Lambda provides a maximum of 10 GBytes memory allo-
+cation for each serverless function. Its corresponding cloud
+storage service, S3, grants unlimited bandwidth to concurrent
+access. Alibaba Cloud Function Compute has different re-
+source availability compared with AWS Lambda. It allows
+a maximum memory allocation of 32 Gbytes and its cloud
+storage OSS puts a limit on the concurrent bandwidth, e.g. a
+total of 10Gb/s for a normal user. Our evaluation is mainly
+performed on AWS Lambda and we evaluate FUNCPIPE on
+Alibaba Cloud Function Compute to discuss the effect of
+resource availability on different serverless platforms.
+
+Models and Datasets. The DL models used for our evalua-
+tion are displayed in Table 1. ResNet101, AmoebaNet-D18,
+and AmoebaNet-D36 are popular Convolution Neural Net-
+work (CNN) models for computer vision tasks. BERT-Large
+is a transformer model for natural language processing. We
+use the popular image classiﬁcation dataset CIFAR-10 to
+train the CNN models. To train BERT-Large, we run masked
+language modeling on the dataset Wikitext-2. We use syn-
+chronous Stochastic Gradient Descent (SGD) optimizer with
+the same global batch size (further explained in § 5.2) for all
+tested designs in the evaluation, and we report the average
+per-iteration training time and cost.
+
+Baselines. We compare FUNCPIPE with existing serverless-
+based training designs with two different structures: the pure
+serverless-based structure and the hybrid PS structure (as in-
+troduced in § 2.2). LamdaML [27] is the state-of-the-art pure
+serverless-based training framework and it also includes an
+implementation of the hybrid design exempliﬁed by Cirrus [9].
+The two implementations are referred to as LambdaML and
+HybridPS. Their default resource strategy uses the maximum
+memory allocation and maximum local batch size within the
+memory limit for each worker. We further integrate gradi-
+ent accumulation into the two implementations, referred to
+as LambdaML-GA and HybridPS-GA. Gradient accumula-
+tion is a commonly adopted technique used for reducing the
+
+memory consumption in training [12, 49, 50]. LambdaML-
+GA and HybridPS-GA use the same number of workers as
+LambdaML and HybridPS but allocate the minimum mem-
+ory required after performing gradient accumulation for each
+worker. LambdaML-GA and HybridPS-GA serve as baselines
+with reduced worker memory allocation and better balanced
+computation to communication time ratio.
+
+To validate the effectiveness of our co-optimization on
+model partition and resource allocation, we compare with
+the existing algorithms TPDMP and Bayes. TPDMP is the
+latest graph-based model partition algorithm [51] developed
+for server-based pipeline training, it optimizes model parti-
+tion on a ﬁxed set of workers/resources. We perform a grid
+search on the resource allocation and optimizes the model
+partition with TPDMP for each allocation. We select the con-
+ﬁguration that minimizes the objective function in (3). Bayes
+is a blackbox optimization method that has been proved ef-
+fective in deciding conﬁgurations for cloud services [4]. It
+can jointly optimize model partition and resource allocation.
+Further details of the baselines are explained in Appendix D.
+
+FUNCPIPE Settings. For the evaluation, we use 8 discrete
+memory allocation choices, i.e., [512MB, 1024MB, 2048MB,
+3072MB, 4096MB, 6144MB, 8192MB, 10240MB]. We empiri-
+cally set the micro-batchsize to 4 as it achieves a generally bet-
+ter performance on the evaluation models. We use four pairs
+of weights of (α1, α2), i.e. [(1, 0), (1, 216), (1, 219), (1, 222)],
+to locate the corresponding points on the Pareto Frontier. The
+same pairs of weights are used for the baseline algorithm
+TPDMP and Bayes.
+
+Recommendation. FUNCPIPE also recommends a conﬁgu-
+ration out of the optimized results. Denote the training time
+and cost of the cheapest conﬁguration, i.e., conﬁguration that
+optimizes only for cost, as tcost and ccost , and the training
+time and cost of another conﬁguration as tp and cp. We use
+δ = ( tcost
+− 1) to represent how efﬁcient a conﬁg-
+tp
+uration is by comparing its speedup with its cost increase
+over the cheapest conﬁguration. In our evaluation FUNCPIPE
+recommends the fastest conﬁguration that satisﬁes δ ≥ 0.8.
+
+− 1)/(
+
+cp
+ccost
+
+5.2 Overall Performance
+
+The training performance of FUNCPIPE and its comparison
+with existing serverless-based training designs are shown in
+Fig. 6 and Fig. 7. Generally, FUNCPIPE achieves better perfor-
+mance in both training speed and cost over existing designs
+in most of the test cases (comparable or faster performance
+in other cases). And the performance improvement increases
+with the model size and global batch size. The results are
+obtained with three commonly adopted global batch size of
+16, 64 and 256. The performance of each baseline method is
+represented as a single point in the ﬁgure, and for FUNCPIPE
+it is a curve consisting of the points corresponding to the
+conﬁgurations obtained using the four pairs of weights. Note
+
+8
+
+(a) Batch size = 16
+
+(b) Batch size = 64
+
+(c) Batch size = 256
+
+Figure 6: Overall training performance. FUNCPIPE outperforms existing designs in both training speed and cost in most of
+the test cases, and achieves comparable or faster performance in other cases.
+
+(a) BERT-Large (Batch size 16)
+
+(b) ResNet101 (Batch size 64)
+
+(c) BERT-Large (Batch size=64)
+
+(d) AmoebaNet-D36 (Batch size 64)
+
+Figure 7: Training time breakdown. Labels: (cid:192)FUNCPIPE,
+(cid:193)LambdaML, (cid:194)HybridPS, (cid:195)LambdaML-GA, (cid:196)HybridPS-GA.
+The multiple bars of FUNCPIPE correspond to different conﬁg-
+urations on the Pareto Frontier. Legend shared across ﬁgures.
+
+that there can be less than four points on a curve as different
+weights can lead to the same conﬁguration. The conﬁguration
+recommended by FUNCPIPE is also highlighted in this ﬁgure.
+We make the following key observations.
+
+First, when the global batch size is small and that training
+on a single worker is feasible, FUNCPIPE can achieve up
+to 1.6x speedup over the best-performing serverless-based
+training baseline (LambdaML) when given more resources
+(2.4x cost). Although existing designs can achieve similar
+cost-efﬁcient training to FUNCPIPE, their training speed can
+not be improved giving more resource, as further illustrated
+by the time breakdown in § 5.3.
+
+Second, FUNCPIPE achieves an average of 1.7X training
+
+9
+
+speedup and 53% cost reduction compared with the best-
+performing baseline LambdaML when training AmoebaNet-
+D18, AmoebaNet-D36 and BERT-Large with global batch
+sizes of 64 and 256, with up to 2.2X speedup and 77% cost
+reduction when training BERT-Large with global batch size
+256. The improved training speed and cost-efﬁciency come
+from the reduced communication time and increased compu-
+tation to communication ratio, as further illustrated in § 5.3.
+Third, the hybrid design, HybridPS, achieves comparable
+or even better performance than LambdaML when train-
+ing ResNet101. However, with the increase of model size
+and global batch size (leading to the use of more workers),
+the server node in this centralized structure can be heavily
+burdened. As a result, we can observe noticeable perfor-
+mance gap between HybridPS and LambdaML when training
+AmoebaNet-D36 and BERT-Large in Fig. 6(c). In addition,
+we see that the use of gradient accumulation (LambdaML-GA
+and HybridPS-GA) can reduce the training cost at the price
+of a longer training time. However, the reduction is neither
+signiﬁcant nor guaranteed to exist. We attribute it to that the
+use of gradient accumulation reduces the memory allocation
+but the increased runtime raises up the cost.
+
+5.3 Training Time Breakdown
+
+Fig. 7(a) displays the time breakdown for the training of
+BERT-Large in Fig. 6(a). The small batch size allows the
+baseline methods to train the model on a single worker (no
+communication time), and thus fully utilize the computation
+resource and achieve cost-efﬁcient training. However, their
+training speed cannot be improved any further. As their work-
+
+102030405089Cost (USD)1e4ResNet101102030405060702.53.03.51e3AmoebaNet-D18203040502.55.01e2AmoebaNet-D361020302.55.01e3BERT-LargeFuncPipeRecommendationLambdaMLHybridPSLambdaML-GAHybridPS-GAIteration time(s)1020304012Cost (USD)1e2ResNet101203040502.55.07.51e2AmoebaNet-D1820304050600.51.01e1AmoebaNet-D362030405060702.55.07.51e2BERT-LargeFuncPipeRecommendationLambdaMLHybridPSLambdaML-GAHybridPS-GAIteration time(s)10203040502.55.07.5Cost (USD)1e2ResNet1012030405060121e1AmoebaNet-D183040506070802.55.07.51e1AmoebaNet-D362030405060708090241e1BERT-LargeFuncPipeRecommendationLambdaMLHybridPSLambdaML-GAHybridPS-GAIteration time(s)0102030Time (s)ComputationModel syncPipeline flush010203040Time (s)0204060Time (s)0204060Time (s)For FUNCPIPE, we increase the global batch size and use the
+recommended conﬁguration.
+
+Fig. 8 reports the average training throughput, i.e., number
+of processed samples per second, on model AmoebaNet-D18
+and AmoebaNet-D36. The training throughput is normalized
+to that of LambdaML with global batch size 32. We ﬁrst
+observe that FUNCPIPE achieves higher training throughput
+than LambdaML when given the same resource allocation.
+For example, when training the AmoebaNet-D36 model, the
+throughput is estimately 180% higher when both given 800
+GB total memory. Second, both FUNCPIPE and LambdaML
+exhibit a non-linear scaling up performance with FUNCPIPE
+scales better with the total memory and the global batch size.
+We ﬁnd that the per-worker network bandwidth reduction
+contributes to the scaling up performance. The per-worker
+bandwidth reduction was also observed in prior work [53],
+and we suspect that it is due to the serverless platforms sched-
+ule different serverless functions to machines that share the
+bandwidth capacity. Additionally, we see that FUNCPIPE is
+less impacted by the bandwidth reduction than LambdaML,
+possibly due to the effectiveness of FUNCPIPE’s designs in
+reducing the overall communication burden.
+
+5.5 Scatter-reduce Communication Efﬁciency
+
+We compare our pipelined scatter-reduce design with Lamb-
+daML’s scatter-reduce [27]. The results show that our de-
+sign reduces the synchronization time by up to 26% and
+improves the training throughput by 22% (18% reduction in
+iteration time). To perform the comparison, we use the rec-
+ommended conﬁguration for training AmoebaNet-D18 with
+a global batch size 32. The conﬁguration divides the model
+into three stages and each stage has a data parallelism of two.
+We gradually increase the level of data parallelism (the global
+batch size is increased proportionally) from two to 32, and
+compares the training throughput. As shown in Fig. 9(a), the
+two scatter-reduce methods achieve similar performance with
+small data parallel levels at the beginning. As the data parallel
+level increases, we observe a growing performance gap and
+our pipelined scatter-reduce design achieves a 22% higher
+training throughput than LambdaML’s scatter-reduce. This
+increased performance gap can be understood in two ways.
+First, the increased data parallelism level will increase the
+difference in transfer time of the two algorithms; this can be
+seen by comparing (1) and (2). Theoretically, a reduction of
+up to 33% in transfer time can be achieved. In Fig. 9(b), we
+show that the gap between the synchronization time gradually
+increases and can reach 26%. Second, the increased data par-
+allelism level requires the use of more workers. Based on our
+observation in AWS Lambda, more workers can reduce the
+available bandwidth per worker. As such, the communication
+time can take up a larger proportion of the overall training
+time, thus emphasizing the critical role of and the beneﬁt of
+our co-optimization. In summary, our pipelined scatter-reduce
+
+Figure 8: System scalability test. FUNCPIPE achieves higher
+throughput and is more robust to bandwidth contention. Each
+data point is annotated with the global batch size.
+
+ers already have the maximum memory allocation, increasing
+the resource usage means using more workers. Such scaling
+up incurs high communication cost and stalls the training—
+synchronizing BERT-Large (1153MB) with 70MB/s band-
+width can take ten of seconds, which is longer the total com-
+putation time. This shows that FUNCPIPE can be faster than
+existing designs even when training with small batch size.
+
+Fig. 7(b) shows the time breakdown of training ResNet101
+with batch size = 64 (i.e., Fig. 6(b)). The improvement in
+training speed achieved by FUNCPIPE is relatively smaller
+compared to that in Fig. 7(c) and Fig. 7(d). This is because
+when the model size is small, the synchronization time of
+LambdaML and HybridPS can be close to the sum of pipeline
+ﬂush time and intra-stage model synchronization time in
+FUNCPIPE. This suggests that with small-sized models, we
+expect small improvement or comparable performance from
+FUNCPIPE.
+
+Fig. 7(c) and Fig. 7(d) show the time breakdown for
+training BERT-Large and AmoebaNet-D36, respectively (i.e.,
+Fig. 6(b)). The breakdown explains the major performance
+improvement observed in Fig. 6. The improvement achieved
+by FUNCPIPE can be largely attributed to the reduced com-
+munication time, i.e., its pipeline ﬂush time and intra-stage
+model synchronization time is much lower than the synchro-
+nization time of LambdaML. We can also see that FUNCPIPE
+has a larger computation to communication time ratio com-
+pared with the baseline methods, making FUNCPIPE more
+cost-efﬁcient.
+
+5.4 System Scalability
+
+Next, we evaluate the scalability of FUNCPIPE by comparing
+its performance to the best-performing design, i.e., Lamb-
+daML, based on observations from § 5.2. For this experiment,
+we use the total amount of allocated memory to denote the
+system resource. Further, we use the global batch size to
+specify the amount of work. As such, we are evaluating both
+FUNCPIPE and LambdaML’s ability to handle more work (i.e.,
+increased global batch size) given more resource (i.e., total
+memory). For LambdaML, we increase the global batch size
+and resource usage by adding more workers. Each worker is
+allocated the maximum memory and uses the maximum local
+batch size according to the resource strategy of LambdaML.
+
+10
+
+100200300400500600 02468101Normalized throughput32641282565123264128256512AmoebaNet-D18FuncPipeLambdaML020040060080010001200 051015132641282565123264128256512AmoebaNet-D36Total memory (GB)resource availability. The major difference between AWS and
+Alibaba cloud is that the bandwidth of Alibaba Cloud storage
+OSS [3], has a limit of 10Gb/s. The same bandwidth limit is
+with the VM instsance used by the HybridPS baseline. We
+study how the same bandwidth bottleneck effect the perfor-
+mance of these methods. Due to the space limitation, we only
+display the results of training ResNet101 and AmoebaNet-
+D36 with global batch size 64 and 256 in Fig. 11. Overall, we
+ﬁnd that FUNCPIPE demonstrates similar beneﬁts in Alibaba
+Cloud to AWS: comparable performance or small improve-
+ment on small-sized models and better performance in both
+training speed and cost as the model size and global batch
+size increase, with up to 1.8X speedup and 49% cost reduc-
+tion compared with the best-performing baseline HybridPS.
+Such performance beneﬁts are attributed to the key designs
+of FUNCPIPE, including the use of model partition technique,
+efﬁcient scatter-reduce design, and the co-optimization of par-
+tition and resource allocation policy; FUNCPIPE can greatly
+reduce the communication burden in training and thus allevi-
+ate the effect of the limited bandwidth.
+
+Other platforms [36] may have similar limit on the storage
+bandwidth, e.g. Azure Storage has a total limit of 25Gb/s [37].
+Such bandwidth bottleneck may limit the ability of FUNCPIPE
+to scale out, and FUNCPIPE may eventual be outperformed by
+HybridPS as the bandwidth of HybridPS can be increased by
+scaling up the parameter server. One solution for this is to use
+VM-based storage design, like Pocket [29], and the bandwidth
+can be increased the same way as HybridPS. In such case
+we expect FUNCPIPE to achieve better performance than Hy-
+bridPS, as the evaluation has demonstrated the performance
+beneﬁts of FUNCPIPE with the same available bandwidth.
+Extending FUNCPIPE to VM-based storage and further com-
+paring to the HybridPS design is left as future work.
+
+6 Related Work
+
+Pipeline in Serverless-based Training. To the best of our
+knowledge, Dorylus [53] is the only existing work that com-
+bines the notion of pipeline and serverless-based training.
+Dorylus is specialized for Graph Neural Network (GNN) mod-
+els and adopts a hybrid system structure, i.e., CPU servers
+with serverless functions. It exploits the inherent features of
+GNN to separate the computation tasks, and uses serverless
+functions only for the lightweight linear algebra operations.
+Its pipeline design focuses on overlapping the computation
+tasks on server and serverless functions to hide network la-
+tency. Our work, on the other hand, exploits serverless-based
+pipeline for training DNN models. Our tasks cannot be easily
+separated and trained the same way as GNNs as they require
+much heavier computation and communication on serverless
+functions. We address such challenges with efﬁcient commu-
+nication design and careful co-optimization of model partition
+and resource allocation.
+
+(a) Training throughput
+
+(b) Synchronization time
+
+Figure 9: Performance of our pipelined scatter-reduce
+method. Our design achieves up to 22% higher training
+throughput and 26% lower synchronization time.
+
+can effectively improve communication efﬁciency.
+
+5.6 Co-optimization Performance
+
+We evaluate the performance of our co-optimization design by
+comparing with existing model partition/resource allocation
+algorithms in two major aspects, training performance and
+solution time cost.
+
+Training Performance. Fig. 10 compares the model partition
+and resource allocation policies found by our co-optimization
+method and those by two existing algorithms [8, 51]. Note
+that some methods in the ﬁgure contain less points as they
+generate the same conﬁguration for different pairs of weights.
+The results show that our design achieves the best overall per-
+formance. Compared to TPDMP, our design has a comparable
+average training cost (within 3% difference) but an average
+speedup of 1.8X when optimized for the same objective func-
+tion. The performance gap between our design and TPDMP
+suggests the beneﬁt of co-optimizing the model partition and
+resource allocation. Compared to Bayes, our co-optimization
+method achieves 7% higher average training speed and 55%
+lower average cost. We observe that the policies generated by
+Bayes often have higher monetary costs; we attribute Bayes’s
+cost-inefﬁciency to its tendency of over-provisioning the re-
+source to avoid infeasible solutions, i.e., policies that lead to
+OOM error. We also evaluate the accuracy of the performance
+model to validate the effectiveness of our formulation. Results
+show that our model achieves an average prediction error of
+less than 12%. See Appendix E for further details.
+
+Solution Time Cost. We evaluate the algorithms on the client
+side using an Intel(R) Core(TM) i5-10210U CPU. The aver-
+age solution time for each conﬁguration in Fig. 10 is 274s,
+603s, 45s for FUNCPIPE, TPDMP and Bayes respectively.
+The results show that FUNCPIPE achieves the best perfor-
+mance with a reasonable, i.e. minute level, solution cost.
+
+5.7
+
+Impact of Different Resource Availability
+
+We lastly evaluate the performance of FUNCPIPE on the Al-
+ibaba Cloud to understand the potential impact of different
+
+11
+
+2481632Level of data parallelism02468101Normalized throughputPipelined-scatterReducescatterReduce(LambdaML)2481632Level of data parallelism0.00.20.40.81.0Normalized sync timePipelined-scatterReducescatterReduce(LambdaML)Figure 10: Co-optimization performance evaluation. The global batch size is 64. Other batch sizes are similar.
+
+the number of functions/partitions and co-optimizes the par-
+tition and memory allocation with an MIP formulation [24].
+Compared with inferencing, training has a different and more
+complex process and it requires new formulation. Its optimiza-
+tion includes more decision factors such as inter-stage data
+parallelism and synchronization cost, thus it faces more chal-
+lenges in generating efﬁcient model partition and resource
+conﬁguration. For example, both the number of functions and
+the number of partitions require co-optimization with memory
+allocation.
+
+7 Conclusion
+
+In this paper, we presented the design and implementation
+of the ﬁrst pipelined serverless training framework called
+FUNCPIPE. With the ever increasing interests in truly taking
+advantage of serverless computing, many researchers have
+looked at utilizing serverless functions to build scalable ap-
+plications and improving serverless platforms [44, 45, 53, 55].
+Our key goal can be simply boiled down to understand how
+to allow DL practitioners to train models on serverless plat-
+forms in a fast and low-cost manner, regardless of model size
+and training hyperparameters such as batch size that impact
+memory consumption. Moreover, we wanted FUNCPIPE to be
+an entirely serverless framework to fully enjoy various ben-
+eﬁts of serverless, in contrast to previously proposed hybrid
+design of leveraging VMs [9, 60].
+
+With three key designs—(i) the pipeline parallelism for
+model partitions, (ii) the communication-efﬁcient scatter-
+reduce, and (iii) the co-optimization of partition and resource
+allocation policy, FUNCPIPE was able to overcome the cur-
+rent limitations of serverless platforms (e.g., relatively low
+memory and bandwidth capacity compared to model train-
+ing). The beneﬁts of FUNCPIPE, tested with four commonly
+used models and on two popular serverless providers in nu-
+merous settings, are up to 2.2X training speedup and 77%
+cost reduction compared to state-of-the-art serverless training
+frameworks [27]. We carefully untangled the beneﬁts with
+in-depth component breakdown analysis and showed both (ii)
+and (iii) designs outperformed their counterparts. We con-
+cluded that FUNCPIPE demonstrates a promising design for
+training DL models on current serverless platforms; as part
+of future work, we would like to explore other techniques
+such as tensor parallelism to further improve FUNCPIPE’s
+performance.
+
+Figure 11: Training performance on Alibaba Cloud. With
+the same limit on total communication bandwidth, FUNCPIPE
+achieves up to 1.8X speedup and 49% cost reduction com-
+pared with the best-performing baseline HybridPS.
+
+Serverless Communication. Feng et al. [15] proposes two
+centralized storage-based methods for model synchronization.
+However, such design is generally of low efﬁciency due to
+the bandwidth bottleneck of the central nodes. LambdaML
+proposes a more efﬁcient decentralized scatter-reduce method
+but it fails to fully utilize the available bandwidth [27]. In
+parallel, other works focus on improving the performance of
+storage system for higher communication efﬁciency. Pocket
+proposes a distributed data store that provides better elasticity
+and latency [29]. Shredder designs a low-latency cloud store
+that supports in-storage computing [62]. Such designs and
+optimizations are orthogonal to our pipelined storage-based
+communication approach. Another choice is to use common
+NAT-traversal techniques to enable direct communication
+among functions [16, 59]. The direct communication can al-
+low existing communication designs, e.g., ringAllreduce [43],
+to be used. However, NAT-traversal usually requires exter-
+nal servers that can cause communication bottleneck. The
+performance of using existing communication designs for
+serverless-based training with NAT-traversal remains unclear.
+
+Model Partition and Resource Allocation in Serverless.
+Recent works have studied the model partition and re-
+source allocation problem for serverless-based inference serv-
+ing [24, 61]. These works aim at satisfying Service Level
+Objectives in latency while minimizing cost or further im-
+proving throughput. Gillis ﬁxes the per-function memory allo-
+cation and optimizes model partition to lower inference cost
+with an reinforcement learning approach [61]. AMPS ﬁxes
+
+12
+
+10121416123Cost (USD)1e2ResNet10120300.51.01e1AmoebaNet-D182030405060121e1AmoebaNet-D36182022240.51.01e1BERT-LargeFuncPipeTPDMPBayesIteration time(s)20406080123   1e2ResNet101 (b64)50100150200250121e1AmoebaNet-D36 (b64)FuncPipeRecommendationLambdaMLHybridPSLambdaML-GAHybridPS-GA204060801005.07.51e2ResNet101 (b256)50100150200250461e1AmoebaNet-D36 (b256)Iteration time (s)Cost (USD)References
+
+[1] Istemi Ekin Akkus, Ruichuan Chen, Ivica Rimac,
+Manuel Stein, Klaus Satzke, Andre Beck, Paarijaat
+SAND: Towards High-
+Aditya, and Volker Hilt.
+Performance Serverless Computing. In 2018 Usenix
+Annual Technical Conference (USENIX ATC 18), pages
+923–935, 2018.
+
+[2] Alibaba. Alibaba cloud function compute. https://
+
+www.aliyun.com/product/fc.
+
+[3] Alibaba. Alibaba cloud object storage service. https:
+
+//www.aliyun.com/product/oss.
+
+[4] Omid Alipourfard, Hongqiang Harry Liu, Jianshu Chen,
+Shivaram Venkataraman, Minlan Yu, and Ming Zhang.
+CherryPick: Adaptively unearthing the best cloud conﬁg-
+urations for big data analytics. In 14th USENIX Sympo-
+sium on Networked Systems Design and Implementation
+(NSDI 17), pages 469–482, 2017.
+
+[5] Amazon. Aws lambda. https://aws.amazon.com/
+
+lambda/.
+
+[6] Ammar Ahmad Awan, Arpan Jain, Quentin Anthony,
+Hari Subramoni, and Dhabaleswar K Panda. Hypar-
+ﬂow: Exploiting mpi and keras for scalable hybrid-
+parallel dnn training using tensorﬂow. arXiv preprint
+arXiv:1911.05146, 2019.
+
+[7] Zhengda Bian, Qifan Xu, Boxiang Wang, and Yang
+You. Maximizing parallelism in distributed training for
+huge neural networks. arXiv preprint arXiv:2105.14450,
+2021.
+
+[8] Eric Brochu, Vlad M Cora, and Nando De Freitas. A
+tutorial on bayesian optimization of expensive cost
+functions, with application to active user modeling and
+hierarchical reinforcement learning. arXiv preprint
+arXiv:1012.2599, 2010.
+
+[9] Joao Carreira, Pedro Fonseca, Alexey Tumanov, Andrew
+Zhang, and Randy Katz. Cirrus: A serverless framework
+In Proceedings of the
+for end-to-end ml workﬂows.
+ACM Symposium on Cloud Computing, pages 13–24,
+2019.
+
+[10] Chi-Chung Chen, Chia-Lin Yang, and Hsiang-Yun
+Cheng. Efﬁcient and robust parallel dnn training through
+model parallelism on multi-gpu platform. arXiv preprint
+arXiv:1809.02839, 2018.
+
+[11] Ching-Hsiang Chu, Pouya Kousha, Ammar Ahmad
+Awan, Kawthar Shaﬁe Khorassani, Hari Subramoni, and
+Dhabaleswar K Panda. Nv-group: link-efﬁcient reduc-
+tion for distributed deep learning on modern dense gpu
+systems. In Proceedings of the 34th ACM International
+Conference on Supercomputing, pages 1–12, 2020.
+
+13
+
+[12] Aditya Devarakonda, Maxim Naumov, and Michael Gar-
+land. Adabatch: Adaptive batch sizes for training deep
+arXiv preprint arXiv:1712.02029,
+neural networks.
+2017.
+
+[13] Simon Eismann, Joel Scheuner, Erwin Van Eyk, Maxi-
+milian Schwinger, Johannes Grohmann, Nikolas Herbst,
+Cristina L Abad, and Alexandru Iosup. Serverless appli-
+cations: Why, when, and how? IEEE Software, 38(1):32–
+39, 2020.
+
+[14] Shiqing Fan, Yi Rong, Chen Meng, Zongyan Cao, Siyu
+Wang, Zhen Zheng, Chuan Wu, Guoping Long, Jun
+Yang, Lixue Xia, et al. Dapple: A pipelined data paral-
+lel approach for training large models. In Proceedings
+of the 26th ACM SIGPLAN Symposium on Principles
+and Practice of Parallel Programming, pages 431–445,
+2021.
+
+[15] Lang Feng, Prabhakar Kudva, Dilma Da Silva, and Jiang
+Hu. Exploring serverless computing for neural network
+training. In 2018 IEEE 11th international conference
+on cloud computing (CLOUD), pages 334–341. IEEE,
+2018.
+
+[16] Sadjad Fouladi, Francisco Romero, Dan Iter, Qian Li,
+Shuvo Chatterjee, Christos Kozyrakis, Matei Zaharia,
+and Keith Winstein. From laptop to lambda: Outsourc-
+ing everyday jobs to thousands of transient functional
+containers. In 2019 USENIX Annual Technical Confer-
+ence (USENIX ATC 19), pages 475–488, 2019.
+
+[17] Jinkun Geng, Dan Li, and Shuai Wang. Horizontal or
+vertical? a hybrid approach to large-scale distributed
+machine learning. In Proceedings of the 10th Workshop
+on Scientiﬁc Cloud Computing, pages 1–4, 2019.
+
+[18] Gurobi. Gurobi - the fastest solver. https://www.
+
+gurobi.com.
+
+[19] Gurobi.
+
+Setting up and using a ﬂoating license.
+
+https://www.gurobi.com/documentation/9.5/
+quickstart_mac/setting_up_and_using_a_flo.
+html.
+
+[20] Scott Hendrickson, Stephen Sturdevant, Tyler Harter,
+and Venkataramani. Serverless computation with Open-
+Lambda. In 8th USENIX Workshop on Hot Topics in
+Cloud Computing (HotCloud 16), 2016.
+
+[21] Yanping Huang, Youlong Cheng, Ankur Bapna, Orhan
+Firat, Dehao Chen, Mia Chen, HyoukJoong Lee, Jiquan
+Ngiam, Quoc V Le, Yonghui Wu, et al. Gpipe: Efﬁ-
+cient training of giant neural networks using pipeline
+parallelism. Advances in neural information processing
+systems, 32, 2019.
+
+[22] Arpan Jain, Ammar Ahmad Awan, Asmaa M Aljuhani,
+Jahanzeb Maqbool Hashmi, Quentin G Anthony, Hari
+Subramoni, Dhableswar K Panda, Raghu Machiraju,
+and Anil Parwani. Gems: Gpu-enabled memory-aware
+model-parallelism system for distributed dnn training. In
+SC20: International Conference for High Performance
+Computing, Networking, Storage and Analysis, pages
+1–15. IEEE, 2020.
+
+[23] Arpan Jain, Ammar Ahmad Awan, Asmaa M Aljuhani,
+Jahanzeb Maqbool Hashmi, Quentin G Anthony, Hari
+Subramoni, Dhableswar K Panda, Raghu Machiraju,
+and Anil Parwani. Gems: Gpu-enabled memory-aware
+model-parallelism system for distributed dnn training. In
+SC20: International Conference for High Performance
+Computing, Networking, Storage and Analysis, pages
+1–15. IEEE, 2020.
+
+[24] Jananie Jarachanthan, Li Chen, Fei Xu, and Bo Li.
+Amps-inf: Automatic model partitioning for serverless
+In 50th International
+inference with cost efﬁciency.
+Conference on Parallel Processing, pages 1–12, 2021.
+
+[25] Zhihao Jia, Matei Zaharia, and Alex Aiken. Beyond
+data and model parallelism for deep neural networks.
+Proceedings of Machine Learning and Systems, 1:1–13,
+2019.
+
+[26] Zhihao Jia, Matei Zaharia, and Alex Aiken. Beyond
+data and model parallelism for deep neural networks.
+Proceedings of Machine Learning and Systems, 1:1–13,
+2019.
+
+[27] Jiawei Jiang, Shaoduo Gan, Yue Liu, Fanlin Wang, Gus-
+tavo Alonso, Ana Klimovic, Ankit Singla, Wentao Wu,
+and Ce Zhang. Towards demystifying serverless ma-
+chine learning training. In Proceedings of the 2021 In-
+ternational Conference on Management of Data, pages
+857–871, 2021.
+
+[28] Ana Klimovic, Yawen Wang, Christos Kozyrakis,
+Patrick Stuedi, Jonas Pfefferle, and Animesh Trivedi.
+Understanding ephemeral storage for serverless analyt-
+In 2018 USENIX Annual Technical Conference
+ics.
+(USENIX ATC 18), pages 789–794, 2018.
+
+[29] Ana Klimovic, Yawen Wang, Patrick Stuedi, Animesh
+Trivedi, Jonas Pfefferle, and Christos Kozyrakis. Pocket:
+Elastic ephemeral storage for serverless analytics. In
+13th USENIX Symposium on Operating Systems Design
+and Implementation (OSDI 18), pages 427–444, 2018.
+
+[30] Shen Li, Yanli Zhao, Rohan Varma, Omkar Salpekar,
+Pieter Noordhuis, Teng Li, Adam Paszke, Jeff Smith,
+Brian Vaughan, Pritam Damania, et al. Pytorch dis-
+tributed: Experiences on accelerating data parallel train-
+ing. arXiv preprint arXiv:2006.15704, 2020.
+
+[31] Shigang Li and Torsten Hoeﬂer. Chimera: efﬁciently
+training large-scale neural networks with bidirectional
+In Proceedings of the International Con-
+pipelines.
+ference for High Performance Computing, Networking,
+Storage and Analysis, pages 1–14, 2021.
+
+[32] Shijian Li, Oren Mangoubi, Lijie Xu, and Tian Guo.
+Sync-switch: Hybrid parameter synchronization for dis-
+tributed deep learning. In 2021 IEEE 41th International
+Conference on Distributed Computing Systems (ICDCS),
+2021.
+
+[33] Shijian Li, Robert J. Walls, and Tian Guo. Character-
+izing and modeling distributed training with transient
+In 2020 IEEE 40th International
+cloud gpu servers.
+Conference on Distributed Computing Systems (ICDCS),
+2020.
+
+[34] Ryan McDonald, Keith Hall, and Gideon Mann. Dis-
+tributed training strategies for the structured perceptron.
+In Human language technologies: The 2010 annual con-
+ference of the North American chapter of the association
+for computational linguistics, pages 456–464, 2010.
+
+[35] Garrett McGrath and Paul R Brenner. Serverless comput-
+ing: Design, implementation, and performance. In 2017
+IEEE 37th International Conference on Distributed
+Computing Systems Workshops (ICDCSW), pages 405–
+410. IEEE, 2017.
+
+[36] Microsoft. Microsoft azure cloud computing. https:
+
+//azure.microsoft.com/.
+
+[37] Microsoft. Microsoft azure storage. https://azure.
+
+microsoft.com/services/storage.
+
+[38] Deepak Narayanan, Aaron Harlap, Amar Phanishayee,
+Vivek Seshadri, Nikhil R Devanur, Gregory R Ganger,
+Phillip B Gibbons, and Matei Zaharia. Pipedream: gen-
+eralized pipeline parallelism for dnn training. In Pro-
+ceedings of the 27th ACM Symposium on Operating
+Systems Principles, pages 1–15, 2019.
+
+[39] Patrick Ngatchou, Anahita Zarei, and A El-Sharkawi.
+Pareto multi objective optimization. In Proceedings of
+the 13th International Conference on, Intelligent Sys-
+tems Application to Power Systems, pages 84–91. IEEE,
+2005.
+
+[40] Pitch Patarasuk and Xin Yuan. Bandwidth efﬁcient
+all-reduce operation on tree topologies. In 2007 IEEE
+International Parallel and Distributed Processing Sym-
+posium, pages 1–8. IEEE, 2007.
+
+[41] Pitch Patarasuk and Xin Yuan. Bandwidth optimal all-
+reduce algorithms for clusters of workstations. Journal
+of Parallel and Distributed Computing, 69(2):117–124,
+2009.
+
+14
+
+[42] Thomas
+
+Rausch, Waldemar Hummer, Vinod
+Muthusamy, Alexander Rashed, and
+Schahram
+Dustdar. Towards a serverless platform for edge AI.
+In 2nd USENIX Workshop on Hot Topics in Edge
+Computing (HotEdge 19), 2019.
+
+[43] Baidu Research. baidu-allreduce, 2017. https://
+
+github.com/baidu-research/baidu-allreduce.
+
+[44] Francisco Romero, Gohar Irfan Chaudhry, Íñigo Goiri,
+Pragna Gopa, Paul Batum, Neeraja J Yadwadkar, Ro-
+drigo Fonseca, Christos Kozyrakis, and Ricardo Bian-
+chini. Faa$T: A Transparent Auto-Scaling Cache for
+Serverless Applications. 2021.
+
+[45] Francisco Romero, Mark Zhao, Neeraja J. Yadwadkar,
+and Christos Kozyrakis. Llama: A heterogeneous &
+serverless framework for auto-tuning video analytics
+pipelines. In Proceedings of the ACM Symposium on
+Cloud Computing, SoCC ’21, 2021.
+
+[46] Christopher J Shallue, Jaehoon Lee, Joseph Antognini,
+Jascha Sohl-Dickstein, Roy Frostig, and George E Dahl.
+Measuring the effects of data parallelism on neural net-
+work training. arXiv preprint arXiv:1811.03600, 2018.
+
+[47] Noam Shazeer, Youlong Cheng, Niki Parmar, Dustin
+Tran, Ashish Vaswani, Penporn Koanantakool, Peter
+Hawkins, et al. Mesh-tensorﬂow: Deep learning for
+supercomputers. Advances in neural information pro-
+cessing systems, 31, 2018.
+
+[48] Mohammad Shoeybi, Mostofa Patwary, Raul Puri,
+Patrick LeGresley, Jared Casper, and Bryan Catanzaro.
+Megatron-lm: Training multi-billion parameter lan-
+guage models using model parallelism. arXiv preprint
+arXiv:1909.08053, 2019.
+
+[49] Nimit Sharad Sohoni, Christopher Richard Aberger,
+Megan Leszczynski, Jian Zhang, and Christopher Ré.
+Low-memory neural network training: A technical re-
+port. arXiv preprint arXiv:1904.10631, 2019.
+
+[50] Liuyihan Song, Pan Pan, Kang Zhao, Hao Yang, Yiming
+Chen, Yingya Zhang, Yinghui Xu, and Rong Jin. Large-
+scale training system for 100-million classiﬁcation at
+In Proceedings of the 26th ACM SIGKDD
+alibaba.
+International Conference on Knowledge Discovery &
+Data Mining, pages 2909–2930, 2020.
+
+[51] Jakub M Tarnawski, Amar Phanishayee, Nikhil Devanur,
+Divya Mahajan, and Fanny Nina Paravecino. Efﬁcient
+algorithms for device placement of dnn graph operators.
+Advances in Neural Information Processing Systems,
+33:15451–15463, 2020.
+
+[52] Rajeev Thakur, Rolf Rabenseifner, and William Gropp.
+Optimization of collective communication operations in
+
+mpich. The International Journal of High Performance
+Computing Applications, 19(1):49–66, 2005.
+
+[53] John Thorpe, Yifan Qiao, Jonathan Eyolfson, Shen Teng,
+Guanzhou Hu, Zhihao Jia, Jinliang Wei, Keval Vora,
+Ravi Netravali, Miryung Kim, et al. Dorylus: Affordable,
+scalable, and accurate GNN training with distributed
+CPU servers and serverless threads. In 15th USENIX
+Symposium on Operating Systems Design and Imple-
+mentation (OSDI 21), pages 495–514, 2021.
+
+[54] Parichehr Vahidinia, Bahar Farahani, and Ferei-
+doon Shams Aliee. Cold start in serverless computing:
+In 2020
+Current trends and mitigation strategies.
+International Conference on Omni-layer Intelligent
+Systems (COINS), pages 1–7. IEEE, 2020.
+
+[55] Ao Wang, Jingyuan Zhang, Xiaolong Ma, Ali Anwar,
+Lukas Rupprecht, Dimitrios Skourtis, Vasily Tarasov,
+Feng Yan, and Yue Cheng.
+InﬁniCache: Exploit-
+ing Ephemeral Serverless Functions to Build a Cost-
+Effective Memory Cache. In 18th USENIX Conference
+on File and Storage Technologies (FAST 20), pages 267–
+281. usenix.org, 2020.
+
+[56] Hao Wang, Di Niu, and Baochun Li. Distributed ma-
+chine learning with a serverless architecture. In IEEE
+INFOCOM 2019-IEEE Conference on Computer Com-
+munications, pages 1288–1296. IEEE, 2019.
+
+[57] Liang Wang, Mengyuan Li, Yinqian Zhang, Thomas Ris-
+tenpart, and Michael Swift. Peeking behind the curtains
+of serverless platforms. In 2018 USENIX Annual Tech-
+nical Conference (USENIX ATC 18), pages 133–146,
+2018.
+
+[58] Linnan Wang, Rodrigo Fonseca, and Yuandong Tian.
+Learning search space partition for black-box optimiza-
+tion using monte carlo tree search. In Advances in Neu-
+ral Information Processing Systems (NeurIPS), 2020,
+December 2020.
+
+[59] Ingo Wawrzoniak, Mike and Fraga Barcelos Paulus
+Bruno. Boxer: Data analytics on network-enabled
+In 11th Annual Conference on
+serverless platforms.
+Innovative Data Systems Research, 2021.
+
+[60] Fei Xu, Yiling Qin, Li Chen, Zhi Zhou, and Fangming
+Liu. λdnn: Achieving predictable distributed dnn train-
+ing with serverless architectures. IEEE Transactions on
+Computers, 71(2):450–463, 2021.
+
+[61] Minchen Yu, Zhifeng Jiang, et al. Gillis: Serving large
+neural networks in serverless functions with automatic
+model partitioning. In 2021 IEEE 41st International
+Conference on Distributed Computing Systems (ICDCS),
+pages 138–148. IEEE, 2021.
+
+15
+
+[62] Tian Zhang, Dong Xie, Feifei Li, and Ryan Stutsman.
+Narrowing the gap between serverless and its state with
+storage functions. In Proceedings of the ACM Sympo-
+sium on Cloud Computing, pages 1–12, 2019.
+
+[63] Wei Zhang, Suyog Gupta, Xiangru Lian, and Ji Liu.
+Staleness-aware async-sgd for distributed deep learn-
+ing. arXiv preprint arXiv:1511.05950, 2015.
+
+[64] Zhen Zhang, Chaokun Chang, Haibin Lin, Yida Wang,
+
+Raman Arora, and Xin Jin. Is network the bottleneck of
+distributed training? In Proceedings of the Workshop on
+Network Meets AI & ML, pages 8–13, 2020.
+
+[65] Yiyang Zhao, Linnan Wang, Kevin Yang, Tianjun Zhang,
+Tian Guo, and Yuandong Tian. Multi-objective optimiza-
+tion by learning space partitions. 10th International
+Conference on Learning Representations, ICLR, 2022.
+
+16
+
+A Notations
+
+The notations for Section 3.4 is summarized in Table 2.
+
+Backward time. The backward pipeline is similar. The
+backward computation time ti
+bc of layer i, the upload and
+download time ti
+bd between layers i and i − 1 are given by
+
+bu, ti
+
+B Iteration Time
+
+Forward time. The forward time t f is
+
+t f = t0
+
+f + (µ − 1)∆ f ,
+
+where t0
+f is the time for the ﬁrst micro-batch to traverse the for-
+ward pipeline, ∆ f the lag between consecutive micro-batches
+at the end of the forward pipeline, and µ the number of micro-
+batches per worker. The time t0
+
+f is given by
+
+t0
+f =
+
+L
+∑
+i=1
+
+ti
+f c +
+
+L−1
+∑
+i=1
+
+(ti
+
+f u + ti
+
+f d),
+
+where ti
+f c is the forward computation time of layer i, ti
+f u the
+upload time of the output of layer i to the storage, and ti
+f d the
+download time of the output of layer i from the storage to
+layer i + 1. The individual terms are related to (zi, j) by
+
+ti
+bc = β
+
+J
+∑
+j=1
+
+zi, jT i, j
+bc ,
+
+1 ≤ i ≤ L,
+
+ti
+bu = xi−1
+
+ti
+bd = xi−1
+
+(cid:32) J
+∑
+j=1
+(cid:32) J
+∑
+j=1
+
+(cid:33)
+
++ tlat
+
+,
+
+2 ≤ i ≤ L,
+
+zi, j
+
+gi
+Wj
+
+z(i−1), j
+
+gi
+Wj
+
+(cid:33)
+
++ tlat
+
+, 2 ≤ i ≤ L,
+
+where gi is the gradient size from layer i to layer i − 1. The
+cumulative backward computation time ˆti
+bc from the previous
+partition boundary down to layer i is given by
+
+bc = tL
+ˆtL
+bc,
+
+bc = ti
+ˆti
+
+bc + ˆti+1
+
+bc (1 − xi),
+
+1 ≤ i ≤ L − 1.
+
+(10)
+
+For each 1 ≤ i ≤ L, deﬁne
+
+ti
+b =
+
+L
+∑
+k=i
+
+tk
+bc +
+
+L
+∑
+k=i+1
+
+bu + tk
+(tk
+
+bd) + (µ − 1)∆i
+b,
+
+(11)
+
+1 ≤ i ≤ L,
+
+where
+
+∆i
+b = max
+
+(cid:110)
+
+bc ,t(i+1):L
+ˆti:L
+
+bu
+
+,t(i+1):L
+bd
+
+(cid:111)
+
+.
+
+zi, jT i, j
+f c ,
+
+ti
+f c = β
+
+ti
+f u = xi
+
+ti
+f d = xi
+
+J
+∑
+j=1
+(cid:32) J
+∑
+j=1
+(cid:32) J
+∑
+j=1
+
+(cid:33)
+
++ tlat
+
+,
+
+1 ≤ i ≤ L − 1,
+
+(8)
+
+zi, j
+
+oi
+Wj
+
+z(i+1), j
+
+oi
+Wj
+
+(cid:33)
+
++ tlat
+
+, 1 ≤ i ≤ L − 1,
+
+where T i, j
+f c is the forward computation time of layer i by a
+worker with memory M j, β ≥ 1 is the average slowdown factor
+due to resource contention when we overlap computation
+and communication, oi is the output size of layer i, Wj is
+the bandwidth of a worker with memory M j, and tlat is the
+measured latency to storage. The values of T i, j
+f c , β, Wj and tlat
+are measured by the Model Proﬁler during initial proﬁling.
+Note that communication times ti
+f d are nonzero only
+if xi = 1, i.e. there is a partition boundary after layer i.
+The lag ∆ f is the maximum time of all stages, i.e.
+
+f u and ti
+
+∆ f = max
+
+(cid:110)
+
+f c ,t1:(L−1)
+ˆt1:L
+
+f u
+
+,t1:(L−1)
+f d
+
+(cid:111)
+
+,
+
+(9)
+
+When i is the lowest layer of a partition, ti
+completion time of that partition, and ∆i
+lag between consecutive micro-batches. Note that ti
+i(cid:48) ≥ i and layers i and i(cid:48) belong to the same partition.
+
+b is the computation
+b is the corresponding
+b if
+
+b ≥ ti(cid:48)
+
+Synchronization time. For i ∈ L, the synchronization time
+of the partition containing layer i is
+
+ti
+s = (1 − y1)
+
+(cid:32) J
+∑
+j=1
+
+zi j
+
+ˆsi
+Wj
+
+(cid:33)
+
+· γ + tlat · δ
+
+,
+
+(12)
+
+where γ and δ are parameters that depend on the design of the
+synchronization method. For the pipelined scatter-reduce, we
+have γ = 2 and δ = 2 + d by (2). The model update time is
+negligible and hence not included. Note ti
+s is positive only if
+the degree of data parallelism is more than 1, i.e. y1 (cid:54)= 1. We
+can use (12) to deﬁne ti
+s for other layers. Note that ti
+s if
+i(cid:48) ≥ i and layers i and i(cid:48) belong to the same partition.
+
+s ≥ ti(cid:48)
+
+f c by (4). For i ∈ L, ti
+
+where ti1:i2 denotes the set of variables ti for i1 ≤ i ≤ i2, and
+ˆti
+f c is related to ti
+f c is the computation
+time for the stage containing layer i. For the example in Fig.
+3, ˆt3
+f c is the time for the second computation stage, consisting
+of layer 2 and layer 3. Note we only need to include ˆti
+f c for
+i ∈ H , but the inclusion of the other i gets rid of H .
+
+C Linearization
+
+First we present the major linearization techniques used to
+convert the non-linear binary integer programming to MIP:
+Technique 1: Linearizing the multiplication of two binary
+variables. x, y ∈ {0, 1}, xy can be linearized as follows:
+
+17
+
+Notation Deﬁnition
+
+s0
+M
+L
+P
+tlat
+si
+ai
+oi
+gi
+β
+
+K
+Dk
+J
+M j
+Wj
+T i, j
+f c
+T i, j
+bc
+xi
+yk
+zi, j
+
+titer
+citer
+t f
+t0
+f
+∆ f
+ti
+b
+ti
+s
+ti
+f u
+ti
+f d
+ti
+bu
+ti
+bd
+d
+µ
+mi
+wi
+ˆai
+ˆsi
+ˆti
+f c
+ˆti
+bc
+
+basic memory consumption of a serverless worker
+total number of micro-batches
+number of model layers.
+unit price of serverless function
+latency from serverless worker to cloud storage
+model size of layer i
+size of activations of layer i per micro-batch
+size of output of layer i per micro-batch
+size of gradients from layer i to layer i − 1 per micro-batch
+slowdown factor for computation due to resource contention
+
+number of data parallelism options
+value of k-th data parallelism option
+number of resource allocation options
+memory size of j-th resource option
+bandwidth of j-th resource option
+forward computation time of layer i with j-th resource option
+backward computation time of layer i with j-th resource option
+
+{0, 1}, 1 means model is partitioned between layers i and i + 1
+{0, 1}, 1 means the k-th data parallelism option D j is chosen
+{0, 1}, 1 means layer i workers have j-th memory size M j
+
+iteration time
+iteration cost
+forward time for full forward pipeline
+time for one micro-batch traverse forward pipeline
+lag between micro-batches at end of forward pipeline
+backward time until layer i completes computation
+model synchronizing time at layer i
+time for layer i to upload its output to storage.
+time for layer i + 1 to download input from storage.
+time for i to upload gradient output to storage.
+time for layer i − 1 to be download gradient from storage.
+degree of data parallelism, d = ∑K
+number of micro-batches per worker, µ = M/d
+memory size of layer i worker, mi = ∑J
+j=1 zi, jM j
+bandwidth of layer i worker, wi = ∑J
+accumulated activation size at layer i.
+accumulated model size at layer i.
+accumulated forward computation time at layer i.
+accumulated backward computation time at layer i.
+
+j=1 zi, jWj
+
+i=1 ykDk
+
+f = xy
+f ≤ x
+f ≤ y
+f ≥ x + y − 1
+f ∈ {0, 1}
+
+Table 2: Notations
+
+Technique 2: Linearizing the multiplication of a continuous
+variable and a binary variable. x ∈ {0, 1}, y ∈ [a, b] is a con-
+tinuous variable, xy can be linearized as follows:
+
+f = xy
+f ≤ y
+f ≥ y − b(1 − x)
+ax ≤ y ≤ bx
+
+(14)
+
+(13)
+
+18
+
+Technique 3: Linearizing of the max operator. x, y, z are con-
+tinuous variables, max{x, y, z} can be linearized as follows:
+
+f = max{x, y, z}
+x ≤ f , y ≤ f , z ≤ f
+x ≥ f − H(1 − l1)
+y ≥ f − H(1 − l2)
+z ≥ f − H(1 − l3)
+l1 + l2 + l3 ≥ 1
+l1, l2, l3 ∈ {0, 1}
+where H is a large constant. Next we introduce how we lin-
+earize the formulation in detail.
+
+(15)
+
+f c, ˆti
+
+1. Linearizing the equality constraint for the cumulative
+values ˆti
+bc, ˆsi and ˆai. We introduce ˆti
+bc, ˆsi and
+ˆai as continuous variables and linearize their equality
+constraints. We use ˆti
+bc in (10) as an example and it is
+similar with the others. We can write ˆti
+
+f c, ˆti
+
+bc as:
+
+3. Linearizing forward time t f and backward time ti
+
+b. We
+use ti
+b as an example and it is similar with t f . Linearizing
+ti
+b in (11) is equal to linearizing (µ−1)∆i
+b is the
+max of a set of continuous variables, it can be presented
+as a continuous variable with linear constraints using
+Technique 3. Expand (µ − 1)∆i
+
+b. Since ∆i
+
+b, we have
+
+(µ − 1)∆i
+
+b =
+
+K
+∑
+k=1
+
+∆i
+byk
+
+M
+Dk
+
+− ∆i
+b
+
+(19)
+
+Since ∆i
+variable, ∆i
+
+b is a continuous variable and yk is a binary
+byk can be linearized applying Technique 2.
+
+4. Linearizing ti
+
+s. Expand (12), we have
+
+ti
+s =
+
+J
+∑
+j=1
+
+(zi j ˆsi − y1zi j ˆsi)
+
+γ
+Wj
+
++ (1 − y1)tlat · δ,
+
+(20)
+
+zi j and y1 are binary variables, ˆsi is a continuous variable,
+thus we can ﬁrst linearize zi j ˆsi using Technique 2 and
+then further linearize y1zi j ˆsi by applying Technique 2
+again.
+
+ri = 1 − xi
+bc + ˆti+1
+bc = ti
+ˆti
+bc ri
+q−1
+L
+∑
+∏
+p=i
+q=i
+
+tq
+bc
+
+=
+
+rp
+
+(16)
+
+5. Linearizing full iteration time titer. So far we have lin-
+s in (7). We can further remove the
+
+earized t f , ti
+b and ti
+max operator using Technique 3.
+
+6. Linearizing total memory allocation cmem. Expand (5),
+
+we have
+
+cmem =
+
+L−1
+∑
+i=1
+
+K
+∑
+k=1
+
+J
+∑
+j=1
+
+xiykzi, jDkM j +
+
+K
+∑
+k=1
+
+J
+∑
+j=1
+
+ykzL, jDkM j
+
+(21)
+Since xi, yk, and zi, j are all binary variables, xiykzi, j and
+ykzL, j can be linearized using Technique 1.
+
+7. Linearizing memory constraint. At last, we linearize the
+memory constraint, the ﬁrst constraint in (3). Expand the
+constraint, we have
+
+K
+∑
+k=1
+
+ˆaiyk
+
+M
+Dk
+
++ 4 ˆsi − 2 ˆsiy1 + s0 ≤
+
+J
+∑
+j=1
+
+zi, jM j
+
+(22)
+
+ˆaiyk and ˆsiy1 can both be linearized with Technique 2.
+
+After linearization, titer, cmem and the constraints in (3)
+are all in linear form. citer ((6)) and the objective function
+are quadratic. The formulation becomes a mixed-integer
+quadratic program. It has a total of max{o(JL2), o(JKL)}
+integer variables, max{o(JL), o(KL)} continuous variables
+and max{o(JL2), o(JKL)} linear constraints.
+
+q−1
+p=i rp can be converted to
+Since ri is a binary variable, ∏
+a new binary variable ˆri,q by recursively performing lin-
+earization with Technique 1. Then continuous variable
+ˆti
+bc satisﬁes the following constraint
+
+ˆti
+bc =
+
+L
+∑
+q=i
+
+ti
+bc ˆri,q
+
+= β
+
+L
+∑
+q=i
+
+J
+∑
+j=1
+
+zi, j ˆri,qT i, j
+bc
+
+(17)
+
+zi, j and ˆri,q are both binary variables, thus zi, j ˆri,q can be
+linearized applying Technique 1.
+
+2. Linearizing the equality constraint for ti
+f u, ti
+
+bu and ti
+bd.
+We introduce ti
+bd as continuous variables
+and linearize their equality constraints.We use ti
+f u as an
+example and it is similar with the others. We can write
+ti
+f u in (8) as:
+
+bu and ti
+
+f d, ti
+
+f d, ti
+
+f u, ti
+
+ti
+f u =
+
+J
+∑
+j=1
+
+xizi, j
+
+oi
+Wj
+
++ xitlat
+
+(18)
+
+xi and zi,k are both binary variables, thus xizi, j can be
+linearized applying Technique 1.
+
+19
+
+Batchsize
+
+Model
+ResNet101
+Amoebanet-D18
+Amoebanet-D36
+Bert-large
+Average
+
+16
+
+64
+
+256
+
+Average
+
+5.9%
+13.3%
+10.8%
+9.8%
+9.9%
+
+11.2% 15.4%
+10.6%
+9.0%
+4.0%
+18.1%
+11.0% 16.4%
+15.1%
+8.8%
+
+10.8%
+11.0%
+11.0%
+12.4%
+11.3%
+
+Table 3: Prediction error of training tasks. Our perfor-
+mance model achieves an average prediction error of less
+than 12%.
+
+D Details of Baseline Methods
+
+The serverless-based training designs used in the evaluation
+and their resource allocation strategies are summarized as
+follows:
+
+• LambdaML follows a pure serverless-based training de-
+sign. It uses the maximum memory allocation and max-
+imum local batch size within the memory limit for each
+worker. This strategy reduces the number of workers used
+for training for a given global batch size.
+
+• HybridPS follows a hybrid PS training design and requires
+the use of parameter servers. We select the instance with
+the lowest cost that can perform our tasks without incurring
+CPU or memory bottleneck as the parameter server, i.e. a
+c5.9xlarge instance on AWS, and a r7.2xlarge instance on
+Alibaba. The resource allocation of workers follows the
+same strategy as that of LambdaML. Note that we replace
+the data serialization API in the implementation with the
+python pickle module to better utilize the worker network
+bandwidth. Prior to this modiﬁcation, the implementation
+can only achieve a throughput of about 20MB/s; the current
+implementation can fully utilize the bandwidth at about
+70MB/s. We test this modiﬁcation on the models and ob-
+serve improvement in both training speed and cost.
+
+• LambdaML-GA applies gradient accumulation to the
+LambdaML baseline. It uses the same number of workers
+as LambdaML but allocates the minimum memory required
+after performing gradient accumulation for each worker.
+
+• HybridPS-GA. HybridPS with gradient accumulation. It
+follows the similar resource allocation strategy as that of
+LambdaML-GA.
+
+The details of the baseline partition and resource allocation
+algorithms used in the evaluation, i.e. TPDMP and Bayes are
+as follows
+
+• TPDMP is the latest graph-based model partition algorithm
+for server-based pipeline training [51]. It focuses on maxi-
+mizing the pipeline training throughput with a ﬁxed amount
+of resource. To apply the algorithm to the serverless sce-
+nario, we perform a grid search on the resource allocation
+and optimizes the model partition with TPDMP for each
+allocation. We select the conﬁguration that minimizes the
+objective function in (3).
+
+• Bayes is a blackbox optimization method that has been
+proved effective in deciding conﬁgurations for cloud ser-
+vices [4]. It generates a conﬁguration, measures its perfor-
+mance, and iteratively reﬁnes the decision. It can be used to
+jointly optimize the model partition and resource allocation.
+However, with the search space of this problem, Bayes can
+require many iterations just to ﬁnd a feasible conﬁguration.
+For example, it fails to ﬁnd a feasible conﬁguration for over
+half of our training tasks with 20 iterations. To reduce the
+prohibitive time cost of real-world measurement, we eval-
+uate each conﬁguration with our performance model that
+has a high accuracy of 88% as shown in Appendix E. Using
+performance models in place of the actual measurement
+is recently proposed and demonstrated to produce good
+optimization performance [58, 65]. We run a total of 100
+iterations to minimize the objective function.
+
+E Performance Model Accuracy
+
+Table 3 displays the prediction error in training time for the
+measured points of FUNCPIPE in Fig. 6. The results show that
+our performance model achieves an average prediction error
+of less than 12%. The largest error happens when training
+Amoebanet-D36 with a global batch size of 256. We note that
+this error is mainly caused by the unexpected bandwidth vari-
+ation; other model training is less impacted as they use fewer
+serverless workers and are less subject to the performance
+interference among workers. We leave the consideration of
+such interference in our performance model as part of future
+work.
+
+20
+
+

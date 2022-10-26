@@ -1,0 +1,1713 @@
+2
+2
+0
+2
+
+l
+u
+J
+
+5
+1
+
+]
+S
+O
+.
+s
+c
+[
+
+1
+v
+8
+8
+6
+7
+0
+.
+7
+0
+2
+2
+:
+v
+i
+X
+r
+a
+
+3PO: Programmed
+Far-Memory Prefetching for Oblivious Applications
+
+Christopher Branner-Augmon1, Narek Galstyan1, Sam Kumar1,
+Emmanuel Amaro1, Amy Ousterhout1, Aurojit Panda2, Sylvia Ratnasamy1, Scott Shenker13
+1UC Berkeley, 2NYU, 3ICSI
+
+Abstract
+
+Using memory located on remote machines, or far memory, as
+a swap space is a promising approach to meet the increasing
+memory demands of modern datacenter applications. Oper-
+ating systems have long relied on prefetchers to mask the
+increased latency of fetching pages from swap space to main
+memory. Unfortunately, with traditional prefetching heuris-
+tics, performance still degrades when applications use far
+memory. In this paper we propose a new prefetching tech-
+nique for far-memory applications. We focus our efforts on
+memory-intensive, oblivious applications whose memory ac-
+cess patterns are independent of their inputs, such as matrix
+multiplication. For this class of applications we observe that
+we can perfectly prefetch pages without relying on heuristics.
+However, prefetching perfectly without requiring significant
+application modifications is challenging.
+
+In this paper we describe the design and implementation
+of 3PO, a system that provides pre-planned prefetching for
+general oblivious applications. We demonstrate that 3PO can
+accelerate applications, e.g., running them 30-150% faster than
+with Linux’s prefetcher with 20% local memory. We also use
+3PO to understand the fundamental software overheads of
+prefetching in a paging-based system, and the minimum per-
+formance penalty that they impose when we run applications
+under constrained local memory.
+
+1 Introduction
+
+The rise of memory-intensive big-data applications such as
+machine learning [51] has caused memory demands in dat-
+acenters to increase drastically [11]. At the same time, the
+slowing of Moore’s Law means that memory costs (per GB)
+are no longer decreasing [24, 29]. This has two consequences:
+first, applications often want to access more memory than
+is available on their local server and second, datacenter op-
+erators are incentivized to use their available memory as
+efficiently as possible. Recently far memory has emerged as
+a solution to these challenges, enabling applications to make
+use of unused memory elsewhere in a cluster [4, 5, 19, 39]. By
+moving some data to far memory when local memory is full,
+far memory systems allow applications to run with less local
+memory and improve overall resource utilization.
+
+1
+
+Unfortunately, while existing far-memory systems [4, 5] en-
+able good performance at high local memory ratios,1 their per-
+formance degrades significantly as you decrease the amount
+of local memory. For example, with Fastswap, application
+runtime degrades by 11-226% with 40% local memory [5]. A
+fundamental reason for this degradation is that far memory
+has higher latency than local memory (a few microseconds vs.
+about 100 ns). One way to reduce overhead is to more carefully
+decide what data to move from local memory to far memory
+when local memory is full, in order to reduce the number of
+memory accesses that stall on far memory. However, prefetch-
+ing is a more promising approach because it has the potential
+to prevent all stalls on far memory. Unfortunately, state-of-
+the-art prefetching algorithms [4, 17, 21, 22, 26, 41, 42] rely
+on heuristics, which are imperfect and often behave subopti-
+mally. Therefore, they are not effective enough to fully mask
+the latency of far memory.
+
+However, we observe that some applications—including lin-
+ear algebra operations (e.g., matrix multiply), certain machine
+learning algorithms, and Fourier transforms—have a special
+property that admits heuristic-free, nearly optimal prefetch-
+ing. This special property is that the sequence of memory ac-
+cesses issued by such programs is independent of the program’s
+inputs. For deterministic applications of this type, we can de-
+termine the memory access pattern up front and then use it
+to guide prefetching when the program is run on any input.
+This special property is called obliviousness and it has been
+studied primarily in the context of computer security [18, 31,
+50, 53]. Obliviousness is useful for security because it guar-
+antees that no information about a program’s input is leaked
+via memory-related side channels. One recent prior work,
+MAGE [25], goes further and exploits this obliviousness for
+memory management, including prefetching. Though MAGE
+is limited to a family of cryptographic applications called
+Secure Computation, we observe that the implications of
+obliviousness for memory management extend beyond these
+security-related settings. In this context, we ask the question:
+can we enable nearly perfect prefetching of far mem-
+ory for general oblivious applications, with little to no
+modification? To answer this question, we design and im-
+plement 3PO, a system that provides pre-planned prefetching
+for oblivious applications. 3PO builds on the operating sys-
+tem’s virtual memory subsystem, treating far memory as swap
+
+1The local memory ratio is the fraction of an application’s total memory that
+is allowed to reside in local memory.
+
+ 
+ 
+ 
+ 
+ 
+ 
+Branner-Augmon, Galstyan, Kumar, Amaro, Ousterhout, Panda, Ratnasamy, and Shenker
+
+space. Using 3PO, we (1) explore how much the oblivious ap-
+plications mentioned above can benefit from programmed
+prefetching, and (2) push prefetching to the limit and study the
+fundamental software overheads of prefetching in a paging-
+based virtual memory subsystem.
+
+In designing 3PO, we could not directly leverage designs
+from prior work. MAGE’s techniques and design are special-
+ized to Secure Computation; it assumes that the program is
+written in a DSL and that it is acceptable to run it in a soft-
+ware interpreter. Other approaches to application-directed
+prefetching assume that the program is built with a particu-
+lar compiler [33] or that the programmer provides hints to
+the prefetcher [36, 45, 48]. These approaches are not suitable
+for 3PO, which aims to support general oblivious applica-
+tions with little to no modification. Instead, 3PO works in
+two phases, as follows. First, 3PO observes a program as it
+executes (with a given input) and generates a tape indicating
+which pages of memory need to be fetched as this program
+executes. Second, when the program is run later on a different
+input, 3PO prefetches pages from far memory, using the tape
+as a guide. Realizing this design required overcoming two
+main challenges.
+
+3PO’s first challenge is generating a program’s tape. To do
+this, 3PO introduces a tracer, which records the pages accessed
+by a program as it executes. Existing tools based on dynamic
+binary instrumentation (DBI) [32, 34] can collect such a trace
+but are not efficient; they are known to take impractically
+long and result in a trace that is impractically large [25].
+
+We address this challenge with two insights. The first in-
+sight is that, for the purpose of page-based prefetching, page-
+granularity traces (rather than access-granularity) are suffi-
+cient. This enables us to design an efficient in-kernel tracer
+that ensures that it incurs a page fault each time a new page
+is accessed and then records these page accesses in the page
+fault handler. We improve on this further with our second in-
+sight: to organize the trace not as a series of page accesses, but
+as a series of microsets—small working sets. With microsets,
+our tracer records sets of pages that are accessed consecu-
+tively, but does not record the complete sequence of accesses
+within each set of pages. This accelerates tracing and produces
+smaller traces. Microsets omit information about the exact
+sequence of page accesses within a microset, yet we find that
+we can use microsets that are up to hundreds of pages in size
+without degrading prefetching accuracy. 3PO additionally
+post-processes each trace to filter out pages that are likely to
+already be in local memory, leaving a more concise tape of
+pages to be prefetched at runtime. Note that the tape only
+specifies which pages to prefetch; 3PO lets Linux’s default
+eviction policy determine which pages to evict.
+
+3PO’s second challenge is to ensure that prefetching is
+timely. 3PO does not have visibility into where the program is
+in its execution, so it is difficult for 3PO to know when it should
+prefetch the next page on the tape. Prior approaches circum-
+vent this by having the application software manage memory
+
+2
+
+(e.g., in a software interpreter [25]) or by relying on a com-
+piler [33] or developer [37, 46, 49] to insert prefetch directives.
+But such techniques are unsuitable for supporting generic
+applications with minimal modifications, as 3PO aims to do.
+To solve this problem, 3PO identifies pages in the tape that
+are guaranteed to page fault when accessed (because they are
+not present), and selects a subset of them as key pages. Key
+pages serve as synchronization points from which to initiate
+prefetching, so 3PO aims to space them evenly along the tape.
+Specifically, 3PO uses the page fault on each key page as a sig-
+nal to select the next key page and to prefetch all pages that will
+be accessed in between. 3PO generalizes both its tracing and
+prefetching techniques to support multithreaded applications,
+with a separate tape and separate key pages for each thread.
+We implemented a prototype of 3PO in the Linux 4.11.0
+kernel, and evaluated it by combining the 3PO prefetcher with
+Fastswap [5], a state-of-the-art far-memory system. We found
+that 3PO can collect the memory-access trace of a program or-
+ders of magnitude faster than Intel Pin [32], a state-of-the-art
+tool for dynamic binary instrumentation. Using 3PO, we can
+run applications at much lower local memory ratios than with
+Linux or state-of-the-art prefetchers such as Leap [4], or run
+them at the same local memory ratio with better performance.
+For example, with 3PO, applications run 30-150% faster at 20%
+local memory than with Linux’s prefetcher.
+
+Despite 3PO’s benefits, we find that we cannot completely
+prevent performance degradation at low local memory ratios.
+Overheads such as minor page faults on prefetched pages
+and TLB flushes for multithreaded applications still cause
+runtimes to degrade, for example by 0-300% at a local memory
+ratio of 20%. Even so, we believe that 3PO can be a useful
+tool for oblivious applications and that it sheds light on the
+fundamental limitations of how much performance we can
+hope to salvage with better prefetching.
+
+2 Background
+2.1 Far Memory
+
+Far memory is an emerging datacenter design that allows op-
+erators to improve cluster resource utilization by leveraging
+the unused memory of remote servers or memory blades. In
+a typical setup, an oversubscribed machine fetches memory
+over a low-latency network using RDMA, [5, 19, 30] or even
+traditional TCP [39]. Applications can leverage far memory
+using custom APIs [3, 39] or in ways that remain transparent
+to applications [4, 5, 19, 40]; this transparency is achieved by
+using the existing virtual memory subsystem to swap pages.
+3PO takes the latter approach because of its goal of generality.
+Indeed, some cloud operators argue that adopting specialized
+APIs for far memory in large scale clusters is impractical [27].
+Running applications that swap at low local memory ratios
+can impose very high bandwidth requirements. In the worst
+case, if the allowed local memory for an application is close to
+zero, then the network bandwidth would need to be compa-
+rable to the local memory bus bandwidth—e.g., 800 Gbps on
+
+3PO: Programmed Far-Memory Prefetching for Oblivious Applications
+
+one modern platform [7]—in order to achieve performance
+similar to that of only using local memory. Thus, running
+applications at low local memory ratios would be infeasible
+with older storage technologies such as HDDs, even with
+perfect prefetching hiding access latency, because they pro-
+vide less than 5 Gbps [8]. In contrast, recent high-bandwidth
+non-volatile memory technologies can achieve tens of Gbps
+per memory module [23], while network bandwidth can ex-
+ceed 100 Gbps. These technologies make it feasible to explore
+running applications with severely restricted local memory.
+However, as an application’s local memory ratio decreases,
+accurate and timely prefetching become more important.
+
+2.2 Memory Management in Linux
+
+Most modern processors manage memory at the granularity
+of pages, typically 4 KB each. When a program tries to access
+a page, the processor checks its page table entry (PTE) to see if
+it is marked as “present” in local memory, and the CPU trigger
+a page fault if the page is “not present”. The operating system
+is responsible for handling faults by fetching the faulted page
+from a swap device. When fetching pages from swap, Linux
+will also prefetch a dynamically-sized batch of pages that are
+consecutive (either in swap space or virtual address space) to
+the page that triggered the fault.
+
+Linux’s paging mechanisms impose overheads on applica-
+tions primarily in two ways. First, if an application tries to
+access a page that Linux failed to prefetch, it incurs a major
+page fault and must block until the page has been fetched
+from the swap device and mapped into the process’s address
+space. Second, if a page is present but not yet mapped into a
+process’s address space (e.g., because it was prefetched but
+has not yet been accessed), the first access to it will incur a
+minor page fault. Handling minor page faults entails some soft-
+ware overhead but typically does not require waiting on I/O.
+Most prefetching algorithms aim to eliminate overheads from
+major page faults, though as we will discuss (§3.3), oblivious
+applications provide an opportunity to reduce the overheads
+of minor page faults as well.
+
+2.3 Application Requirements
+
+3PO requires two main properties from applications: (1) obliv-
+iousness, meaning that application’s memory access patterns
+are independent of their inputs, and (2) deterministic memory
+access patterns at page granularity. Obliviousness originates
+from security contexts, where it is useful because it can guar-
+antee that a program does not leak information via memory-
+related side channels [18, 31, 50, 53]. Instead, 3PO leverages
+obliviousness for its potential to improve prefetching per-
+formance. As a result, 3PO’s requirements for applications
+differ slightly from those for traditional oblivious applica-
+tions. First, because 3PO fetches memory at the granularity
+of pages, it requires only page-level obliviousness rather than
+access-level obliviousness; an application that might reorder
+
+Figure 1: 3PO (1) runs an oblivious program with input
+data, using its tracer to collect a memory-access trace, (2)
+post-processes the trace to create a concise tape, and (3) runs
+the same program with different input data, prefetching
+pages according to the tape.
+
+accesses within a page is sufficiently oblivious for 3PO. Sec-
+ond, 3PO can eliminate some inputs that might prevent an
+application from being traditionally oblivious (e.g., matrix
+size) by retracing the application for each of these inputs (e.g.,
+generate one tape for each target matrix size).
+
+We observe that many memory-intensive applications to-
+day meet these requirements. Examples include linear algebra
+operations such as matrix multiplication, determinant com-
+putation, and eigenvalue computation. In addition, Fourier
+transforms, and some graphics workloads (e.g., ray tracing,
+marching cubes) and machine learning algorithms (e.g., neu-
+ral networks) also have these properties. 3PO targets these
+workloads.
+
+3 3PO’s Design
+
+3PO’s goal is to enable nearly perfect prefetching of far mem-
+ory for oblivious applications, without requiring significant
+application modifications. To limit modifications to the ap-
+plication, we build 3PO into the Linux kernel and leverage
+Linux’s machinery for page-based memory management,
+rather than requiring applications to use a new API as in
+some existing approaches [3, 25, 39]. By “nearly perfect” we
+mean that memory accesses should almost never stall because
+they are waiting for memory to be swapped in, even when
+running applications with very limited local memory. Ideally
+3PO would also achieve this with low overhead, allowing an
+application to achieve the exact same runtime when run with
+a low local memory ratio (e.g., 5%) as when run with 100%
+local memory. While 3PO is able to provide high accuracy, we
+find that it does entail some overheads which prevent it from
+achieving performance that is completely independent of the
+local memory ratio (§5.3).
+
+There are two main challenges in designing 3PO: (1) ob-
+taining a tape for an application describing which pages to
+prefetch, and (2) prefetching pages at the correct times during
+execution, i.e., ensuring that prefetching is timely. 3PO ad-
+dresses these challenges with a three-step process, as shown
+in Figure 1. First, before actually running an oblivious pro-
+gram, a user executes it offline with sample input data, using
+3PO’s in-kernel tracer to record the program’s sequence of
+memory accesses, or trace. When the user later executes their
+program online, many accesses in the tape will not trigger
+
+3
+
+TracerPost-ProcessorTape PrefetchertapetracedatadataprocessprocessprogramdataprocessprogramdataBranner-Augmon, Galstyan, Kumar, Amaro, Ousterhout, Panda, Ratnasamy, and Shenker
+
+prefetches, because the pages will be resident in memory from
+earlier accesses in that run. Thus 3PO’s second step is for the
+user to feed the trace through 3PO’s post-processor, which
+simulates which pages are evicted given a specific target local
+memory ratio, in order to generate a more concise tape of
+pages to prefetch during execution. This reduces overheads
+during prefetching, because the prefetcher does not have to
+scan through a long list of pages that are already present. Fi-
+nally, the user can run their program with different input data
+under constrained local memory, with 3PO’s prefetcher load-
+ing the tape and accurately prefetching according to it. Note
+that 3PO assumes that the amount of available local memory
+remains fixed throughout the execution of the program.
+
+3PO uses Linux’s default eviction policy, which is similar to
+LRU. One could extend 3PO’s current design to use Belady’s
+optimal MIN [12] algorithm to precompute what pages should
+be evicted; we leave this to future work. Next we describe
+each step of 3PO—tracing (§3.1), post-processing (§3.2), and
+prefetching (§3.3)—in more detail. We describe how 3PO han-
+dles single-core applications, and then explain how we extend
+the techniques to multicore in §3.4.
+
+3.1 Collecting a Memory Trace
+
+When collecting a trace of a program’s memory accesses, 3PO
+aims to: (1) collect a concise trace, (2) collect it quickly, and
+(3) support general programs—programs that are not written
+in a specialized way for memory-trace collection. Existing
+general-purpose tracing options based on dynamic binary
+instrumentation (DBI) [14, 32, 34] have very high overheads
+and are slow enough that it is impractical to trace even small
+programs this way. This is because DBI-based approaches
+involve instrumenting most memory accesses which adds
+significant overhead, particularly for memory-intensive ap-
+plications that can access memory very frequently. 3PO aims
+to retain the generality of DBI but at higher efficiency, by
+allowing most memory accesses to execute without software
+intervention. We achieve this benefit via two techniques we
+discuss next: page-granularity tracing and microsets.
+
+Note that 3PO’s tracing techniques apply to regular ap-
+plications as well as those that are data oblivious. Thus we
+believe that 3PO’s tracer is useful independent of 3PO, as a
+tool for helping researchers and developers better understand
+the memory-access patterns of their programs.
+
+3.1.1 Page-Granularity Tracing Because operating sys-
+tems typically fetch memory (from storage or far memory)
+in units of pages, it is sufficient to record traces at page-
+granularity. By page-granularity, we mean that consecutive
+accesses to the same page are condensed into a single entry in
+the trace. This approach not only makes the trace smaller, but
+also allows us to leverage the processor’s hardware page table
+support to only perform tracing work when an application ac-
+cesses a different page, rather than on most memory accesses.
+
+4
+
+3PO’s high-level approach to page-granularity tracing is to
+modify the page-fault handler to record all page accesses, and
+to force a program to incur a page fault each time it accesses
+a different page. This approach incurs many more page faults
+than a program would normally incur during execution, but
+allows 3PO to record a complete trace of page accesses.
+
+More precisely, the tracer maintains an invariant over 𝑆,
+the set of pages whose accesses are recorded in a trace. The
+invariant is that of all pages in 𝑆, only the most recently accessed
+page has its “present” bit set in its page table entry (PTE). If the
+next access to a page in 𝑆 is to a different page than the most
+recently accessed page, the memory management unit will
+observe that the page is not present and raise a page fault. This
+allows 3PO’s tracer to record the access in the trace, mark this
+page as “present,” and mark the previous page as “not present”.
+Alternatively, if the next access to a page in 𝑆 is to the most
+recently accessed page, then the access proceeds without a
+page fault, thereby coalescing all consecutive accesses into
+a single entry in the trace with no additional tracer overhead.
+This approach poses a challenge: how can 3PO distinguish
+between pages that are actually present but have been marked
+as “not present” by the tracer, and those that are truly not
+present? For example, when a process accesses a page for the
+first time, the Linux page fault handler needs to execute to allo-
+cate a page frame to back the page; simply setting the “present”
+bit in the PTE would cause incorrect behavior. To distinguish
+between these two cases, when 3PO’s tracer marks the PTE
+of a present page as “not present”, it also sets a special bit in
+the PTE, which we call the 3PO bit. On a page fault, the tracer
+can then check if the 3PO bit is set and use this to determine if
+it can simply set the “present” bit to true and return, or if this
+page must be handled by Linux’s regular page-fault handler.
+The invariant of at-most-one-page-present-at-once poses
+challenges with instructions that can access multiple pages
+at once, such as movdqu or vscatterqpd. Though we relax
+this invariant below (§3.1.2), these instructions require that
+a specific set of pages are present simultaneously, which re-
+quires special care. For example, movdqu can require that up to
+two pages are present simultaneously. 3PO handles this case
+by recognizing when a sequence of page faults on the same
+instruction alternates between two pages (e.g., pages ABAB)
+and responds by temporarily marking both pages as “present”
+until the instruction pointer advances. This technique handles
+instructions that access two pages at once. It can be extended
+to support instructions that can access more than two pages,
+such as vscatterqpd; we leave this to future work.
+
+The tracer provides a system-call-based interface for pro-
+cesses to specify when tracing begins and ends (§4); pages
+allocated outside of this interval will be excluded from 𝑆. Pro-
+cesses should invoke the syscall to start tracing as soon as
+possible during startup and before allocating the large mem-
+ory buffers they will use for computation (e.g., on the heap),
+so that accesses to that memory will be included in the trace.
+This approach has tradeoffs: it may miss some page accesses
+
+3PO: Programmed Far-Memory Prefetching for Oblivious Applications
+
+1 𝑚𝑖𝑐𝑟𝑜𝑠𝑒𝑡 = { }
+2 def on_page_fault(page p):
+3
+
+// record access to p
+if size of microset == MICROSET_SIZE:
+// start a new microset
+for p’ in microset:
+
+append 𝑝′ to trace
+clear present bit for 𝑝′
+
+𝑚𝑖𝑐𝑟𝑜𝑠𝑒𝑡 = { }
+add 𝑝 to 𝑚𝑖𝑐𝑟𝑜𝑠𝑒𝑡
+
+// resolve page fault
+if p’s 3PO bit is set:
+
+// skip normal page-fault handling
+set 𝑝’s present bit
+
+else:
+
+// first access to p
+set 𝑝’s 3PO bit
+run normal page-fault handling
+
+return
+
+Algorithm 1: The main logic in 3PO’s tracer.
+
+4
+
+5
+
+6
+
+7
+
+8
+
+9
+
+10
+
+11
+
+12
+
+13
+
+14
+
+15
+
+16
+
+17
+
+18
+
+19
+
+20
+
+that need to be prefetched during execution, but it also al-
+lows tracing to skip memory accesses that occur only during
+process initialization. In addition, to speed up tracing and
+focus only on the large memory buffers used for computation,
+the tracer explicitly excludes stack pages from 𝑆 by checking
+which virtual memory area an access falls in. The tracer also
+ignores page faults due to instruction fetches by checking a
+bit in the page-fault error code.
+
+Assumptions. The current implementation of 3PO’s tracer
+assumes that during tracing, page faults only occur for two rea-
+sons: (1) self-induced page faults caused by marking present
+pages as “not present” or (2) page faults due to memory al-
+location. It may be possible for the tracer to handle other
+special minor page faults, such as those due to copy-on-write
+resulting from a call to mmap. This could be done by detecting
+a minor page fault on a page that has its 3PO bit set and is
+already marked as present, and then executing the regular
+Linux page-fault handler; we leave this to future work.
+
+3PO could similarly support tracing in the presence of ma-
+jor page faults, i.e., when a process’s memory does not fit in
+available local memory. While a page is swapped out of mem-
+ory, Linux repurposes its PTE to record information about
+where the page is stored, so the 3PO bit may be overwritten
+and cannot be used to determine if a page is physically present
+or not. However, 3PO could leverage other mechanisms to
+detect if a page was swapped out, and still rely on the 3PO bit
+for pages that remained physically present.
+
+3.1.2 Microsets While page-granularity tracing provides
+a significant improvement relative to a DBI-based solution,
+it still wastes time and space by recording information at sig-
+nificantly higher granularity than necessary for prefetching.
+In practice, when a program runs, more than one page will
+
+5
+
+Figure 2: A sequence of accessed pages and resulting traces
+with different microsets sizes.
+
+be resident in local memory at once, and tracing accesses for
+these already-present pages provides no useful information
+for the prefetcher. For example, if a program accesses the
+sequence of pages ABABAB, as long as the amount of local
+memory is at least two pages, A and B should remain present,
+so the last four accesses will not trigger prefetches and are
+therefore not useful to record.
+
+Thus to improve efficiency, 3PO’s tracer relaxes the invari-
+ant described above (§3.1.1) to allow multiple pages—a small
+microset of up to MICROSET_SIZE pages—to remain marked
+as “present” simultaneously. As shown in Algorithm 1, the
+microset starts out empty and each time a new page is ac-
+cessed, triggering a page fault, the tracer adds it to the mi-
+croset (line 10) and marks it as present (line 15). When a new
+page is accessed and the current microset is full (lines 4-9),
+the tracer adds all pages in the microset to the trace, marks
+them as “not present”, and resets the microset to empty. Then
+when pages in that microset are accessed again, they will
+incur minor page faults and be added to the microset again.
+With microsets, each trace consists of a sequence of mi-
+crosets where each microset represents a small working set
+of MICROSET_SIZE pages that are accessed consecutively, as
+illustrated in Figure 2. During tracing, only MICROSET_SIZE
+page faults are incurred per microset, and the remaining ac-
+cesses proceed without software intervention. In most cases
+increasing the microset size yields a shorter trace, and tracing
+time decreases commensurately with the length of the trace.
+How large should MICROSET_SIZE be? At one extreme,
+MICROSET_SIZE could be the number of pages in the smallest
+local memory size that we intend to use for this application.
+However, microsets this large degrade prefetching accuracy.
+The reason for this is that 3PO assumes that at runtime, Linux
+will not evict any page in a microset between when the page
+is first and last accessed as part of that microset; if a page
+was evicted during this interval, it would not be prefetched
+before its next access and would incur a major page fault. In
+practice this assumption holds as long as MICROSET_SIZE is
+not too large, so that pages within a microset are accessed
+close together in time. However, because Linux’s eviction
+policy is not strictly LRU, this assumption may not hold with
+very large values of MICROSET_SIZE. Overall we found that a
+wide range of microset sizes are able to strike a good balance,
+significantly accelerating tracing without degrading accuracy
+(§5.5); by default 3PO uses a MICROSET_SIZE of 1024 pages.
+
+Pages accessed:Trace with MICROSET_SIZE=1:ABCDCDTrace with MICROSET_SIZE=2:ABCDBATrace with MICROSET_SIZE=4:ABCDlength=8length=6length=4ABCCDCDBAEABBranner-Augmon, Galstyan, Kumar, Amaro, Ousterhout, Panda, Ratnasamy, and Shenker
+
+3.2 Computing the Tape from the Trace
+
+In principle, 3PO could accurately prefetch data at runtime
+using the memory trace produced in §3.1 directly, by inter-
+preting it as a list of pages to prefetch. However, this would
+result in needlessly attempting to prefetch many pages that
+are already present in local memory from an earlier access.
+For example, in Figure 2 with a microset size of 2, if our local
+memory contained at least 4 pages, 3PO probably would not
+need to prefetch BA again, because they would still be in mem-
+ory from the earlier accesses to AB. To avoid prefetching BA
+again, 3PO must traverse the page table to discover whether
+the pages are already local, adding overhead. In addition, de-
+spite the techniques in §3.1, the redundant accesses in the trace
+can make it large enough (e.g., gigabytes) that traversing it at
+runtime would consume significant memory and CPU cycles.2
+Therefore, we perform a post-processing step on the trace
+to filter out pages that are likely to be in local memory and
+therefore do not need to be prefetched. Conceptually, this
+transforms the trace, which is a sequence of accessed pages
+structured as microsets, into a tape describing what to prefetch
+at runtime. The tape allows 3PO to avoid extraneous prefetch-
+ing and reduces the amount of memory the prefetcher must
+traverse at runtime (§5.5).
+
+The set of pages that remains in memory at runtime de-
+pends on three factors: the prefetching algorithm, the eviction
+policy, and the amount of available local memory. Thus to gen-
+erate a tape, 3PO’s post-processor traverses the trace, simulat-
+ing 3PO’s perfect prefetching algorithm and an eviction policy
+with a particular target local memory size to determine which
+pages will not be present and will need to be prefetched. Ide-
+ally 3PO would simulate Linux’s eviction policy, since this is
+what will be used at runtime. Unfortunately, Linux’s eviction
+policy is quite complex and depends on the timing of different
+events [13], so it would be difficult to simulate it accurately.
+Instead, 3PO simulates a simple LRU eviction policy. Linux’s
+eviction policy bears some resemblance to LRU but differs in
+many ways; despite this we found that simulating LRU instead
+is accurate enough to avoid major page faults in practice (§5.5).
+A user should run post processing to generate a separate
+tape for different local memory ratios they would like to be
+able to run their program at. However, we have found that
+tapes generated for a specific target local memory ratio can be
+used for executions at slightly larger local memory ratios; this
+adds a small runtime overhead from scanning through the
+extra pages on the tape, but does not degrade accuracy (§5.5).
+For example, a user could generate tapes at increments of
+10% local memory, and round their local memory ratio down
+when choosing which tape to use.
+3.3 Prefetching using the Tape
+
+The goal of the 3PO prefetcher is to use the tape to bring
+pages from remote memory to local memory ahead of time,
+
+2One could in theory prefetch the trace, but this would save memory at the
+expense of network bandwidth and would still consume CPU cycles.
+
+6
+
+thereby avoiding major page faults. Though the tape provides
+information about exactly which pages need to be prefetched,
+it has no information about when to prefetch them. For exam-
+ple, a naïve prefetcher could prefetch all of an application’s
+remote memory at once according to the tape as soon as
+the application started, but this would provide no benefit
+since the prefetched pages would be evicted to make room
+for subsequent prefetches, before any of them were accessed.
+Thus the main challenge faced by the prefetcher is to provide
+timely prefetching. This involves two components. First, the
+prefetcher needs to stay synchronized with the application,
+that is, it must know roughly where along the tape the ap-
+plication currently is in its execution. Second, the prefetcher
+must fetch each batch of pages in advance so that the pages
+are likely to arrive by the time the application accesses them.
+
+Synchronization. In order to provide synchronization, 3PO
+introduces key pages. At any given time, the prefetcher main-
+tains one key page for each application. When choosing a
+key page, 3PO chooses a page that will be accessed in the
+near future and that will trigger a page fault (because it is not
+currently mapped). When a page fault occurs on a key page,
+the prefetcher can resynchronize, updating its state about
+where the application is in its execution along the trace. In ad-
+dition, the prefetcher will prefetch the next batch of pages and
+choose the next key page at this time. Though the prefetcher
+prefetches key pages, it does not mark them as present, so
+they will still trigger a minor page fault when accessed.
+
+3PO chooses each key page by scanning forward along
+the tape to find a page that is guaranteed to trigger a page
+fault. Because the prefetcher fetches pages in batches, it starts
+looking for the next key page at the index of the current key
+page plus BATCH_SIZE. However, it is possible that this page
+is already currently present and mapped, and will thus not
+trigger a page fault. This can occur because the post processing
+uses an approximate rather than an exact model of Linux’s
+eviction policy, or due to other threads executing concurrently
+(§3.4). In either case, the prefetcher scans forward along the
+tape after the current key page plus BATCH_SIZE, checking if
+each page is mapped by consulting the page table, until it finds
+a page that is unmapped and uses this as the next key page.3
+Prefetching in advance. When a page fault occurs on a key
+page, the prefetcher needs to decide which pages to prefetch
+next. One approach to do this would be to start with the next
+page on the tape after the key page and prefetch all pages
+through the next key page. However, this approach does not
+prefetch pages far enough in advance and causes delayed
+hits [9]. These can occur due to either the latency overhead of
+fetching pages or due to bandwidth limitations. For latency,
+each page prefetch takes several microseconds to complete, so
+if the program accesses the first page after the key page in the
+
+3In an alternate approach, you could always advance the key page by
+BATCH_SIZE and force it to trigger a page fault by marking its PTE as “not
+present”, but this would add overheads from TLB shootdowns.
+
+3PO: Programmed Far-Memory Prefetching for Oblivious Applications
+
+Figure 3: The state of pages after the prefetcher finishes han-
+dling a fault on key page B. It chooses E as the next key page,
+maps all pages before E, and prefetches pages through K.
+
+meantime, it will suffer a delayed hit and have to block until
+the page arrives. The bandwidth needed for prefetching pages
+can also be bursty over time (§5.4), so that even if the first
+prefetched page in a batch arrives on time, later pages may not
+if the NIC is not fast enough (we observed this phenomenon
+often with 10 Gbits/s NICs).
+
+To reduce delayed hits, 3PO prefetches pages in advance of
+when they are needed. As Figure 3 shows, the LOOKAHEAD pa-
+rameter determines how far in advance pages are prefetched.
+When 3PO needs to prefetch the next batch of pages, it will
+begin prefetching from the first page in the tape it has not yet
+prefetched, and fetch all pages up to LOOKAHEAD + BATCH_SIZE
+pages after the key page it just faulted on.
+Reducing prefetching overheads. 3PO’s focus on oblivi-
+ous applications provides a unique opportunity to reduce the
+overheads of prefetching. When Linux prefetches pages, it
+brings them into local memory but does not map them into
+the process’s address space; this way Linux will not charge
+an incorrectly prefetched page to a process’s memory limit.
+Additionally, the prefetched page may not even belong to the
+current process. The first access to a prefetched page will then
+trigger a minor page fault, the process will switch into the
+kernel, and the kernel will map the page into the process’s
+address space. In contrast, 3PO can assume that prefetched
+pages belong to the current process and will always be ac-
+cessed, so it can map them in advance of their actual access:
+when handling a page fault on a key page, 3PO maps the pages
+from this key page up until the page before the next key page,
+as shown in Figure 3. This avoids extra mode switches in and
+out of the kernel and reduces the overhead of prefetching.
+
+3.4 Multi-Threaded Applications
+
+An oblivious single-threaded application may no longer be
+oblivious when parallelized, if the set of memory accesses is-
+sued by each thread is not deterministic. For example, if work
+is partitioned dynamically between threads at runtime (e.g.,
+with work stealing [28, 38, 43]), then the resulting program is
+not oblivious. However, in a restricted class of multi-threaded
+applications—those that partition work statically and deter-
+ministically across threads—each thread can remain oblivi-
+ous. Libraries for parallel computation such as OpenMP [44]
+and IntelTBB [38] support parallelizing computation in this
+way. 3PO aims to support these statically-partitioned multi-
+threaded oblivious applications.
+
+7
+
+Even when work is statically partitioned across threads,
+perfect prefetching is challenging because threads may run
+in a non-deterministic order (e.g., thread A runs first during
+tracing but thread B runs first at runtime). This can cause the
+complete sequence of page accesses (across all threads) to also
+be non-deterministic. 3PO addresses this by handling each
+thread separately. 3PO collects a separate tape for each thread,
+post-processes each tape individually to generate per-thread
+tapes, and prefetches for each thread using its own tape.
+
+While this is conceptually straightforward, additional chal-
+lenges arise because multiple threads may access the same
+page. During tracing, if thread A accesses a page while it
+is already mapped due to an access by thread B, it will not
+trigger a page fault and that page will be omitted from A’s
+trace. This can cause a major page fault at runtime if thread
+A happens to access that page before thread B. 3PO addresses
+this by pinning all threads to the same core during tracing,
+so that multiple threads cannot concurrently access the same
+page. Counter-intuitively, this approach also makes tracing
+faster. This is because the tracer modifies PTEs frequently
+(§3.1), and each modification requires a TLB shootdown to
+invalidate any cached copies of this PTE on other cores. These
+shootdowns add significant overhead [6] and we found that
+it is much faster to trace programs on a single core, where we
+can leverage cheaper core-local TLB invalidations instead.
+
+During post processing, the target amount of local memory
+is a key input parameter, but 3PO does not know what fraction
+of the target local memory will be utilized by each of the 𝑁
+threads. 3PO addresses this by post processing each tape with
+one 𝑁 th of the target local memory. The intuition is that each
+thread is entitled to roughly one 𝑁 th of the memory if threads
+operate on disjoint memory and perhaps more if they share
+memory; we have found that this approach works well in
+practice (§5.5).
+
+Finally, during prefetching at runtime, concurrent threads
+risk breaking 3PO’s synchronization mechanism, by violat-
+ing the guarantee that each thread’s key page will cause that
+thread to incur a page fault. For example, suppose thread A
+chooses its next key page, but before thread A accesses it,
+thread B accesses that page. B will incur a page fault and will
+map A’s key page in the process’ virtual address space, pre-
+venting thread A from incurring a page fault when it accesses
+the page. Thus, the prefetcher will lose track of A’s position
+on its tape. 3PO takes special measures to prevent this from
+happening. Each time a thread B maps a page, it checks if
+this page is a key page for another thread A, and if it is, B
+advances A’s key page to the next unmapped page on B’s tape.
+To prevent a race condition in which one thread maps a page
+concurrently with another thread selecting that page as its key
+page, threads use a lock-protected variable to declare that they
+are about to map a page before doing so, so that other threads
+can identify the page as ineligible for use as a key page.
+
+Tape:mapped pagekey pageprefetched page (unmapped)BATCH_SIZEABCDEFGHIJKLLOOKAHEADBATCH_SIZEnext key pagecurrent positionBranner-Augmon, Galstyan, Kumar, Amaro, Ousterhout, Panda, Ratnasamy, and Shenker
+
+4 Implementation
+
+3PO’s implementation consists of two parts. First, a kernel
+component comprised of 1400 lines of C code added to the
+Linux kernel memory subsystem; this code exposes a system
+call API to applications (Table 1), creates and manages trace
+files within the Linux kernel, and prefetches from remote
+memory according to a tape. Second, a trace post-processing
+tool written in 250 lines of Python. To use 3PO, a user first uses
+the sys_begin(RECORD) syscall to generate a trace for their
+application. Next, they run the post processor to generate
+a tape. Finally, they use the sys_begin(PREFETCH) syscall
+to load the tape and run the program with 3PO’s prefetcher.
+Users can also use the sys_begin(AUTO) syscall to avoid re-
+compiling their program between tracing and execution.
+
+As we mentioned in §3.1.1, our tracer sets a 3PO bit and
+marks as “not present” the PTEs of the pages accessed by the
+traced application. Using the special bit this way is done care-
+fully because if the kernel sees our special bit when it does
+not expect it, it could cause unexpected behavior or sofware
+bugs. Therefore, we also modified the kernel to make sure
+that when tracing, the 3PO bit is cleared before any kernel
+procedure reads a PTE, and is set again afterwards.
+
+We considered leveraging multiple different existing far-
+memory systems for far-memory support; each has pros and
+cons. One system, Fastswap [5], offloads the work of choosing
+pages to evict and writing them to far memory to a separate
+“reclaimer core”, accelerating applications by freeing applica-
+tion cores from this task in most cases. However, Fastswap
+performs evictions synchronously, only allowing one out-
+standing write per core and wasting CPU cycles on evictions.
+As a result, applications are throttled because a single re-
+claimer core cannot handle all evictions for an application
+when evicting one page at a time, even at moderate local mem-
+ory ratios. Another far-memory system, Leap [4], overcomes
+this by supporting asynchronous evictions, but does not of-
+fload reclamation to a separate core. To achieve the best of
+both systems, we built on top of Fastswap, but augmented it
+with support for asynchronous evictions, changing about 80
+lines of code. This allows us to handle evictions for several
+applications with a single reclaimer core (§5.4).
+
+For simplicity, 3PO’s implementation does not support
+transparent huge pages or address space layout randomiza-
+tion; we disable both when tracing and running applications.
+We have tested our 3PO implementation with C++ bina-
+ries and with Python programs that use numpy (see Table 2).
+For the Python applications, we disable the garbage collec-
+tor by calling gc.disable() at the beginning of the appli-
+cation to avoid its non-deterministic memory accesses. We
+experimented with another Python library, scikit-learn,
+but found that it yielded traces that are not oblivious, even for
+oblivious algorithms. One possible cause is that Python im-
+port statements trigger calls to mmap, which can map memory
+in different locations in different runs.
+
+8
+
+Function
+sys_begin(RECORD)
+
+sys_begin(PREFETCH)
+sys_begin(AUTO)
+
+sys_end()
+
+Description
+Begin recording a trace for the current
+process.
+Begin prefetching with an existing tape.
+If the kernel does not have a trace for this
+binary, generate it. Otherwise use existing
+tape to prefetch.
+Indicates end of trace recording or prefetch-
+ing. Resources get freed here.
+
+Table 1: 3PO’s tracing and prefetching system-calls.
+
+5 Evaluation
+
+In evaluating 3PO, we focus on four main questions:
+1. How do applications perform with 3PO, compared to with
+
+other prefetchers? (§5.1)
+
+2. How do network characteristics impact prefetching per-
+
+formance with 3PO? (§5.2)
+
+3. What prevents 3PO from achieving constant performance
+
+as we decrease the local memory ratio? (§5.3)
+
+4. What are 3PO’s CPU and network requirements? (§5.4)
+5. How fast are 3PO’s tracer and post processor, and how
+are speed and accuracy impacted by parameters such as
+MICROSET_SIZE? (§5.5)
+
+Applications. We evaluate 3PO using the seven applications
+listed in Table 2. For each application, we measure its maxi-
+mum memory usage (or resident set size) when running with
+unlimited local memory (using /usr/bin/time -v) and use
+this as the amount of memory it is allocated at a local mem-
+ory ratio of 100%. The only modification we applied to each
+application was to invoke the 3PO syscalls.
+Systems evaluated. We evaluate four systems:
+1. 3PO, our proposed system. Unless stated otherwise, we use
+a MICROSET_SIZE of 1024 pages, BATCH_SIZE of 100 pages,
+and LOOKAHEAD of 400 pages. We found that these values
+performed well across different local memory ratios and
+across the applications we evaluated.
+
+2. Leap [4], a state-of-the-art far-memory prefetcher.
+3. Linux (Fastswap*), which consists of Linux’s default prefetch-
+ing policy and our version of Fastswap, augmented to sup-
+port asynchronous evictions.
+
+4. Linux (Leap), which consists of Linux’s default prefetching
+policy using Leap’s Infiniswap-based RDMA backend [19]
+for fetching pages from far memory.
+
+For all systems we use the most recent Linux kernel version
+they support; for 3PO and Linux (Fastswap*) we use version
+4.11, and for Leap and Linux (Leap) we use version 4.4.125.
+Kernel versions <4.14 prefetch a window of pages that are
+contiguous to the faulted page in swap space. In versions ≥4.14
+there is second prefetching policy that builds the window of
+pages to prefetch based on each application’s virtual address
+space. We did not evaluate the latter as none of the systems
+in our evaluation support it.
+Experimental setup. We ran experiments on CloudLab. To
+evaluate how different network latencies and bandwidths
+impact performance, we used three different setups.
+
+3PO: Programmed Far-Memory Prefetching for Oblivious Applications
+
+Workload
+
+Language
+
+Max RSS (MB) Description
+
+dot_prod
+mvmul
+matmul
+matmul_𝑝
+sparse_mul
+np_matmul
+np_fft
+
+C++
+C++
+C++
+C++
+C++
+Python
+Python
+
+2000
+2100
+400
+400
+1200
+400
+4100
+
+computes the dot product of two vectors using Eigen [1]
+multiplies a square matrix by a vector using Eigen [1]
+multiplies two matrices using Eigen [1]
+same as matmul, but parallelized over 𝑝 threads using static work partitioning with OpenMP [44]
+multiplies two square matrices in a sparse representation using Eigen [1], matrices are 90% zeroes
+multiplies two square matrices using the numpy library [2]
+computes a discrete Fourier transform using the numpy library [2]
+
+Table 2: Applications used for evaluation. Resident set sizes (RSS) are rounded to the nearest 100 MB.
+
+Figure 4: Runtime vs. local memory ratio (see also Figure 5).
+
+Figure 5: Runtime vs. local memory ratio (see also Figure 4).
+
+1. 25gb. For our default setup we use xl170 machines with
+Intel E5-2640v4 CPUs, connected with a 25 Gbps network.
+Reading a 4 KB page over this network takes 5.0 𝜇s.
+
+2. 10gb. While most prior far-memory research has focused
+on settings within a single rack, we also evaluate what
+happens if far memory is placed in a different rack, lead-
+ing to higher latencies to access it. For these experiments,
+we use programmable Dell-S4048 switches to build net-
+works where the xl170 machines are separated by multiple
+switches; these switches only support 10 Gbps bandwidth.
+Reading a 4 KB page takes from 5.5 𝜇s with 0 interven-
+ing switches (10gb_0switch) to 15.2 𝜇s with 4 intervening
+switches (10gb_4switch).
+
+3. 56gb. Finally, we were unable to use the Leap kernel with the
+xl170 instances, so we evaluate Leap with c6220 instances
+instead. These instances have 2 Intel Xeon E5-2650v2 CPUs
+and are connected by a 56 Gbps Infiniband fabric where
+reading one page takes 3.4 𝜇s.
+We use Linux’s cgroup feature to limit the physical memory
+
+available to each application to induce memory pressure.
+
+5.1 Application Performance
+
+We begin by comparing the performance of 3PO and Linux
+(Fastswap*) for a variety of workloads and local memory ra-
+tios (Figures 4 and 5).4 Overall, 3PO provides a measurable
+improvement over Linux on most workloads. 3PO’s speedup
+varies depending on the application and memory ratio, with
+
+43PO slightly increases the memory footprint of programs, meaning that
+the wall-clock time at 100% local memory may exceed the user time at 100%
+local memory. Therefore, we normalize the runtime by the user time at 100%
+local memory, rather than the wall-clock runtime at 100% local memory. The
+only exception is that, at 100% local memory, we always report the ratio as
+1, to indicate “no degradation.”
+
+Figure 6: Wall-clock runtimes for sparse matrix multiply.
+
+the speedup generally higher at lower memory ratios. This is
+because memory accesses go to far memory more frequently
+at low memory ratios, making performance more sensitive
+to the prefetching algorithm that is used.
+
+Next, we evaluate how 3PO’s performance compares to
+Leap [4], a state-of-the-art prefetching system. Figure 6 shows
+the wall-clock runtime of the matrix multiply workload for all
+4 setups, as we vary the amount of local memory from 100%
+(no memory pressure) to 5% (95% percent of resident set in far
+memory). Due to the previously mentioned Leap limitations,
+we use c6220 instances connected by a 56 Gbps network for
+this evaluation. In this case we find that Leap and Linux (Leap)
+perform similarly, and 3PO and Linux (Fastswap*) perform
+similarly, suggesting that prefetching algorithms have a min-
+imal impact on runtime. This is to be expected due to the low-
+latency network used for this evaluation. The performance
+difference between Linux (Leap) and Linux (Fastswap*) is
+comparatively larger due to offloaded evictions in Fastswap*,
+which suggests that the choice of RDMA backend is more
+important than the prefetching policy for this hardware setup.
+Although Figure 6 only shows the results for sparse_mul, these
+same observations hold for other workloads as well.
+
+9
+
+020406080100Local Memory Ratio (%)0246810Wall-Clock RuntimeNormalized by User Time at 100%np_fft (3PO)np_fft (Linux)np_matmul (3PO)np_matmul (Linux)matmul (3PO)matmul (Linux)matmul_3 (3PO)matmul_3 (Linux)020406080100Local Memory Ratio (%)0.00.51.01.52.02.53.0Wall-Clock RuntimeNormalized by User Time at 100%mvmul (3PO)mvmul (Linux)dot_prod (3PO)dot_prod (Linux)sparse_mul (3PO)sparse_mul (Linux)020406080100Memory Ratio (%)05101520Wall-Clock Runtime (s)3POLinux (Fastswap* Backend)LeapLinux (Leap Backend)Branner-Augmon, Galstyan, Kumar, Amaro, Ousterhout, Panda, Ratnasamy, and Shenker
+
+Figure 7: Major page fault counts at a 30% memory ratio
+
+Figure 9: Components of system overhead at 20% local
+memory, with 3PO. np_fft’s “3PO pf time” is about 2.1; it is
+cut off in the displayed graph.
+
+Figure 8: 3PO’s speedup over Linux for various workloads
+and network configurations, at a 20% memory ratio
+
+To understand the impact of prefetching in a way that is less
+dependent on the hardware setup, particularly the latency of
+RDMA, we measure the number of major page faultsperating
+at a 20% memory ratio. Figure 7 compares, at a 30% memory
+ratio, the number of major page faults experienced by Leap
+and 3PO for various workloads.5 Note the log-scale vertical
+axis. 3PO’s major page fault count is consistently orders of
+magnitude smaller than Leap’s. This suggests that 3PO may
+significantly outperform Leap on higher-latency networks
+where major page faults impose higher overheads.
+
+5.2 Impact of Network Characteristics
+
+In a datacenter deployment, far memory may be located in
+a different rack than the machine accessing it. This would
+result in higher latency to access far memory, impacting the
+performance implications of 3PO’s prefetching. To explore
+this, we measure the speedup of 3PO and Linux in the 25gb,
+10gb_0switch, and 10gb_4switch setups.
+
+The results, shown in Figure 8, show that 3PO has larger
+speedups on higher latency networks. This is because the cost
+of a major page fault is higher on such networks, causing per-
+fect prefetching to have a bigger impact on performance. For
+some workloads, such as dot_prod, 3PO has a higher speedup
+on 10gb_0switch than on 25gb, even though 25gb has lower
+latency. The reason is that the network bandwidth becomes
+a bottleneck. Once the network is saturated, the latency of ac-
+cessing far memory increases due to queuing delays, causing
+performance to degrade due to delayed hits. This affects both
+3PO and Linux, causing the speedup of 3PO relative to Linux
+to decrease for the 10gb setup for these workloads.
+
+5Linux major page fault numbers are sometimes bimodal. For example, in
+Figure 7 the number of major page faults for Linux (Fastswap* Backend) for
+dot_prod were often similar to those for Linux (Leap Backend).
+
+10
+
+Figure 10: Components of system overhead at 20% local
+memory. np_fft’s “miss pf time” is about 5.2 and its “other pf
+time” is about 1.8; they are cut off in the displayed graph.
+
+Overall, at a 20% memory ratio, 3PO’s speedup compared
+to Linux ranges from 0.9× to 1.8× on the low-latency 25gb
+setup. On the higher-latency 10gb_4switch setup, the speedup
+increases to 1.3× to 2.5×.
+
+5.3 3PO Overheads
+
+In previous sections, we saw that performance degrades as the
+local memory ratio is reduced, even with 3PO. This section
+aims to characterize the sources of this degradation.
+
+Figure 9 and Figure 10 show a breakdown of the perfor-
+mance degradation at 20% local memory on the 25gb setup
+into various components, to help determine the relative con-
+tribution of each. Extra user time refers to the amount of
+additional time spent in userspace when executing at 20%
+memory ratio, compared to 100% memory ratio. A possible
+cause is additional cache misses and TLB misses caused by
+switching to kernel mode to prefetch pages and the high rate
+of TLB shootdowns [6]. Eviction time is the time that the appli-
+cation is blocked because pages need to be evicted. Fastswap
+offloads evictions to a different core, so the application would
+only block on evictions if the evictions core or network is
+saturated. “Miss pf time” is the time spent on page I/O on
+a major page fault, and “delayed hit time” is the time spent
+waiting for page I/O to complete in a minor page fault. 3PO
+time is the time in the page fault handler spent on processing
+for 3PO’s prefetching. Finally, “other pf time” is the amount
+of time in the page fault handler not spent waiting for I/O or
+on processing for 3PO, and “other time” is the remaining time
+in the system’s overall wall clock time (across all cores, for
+multicore applications) not explained by the previous factors.
+We normalize times by the time spent executing the program
+in userspace at a 100% memory ratio.
+
+matmulmatmul_3mvmuldot_prodsparse_mulnp_matmulnp_fft100103106109No. Major Page Faults3POLeapLinux (Fastswap* Backend)Linux (Leap Backend)matmulmatmul_3mvmuldot_prodsparse_mulnp_matmulnp_fft01233PO Speedup vs. Linux25gb10gb_0switch10gb_4switchextra usertimeevicttimemisspf timedelayed hitpf time3POpf timeotherpf timeother0.00.20.40.60.8Slowdown Compared toUser Time at 100%matmulmatmul_3mvmuldot_prodsparse_mulnp_matmulnp_fftextra usertimeevicttimemisspf timedelayed hitpf time3POpf timeotherpf timeother0.00.20.40.60.8Slowdown Compared toUser Time at 100%matmulmatmul_3mvmuldot_prodsparse_mulnp_matmulnp_fft3PO: Programmed Far-Memory Prefetching for Oblivious Applications
+
+Eviction time, “miss pf time” and “delayed hit time” com-
+ponents are small for 3PO, leading us to conclude that 3PO
+can effectively avoid requiring the application to block on
+I/O. Therefore, these items do not significantly contribute to
+3PO’s performance degradation at low memory ratios.
+
+One cause of the degradation is overhead that 3PO does not
+reduce. For example, the extra user time is about the same for
+3PO and Linux. Additionally, a significant amount of degrada-
+tion, both for 3PO and for Linux, is due to software overheads
+in the page fault handler unrelated to 3PO. This could be due
+to reading and updating the state Linux maintains separate
+from the page table (e.g, swap cache, cgroups, etc.). Systems
+that implement prefetching in user space [39, 54] or via cache
+coherence [15] could avoid some of these overheads, though
+they may suffer from different overheads (e.g., “software page
+faults” cause high overheads from smart pointers [35, 39]).
+
+Another cause of degradation is overhead of 3PO itself.
+3PO’s routines for prefetching and prefaulting pages add
+overhead not present in Linux, and in some cases, these over-
+heads eat away significantly at the gains from eliminating I/O
+time. This is consistent with other observations that software
+overheads can be significant compared to I/O that completes
+in microsecond timescales [10].
+
+5.4 CPU and Network Requirements
+
+3PO enables applications to run at low local memory ratios,
+but doing so requires extra network bandwidth and CPU us-
+age to handle the high rates of prefetching and evicting. Here
+we measure the extra CPU cores and network bandwidth
+required to support low local memory ratios.
+
+Like Fastswap, 3PO offloads evictions to a separate re-
+claimer core as much as possible; once the reclaimer is satu-
+rated, the application cores must assist with handling evic-
+tions. To measure when the reclaimer core or the network
+becomes a bottleneck in 3PO, we run multiple instances of
+our applications in parallel and for each memory ratio record
+the number of application cores that can successfully offload
+their evictions to the single reclaimer core (or spend less than
+5% of their runtime handling evictions).
+
+As shown in Figure 11, 3PO can handle at least 2 and up
+to 8 or more application cores with a single reclaimer core,
+depending on the network bandwidth and local memory ratio.
+The primary bottleneck in this experiment seemed to be the
+network, rather than the reclaimer core. This is evident from
+the fact that we can support more application cores with the
+25 Gbps network than the 10 Gbps network. In addition, we
+observed that when application cores start handling evictions,
+the network bandwidth is close to saturation. However, these
+results show the worst-case behavior, because all applications
+start at the same time, aligning their peak bandwidth usage,
+which is about 50-100% higher than average usage. Thus, 3PO
+could support more applications if their start times were stag-
+gered. Because running applications at low memory ratios can
+impose significant network bandwidth requirements, 3PO is
+
+Figure 11: Maximum number of application cores that can
+be used in parallel before the applications get throttled by
+handling evictions on their assigned cores.
+
+Figure 12: Relative tracing time vs. microset size.
+
+Figure 13: Tape size vs. microset size. np_fft is not shown; it
+is consistently at about 60 MiB.
+
+Figure 14: Execution time vs. microset size.
+
+most suitable for making use of a moderate number of extra
+cores on a memory-constrained server.
+
+5.5 Tracing and Post Processing
+
+We now aim to understand how 3PO’s performance is affected
+by the microset size. Although the microset size is a parameter
+of only the tracing phase, the microset size indirectly affects
+the postprocessing and runtime phases via the size and quality
+of the produced trace.
+
+11
+
+20406080Memory Ratio (%)02468+Max App Cores10Gbpsnp_matmulmatmulmvmuldot_prodsparse_mul20406080Memory Ratio (%)02468+25Gbps100101102103104105106Microset Size (Pages) (Log Scale)0.000.250.500.751.00Tracing Time(Relative to Microset Size = 2)matmulmatmul_3mvmuldot_prodsparse_mulnp_matmulnp_fft100101102103104105106Microset Size (Pages) (Log Scale)02468Size of Tape (MiB)matmulmatmul_3mvmuldot_prodsparse_mulnp_matmul100101102103104105106Microset Size (Pages) (Log Scale)05101520Wall Clock Runtime (s)matmulmatmul_3mvmuldot_prodsparse_mulnp_matmulnp_fftBranner-Augmon, Galstyan, Kumar, Amaro, Ousterhout, Panda, Ratnasamy, and Shenker
+
+workload
+
+Tracing Time (s)
+
+Trace Size (MiB)
+
+PostP Time (s)
+
+matmul
+matmul_3
+mvmul
+dot_prod
+sparse_mul
+np_matmul
+np_fft
+
+4.74
+6.30
+2.91
+2.94
+69.2
+4.98
+10.5
+
+17.3
+29.4
+8.16
+8.00
+1110
+16.2
+94.9
+
+2.18
+1.26
+1.77
+1.77
+102
+2.02
+17.1
+
+Table 3: Tracing time, trace size, and postprocessing time for
+microset size 1024, presented to 3 significant figures.
+
+Figure 15: Major page faults (30% memory ratio) vs. memory
+ratio used for postprocessing.
+
+The tracing time (Figure 12) and trace size (not shown) have
+similar patterns. Trace size has a similar pattern as tracing
+time because our tracing algorithm (§3.1.2) incurs page faults
+proportional to the size of the result trace. Postprocessing
+time (not shown) has a very similar pattern to trace size be-
+cause the postprocessing procedure linearly scans the trace,
+operating on it in a streaming fashion. These three quantities
+(tracing time, trace size, and postprocessing time) remain the
+same or decrease as the microset size is increased, for each
+workload. This is because, when the microset size is doubled,
+the programs’ locality causes the number of accesses cov-
+ered by a microset to increase by more than a factor of two.
+Programs that do not exhibit locality, like dot_prod, do not
+become more efficient to trace at larger microset sizes. Some
+workloads have one or more “cliffs” in the graph, at points
+where the microsets become large enough to contain larger
+aspects of the program’s structure. Similar trends have been
+observed in prior systems (e.g., lifetime curves [16]).
+
+The size of the postprocessed tape (Figure 13) follows a
+different pattern—for most workloads it is flat, with a cliff at
+high microset sizes. This is because much of the unnecessary
+accesses preserved at low microset sizes are “filtered out” by
+the postprocessing. Thus, the postprocessing allows the tape
+to be small even at small microset sizes, for which the trace is
+large. This suggests that we could rely solely on postprocess-
+ing instead of using microsets, but this would be undesirable
+because larger microset sizes make tracing faster, whereas
+postprocessing does not. At very high microset sizes, the tape
+size decreases. One explanation for this is that, at these very
+high microset sizes, the tracing process filters out informa-
+tion that the postprocessing would have preserved. Indeed,
+we can see that this “cliff” in the tape size often corresponds
+to an increase in runtime in Figure 14. This may be because
+the information lost by using these very large microset sizes
+resulted in lower prefetching quality.
+
+Our goal with microsets in §3.1.2 was to make it practical to
+trace programs. Even using a microset size of 2 is borderline
+impractical for some workloads; for example, for sparse_mul,
+the trace is > 40 GiB and takes over 40 minutes to collect.
+Using DBI would be much slower than even this.
+
+3PO postprocesses the collected trace by simulating an LRU
+eviction policy, but the actual eviction policy used by Linux at
+runtime may differ significantly from this (§3.2). To evaluate
+the impact of using this approximation, we vary the amount of
+
+12
+
+memory used when simulating LRU for postprocessing, while
+keeping the available memory at runtime fixed. The results
+are shown in Figure 15. For some workloads, like np_fft and
+sparse_mul, prefetching accuracy increases when postpro-
+cessing is done assuming a smaller amount of memory than is
+actually available at runtime. This indicates that these work-
+loads are affected by inaccuracies of assuming LRU, which
+can be somewhat mitigated by assuming less memory when
+postprocessing to be more conservative.
+
+6 Related Work
+
+The prior work most similar to 3PO is MAGE [25]. MAGE
+computes the memory access pattern of an oblivious program
+in advance and both prefetches and evicts according to it at
+runtime. However, MAGE’s techniques for collecting the ac-
+cess pattern and managing memory at runtime are tailored
+to Secure Computation, a type of cryptographic computation.
+For example, MAGE assumes that the program is written in a
+specific DSL. In contrast, 3PO develops techniques that apply
+to Linux processes that are oblivious and deterministic, but
+are otherwise generic.
+
+Other prior works use a variety of heuristics for prefetching.
+Some perform prefetching by predicting a program’s future
+accesses based on earlier memory accesses, often from within
+the same execution [4, 17, 22, 42]. Others perform targeted
+prefetching based on measurements of a program’s working
+sets from prior executions [47, 52]. Some prior works have
+even used machine learning to predict future memory ac-
+cesses based on prior ones [21, 26, 41]. Unlike these lines of
+research, 3PO prefetches data using the access pattern directly
+instead of heuristics.
+
+Another line of work aims to allow application developers
+to include prefetch hints in their program [36, 45, 48], or other-
+wise gain increased control of paging from userspace [20, 39].
+For example, the recent AIFM system [39] allows applications
+to use far memory via “remoteable” data structures with cus-
+tom prefetching policies designed using special AIFM APIs.
+In contrast, 3PO does not require the application developer
+to extensively modify her code or provide hints.
+
+Another approach to memory management is for the com-
+piler, rather than the application developer, to insert prefetch
+directives into the program [33]. With this approach, the com-
+piler analyzes the source code to prefetch data for future iter-
+ations of a loop, without requiring hints from the application
+
+01020304050607080Memory Ratio used for Postprocessing (%)100102104106Major Page Faultsat 30% Memory Ratiomatmulmatmul_3mvmuldot_prodsparse_mulnp_matmulnp_fft3PO: Programmed Far-Memory Prefetching for Oblivious Applications
+
+developer. In contrast, 3PO operates on Linux processes as a
+black box. It is agnostic to the language the program is written
+in, and can prefetch for the entire application, not just loops.
+
+7 Conclusion
+
+In this paper we describe 3PO, a system that enables perfect
+heuristic-free prefetching from far memory for general obliv-
+ious applications. With 3PO, applications can run at low local
+memory ratios with significantly less performance degrada-
+tion than with existing prefetchers such as Linux’s prefetcher
+and state-of-the-art Leap [4]. 3PO also allows us to study the
+fundamental overheads of paging-based prefetching.
+
+Acknowledgments
+
+Emmanuel Amaro was partially supported by a UCMEXUS-
+Conacyt Fellowship. This work was funded by NSF Grants
+1817115, 1817116, 1704941, and was supported by Intel, VMware,
+and Microsoft. This material is based upon work supported by
+the National Science Foundation Graduate Research Fellow-
+ship Program under Grant No. DGE-1752814. Any opinions,
+findings, and conclusions or recommendations expressed in
+this material are those of the authors and do not necessarily
+reflect the views of the National Science Foundation.
+
+References
+
+[1] Eigen. http://eigen.tuxfamily.org.
+[2] Numpy. https://numpy.org/.
+[3] Marcos K. Aguilera, Nadav Amit, Irina Calciu, Xavier Deguillard,
+Jayneel Gandhi, Stanko Novakovic, Arun Ramanathan, Pratap
+Subrahmanyam, Lalith Suresh, Kiran Tati, Rajesh Venkatasubramanian,
+and Michael Wei. Remote regions: A simple abstraction for remote
+memory. USENIX ATC ’18, pages 775–787, 2018.
+
+[4] Hasan Al Maruf and Mosharaf Chowdhury. Effectively prefetching
+In 2020 {USENIX} Annual Technical
+
+remote memory with Leap.
+Conference ({USENIX} {ATC} 20), pages 843–857, 2020.
+
+[5] Emmanuel Amaro, Christopher Branner-Augmon, Zhihong Luo, Amy
+Ousterhout, Marcos K Aguilera, Aurojit Panda, Sylvia Ratnasamy,
+and Scott Shenker. Can far memory improve job throughput? In
+Proceedings of the Fifteenth European Conference on Computer Systems,
+pages 1–16, 2020.
+
+[6] Nadav Amit. Optimizing the {TLB} shootdown algorithm with page
+In 2017 {USENIX} Annual Technical Conference
+
+access tracking.
+({USENIX} {ATC} 17), pages 27–39, 2017.
+
+[7] Anandtech. Amd 3rd gen epyc milan review: A peak vs per core
+
+performance balance. Accessed: October 9, 2021.
+
+[8] Arstechnica. Seagate’s new mach.2 is the world’s fastest conventional
+
+hard drive. Accessed: October 9, 2021.
+
+[9] Nirav Atre, Justine Sherry, Weina Wang, and Daniel S Berger. Caching
+with delayed hits. In Proceedings of the Annual conference of the ACM
+Special Interest Group on Data Communication on the applications,
+technologies, architectures, and protocols for computer communication,
+pages 495–513, 2020.
+
+[10] Luiz Barroso, Mike Marty, David Patterson, and Parthasarathy
+Ranganathan. Attack of the killer microseconds. Communications of
+the ACM, 60(4):48–54, 2017.
+
+[11] Luiz André Barroso and Urs Hölzle. The datacenter as a computer:
+An introduction to the design of warehouse-scale machines. Synthesis
+lectures on computer architecture, 4(1):1–108, 2009.
+
+[12] Laszlo A. Belady. A study of replacement algorithms for a virtual-
+
+storage computer. IBM Systems journal, 5(2):78–101, 1966.
+
+13
+
+[13] Daniel Pierre Bovet and Marco Cesati. Page frame reclaiming. In Under-
+standing the Linux Kernel, chapter 17, page 679. O’Reilly Media, 2006.
+[14] Derek Bruening, Qin Zhao, and Saman Amarasinghe. Transparent dy-
+namic instrumentation. In Proceedings of the 8th ACM SIGPLAN/SIGOPS
+conference on Virtual Execution Environments, pages 133–144, 2012.
+[15] Irina Calciu, M Talha Imran, Ivan Puddu, Sanidhya Kashyap, Hasan Al
+Maruf, Onur Mutlu, and Aasheesh Kolli. Rethinking software runtimes
+for disaggregated memory. In Proceedings of the 26th ACM International
+Conference on Architectural Support for Programming Languages and
+Operating Systems, pages 79–92, 2021.
+
+[16] P. J. Denning. Working sets past and present. IEEE Trans. Softw. Eng.,
+
+SE-6(1), 1980.
+
+[17] Xiaoning Ding, Song Jiang, Feng Chen, Kei Davis, and Xiaodong Zhang.
+Diskseen: Exploiting disk layout and access history to enhance i/o
+prefetch.
+In USENIX Annual Technical Conference, volume 7, pages
+261–274, 2007.
+
+[18] O. Goldreich and R. Ostrovsky. Software protection and simulation
+
+on oblivious RAMs. J. ACM, 43(3), 1996.
+
+[19] J. Gu, Y. Lee, Y. Zhang, M. Chowdhury, and K. G. Shin. Efficient memory
+
+disaggregation with infiniswap. In NSDI. USENIX, 2017.
+
+[20] K. Harty and D. R. Cheriton. Application-controlled physical memory
+using external page-cache management. In ASPLOS. ACM, 1992.
+[21] M. Hashemi, K. Swersky, J. A. Smith, G. Ayers, H. Litz, J. Chang,
+C. Kozyrakis, and P. Ranganathan. Learning memory access patterns.
+In ICML, 2018.
+
+[22] J. He, J. Bent, A. Torres, G. Grider, G. Gibson, C. Maltzahn, and X.-H.
+Sun. I/O acceleration with pattern detection. In HPDC. ACM, 2015.
+
+[23] Joseph Izraelevitz, Jian Yang, Lu Zhang, Juno Kim, Xiao Liu, Amirsaman
+Memaripour, Yun Joon Soh, Zixuan Wang, Yi Xu, Subramanya R
+Dulloor, et al. Basic performance measurements of the intel optane
+dc persistent memory module. arXiv preprint arXiv:1903.05714, 2019.
+
+[24] Uksong Kang, Hak-Soo Yu, Churoo Park, Hongzhong Zheng, John Hal-
+bert, Kuljit Bains, S. Jang, and Joo Sun Choi. Co-architecting controllers
+and dram to enhance dram process scaling. In The memory forum, 2014.
+[25] Sam Kumar, David E. Culler, and Raluca Ada Popa. MAGE: Nearly zero-
+cost virtual memory for secure computation. In 15th {USENIX} Sympo-
+sium on Operating Systems Design and Implementation ({OSDI} 21), 2021.
+[26] A. Laga, J Boukhobza, M. Koskas, and F. Singhoff. Lynx: A learning
+Linux prefetching mechanism for SSD performance model. In NVMSA.
+IEEE, 2016.
+
+[27] Andres Lagar-Cavilla, Junwhan Ahn, Suleiman Souhlal, Neha Agarwal,
+Radoslaw Burny, Shakeel Butt, Jichuan Chang, Ashwin Chaugule,
+Nan Deng, Junaid Shahid, et al. Software-defined far memory in
+warehouse-scale computers.
+In Proceedings of the Twenty-Fourth
+International Conference on Architectural Support for Programming
+Languages and Operating Systems, pages 317–330, 2019.
+
+[28] Doug Lea. A java fork/join framework. In Proceedings of the ACM 2000
+
+conference on Java Grande, pages 36–43, 2000.
+
+[29] Seok-Hee Lee. Technology scaling challenges and opportunities of
+memory devices. In IEEE International Electron Devices Meeting, 2016.
+[30] Shuang Liang, Ranjit Noronha, and Dhabaleswar K Panda. Swapping
+to remote memory over infiniband: An approach using a high perfor-
+mance network block device. In 2005 IEEE International Conference
+on Cluster Computing, pages 1–10. IEEE, 2005.
+
+[31] C. Liu, M. Hicks, and E. Shi. Memory trace oblivious program execution.
+
+In Computer Security Foundations Symposium. IEEE, 2013.
+
+[32] C.-K. Luk, R. Cohn, R. Muth, H. Patil, A. Klauser, G. Lowney, S. Wallace,
+V. J. Reddi, and K. Hazelwood. Pin: Building customized program
+analysis tools with dynamic instrumentation. In PLDI. ACM, 2005.
+[33] T. C. Mowry, A. K. Demke, and O. Krieger. Automatic compiler-inserted
+
+I/O prefetching for out-of-core applications. In OSDI. USENIX, 1996.
+
+[34] N. Nethercote and J. Seward. Valgrind: A framework for heavyweight
+
+dynamic binary instrumentation. In PLDI. ACM, 2007.
+
+Branner-Augmon, Galstyan, Kumar, Amaro, Ousterhout, Panda, Ratnasamy, and Shenker
+
+[35] Meni Orenbach, Pavel Lifshits, Marina Minkin, and Mark Silberstein.
+Eleos: Exitless os services for sgx enclaves. In Proceedings of the Twelfth
+European Conference on Computer Systems, pages 238–253, 2017.
+[36] R. H. Patterson, G. A. Gibson, E. Ginting, D. Stodolsky, and J. Zelenka.
+
+Informed caching and prefetching. In SOSP. ACM, 1995.
+
+[37] R Hugo Patterson, Garth A Gibson, Eka Ginting, Daniel Stodolsky, and
+Jim Zelenka. Informed prefetching and caching. In Proceedings of the
+fifteenth ACM symposium on Operating systems principles, pages 79–95,
+1995.
+
+Evaluation Review, 25(1):100–114, 1997.
+
+[47] D. Ustiugov, P. Petrov, M. Kogias, E. Bugnion, and B. Grot. Benchmark-
+ing, analysis, and optimization of serverless function snapshots. In
+ASPLOS. ACM, 2021.
+
+[48] S. VanDeBogart, C. Frost, and E. Kohler. Reducing seek overhead with
+
+application-directed prefetching. In ATC. USENIX, 2009.
+
+[49] Steve VanDeBogart, Christopher Frost, and Eddie Kohler. Reducing
+In USENIX
+
+seek overhead with application-directed prefetching.
+Annual Technical Conference, 2009.
+
+[38] James Reinders.
+
+Intel Threading Building Blocks: Outfitting C++ for
+
+[50] X. S. Wang, K. Nayak, C. Liu, T.-H. H. Chan, E. Shi, E. Stefanov, and
+
+Multi-Core Processor Parallelism. 2007.
+
+[39] Zhenyuan Ruan, Malte Schwarzkopf, Marcos K Aguilera, and Adam
+Belay. {AIFM}: High-performance, application-integrated far memory.
+In 14th {USENIX} Symposium on Operating Systems Design and
+Implementation ({OSDI} 20), pages 315–332, 2020.
+
+[40] Yizhou Shan, Yutong Huang, Yilun Chen, and Yiying Zhang. Legoos:
+A disseminated, distributed os for hardware resource disaggregation.
+OSDI’18, pages 69–87, 2018.
+
+[41] Z. Song, D. S. Berger, K. Li, and W. Lloyd. Learning relaxed Belady for
+content distribution network caching. In NSDI. USENIX, 2020.
+[42] G. Soundararajan, M. Mihailescu, and C. Amza. Context-aware
+
+prefetching at the storage server. In ATC. USENIX, 2008.
+
+[43] The Go Community. The go programming language. https://golang.org.
+[44] The Go Community. Openmp. https://www.openmp.org/.
+[45] A. Tomkins, R. H. Patterson, and G. Gibson. Informed multi-process
+
+prefetching and caching. In Sigmetrics. ACM, 1997.
+[46] Andrew Tomkins, R Hugo Patterson, and Garth Gibson.
+
+Informed
+multi-process prefetching and caching. ACM SIGMETRICS Performance
+
+Y. Huang. Oblivious data structures. In CCS. ACM, 2014.
+
+[51] Matei Zaharia, Mosharaf Chowdhury, Tathagata Das, Ankur Dave,
+Justin Ma, Murphy McCauly, Michael J Franklin, Scott Shenker, and Ion
+Stoica. Resilient distributed datasets: A fault-tolerant abstraction for in-
+memory cluster computing. In 9th {USENIX} Symposium on Networked
+Systems Design and Implementation ({NSDI} 12), pages 15–28, 2012.
+
+[52] I. Zhang, A. Garthwaite, Y. Baskakov, and K. C. Barr. Fast restore of
+checkpointed memory using working set estimation. In VEE. ACM, 2011.
+[53] Wenting Zheng, Ankur Dave, Jethro G Beekman, Raluca Ada Popa,
+Joseph E Gonzalez, and Ion Stoica. Opaque: An oblivious and encrypted
+In 14th {USENIX} Symposium on
+distributed analytics platform.
+Networked Systems Design and Implementation ({NSDI} 17), pages
+283–298, 2017.
+
+[54] Kan Zhong, Wenlin Cui, Youyou Lu, Quanzhang Liu, Xiaodan Yan,
+Qizhao Yuan, Siwei Luo, and Keji Huang. Revisiting swapping in user-
+space with lightweight threading. arXiv preprint arXiv:2107.13848, 2021.
+
+14
+
+

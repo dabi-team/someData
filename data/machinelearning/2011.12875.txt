@@ -1,0 +1,1585 @@
+0
+2
+0
+2
+
+v
+o
+N
+5
+2
+
+]
+
+C
+D
+.
+s
+c
+[
+
+1
+v
+5
+7
+8
+2
+1
+.
+1
+1
+0
+2
+:
+v
+i
+X
+r
+a
+
+Rapid Exploration of Optimization Strategies on
+Advanced Architectures using TestSNAP and
+LAMMPS
+
+1st Rahulkumar Gayatri
+NERSC
+Lawrence Berkeley National Lab
+Berkeley, USA
+rgayatri@lbl.gov
+
+2nd Stan Moore
+Sandia National Laboratories
+Albuquerque, USA
+stamoor@sandia.gov
+
+3rd Evan Weinberg
+NVIDIA Corporation
+Santa Clara, USA
+eweinberg@nvidia.com
+
+4th Nicholas Lubbers
+Los Alamos National Lab
+Los Alamos, USA
+nlubbers@lanl.gov
+
+5th Sarah Anderson
+Cray Inc
+Minneapolis, USA
+saraha@hpe.com
+
+6th Jack Deslippe
+NERSC
+Lawrence Berkeley National Lab
+Berkeley, USA
+jrdeslippe@lbl.gov
+
+7th Danny Perez
+Los Alamos National Lab
+Los Alamos, USA
+danny perez@lanl.gov
+
+8th Aidan P. Thompson
+Sandia National Laboratories
+Albuquerque, USA
+athomps@sandia.gov
+
+Abstract—The exascale race is at an end with the announce-
+ment of the Aurora and Frontier machines. This next gener-
+ation of supercomputers utilize diverse hardware architectures
+to achieve their compute performance, providing an added
+onus on the performance portability of applications. A solu-
+tion to this challenge is the evolution of performance-portable
+frameworks, providing uniﬁed models for mapping abstract
+hierarchies of parallelism to diverse architectures. Kokkos is
+one such performance portable programming model for C++
+applications, providing back-end implementations for each ma-
+jor HPC platform. Even with the availability of performance
+portable frameworks, modern compute resources which feature
+heterogeneous node architectures containing multicore processors
+and manycore accelerators, challenge application developers to
+restructure algorithms to expose higher degrees of parallelism.
+The Spectral Neighbor Analysis Potential (SNAP) is a machine-
+learned inter-atomic potential utilized in cutting-edge molecular
+dynamics simulations. Previous implementations of the SNAP
+calculation showed a downward trend in their performance
+relative to peak on newer-generation CPUs and low performance
+on GPUs. In this paper we describe the restructuring and opti-
+mization of SNAP as implemented in the Kokkos CUDA backend
+of the LAMMPS molecular dynamics package, benchmarked
+on NVIDIA GPUs. We identify novel patterns of hierarchical
+parallelism, facilitating a minimization of memory access over-
+heads and pushing the implementation into a compute-saturated
+regime. Our implementation via Kokkos enables recompile-and-
+run efﬁciency on upcoming architectures. We ﬁnd a ∼22x time-
+to-solution improvement relative to an existing implementation
+as measured on an NVIDIA Tesla V100-16GB for an important
+benchmark.
+
+Sandia National Laboratories is a multimission laboratory managed and
+operated by National Technology and Engineering Solutions of Sandia, LLC.,
+a wholly owned subsidiary of Honeywell International, Inc., for the U.S.
+Department of Energy’s National Nuclear Security Administration under
+contract DE-NA-0003525. This paper describes objective technical results
+and analysis. Any subjective views or opinions that might be expressed in
+the paper do not necessarily represent the views of the U.S. Department of
+Energy or the United States Government.
+
+Index Terms—exascale, GPUs, programming frameworks,
+Kokkos, hierarchical parallelism, shared memory, manycore
+architectures, multicore architectures.
+
+I. INTRODUCTION
+
+In order to reach exaﬂop performance while maintaining
+power constraints, heterogeneous node architectures have be-
+come the norm. The heterogeneous node combination consists
+of one or more host CPUs, which are usually multicore
+processors, and one or more accelerators or GPUs also called a
+device. As of June 2020, six out of the top ten machines in the
+list of top 500 supercomputers depend on such heterogeneous
+architectures to achieve their compute performance [1]. The
+next generation of supercomputers such as Perlmutter, Aurora,
+and Frontier follow the same path by relying on NVIDIA,
+Intel, and AMD GPUs, respectively, for the majority of their
+compute bandwidth.
+
+The trend of heterogeneous node composition has also led
+to an increased focus on application development. Application
+developers are now forced to re-think their parallelization
+strategies to effectively utilize nearly a 100× increase in
+the number of threads available on each node. Apart from
+effectively utilizing the increase in the computational power,
+programmers now need to parallelize the application code for
+both multicore and manycore architectures. This has led to the
+development of multiple performance-portability frameworks
+such as Kokkos [2], Raja [3], OpenMP ofﬂoad, etc. The
+intention of these models is to provide a single coding front-
+end for the application developers while the frameworks main-
+tain multiple backend implementations optimized for speciﬁc
+hardware architectures such as CPUs and GPUs.
+
+While these frameworks strive to generate optimized code
+tailored for the underlying architecture, it is also important for
+
+ 
+ 
+ 
+ 
+ 
+ 
+the application developers to restructure their code to exploit
+the massive increase in computational power via hardware
+tailored to exploiting parallelism. The threads on a GPU are
+organized in a hierarchical fashion. For example on NVIDIA
+GPUs, O(100 − 1000) threads are grouped as a thread block
+and share resources among themselves. Similarly on Intel’s
+Gen9 GPU architectures, the threads are divided into thread-
+groups and threads. Application developers need to design a
+parallel implementation that can distribute work effectively
+across both levels of the hierarchy.
+
+Additionally, GPUs have their own memory space and
+memory hierarchies, increasing the complexity of the appli-
+cation. On GPUs, threads performing fully coalesced memory
+reads (i.e., access of consecutive memory locations) minimize
+memory transactions and thus minimize latencies. Such a
+memory access pattern should be avoided on CPUs since
+separate threads accessing memory locations in the same cache
+line results in false sharing and thrashing.
+
+Compared to CPUs, modern GPUs have a very large ratio
+of compute throughput to memory bandwidth, also referred to
+as a high arithmetic intensity (AI). Optimally written kernels
+on CPUs often become memory bound on GPUs. In these
+scenarios new strategies which reduce reads are invaluable:
+kernel fusion and even redundant computation can be net-
+beneﬁcial if such optimizations improve the AI of a kernel [4].
+Spectral Neighbor Analysis Potential (SNAP) is a compu-
+tationally intensive interatomic potential in the LAMMPS [5]
+molecular dynamics software package. With the introduction
+of new CPU and GPU architectures, SNAP’s performance
+relative to the peak ﬂop rating of the architecture showed
+a downward trend on CPUs and low compute utilization
+on GPUs. In this paper we describe our efforts to improve
+the performance of SNAP by optimizing on all the points
+mentioned above. We explain how we overcame performance
+deterrents in SNAP to gain a ∼22× performance increase over
+the existing GPU implementation.
+
+II. THE SNAP FORCE KERNEL
+
+Interatomic potentials (IAPs) are a critical part of any
+classical molecular dynamics (MD) simulation. The use of a
+classical IAP implies that accuracy-limiting approximations
+are acceptable. The most important assumptions shared by
+many IAPs are as follows. First, all-electron mediated inter-
+actions of atoms can be described by the Born-Oppenheimer
+potential energy surface. Second, the force on a given atom
+does not depend on the positions of atoms beyond a certain
+distance. This latter constraint permits the use of efﬁcient
+algorithms that are linear scaling in the number of atoms,
+as well as ensuring that large problems can be efﬁciently
+distributed over leadership computing platforms. Many IAPs
+capture local interactions using approximations inspired by
+known physical and chemical phenomena, such as chemical
+bonding, electrostatic screening, local coordination, etc. The
+development of new IAPs follows a decades long trend where
+much of the effort has focused on more accurate, but also more
+complex and computationally expensive IAPs [6].
+
+A recent branch of this development combines strategies
+of MD and data science, producing machine-learned (ML)
+IAPs. Machine-learned IAPs translate the atomic neighbor-
+hood into a set of generalized descriptors. These descriptors
+are independently weighted to match a database of higher
+ﬁdelity results (e.g. ab initio quantum electronic structure
+calculations). A variety of different descriptors which describe
+the local environment of an atom exist in the literature [7],
+such as symmetry functions [8], bispectrum components [9],
+and the Coulomb matrix [10]. The Spectral Neighbor Analysis
+Potential (SNAP) [11] utilizes a basis expansion of bispectrum
+components as a descriptor of atomic environments. Drautz
+has recently shown that many of these descriptors, including
+the SNAP bispectrum, share a common mathematical founda-
+tion in the atomic cluster expansion for the Born-Oppenheimer
+potential energy function [12].
+
+A. Mathematical Structure of SNAP
+
+In the SNAP potential energy model, the total energy of
+a conﬁguration of atoms is composed as a sum of atomic
+energies. For each atom i, its energy Ei is assumed to be a
+function of the positions of neighbor atoms out to some ﬁnite
+distance Rcut. The positions of neighbor atoms are represented
+as an atomic density function deﬁned in the 3D ball of radius
+Rcut. In SNAP, this compact domain is mapped to the unit
+3-sphere. Expanding the neighbor density as a Fourier series,
+we obtain the following Fourier coefﬁcients
+
+Uj =
+
+(cid:88)
+
+rik<Rcut
+
+fc(rik)uj(θ0, θ, φ)
+
+(1)
+
+2 , 1, 3
+
+where Uj are the Fourier expansion coefﬁcients and uj are
+hyperspherical harmonics on the unit 3-sphere. Both Uj and
+uj are rank (2j +1) complex square matrices, where the index
+j takes half-integer values {0, 1
+2 , . . .}. The 3D vector
+rik = rk − ri is the position of neighbor atom k relative
+to the central atom i and is mapped to a point on the 3-sphere
+given by the three polar coordinates θ0, θ, and φ. The sum
+is over all neighbor atoms within the cutoff. The switching
+function fc(r) ensures that contributions go smoothly to zero
+as r approaches Rcut. For conciseness of presentation we omit
+density weighting factors and self-contributions which require
+negligible computation but are important for constructing
+physically realistic potentials. Full details are given in [11].
+
+The matrices Uj are complex-valued and are not directly
+useful as descriptors because they are not invariant under
+rotation of the polar coordinate frame. However, the following
+scalar triple products of matrices are real-valued and invariant
+under rotation [9]:
+
+Bj1j2j = Uj1 ⊗j
+
+Uj2 : U∗
+j
+
+(2)
+
+(3)
+
+j1j2
+: U∗
+j
+
+= Zj
+
+j1j2
+
+j1j2
+
+The symbol ⊗j
+
+indicates a Clebsch-Gordan product of
+matrices of rank 2j1 + 1 and 2j2 + 1 yielding a matrix of rank
+2j + 1, which we deﬁne here to be Zj
+. The computational
+complexity of this product is O(j4). The : symbol indicates
+
+j1j2
+
+the element-wise scalar product of two matrices of equal rank,
+an operation of computational complexity O(j2). The resultant
+real scalar bispectrum components Bj1j2j characterize the
+strength of density correlations at three points on the 3-sphere.
+The lowest-order components describe the coarsest features of
+the density function, while higher-order components reﬂect
+ﬁner detail. The bispectrum components deﬁned here have
+been shown to be closely related to the 4-body basis functions
+of the Atomic Cluster Expansion introduced by Drautz [12]. In
+SNAP, we assume that the local energy can be expressed as
+a linear function of all the distinct bispectrum components
+formed from matrices Uj up to some maximum degree
+J. We enumerate the bispectrum components by restricting
+0 ≤ 2j2 ≤ 2j1 ≤ 2j ≤ 2J, so that the number of unique
+bispectrum components scales as O(J 3). The factor of 2 is a
+convenient convention to avoid half-integers.
+
+For a particular choice of J, we can list the NB total bis-
+pectrum components in some arbitrary order as B1, . . . , BNB ,
+atom index i implicit, and express the energy as a linear
+function of these
+
+Ei(B) =
+
+NB(cid:88)
+
+l=1
+
+βlBl
+
+(4)
+
+where βl are the linear SNAP coefﬁcients. These coefﬁcients
+are trained via ML methods to deﬁne the SNAP energy model
+for a particular material. The force on each atom k is obtained
+by summing over all neighbor atoms i and all bispectrum
+components
+
+The computational complexity per atom of compute U and
+compute Z are O(J 3Nnbor) and O(J 7), respectively. We
+next enter a nested loop over neighbors. In the compute dU
+routine we compute dU , the derivative of U w.r.t. the position
+of one neighbor atom rk, storing the results in the dUlist
+data structure. Subsequently in the routine compute dB we
+compute the partial derivatives of Bl shown in (6), storing the
+results in dBlist. The computational complexity per neighbor
+atom of compute dU and compute dB are O(J 3) and O(J 5),
+respectively. Last, in the update forces routine, we compute
+the force contribution due to the neighbor as shown in (5).
+This ﬁnal operation has a computational complexity per atom-
+neighbor pair of O(J 3). We emphasize that as formulated,
+the order of the functions cannot be changed because the
+outputs from one routine pipe into the following routine.
+
+for(int natom=0; natom<num_atoms; ++natom)
+{
+
+// build neighbor-list for each atom
+build_neighborlist();
+// compute atom specific coefficients
+compute_U(); //Ulist and Ulisttot
+compute_Z(); //Zlist
+// For each (atom,neighbor) pair
+for(int nbor=0; nbor<num_nbors; ++nbor)
+{
+
+compute_dU(); //dUlist
+compute_dB(); //dBlist
+update_forces(); //force-array
+
+}
+
+}
+
+Listing 1: SNAP code
+
+Fk = −
+
+N
+(cid:88)
+
+NB(cid:88)
+
+i=1
+
+l=1
+
+βl
+
+∂Bl
+∂rk
+
+C. GPU implementation of SNAP
+
+(5)
+
+As described in Ref. 11, the partial derivative of Bl w.r.t.
+rk is a sum of three terms, each involving a neighbor-atom
+independent and thus precomputable Z and a neighbor-atom
+dependent derivative of U,
+
+∂Bj1j2j
+∂rk
+
+= Zj
+
+j1j2
+
+:
+
++Zj1
+jj2
+
+:
+
+∂U∗
+j
+∂rk
+∂U∗
+j1
+∂rk
+
++ Zj2
+jj1
+
+:
+
+∂U∗
+j2
+∂rk
+
+(6)
+
+This formulation prescribes the structure of an algorithm for
+computing forces from the SNAP potential. We present this in
+Listing 1.
+
+B. Initial SNAP Pseudocode
+
+Listing 1 shows the pseudocode of SNAP implementation
+by correlating the routines with the equations shown above.
+Initially the build neighborlist routine generates a list of
+neighbor atoms within the cutoff distance Rcut. Next, in the
+compute U routine, we calculate the expansion coefﬁcients
+Uj
+from (1) for each atom and neighbor pair and store
+them in Ulist. The sum of these coefﬁcients over neigh-
+bors is stored in Ulisttot. Given Ulisttot, in the compute Z
+routine we calculate the Clebsch-Gordan product based on
+(2) and store the results of Zj
+in the Zlist structure,
+a 5-dimensional array of complex double precision values.
+
+j1j2
+
+The original GPU implementation of SNAP used the
+Kokkos [2] framework to distribute the work described in
+Listing 1 across the threads of a GPU. This implementation
+was based on prior work by Moore and Trott [13], which
+in turn was based on an earlier CUDA implementation of
+SNAP [14]. The loop over atoms on line 2 of listing 1 is
+mapped to a loop over Kokkos teams, which are an abstraction
+of CUDA thread blocks. Further parallelism over neighbors,
+line 12 of listing 1, and over bispectrum components, implicit
+in compute [U,Z,dU,dB], is mapped to Kokkos’s hierarchical
+parallelism. This includes the TeamThread abstraction, paral-
+lelism over Kokkos “threads”, and the ThreadVector abstrac-
+tion, parallelism over “vector lanes”. In the case of GPUs these
+abstractions can map to warps and threads within warps (a
+“vector width” of 32), respectively.
+
+Table I lists the performance of these initial implementations
+of the SNAP potential across several HPC architectures. The
+problem sizes chosen for these comparisons comprised of 2000
+atoms with 26 neighbors per atom and 2J = 8. The Kokkos
+version of SNAP was used for the GPU benchmarks; the
+original (non-threaded) SNAP version was used for all others.
+Performance speed for classical MD simulations is often
+reported in units of Katom-timesteps per second. For example,
+given a 2000 atom system, the speed of 29.4 Katom-steps/s
+on Intel Haswell implies that the simulation rate was ∼15 MD
+timesteps per second. The peak/node column is the nominal
+
+TABLE I: SNAP performance on different hardware.
+
+A. Refactor compute routines
+
+Hardware
+
+Intel SandyBridge
+IBM PowerPC
+AMD CPU
+NVIDIA K20X
+Intel Haswell
+Intel KNL
+NVIDIA P100
+Intel Broadwell
+NVIDIA V100
+
+Year
+
+2012
+2012
+2013
+2013
+2016
+2016
+2016
+2017
+2018
+
+Speed
+(Katom-steps/s)
+
+Peak/node
+(Tﬂops)
+
+Fraction of Peak
+(normalized)
+
+17.7
+2.52
+5.35
+2.60
+29.4
+11.1
+21.8
+25.4
+32.8
+
+0.332
+0.205
+0.141
+1.31
+1.18
+2.61
+5.30
+1.21
+7.8
+
+1.0
+0.23
+0.71
+0.037
+0.47
+0.080
+0.077
+0.39
+0.079
+
+maximum FLOP rate (double precision) for one CPU node
+or one GPU. The fraction of peak column is ratio of speed
+divided by peak/node for a particular platform relative to
+the Intel SandyBridge baseline. This convention is chosen to
+abstract away technical differences in FLOP counts between
+architectures, for example due to recomputing values on a
+GPU as opposed to loading from memory on a CPU.
+
+The results in Table I support our assertion that relative
+performance has declined with advances in CPU architectures.
+Performance is low on GPUs despite the utilization of hierar-
+chical parallelism and scratch memory in Kokkos. To address
+these performance issues and arrive at a new parallelization
+strategy we created a proxy application “TestSNAP”, a stand-
+alone serial application reproducing the implementation given
+in listing 1, without the additional complexities of a full molec-
+ular dynamics code (https://github.com/FitSNAP/TestSNAP).
+In this paper we will systematically describe our paralleliza-
+tion and optimization process, benchmarking our progress in
+TestSNAP and LAMMPS relative to the initial Kokkos SNAP
+implementation, or “baseline” [15] in LAMMPS. The results
+shown in this paper are for systems of 2000 atoms with 26
+neighbors each. We consider two values of J, 8 and 14, corre-
+sponding to 55 and 204 bispectrum components, respectively.
+We will henceforth use 2J8 and 2J14 as shorthand for these
+problem sizes. The optimizations here are targeted towards
+NVIDIA’s V100 GPU, although in most cases they are generic
+optimizations that are applicable to all GPUs. All performance
+measurements given in this paper are from one NVIDIA V100
+GPU of the Summit supercomputer at Oak Ridge National
+Laboratory.
+
+III. TESTSNAP
+
+The intention behind TestSNAP is to provide a testbed in
+which many different optimizations can be explored without
+needing to build and run the full LAMMPS code, allowing de-
+velopers to focus on the core components of SNAP algorithm
+and their implementation. Successful optimization strategies
+can then be merged back into the LAMMPS production code.
+There is no fundamental reason why these performance explo-
+rations could not have been performed directly in LAMMPS,
+however TestSNAP allowed us to effectively collaborate be-
+tween our diverse team of developers irrespective of their
+familiarity to LAMMPS.
+
+One of the main disadvantages of the baseline implemen-
+tation was the over-subscription of limited resources such as
+registers, leading to a limit on available occupancy. This was
+a side effect of the use of a single large kernel being launched.
+To address this, our ﬁrst step was to refactor the SNAP
+algorithm into individual stages, as demonstrated in listing 2.
+
+// build neighbor-list for all atoms
+for(int natom=0; natom<num_atoms; ++natom)
+
+build_neighborlist();
+
+// compute matrices for all atoms
+
+for(int natom=0; natom<num_atoms; ++natom)
+
+compute_U(); //Ulist(num_atoms,...)
+
+for(int natom=0; natom<num_atoms; ++natom)
+
+compute_Z(); //Zlist(num_atoms,...)
+
+// For each (atom,neighbor) pair
+
+for(int natom=0; natom<num_atoms; ++natom)
+for(int nbor=0; nbor<num_nbors; ++nbor)
+compute_dU(); //dUlist(num_atoms,...)
+
+for(int natom=0; natom<num_atoms; ++natom)
+for(int nbor=0; nbor<num_nbors; ++nbor)
+compute_dB(); //dBlist(num_atoms,...)
+
+for(int natom=0; natom<num_atoms; ++natom)
+for(int nbor=0; nbor<num_nbors; ++nbor)
+
+update_forces();
+
+Listing 2: Refactored TestSNAP code
+
+In this refactoring each stage can be viewed as a single
+GPU kernel which performs the necessary work for all atoms.
+Launching individual kernels allows parameters such as block
+size to be speciﬁcally tailored to each kernel. For some
+kernels register usage will be lower,
+leading to increased
+occupancy. The order of loops for individual kernels can also
+be optimized.
+
+This refactoring into separate kernels does have disadvan-
+tages. The dominant disadvantage is that, because the state
+of memory does not persist across kernel calls, we need
+to manually “cache” results between kernel launches. Every
+data structure now has an additional dimension to reference
+individual atoms as shown in comments of listing 2. This
+increases memory requirements by a factor of the number
+of atoms being processed, in our case 2000. While not a
+prohibitive issue,
+this did lead to novel challenges whose
+solutions will be discussed later in the paper.
+
+We used the Kokkos framework to port TestSNAP to GPU
+in order to be consistent with the original baseline imple-
+mentation. For the rest of the paper we show code snippets
+from the Kokkos implementation of TestSNAP to explain our
+optimization strategies. As a step towards transitioning to a
+Kokkos implementation, we pushed the atom and, as appropri-
+ate, neighbor loops inside the individual routines. In addition,
+we converted the data structures Ulist,Zlist,dUlist,dBlist
+to
+Kokkos views, abstractions of multi-dimensional arrays.
+
+B. GPU implementation
+
+In this subsection we describe the early GPU implementa-
+
+tions of the refactored TestSNAP code.
+
+1) Atom loop parallelization: As with the baseline im-
+the ﬁrst step is to parallelize over indepen-
+plementation,
+In our new implementation, we assign one
+dent atoms.
+GPU thread to each atom,
+to the baseline
+in contrast
+where an entire thread block was assigned to each atom.
+We utilize this pattern for each of the four dominant ker-
+nels, compute [U,Z,dU,dB]. As part of our refactoring with
+Kokkos each complex data structure in listing 2 is converted
+into Kokkos views of type SNAcomplex, a thin wrapper
+of a complex double. Listing 3 sketches the refactoring
+of compute U to use Kokkos, as well as the deﬁnition
+of SNAcomplex. The salient feature of this refactoring is
+the per-atom loop body within compute U has been
+that
+wrapped inside a C++ lambda. This lambda is passed to the
+Kokkos::parallel for construct along with the loop dimension.
+
+void compute_U
+{
+
+struct SNAcomplex {double re, im;};
+using Kokkos::parallel_for;
+parallel_for(num_atoms, KOKKOS_LAMBDA(const int natom)
+{
+
+Ulist(natom,...) = ...
+
+});
+
+}
+
+Listing 3: Kokkos::parallel for routine to distribute work of
+atoms inside compute U routine
+
+Broadly, Kokkos then manages dispatching work to the
+target architecture. Here, Kokkos distributes the per-atom work
+across GPU threads, only offering the guarantee that
+the
+lambda body is executed once per atom on the GPU. The
+SNAP algorithm is well suited to this design because each
+atom performs independent work. We will present the results
+of distributing the work of an atom across threads of a GPU
+along with the next optimization since it is a logical extension
+to our initial step.
+2) Atom and
+
+For
+additional
+our
+compute dU
+parallelism across
+compute dB
+and
+an
+MDRangePolicy as an abstraction for parallelizing over
+the use of which we sketch in listing 4.
+nested loops,
+
+optimization we
+neighbors
+routines.
+
+parallelization:
+the
+
+exposed
+inside
+Kokkos
+
+neighbor
+
+provides
+
+loop
+
+next
+
+the
+
+void compute_dU
+{
+
+using Execspace = Kokkos::execution_space;
+using MDPolicyType2D = typename Kokkos::MDRangePolicy<
+
+ExecSpace, Kokkos::Rank<2>, int>;
+
+MDPolicyType2D mdPolicy2D({0, 0}, {num_atoms, num_nbor
+
+});
+
+parallel_for(mdPolicy2D, KOKKOS_LAMBDA(const int natom
+
+, const int nbor)
+
+{
+
+dulist(natom,nbor) = ...;
+
+});
+
+}
+
+Listing 4: MDRangePolicy to collapse atom and neighbor
+loops in compute dU routine.
+
+Line 3 of listing 4 acquires the default execution space for
+launching the work inside a Kokkos parallel for construct, the
+NVIDIA GPU in the context of this work. Line 4 shows the
+declaration of a 2D range policy type in the default execution
+
+Fig. 1: Baseline performance compared with TestSNAP after
+atom and neighbor loop parallelization on V100.
+
+space with a 32-bit integer iterator. Line 5 creates a 2D policy
+type where the ﬁrst and second loop are over num atoms and
+num nbor respectively. Line 7 shows the launching of the 2D
+range policy.
+
+The results of the two parallelization strategies discussed
+above are shown in Fig. 1 for the 2J8 and 2J14 problem
+sizes on NVIDIAs V100 architecture. As explained earlier,
+we present the results of our GPU implementation relative
+to the baseline implementation. Hence anything higher than
+“1” would imply performance improvement and conversely
+anything lower would mean that our implementation is slower
+than the baseline.
+In Fig. 1,
+
+the ﬁrst set of bars show the performance
+comparison of our implementation when only atom loop is
+distributed across threads of a GPU. For our target problem
+size we see a 1.5× and 2.0× regression for the 2J8 and
+2J14 problem sizes. A regression at this stage is reasonable.
+We increased our memory footprints to 3 and 5GB for the
+two problem sizes, respectively, with implications for cache
+reuse. In addition, relative to the baseline we are exposing
+less parallelism by not threading over neighbors and j, j1, j2.
+The latter is our next point of focus.
+
+The second set of bars in Fig. 1 show the performance
+comparison of atom and neighbor loop parallelization. Refac-
+toring to use an MDRangePolicy increases the amount of
+exposed parallelism by a factor equal
+to the number of
+neighbors per atom, here 26. Unfortunately, we now also need
+to store information between kernel launches as a function of
+both atom and neighbor number. This increases the memory
+footprint of [U,dU,dE]list by a number-of-neighbors factor,
+again 26, leading to a total memory footprint of 5 GB for
+the 2J8 problem size and an out-of-memory error for the 2J14
+problem size! Hence as can be observed in the second set
+of bars in the ﬁgure, while the performance parity for 2J8 is
+restored with the baseline code, the comparison for 2J14 is
+conspicuously missing. For comparison, the baseline code has
+a GPU memory footprint of 2 GB for the 2J8 problem and 14
+GB for the 2J14 problem.
+
+0.000.250.500.751.00Atom onlyAtom+nborBaseline2J82J14Baseline vs TestSNAPThere is no trivial solution to the out-of-memory error for
+the 2J14 problem size. The robust solution to this problem
+is given by the so-called adjoint refactorization which we
+describe in section IV.
+
+IV. ADJOINT REFACTORIZATION
+
+The original formulation of the SNAP force calculation
+relied on pre-calculating and storing the Z matrices for each
+atom. This avoided repeated calculation of the O((2j + 1)4)
+Clebsch-Gordan products for each of the (2J + 1) Z matrices.
+With this strategy the total memory footprint per atom scales
+as O(J 5). To avoid this issue we combine (5) and (6) and
+deﬁne a new quantity Y that is the adjoint of B with respect
+to U,
+
+Yj =
+
+βj
+j1j2
+
+Zj
+
+j1j2
+
+.
+
+(cid:88)
+
+j1j2
+
+(7)
+
+In this formulation each Z matrix can be computed and
+immediately accumulated to the corresponding Yj. This re-
+duces the O(J 5) storage requirement for Z, replacing it by
+the O(J 3) storage requirement for Yj. As noted in a recent
+paper by Bachmayr et al. [16], this refactorization is equivalent
+to the backward differentiation method for obtaining gradients
+from neural networks. This separate computation of Yj has the
+additional beneﬁt of eliminating the sum over j1 and j2 from
+compute dB. Since Yj is neighbor-independent this eliminates
+an additional O(Nnbor) of storage and computation relative to
+the previous implementation.
+
+With this refactorization we can avoid calculating and
+storing dB prior to the force calculation, an O(J 3) reduction in
+memory overheads. The optimized SNAP force calculation is
+now formulated as a sum over one bispectrum index j instead
+of three, giving
+
+Fk = −
+
+N
+(cid:88)
+
+J
+(cid:88)
+
+i=1
+
+j=0
+
+Yj :
+
+∂U∗
+j
+∂rk
+
+.
+
+(8)
+
+In practice we store the force contributions to an Natom ×
+Nneigh structure dElist. This is because in the full LAMMPS
+MD workﬂow individual dElist components contribute to other
+quantities of interest, such as the virial tensor.
+
+Listing 5 shows
+
+the modiﬁed TestSNAP algorithm
+In summary,
+with the adjoint
+and
+we
+have
+compute dB by compute Y and compute dE, respectively.
+
+factorization implemented.
+
+compute Z
+
+replaced
+
+routines
+
+the
+
+int natom, nbor;
+build_neighborlist();
+compute_U();
+compute_Y();
+compute_dU();
+compute_dE();
+update_forces();
+
+Listing 5: TestSNAP code
+
+Fig. 2: TestSNAP progress relative to baseline for 2J8 problem
+size on NVIDIA V100.
+
+Fig. 3: TestSNAP progress relative to baseline for 2J14 prob-
+lem size on NVIDIA V100.
+
+We additionally ﬂattened jagged multi-dimensional arrays re-
+lated to the j1, j2, j structures which further reduced memory
+use. These optimizations reduced the memory requirements for
+the 2J = 14 problem size to 12 GB, rendering our algorithm
+tractable on a V100-16GB. The adjoint refactorization and
+memory reduction improved performance on CPUs as well
+giving us a 3× performance boost on the Intel Broadwell CPU
+for the 2J8 problem size.
+
+We document next a series of optimizations we performed
+on the refactored algorithm. A summary of our ﬁgure of merit,
+the grind-time, relative to the baseline is given in Fig. 2
+and 3 for the 2J8 and 2J14 problem sizes, respectively. The
+performance numbers shown in the ﬁgures are obtained by
+running TestSNAP on NVIDIA’s V100 GPU. The labels on the
+x-axis correspond to subsection numbers, V1 through V7, in
+which we provide detailed descriptions of our optimizations.
+The height of the bar for any given subsection assumes the
+optimizations from all previous subsections are in place.
+
+V. OPTIMIZATION OF REFACTORED CODE
+
+A. V1 - Atom loop parallelization
+
+The adjoint refactorization reduced both memory overheads
+and the computational complexity of the SNAP calculation.
+
+Following the pattern of our initial TestSNAP Kokkos
+implementation, our ﬁrst step is to refactor the algorithm
+
+0123456789BaselineV1V2V3V4V5V6V7TestSNAP progress relative to baseline for 2J80123456789BaselineV1V2V3V4V5V6V7TestSNAP progress relative to baseline for 2J14into four discrete kernels, each of which act on all atoms.
+In summary, for each of compute [U,Y,dU,dE] we launch
+a Kokkos::parallel for in which each Kokkos thread (here
+mapping to a CUDA thread) performs work for a single atom.
+For further details we refer the reader back to Sec. III-B1 and
+to the reference code for compute U in listing 3. In particular
+the Kokkos re-implementation of compute U is unchanged
+relative to TestSNAP as the adjoint refactoring did not effect
+that kernel.
+
+Because this stage is a prescriptive refactorization, success
+was evaluated by verifying correctness relative to the baseline.
+This is provided by construction in TestSNAP as discussed
+in Section II. In contrast to the implementation before the
+adjoint refactorization demonstrated in Fig. 1, we already see
+a 15% and 50% improvement for the 2J8 and 2J14 problem
+sizes respectively. We owe this beneﬁt to the reduction in
+memory transfers, most importantly the elimination of the
+O(J 5) storage required for Zlist. Both problem sizes already
+show a speed-up relative to the baseline code.
+
+B. V2 - Atom and neighbor loop parallelization
+
+The next step is to expose additional parallelism over
+the neighbor dimension in the compute dU and compute dE
+routines. We refer the reader back to Sec. III-B2 for the
+broad motivations. In contrast to the TestSNAP case where we
+used an MDRangePolicy, here we consider additional methods
+of parallelizing over the nested atom, neighbor loops. One
+strategy to consider is assigning one Kokkos team, equivalently
+CUDA threadblock, to each atom and distributing the neigh-
+bors across the Kokkos threads, equivalently CUDA threads,
+within a block. In our benchmark each atom has exactly 26
+neighbors, implying one warp per threadblock (32 threads)
+would be sufﬁcient. Another strategy, the one we found most
+effective, is to collapse the neighbor and atom loops and
+launch a one-dimensional Kokkos parallel for. This allows
+Kokkos to manage scheduling work across threads and thread
+blocks. We sketch this implementation in listing 6.
+
+This strategy begged an opportunity to expose neighbor
+parallelism in the compute U routine. This requires the in-
+troduction of atomic additions. As noted in Sec. II, for each
+atom the compute U routine calculates the sum of expan-
+sion coefﬁcients Uj over each neighbor. When we did not
+thread over neighbors this sum could be safely performed
+without atomics. Our implementation featuring both atom,
+neighbor parallelism and atomic additions is given in listing 7.
+
+void compute_dU
+{
+
+const int nTotal = num_atoms*num_nbor;
+Kokkos::parallel_for(nTotal, KOKKOS_LAMBDA(int iter)
+{
+
+int natom = iter / num_nbor;
+int nbor = iter % num_nbor;
+dUlist(natom,nbor,...) = ...
+
+});
+
+}
+
+void compute_U
+{
+
+//Kernel 1
+Kokkos::parallel_for(nTotal, KOKKOS_LAMBDA(int iter)
+{
+
+int natom = iter / num_nbor;
+int nbor = iter % num_nbor;
+for(int j = 0; j < idxz; ++j)
+
+Ulist(natom,nbor,j) = ... //Update Ulist
+
+});
+//Kernel 2
+Kokkos::parallel_for(nTotal, KOKKOS_LAMBDA(int iter)
+{
+
+int natom = iter / num_nbor;
+int nbor = iter % num_nbor;
+for(int j = 0; j < idxz; ++j)
+
+Kokkos::atomic_add(Ulisttot(natom,j), Ulist(natom,
+
+nbor,j));
+
+});
+
+}
+
+Listing 7: 2 kernels in compute U routine
+
+In contrast to V1, the evaluation of merit is non-trivial
+because the atomic additions we introduced do have a per-
+formance penalty relative to non-atomic additions. Nonethe-
+less, proﬁler-driven optimization indicates this penalty is well
+amortized by the introduction of additional parallelism. As
+documented in Figs. 2 and 3 we ﬁnd a net ∼2× performance
+improvement from a veriﬁed correct introduction of neighbor
+parallelism for both the problem sizes.
+
+C. V3 - Data layout optimizations
+
+The previous two sections document exposing additional
+parallelism in each routine. Exposing additional parallelism
+requires a careful reconsideration of data layouts to preserve
+sequential memory accesses across threads. For GPUs, the
+data dimension over which the parallelization happens should
+be stored contiguously in memory. Our TestSNAP implemen-
+tation originally used a CPU-friendly row-major data layout
+where the ﬂattened j indices were fastest while the paral-
+lelization happened over the atom dimension. The strategy
+of threading over atoms lends itself to an atom-fastest data
+layout on GPUs. Changing to a column-major data layout, and
+proﬁling each kernel to verify if the intended change resulted
+in memory coalescing, showed that this transformation only
+improved coalescing in compute Y. The reason for this will
+be addressed in V4. For now, we note that this data layout
+modiﬁcation in compute Y gave us a 1.6× speedup for 2J8
+and 1.3× speedup for the 2J14 problem sizes.
+
+D. V4 - Atom loop as the fastest moving index
+
+earlier
+
+As mentioned
+
+compute [U,dU,dE]
+
+there
+in
+are still non-coalesced accesses because our convention
+for unﬂattening the atom, neighbor
+loop was neighbor-
+fastest. The solution to this problem is trivially changing
+neighor
+to
+shows
+index calculation in listing 6 and listing 8,
+index.
+us how the atom loop can be made the fastest
+
+atom-fastest. Comparing
+
+atom and
+
+the
+
+int nbor = iter / num_atoms;
+int natom = iter % num_atoms;
+
+Listing 6: Atom and neighbor loops collapsed in compute dU
+routine
+
+Listing 8: Atom loop as the fastest moving index
+
+This loop reversal gave us another 2× performance boost. We
+
+veriﬁed that these optimizations were implemented correctly
+by, as with V3, proﬁling and checking memory coalescing
+metrics. The data layout and loop order optimizations
+documented above gave an aggregate ∼3.5× speedup for 2J8
+and ∼4× speedup for 2J14 problem size. This is shown in
+bars V3 and V4 of Fig. 2 and 3.
+
+E. V5 - Collapse bispectrum loop
+
+At this point, the compute Y routine was the most compute
+intensive. To expose more parallelism in the routine we
+assigned a single Kokkos team to an atom and distributed
+the ﬂattened loops over j,j1,j2 across the Kokkos threads
+within a team. As this optimization is prescriptive, success is
+deﬁned by an improvement in performance. We benchmarked
+this optimization and verﬁed a ∼ 3× performance boost in
+in
+the particular kernel and an 80% overall
+the performance as can be observed in the V5 bars of the
+performance ﬁgures.
+
+improvement
+
+F. V6 - Transpose Ulisttot
+
+Coalesced memory access is preferred on GPUs if con-
+secutive threads access consecutive memory locations in a
+data structure. We were aware at the conclusion of V3 that
+in compute Y consecutive threads access strided indexes in
+Ulisttot. This led to row-major being the optimal access pattern
+for Ulisttot in compute Y. However its access in compute U
+should be column-major to optimize the atomic add calls
+shown in listing 7. The solution to this problem is to add
+a transpose of Ulisttot between compute U and compute Y.
+This is a negligible overhead, 0.2%, compared to the beneﬁt
+of coalescing the repeated reads on Ulisttot, giving a 15%
+and 20% performance improvement for 2J8 and 2J14 problem
+sizes. This optimization is reﬂected in column V6 of Figs. 2
+and 3.
+
+G. V7 - 128 bit load/store
+
+Targeted proﬁling of TestSNAP using Nsight Compute
+showed that the SNAcomplex complex data type was gener-
+ating two distinct 64 bit loads and stores instead of a single
+128 bit transaction. This led to non-coalesced reads and writes
+on GPUs. To guarantee the alignment requirements of 128
+bit instructions we marked the SNAcomplex with the C++11
+alignas(16) speciﬁer. This optimization gave an additional
+15% performance improvement for 2J8 and 19% improvement
+for 2J14.
+
+While TestSNAP gave us an overall of 7.5× speedup for
+2J8 and 8.9× for 2J14, when these optimizations were imple-
+mented in the LAMMPS production code [17], we achieved a
+7.3× speedup for 2J8 and an 8.2× speedup for 2J14 relative
+to the baseline.
+
+VI. ARCHITECTURE SPECIFIC OPTIMIZATIONS
+
+To this point each of our optimizations were agnostic to
+running on the CPU or GPU up to differences hidden within
+implicit conventions in the Kokkos framework. We identiﬁed
+that further optimizations were possible on the GPU relative
+
+to the CPU because of the required arithmetic intensity (AI)
+to properly saturate each device. It is well known that GPU
+devices require a higher AI, equivalently FLOPS/byte fetched
+from memory, to break out of a memory bandwidth bound
+regime. In contrast to the previous section, these optimizations
+were implemented directly in LAMMPS without ﬁrst being
+implemented in the TestSNAP proxy. Numerical correctness
+of the optimizations was veriﬁed by comparing the thermody-
+namic output (e.g. energy and pressure) of the new version to
+that of the baseline version over several timesteps.
+
+A. Recursive Polynomial Calculations
+
+Via a straightforward analysis, the kernels Compute U and
+compute dU should be (close to) compute-bound due to the
+large numbers of ﬂoating-point operations per atom, neigh-
+bor pair. However, GPU proﬁling found these kernels were
+memory bandwidth bound as implemented. After analysis, we
+determined this is due to repeated loads and stores to Ulist
+and dUlist, respectively, represented for example in listing 7.
+This is less of an issue on the CPU again because of the lower
+required arithmetic intensity to saturate the host processor. On
+the GPU, eliminating these loads and stores to device memory
+is a high priority optimization.
+
+We will use the structure of the hyperspherical harmonic
+calculation as a motivator for our optimizations. The hyper-
+spherical harmonics are deﬁned by a recursion relation
+
+uj = F(uj− 1
+
+2
+
+)
+
+(9)
+
+where F is a linear operator in which each of the (2j + 1)2
+elements of uj
+is a linear combination of two adjacent
+elements of uj− 1
+. The key observation is that this bounds the
+size of the state required for one atom, neighbor pair for any
+given value of j to 16×(2j)2 bytes, the 16 corresponding to a
+complex double, from the previous level. This motivates using
+low-latency GPU shared memory to cache the state, exposed
+in Kokkos as scratch memory.
+
+2
+
+Shared memory is a limited resource per GPU compute
+unit, which imposes a strict bound on the maximum thread
+occupancy, limiting the throughput of atom, neighbor pairs.
+This can be addressed using more CUDA threads per pair,
+both expediting the calculation and relaxing the occupancy
+limitations. Extra parallelism is afforded by the structure of
+(9): for ﬁxed j the (2j + 1)2 elements of uj can be computed
+independently and thus concurrently.
+
+Furthermore, we can exploit the symmetry property of uj
+to reduce the scratch memory requirements by roughly an
+additional factor of two. For ﬁxed j, uj is dependent, up to a
+small overcounting for convenience of indexing, on ceil(j + 1
+2 )
+rows of uj− 1
+. This reduces the scratch memory overheads to
+(2j +1)(ﬂoor(j)+1) elements, again times two for the double
+buffer. Of important note, this memory layout optimization
+also carries over to Ulist and Uarraytot, roughly halving
+memory overheads, and also reducing the number of atomic
+additions required into Uarraytot.
+
+2
+
+As a second, more nuanced optimization, we split
+the
+Uarraytot data structure into two data structures corresponding
+
+to the real and imaginary parts. This is informed by the lack
+of “double2” atomics, where two consecutive double precision
+values are updated atomically. While this removes the beneﬁt
+of 128-bit loads and stores, this does allow non-strided atomic
+additions, net boosting performance.
+
+An efﬁcient implementation of this pattern is accomplished
+by assigning one GPU warp per atom, neighbor pair, exposed
+in Kokkos via a VectorRange construct. Here we parallelize
+computing the elements of uj over the “vector lanes.” The
+compute U kernel
+in isolation achieves a 5.2× and 4.9×
+speedup for the 2J8 and 2J14 problem sizes, respectively, given
+these optimizations.
+
+This implementation has additional beneﬁts. Compared with
+listing 7, this implementation fuses the parallel loops for com-
+puting Ulist and accumulating into Uarraytot. This eliminates
+the need to store any value to Ulist, allowing us to remove one
+of two data structures of size O(J 3NatomNnbor). Furthermore,
+now that one warp is assigned to each atom/neighbor pair,
+coalesced memory accesses require a return to a row-major or
+right layout for Uarraytot, removing the need for a transpose
+kernel before compute Y.
+
+We note that the number of components in a given uj is
+generally not divisible by 32, the warp length, and as such
+some threads will go unused. While this is not ideal, this load
+imbalance is a reasonable penalty to pay relative to the overall
+speed-up.
+
+These optimizations transfer well to the compute dU kernel.
+A recursion relation for duj can be written from the derivative
+of (9). There are two novel new constraints on the kernel.
+First, because we have eliminated Ulist, we need to recompute
+values. This is net beneﬁcial due to the relative cost of compute
+versus loads from memory. Next, because we need to compute
+dUlist for x, y, z, we need four times as much shared memory.
+Relative to compute U this is a prohibitive occupancy limiter.
+The solution is to split compute dU into three separate kernels,
+one per direction. Despite the redundant work this leads to a
+net speed-up.
+
+We can eliminate the standing need to write dUlist
+to
+memory via kernel fusion with update forces. This requires
+re-introducing a global memory read from Ylist, however the
+latency of this read can be hidden behind the computation of
+dU; further, because Ylist is a smaller data structure the reads
+are well cached. This is further improved by noting there is
+a one-to-one product between components of dU and Ylist
+in the kernel, letting us carry the symmetry properites of dU
+over to Ylist, again halving memory overheads. Last, because
+dE is a function of atom, neighbor pairs, it can be accumu-
+lated within the kernel via a low-overhead parallel reduce
+construct. For discussion we will refer to this new kernel as
+compute fused dE.
+
+The aggregate beneﬁt of shared memory optimizations,
+splitting the kernels per-direction, halving memory overheads,
+and fusing in the force computation is a 3.3× and 5.0×
+speedup for the 2J8 and 2J14 problem sizes, respectively, for
+the new compute fused dE kernel in isolation.
+
+B. Data Layout Optimizations
+
+A second point of optimization is improving the data layout
+of the Ylist data structure. As described in V5, the current data
+layout on the GPU has the ﬂattened index j, j1, j2 as the fast-
+moving index and atom number as the slow index. While this
+led to a large improvement in performance, it was not without
+ﬂaw.
+
+As noted in (7), Y is a sum over elements of Zj
+
+, which it-
+self is a Clebsch-Gordon contraction of elements of U as seen
+in (2). The Clebsch-Gordon contractions are over a variable
+number of elements as a function of j, j1, j2. The convention
+of giving each thread of compute U a different Clebsch-
+Gordon contraction implies both imperfect read coalescing and
+a natural load imbalance between different sums.
+
+j1j2
+
+The former issue is a well-understood consequence of using
+an “array-of-structures” (AoS) data layout for Uarraytot and
+Ylist, where the “S” corresponds to the quantum numbers,
+while the “A” is for atom number. This layout was beneﬁcial
+for Uarraytot because, in the optimized implementation of
+compute U, coalesced reads and writes over quantum numbers
+were naturally achieved—the “S” incidentally ended up acting
+as an “A” for the purpose of the kernel. On the other hand,
+compute Y sees no such beneﬁt. Proﬁling indicates that, while
+compute Y does indeed leave read coalescing lacking, it still
+achieves good L1 cache reuse, which saves performance.
+
+This leaves the problem of load imbalance between different
+sums. The solution to this problem is changing the data layout
+of Uarraytot and Ylist to an “array-of-structures-of-arrays”
+(AoSoA) data layout, and changing the threading pattern
+appropriately. For the new data layout, the inner-most (fastest
+index) “A” is ﬁxed at 32—the length of a CUDA warp. This
+guarantees perfect read and write coalescing. The intermediate
+index “S” is the same as before—all quantum numbers. Last,
+the outer-most “A” is ceil(Natom/32). A natural threading
+pattern follows, most easily achieved by a MDRangePolicy
+as noted in listing 4, except now it is a rank-3 policy mapping
+hierarchically to the data layout above. Last, as compute Y
+also requires atomic additions, we follow the pattern noted
+for compute U of spliting the AoSoA data structure into real
+and imaginary parts.
+
+With this formulation, all reads and writes are perfectly
+coalesced, and there is perfect load balancing within a warp.
+For the compute Y kernel in isolation, this optimization leads
+to a 1.4x speed-up for both the 2J8 and 2J14 problem sizes,
+owed to the elimination of load imbalance within a warp.
+
+This reformulation to an AoSoA data layout does require
+the re-introduction of “transpose” kernels, as existed in opti-
+mization V6. As was observed there, these additional transpose
+kernels are a negligible overhead relative to the improvement
+offered by the optimization of compute Y.
+
+C. Overall Improvements
+
+Fig. 4 shows the ﬁnal performance comparison of the
+newer implementation in LAMMPS [18] over the baseline
+after all the optimizations discussed in this paper. For the 2J8
+benchmark, we see a 19.6× overall speedup over the baseline,
+
+optimizations, and architecture-speciﬁc optimizations such as
+shared memory caching of intermediate computations. Each
+performance optimization in Sec. V is inherently performance
+portable. Additional shared memory optimization in Sec. VI
+are applicable across GPU architectures. The majority of
+our algorithmic explorations were done in the standalone
+TestSNAP proxy-app which enabled the rapid conception and
+prototyping of many different optimizations. We encourage all
+developers to develop proxy apps to shorten the design/imple-
+ment/test/review cycle as was beneﬁcial here. Since then, all
+optimizations described here have been ported into the public
+release of the LAMMPS and are freely available.
+
+REFERENCES
+
+[1] “Top500,” 2020,
+
+[Online;
+Available: https://www.top500.org/lists/2020/06/
+
+accessed 19-October-2020].
+
+[Online].
+
+[2] H. C. Edwards, C. R. Trott, and D. Sunderland, “Kokkos: Enabling
+manycore performance portability through polymorphic memory access
+patterns,” Journal of Parallel and Distributed Computing, vol. 74, no. 12,
+pp. 3202 – 3216, 2014.
+
+[3] D. A. Beckingsale, J. Burmark, R. Hornung, H. Jones, W. Killian, A. J.
+Kunen, O. Pearce, P. Robinson, B. S. Ryujin, and T. R. Scogland,
+“Raja: Portable performance for large-scale scientiﬁc applications,” in
+2019 IEEE/ACM International Workshop on Performance, Portability
+and Productivity in HPC (P3HPC).
+
+IEEE, 2019, pp. 71–81.
+
+[4] J. Filipoviˇc, M. Madzin, J. Fousek, and L. Matyska, “Optimizing
+CUDA code by kernel fusion: application on BLAS,” The Journal of
+Supercomputing, vol. 71, no. 10, pp. 3934–3957, 2015.
+
+[5] S. Plimpton, “Fast parallel algorithms for short-range molecular
+dynamics,” J. Comput. Phys., vol. 117, no. 1, pp. 1 – 19, 1995.
+[Online]. Available: http://lammps.sandia.gov
+
+[6] S. J. Plimpton and A. P. Thompson, “Computational aspects of many-
+
+body potentials,” MRS Bulletin, vol. 37, pp. 513–521, 2012.
+
+[7] A. P. Bart´ok, R. Kondor, and G. Cs´anyi, “On representing chemical
+
+environments,” Phys. Rev. B, vol. 87, p. 184115, May 2013.
+
+[8] J. Behler and M. Parrinello, “Generalized neural-network representation
+of high-dimensional potential-energy surfaces,” Phys. Rev. Lett., vol. 98,
+p. 146401, Apr 2007.
+
+[9] A. P. Bart´ok, M. C. Payne, R. Kondor, and G. Cs´anyi, “Gaussian
+approximation potentials: The accuracy of quantum mechanics, without
+the electrons,” Phys. Rev. Lett., vol. 104, p. 136403, Apr 2010.
+[10] M. Rupp, A. Tkatchenko, K.-R. M¨uller, and O. A. von Lilienfeld, “Fast
+and accurate modeling of molecular atomization energies with machine
+learning,” Phys. Rev. Lett., vol. 108, p. 058301, Jan 2012.
+
+[11] A. Thompson, L. Swiler, C. Trott, S. Foiles, and G. Tucker, “Spectral
+neighbor analysis method for automated generation of quantum-accurate
+interatomic potentials,” Journal of Computational Physics, vol. 285, pp.
+316 – 330, 2015.
+
+[12] R. Drautz, “Atomic cluster expansion for accurate and transferable
+interatomic potentials,” Phys. Rev. B, vol. 99, p. 014104, Jan 2019.
+[13] S. Moore, C. Trott, and S. Plimpton, “ECP CoPA Milestone Report:
+
+Deploy ExaMiniMD optimizations into LAMMPS,” 6 2018.
+
+[14] C. R. Trott, S. D. Hammond, and A. P. Thompson, “SNAP: Strong
+scaling high ﬁdelity molecular dynamics simulations on leadership-
+class computing platforms,” ISC 2014, Supercomputing, Lecture Notes
+in Computer Science, vol. 8488, p. 19, 2014.
+
+[15] “Lammps github commit,” 2018,
+
+[Online].
+
+[Online]. Available:
+
+https://github.com/lammps/lammps/commit/39a09d3
+
+[16] M. Bachmayr, G. Csanyi, G. Dusson, S. Etter, C. van der Oord, and
+C. Ortner, “Approximation of potential energy surfaces with spherical
+harmonics,” 2019.
+
+[17] “Lammps github commit,” 2019. [Online]. Available: https://github.
+
+com/lammps/lammps/commit/fe9f7f4
+
+[18] “Lammps github commit,” 2020. [Online]. Available: https://github.
+
+com/lammps/lammps/commit/dae2cb2
+
+Fig. 4: Performance boost of new implementation compared
+to the older GPU implementation.
+
+whereas in the 2J14 case we observe a 21.7× speedup.
+Memory use was also greatly reduced: the 2J8 benchmark now
+uses only 0.1 GB of GPU memory, while the 2J14 benchmark
+uses 0.9 GB.
+
+The ﬁne-tuned optimizations for the GPU in this section
+lead to a performance regression on the CPU. For this reason,
+in our LAMMPS Kokkos implementation we used divergent
+code paths, where the CPU path largely uses only the opti-
+mizations up through section V.
+
+We note that some aspects of the ﬁne-tuned GPU optimiza-
+tions do carry over to the CPU codepath. One is exploiting the
+symmetries of uj, as well as the implicit extensions to Uj,
+∂Uj
+, and Y via the one-to-one contraction with the derivative
+∂rk
+of Uj. This can still be used to half memory overheads
+across these data structures, which is important given the
+O(NatomNnborJ 3) memory scaling of Ulist and dUlist in
+particular. We note that backporting this optimization to the
+CPU (non-Kokkos) codepath has not yet occurred, but will be
+done in the future.
+
+The second optimization of switching to an AoSoA data
+layout for Ylist also has a generalization to the CPU, where
+instead of the inner-most “A” being of length 32, correspond-
+ing to the size of the warp, the inner-most “A” corresponds
+to the vector index of a CPU SIMD data type. CPU SIMD
+optimizations to the SNAP potential will be explored in the
+future.
+
+VII. CONCLUSIONS
+
+In this paper we presented our efforts to improve the
+performance of the SNAP interatomic potential by using the
+NVIDIA V100-16GB GPU as the benchmark hardware. We
+have quantiﬁed the beneﬁts of a series of algorithmic and
+implementation strategies, leading up to an aggregate ∼22×
+speedup over a previous GPU implementation on the same
+hardware. The fundamental adjoint refactorization of Sec. IV
+was essential for a viable implementation. Key implementation
+optimizations included the counterintuitive approach of kernel
+ﬁssion instead of kernel fusion, loop reordering and data access
+
+Performance Comparison of Baseline implementation versus the most optimized 05101520252J82J14BaselineOptimized

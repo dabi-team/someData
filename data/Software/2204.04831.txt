@@ -1,0 +1,1836 @@
+2
+2
+0
+2
+
+r
+p
+A
+1
+1
+
+]
+
+G
+L
+.
+s
+c
+[
+
+1
+v
+1
+3
+8
+4
+0
+.
+4
+0
+2
+2
+:
+v
+i
+X
+r
+a
+
+Cello: Efficient Computer Systems Optimization with Predictive
+Early Termination and Censored Regression
+
+Yi Ding
+MIT CSAIL
+Cambridge, MA, USA
+ding1@csail.mit.edu
+
+Alex Renda
+MIT CSAIL
+Cambridge, MA, USA
+renda@csail.mit.edu
+
+Ahsan Pervaiz
+University of Chicago
+Chicago, IL, USA
+ahsanp@uchicago.edu
+
+Michael Carbin
+MIT CSAIL
+Cambridge, MA, USA
+mcarbin@csail.mit.edu
+
+Henry Hoffmann
+University of Chicago
+Chicago, IL, USA
+hankhoffmann@cs.uchicago.edu
+
+ABSTRACT
+Sample-efficient machine learning (SEML) has been widely applied
+to find optimal latency and power tradeoffs for configurable com-
+puter systems. Instead of randomly sampling from the configuration
+space, SEML reduces the search cost by dramatically reducing the
+number of configurations that must be sampled to optimize system
+goals (e.g., low latency or energy). Nevertheless, SEML only reduces
+one component of cost—the total number of samples collected—but
+does not decrease the cost of collecting each sample. Critically, not
+all samples are equal; some take much longer to collect because they
+correspond to slow system configurations. This paper present Cello,
+a computer systems optimization framework that reduces sample
+collection costs—especially those that come from the slowest con-
+figurations. The key insight is to predict ahead of time whether
+samples will have poor system behavior (e.g., long latency or high
+energy) and terminate these samples early before their measured
+system behavior surpasses the termination threshold, which we call
+it predictive early termination. To predict the future system behavior
+accurately before it manifests as high runtime or energy, Cello uses
+censored regression to produces accurate predictions for running
+samples. We evaluate Cello by optimizing latency and energy for
+Apache Spark workloads. We give Cello a fixed amount of time to
+search a combined space of hardware and software configuration
+parameters. Our evaluation shows that compared to the state-of-
+the-art SEML approach in computer systems optimization, Cello
+improves latency by 1.19× for minimizing latency under a power
+constraint, and improves energy by 1.18× for minimizing energy
+under a latency constraint.
+
+1 INTRODUCTION
+Optimizing latency and power tradeoffs (e.g., minimizing latency
+while meeting a power constraint) is crucial to modern computer
+systems. To achieve these goals, hardware and software configu-
+ration parameters—e.g., number of cores, core frequency, memory
+management, etc.—are exposed to users such that both the under-
+lying system and application can be configured to operate at an
+optimal point in the latency-power tradeoff space [1–3]. Selecting
+an optimal configuration, however, is a challenging problem as the
+
+Conference’17, July 2017, Washington, DC, USA
+2022. ACM ISBN 978-x-xxxx-xxxx-x/YY/MM. . . $15.00
+https://doi.org/10.1145/nnnnnnn.nnnnnnn
+
+size and complexity of the configuration space require intelligent
+methods to avoid local optima [4, 5].
+
+Sample Efficiency. Machine learning techniques have proven
+effective solutions to optimizing computer system configurations [6–
+8]. While a variety of such methods have been applied, they require
+a large sampling effort; i.e., generating a candidate configuration,
+running it to measure its high-level system behavior (e.g., latency
+and energy), and then building a model to predict the system be-
+havior of unsampled configurations. Among these techniques, an
+appealing direction is sample-efficient machine learning (SEML),
+which reduces the number of samples required to find the optimal
+configuration [9–13]. A powerful example of SEML is Bayesian op-
+timization [10, 12, 13]. Bayesian optimization intelligently selects
+samples that provide the most information for the model updates,
+and this intelligence reduces the number of samples required to find
+the configuration that produces optimal systems behavior. Besides
+Bayesian optimization, other sample-efficient optimizers have been
+proposed for specific systems problems [9, 11, 14, 15].
+
+Cost of Samples. SEML reduces the cost for computer systems
+optimization by reducing the number of samples to find the optimal
+configuration. There is, however, a significant additional cost: the
+time to collect each sample. Critically in computer systems opti-
+mization, the samples corresponding to the worst configurations
+take a much longer time to collect than others. For instance, a slow
+configuration can take 10× the execution time of the optimal con-
+figuration on the same Apache Spark workload [16]. Thus, there
+is a need for reducing the cost of individual sample collection and
+not just the total number of samples.
+
+Compute Efficiency. We note that achieving compute efficiency
+for SEML should reduce both the number of samples and the cost of
+collecting each sample. To reduce the cost of collecting each sample,
+prior work replies on measured early termination that terminates
+samples when the measured system behavior surpasses a given ter-
+mination threshold (e.g., a target latency) [17, 18]; and this threshold
+typically distinguishes between good and poor system behavior.
+For instance, if the termination threshold is 40 seconds and the true
+latency of the workload running at a particular configuration is
+60 seconds, measured early termination techniques will terminate
+samples when their runtime surpasses 40 seconds. However, this
+approach still pays the cost of waiting for the sample to hit the
+termination threshold, which is compute-inefficient.
+
+ 
+ 
+ 
+ 
+ 
+ 
+Conference’17, July 2017, Washington, DC, USA
+
+Yi Ding, Alex Renda, Ahsan Pervaiz, Michael Carbin, and Henry Hoffmann
+
+1.1 Compute Efficiency with Cello
+In contrast to prior work based on measured early termination,
+we introduce predictive early termination. This approach monitors
+running samples, predicts whether the sample will surpass the
+threshold, and terminates such unpromising samples before they
+are measured to be poor (e.g., long latency or high energy).
+
+To apply this insight, we present Cello, an efficient computer
+systems optimization framework that augments Bayesian optimiza-
+tion with predictive early termination. To enable predictive early
+termination, Cello must predict, both early and accurately, whether
+a running sample will perform poorly; i.e., eventually exceed the
+termination threshold, which Cello sets as the best measured behav-
+ior. To do so, Cello applies censored regression, a prediction approach
+that is designed to model missing data (i.e., samples that are mea-
+sured but not finish running) more accurately than techniques that
+do not account for the missing data [20, 21]. Formally, censoring
+is a condition where a measurement is only partially observable
+due to a given censoring threshold [19]. Instead of observing the
+true measurement, in censored regression we only know that it
+exceeded the censoring threshold. For example, if the censoring
+threshold is 30 seconds, the true latency of a sample that keeps
+running after 30 seconds is not observed at this moment because it
+is censored. Although its true latency is unknown at this moment,
+we know that it must be at least 30 seconds. The intuition behind
+censored regression is to model the censored and uncensored data
+(in our case, the samples that are still running and finished running
+before the termination threshold) differently, and then combine
+these models in a way that produces more accurate predictions
+than standard regression that does not account for censoring (§5.3).
+
+1.2 Summary of Results
+We implement Cello and test it on twelve Apache Spark workloads
+from HiBench [22]. We compare Cello to state-of-the-art Bayesian
+optimization techniques and different variants of early termination
+(including both measured and predictive). We give each method a
+fixed time to search a combined space of hardware and software
+configuration parameters and find solutions for two systems opti-
+mization problems: (1) minimizing latency under a power constraint
+(Latency-Under-Power) and (2) minimizing energy under a latency
+constraint (Energy-Under-Latency). Our evaluation shows a com-
+plete breakdown of results for different constraints and workloads
+for Cello and prior approaches to SEML. Compared to the prior
+work, we find that on average Cello (§5.1):
+• improves latency by 1.19× for Latency-Under-Power and energy
+by 1.18× for Energy-Under-Latency compared to Bliss [29], the
+state of the art SEML approach for computer systems optimiza-
+tions;
+
+• improves latency by 1.24–1.61× for Latency-Under-Power and
+energy by 1.24–1.34× for Energy-Under-Latency compared to
+other SEML approaches that use measured early termination;
+• improves latency by 1.90× for Latency-Under-Power and energy
+by 2.35× for Energy-Under-Latency compared to the SEML ap-
+proach that uses predictive early termination based on standard
+regression, rather than Cello’s censored regression.
+
+1.3 Contributions
+This paper presents the following contributions:
+• Introducing predictive early termination, based on predicted—
+rather than measured—behavior which allows SEML to terminate
+samples much earlier than prior work.
+
+• Introducing censored regression to predict the system behavior
+of samples and enable predictive early termination. To the best
+of our knowledge this is the first demonstration of the benefits
+of censored regression for computer systems optimization.
+
+• Presenting Cello, an efficient computer system optimization frame-
+work that combines predictive early termination and censored re-
+gression to reduce the cost of applying machine learning methods
+for systems optimization while still improving systems outcomes.
+Incomplete data are often prevalent in computer systems optimiza-
+tion. To the best of our knowledge, Cello is the first framework
+that reduces the time cost per sample by intelligently taking ad-
+vantages of incomplete data via censored regression and predictive
+early termination. Our work provides a foundation on which the
+computer systems community can build new efficient frameworks
+that process incomplete data in computer systems research.
+
+2 BACKGROUND AND RELATED WORK
+This section discusses related work on machine learning for config-
+uration optimization (§2.1), early termination (§2.2), and machine
+learning for prediction (§2.3).
+
+2.1 Computer Systems Configuration
+
+Optimization
+
+Modern computer systems are increasingly configurable [1, 23].
+These configuration parameters have a large effect on high-level
+systems behavior including throughput [24], latency [25], and en-
+ergy [4, 11]. Furthermore, the number of parameters and their
+complex interactions create a large search space with many lo-
+cal optima [5, 26], which present challenges for heuristics [4, 5].
+To optimize systems behavior, machine learning techniques have
+been applied to search this configuration space for high-performing
+configurations.
+
+Sample-efficient machine learning (SEML) represents a class of
+machine learning techniques that reduce the number of samples
+required to find the optimal configuration [27]. SEML approaches
+work iteratively, using their current predictions to determine which
+new configuration to sample and then update their model based
+on the observed behavior of that sample. Bayesian optimization
+is a typical SEML approach that has been applied in various do-
+mains [28]. For example, Cherrypick uses Bayesian optimization to
+find optimal cloud configurations [10]. CLITE uses Bayesian opti-
+mization to schedule workloads for datacenters [13]. HyperMapper
+applies Bayesian optimization to tune compilers [12]. Bliss uses
+Bayesian optimization to tune parallel applications on large-scale
+systems [29]. Additional works propose problem-specific SEML ap-
+proaches, including multi-phase sampling [11], optimal experiment
+design in Ernest [15], and fractional factorial design in Flicker [14].
+An example of cost per sample. The SEML approaches above
+reduce the cost of computer systems optimization by reducing the
+number of samples. However, there is also the opportunity to reduce
+the cost of each sample itself. To demonstrate this, we compare the
+
+Cello: Efficient Computer Systems Optimization with Predictive Early Termination and Censored Regression
+
+Conference’17, July 2017, Washington, DC, USA
+
+number of samples and cost per sample between random sampling
+(not a SEML approach), Bayesian optimization, and Cello. We run
+the Apache Spark workload als from HiBench on a cloud comput-
+ing system (details in §4.2) with the goal of finding the configuration
+with the lowest latency. Figure 1 compares the time cost per sample
+between random sampling, Bayesian optimization, and Cello. We
+observe that the time costs per sample from random sampling and
+Bayesian optimization approaches are roughly the same, which
+validates that Bayesian optimization does not reduce the time cost
+of collecting samples Cello, however, focuses on reducing the cost
+of each sample. For achieving the same optimal latency, Cello only
+needs 7.12s per sample, which is a 44% reduction in the time cost
+per sample compared to Bayesian optimization.
+
+strategy is to use low-level, readily-available metrics (e.g., branch
+miss rates, IPC) to predict high-level behavior (e.g., throughput or
+latency) [11, 40, 45, 52–55, 58–63]. For example, Lee and Brooks
+[52, 64] apply linear regression to predict performance and power.
+Delimitrou and Kozyrakis [56, 57] use collaborative filtering to
+predict job performance for datacenter workloads. Mishra et al. [4,
+5] use hierarchical Bayesian models to predict latency and energy.
+Garza et al. [61] and Bhatia et al. [60] use perceptrons to predict
+branch and prefetcher behavior.
+
+Figure 1: Comparing cost per sample between random sam-
+pling (RS), Bayesian optimization (BO), and Cello on the als
+workload.
+
+2.2 Early Termination
+Early termination aborts poor performing configurations before
+they finish, leaving time and resources to sample more promis-
+ing configurations. This approach has been applied to speed up
+hyperparameter optimization and deep neural network (DNN) train-
+ing. For hyperparameter optimization, HyperBand [30] and Hyper-
+Drive [31] randomly generate a large number of configurations
+at one time rather than intelligently sampling a small number of
+configurations iteratively, which is much more compute-intensive
+than SEML approaches. For DNN training, prior work predicts fu-
+ture behavior using learning curves—i.e., the learning accuracy
+of an algorithm as a function of its training time [32–34]. How-
+ever, Bayesian optimization does not have an analogous structure
+to learning curves, so we need a different mechanism for predict-
+ing future behavior and in this work we demonstrate the use of
+censored regression for this prediction problem.
+
+For Bayesian optimization, Hutter et al. [17] and Eggensperger
+et al. [18] apply measured early termination to terminate sam-
+ples when their measured behavior reaches the termination thresh-
+old. Cello, however, uses predictive early termination to terminate
+samples when their predicted behavior—obtained from censored
+regression—reaches the termination threshold. This prediction step
+enables much earlier termination and thus saves more time for
+Cello to explore more samples compared to prior work (§5.1,§5.4).
+
+2.3 Machine Learning for Behavior Prediction
+A large body of machine learning techniques have been applied
+to predict high-level system behavior for resource management
+[4, 5, 11, 14, 35–48] and scheduling [49–51, 56, 57]. The general
+
+Figure 2: Comparing prediction accuracy between standard
+regression (SR) and censored regression (CR) in terms of
+mean squared error (MSE) on als.
+
+Most prior work achieves high prediction accuracy relying on
+a training set that includes samples in a wide range of behavior.
+Bayesian optimization, however, accumulates samples as more iter-
+ations finish. Thus, there are insufficient samples as training data
+in the early stage of Bayesian optimization, and these samples are
+likely to lie in the range of poor values [31]. Directly training mod-
+els on these samples will predict running samples to be poor, which
+leads to a increasing number of predictions of poor values and thus
+inaccurate sample selection for the next round [29]. To overcome
+this inaccuracy, Cello utilizes knowledge of the current elapsed
+latency and energy at each time interval to generate more accurate
+predictions through censored regression.
+
+An example of prediction accuracy. To demonstrate the ben-
+efits of censored regression, we run Bayesian optimization on the
+als workload and predict each new configuration’s latency with
+different predictors: standard and censored regression. We use gra-
+dient boosting trees as our standard regression model due to its high
+predictive accuracy [65]. We monitor the workload execution and
+predict its latency at each time interval (see §4.4). The censoring
+threshold for censored regression is the elapsed latency observed
+at each time interval. We compute the mean squared error (MSE)
+between predicted latency and true latency. Figure 2 shows the
+results, where the y-axis represents the average MSE over all time
+intervals, lower is better. Censored regression has 2.84× lower MSE
+than standard regression. This example illustrates that censored
+regression is effective at improving prediction accuracy when train-
+ing on samples collected from Bayesian optimization. The accurate
+prediction from censored regression is fundamental to predictive
+early termination in Cello, as we describe next.
+
+3 CELLO DESIGN
+Cello is an efficient computer systems optimization framework that
+reduces the cost of samples by predictive early termination which
+we enable with censored regression. Figure 3 illustrates the Cello
+design. After a configuration is selected from Bayesian optimization
+
+RSBOCello051015Costpersample(s)13.2412.637.12SRCR024MSE3.801.34Conference’17, July 2017, Washington, DC, USA
+
+Yi Ding, Alex Renda, Ahsan Pervaiz, Michael Carbin, and Henry Hoffmann
+
+Figure 3: Cello workflow. White Box A is Bayesian optimization, and shaded Boxes B to D are unique to Cello.
+
+( A ), Cello starts monitoring it ( B ), and records the current latency
+and energy at regular time intervals. At each interval, Cello checks
+if the configuration has finished running (Branch 1 ). If so, Cello
+goes back to Bayesian Optimization ( A ) for the next round. Other-
+wise, Cello predicts the final latency or energy using the Censored
+Regressor ( C ). Then, Cello sends the predictions to Predictive
+Early Termination ( D ) to determine whether the configuration
+should be terminated based on its prediction (Branch 2 ). If the pre-
+diction is worse than the existing best from the collected samples,
+Cello terminates this sample collection and goes to the next round.
+Otherwise, the configuration continues running until the next time
+interval. When the configuration finishes, Cello records the data
+for this sample and goes to the next Bayesian optimization round
+( A ).
+
+The remainder of this section first provides a brief set of def-
+initions to establish the core concepts, and then describe Cello’s
+design, and concludes with the Cello’s application to computer
+systems optimization problems.
+
+3.1 Definitions
+Cello’s input includes a workload and a list of configuration param-
+eters over which to optimize. The goal is to find a configuration
+that meets the goal of systems optimization—e.g., the configuration
+that minimizes latency under a power constraint. We assume that
+Cello can measure high-level systems behavior including latency,
+power, and energy at different time intervals, which is reason-
+able since many software frameworks (e.g., Apache Spark [66],
+MapReduce [67], Cassandra [68], HBase [69], etc) already have this
+capability as they log systems behavior at regular time intervals.
+Workload. A program that runs on a computer system.
+Configuration. A configuration x𝑖 is a 𝑝-dimensional vector where
+𝑝 is the number of configuration parameters:
+
+(1)
+
+x𝑖 = [𝑥𝑖1, 𝑥𝑖2, · · · , 𝑥𝑖𝑝 ],
+As SEML sequentially explores configurations, we use index 𝑖 to
+refer to the sequence of configurations explored; x𝑖 is the 𝑖-th
+configuration. 𝑥𝑖 𝑗 refers to an individual parameter setting, the
+𝑗-th parameter, 𝑗 ∈ [𝑝]. A configuration parameter can either be
+a hardware feature such as the number of cores, core frequency,
+etc, or a software feature such as execution behavior, networking,
+scheduling, etc. A complete list of configuration parameters studied
+in this paper is in Table 1.
+System behavior. The high-level system behavior that Cello mon-
+itors and optimizes. In this paper, we use latency (i.e., execution
+
+time of a workload), power, and energy consumption as system
+behavior, depending on the specific problem.
+Sample. Given the above, a sample is the pair of a configuration
+along with its system behavior.
+Termination threshold. The termination threshold is a latency
+or energy value that is used to determine whether to terminate a
+sample early or not. Unlike prior approaches [17, 18], Cello dynam-
+ically updates this threshold based on the best latency or energy
+seen so far.
+Next, we will describe each labeled box in Figure 3.
+
+3.2 Bayesian Optimization
+Cello uses Bayesian optimization ( A ) to select the configuration
+at each round [27]. Formally,
+
+𝑓 (x),
+
+★ = arg min
+x
+x∈R𝑝
+where 𝑓 (·) is the unknown underlying function which is being op-
+timized. There are two main components in Bayesian optimization:
+the surrogate model and the acquisition function. The surrogate
+model learns the unknown underlying function 𝑓 (·). The acquisi-
+tion function selects the most informative configuration at each
+round. We describe these two components as follows.
+
+(2)
+
+Surrogate Model. Bayesian optimization requires a surrogate
+3.2.1
+model that produces uncertainty estimates, and Cello requires the
+surrogate model that can handle different variable modalities (con-
+tinuous, discrete, etc.) that exist in configuration space. In this paper,
+we use random forest as our surrogate model as it satisfies both
+of these requirements [12, 70]. As an ensemble learning method,
+random forest constructs a multitude of decision trees, where its
+predictions are the average of the output from its component trees.
+The uncertainty, therefore, can be obtained by taking the standard
+deviation from the predictions of each tree [71]. For configuration
+x𝑖 , we denote 𝜇𝑖 (·) and 𝜎𝑖 (·) as its predictive mean and uncertainty
+from the surrogate model.
+
+3.2.2 Acquisition Function. After the surrogate model outputs pre-
+dictive mean and uncertainty for the unseen configurations, Cello
+needs an acquisition function to select the best configuration to
+sample. A good acquisition function should balance the tradeoffs
+between exploration and exploitation. For Cello, we chose the
+expected improvement (EI) acquisition function, which has been
+demonstrated to perform well in configuration search [10, 13, 29].
+EI selects the configuration that would have the highest expected
+
+Cello: Efficient Computer Systems Optimization with Predictive Early Termination and Censored Regression
+
+Conference’17, July 2017, Washington, DC, USA
+
+improvement over the best observed system behavior so far. As-
+suming 𝑚𝑖 is the best observed system behavior at the 𝑖-th round,
+we have
+
+x𝑖 = arg max
+
+x∈R𝑝
+
+(cid:40)
+
+(𝜇𝑖 (x) − 𝑚𝑖 ) Φ(𝑍 ) + 𝜎𝑖 (x)𝜙 (𝑍 ),
+0,
+
+if 𝜎𝑖 (x) > 0
+if 𝜎𝑖 (x) = 0
+
+𝜇𝑖 (x)−𝑚𝑖
+𝜎𝑖 (x)
+
+, Φ(·) is the cumulative distribution function
+where 𝑍 =
+and 𝜙 (·) is the probability density function, both assuming nor-
+mal distributions. In particular, (𝜇𝑖 (x) − 𝑚𝑖 ) Φ(𝑍 ) indicates the
+improvement in favor of exploitation, and 𝜎𝑖 (x)𝜙 (𝑍 ) indicates the
+uncertainty in favor of exploration. The unseen configuration with
+the highest expected improvement will be selected.
+
+3.3 System Monitor
+When a configuration is selected, Cello runs the workload in this
+configuration and monitors its status. The System Monitor ( B )
+records behavior (i.e., latency and energy) at regular time intervals
+to check if the configuration has finished running ( 1 ). If the con-
+figuration finishes, Cello reports the latency and energy back to
+Bayesian Optimization ( A ) for the next round. If the configuration
+is still running, the System Monitor reports the current latency and
+energy to the next module.
+
+3.4 Censored Regressor
+Cello’s Censored Regressor ( C ) takes the information from the
+System Monitor ( B ) and predicts the current configuration’s fi-
+nal latency and energy. The key idea of censored regression is to
+use the system behavior at the current time interval to accurately
+predict whether the current configuration will exceed the termina-
+tion threshold. In particular, censored regression categorizes the
+training samples as follows:
+• 1 Samples that finish running; i.e., those which have terminated
+
+normally and thus have known latency and energy.
+
+• 2 Samples that do not finish running; i.e., those which are ter-
+minated early and their latency and energy are censored at the
+current elapsed latency and energy.
+
+Next, we describe how censored regression models these two cat-
+egories of training data. We will use the problem of minimizing
+latency under a power constraint as an example, in which we will
+predict latency.
+
+Let 𝑧𝑖 be the observed latency associated with x𝑖 at the 𝑖-th
+round, and 𝑔(·) be the output from censored regression. Then the
+formal definition of censored regression model [72] is:
+
+log 𝑧𝑖 = 𝑔(x𝑖 ) + 𝜍𝜖𝑖,
+
+(3)
+
+where 𝜍 is a constant and 𝜖𝑖 is the measurement noise. The log-scale
+of the response simplifies modeling different types of exponential
+distributions. The goal of censored regression is to estimate 𝑔(·).
+When x𝑖 is running and the System Monitor returns the current
+latency at the 𝑡-th time interval, the current latency 𝑦𝑖𝑡 is a censored
+value of 𝑧𝑖 such that
+
+𝑦𝑖𝑡 =
+
+(cid:40)𝑧𝑖,
+𝜏𝑖𝑡 ,
+
+𝑧𝑖 < 𝜏𝑖𝑡
+𝑧𝑖 ≥ 𝜏𝑖𝑡
+
+( 1 )
+( 2 )
+
+(4)
+
+where 𝜏𝑖𝑡 is the current latency at the 𝑡-th time interval (i.e., the
+amount of time that has elapsed during the execution of the sample).
+In eq. (4):
+• If the observed latency is less than the current latency 𝑧𝑖 <
+𝜏𝑖𝑡 , Cello observes the latency when the configuration finishes
+running; i.e., 𝑦𝑖 · = 𝑧𝑖 , where 𝑦𝑖 · is the observed latency of a
+sample that terminated normally. Cello treats these uncensored
+(finished) samples by fitting them with regression, corresponding
+to 1 .
+
+• If the observed latency is greater than or equal to the current
+latency 𝑧𝑖 ≥ 𝜏𝑖𝑡 , Cello observes the current latency censored at
+the 𝑡-th time interval, and 𝜏𝑖𝑡 is the current elapsed latency. Cello
+treats this censored (running) sample by estimating its probability
+of 𝑧𝑖 exceeding 𝜏𝑖𝑡 given the configuration, corresponding to 2 .
+Censored regression treats the uncensored (finished) samples and
+the censored (running) sample differently, and solves them together
+by minimizing the total negative log-likelihood (NLL) loss function.
+The NLL loss function at the 𝑡-th time interval in the 𝑖-th round is:
+
+𝜌
+
+(cid:16)
+𝑔; (x𝑗 , 𝑦 𝑗 ·)𝑖−1
+𝑗=1
+
+, (x𝑖, 𝜏𝑖𝑡 )
+
+(cid:17)
+
+= −
+
+1[𝑧 𝑗 =𝑦 𝑗 · ] log
+
+1
+𝑦 𝑗 ·𝜎
+
+𝜙
+
+(cid:18) log 𝑦 𝑗 · − 𝑔(x𝑗 )
+𝜎
+
+(cid:19)
+
+𝑖−1
+∑︁
+
+𝑗=1
+(cid:18)
+
+− log
+
+1 − Φ
+
+(cid:18) log 𝜏𝑖𝑡 − 𝑔(x𝑖 )
+𝜎
+
+(cid:19)(cid:19)
+
+,
+
+(5)
+
+where 𝜙 (·) and Φ(·) are the probability density and cumulative
+distribution functions of the noise 𝜖𝑖 in eq. (3), respectively. The
+first term is the log-likelihood function for the uncensored (finished)
+samples that measures the discrepancy between log 𝑦 𝑗 · and 𝑔(x𝑗 )
+where 𝑗 ∈ [1, 𝑖 − 1], corresponding to 1 . The second term is the
+log-likelihood function for the censored (running) sample of the
+current 𝑖-th round that encourages 𝑔(x𝑖 ) > log 𝜏𝑖𝑡 when 𝑦𝑖𝑡 = 𝜏𝑖𝑡 ,
+corresponding to 2 . To fit this loss function, Cello uses gradient
+boosting trees due to its high fitting power in various predictive
+tasks [65]. Because, all else equal, the loss function in eq. (5) is lower
+when 𝑔(x𝑗 ) is higher, we regularize the predictor by training with
+early stopping [74, Chapter 5.5.2].
+
+3.5 Predictive Early Termination
+Cello’s Predictive Early Termination Module ( D ) will terminate
+the current configuration based on the predictions from the Cen-
+sored Regressor ( C ). If the prediction is better than the existing
+best from the collected samples, Cello lets the configuration keep
+running until the next time interval, when Cello will make another
+prediction to check if the configuration should be terminated. If
+the prediction is worse than the existing best from the collected
+samples, Cello will terminate the running process, drop this config-
+uration, and begin the next round of Bayesian Optimization ( A ).
+In this case, the surrogate model does not change since no new
+samples are added to the training set. To avoid selecting the same
+configuration as the previous rounds, Cello only selects the configu-
+ration that maximizes the acquisition function from the unsampled
+configurations. With this module, Cello reduces the time cost of
+each sample by dynamically determining whether predictive early
+termination should happen and when it will happen.
+
+Conference’17, July 2017, Washington, DC, USA
+
+Yi Ding, Alex Renda, Ahsan Pervaiz, Michael Carbin, and Henry Hoffmann
+
+Algorithm 1 Cello for systems optimization.
+Require: 𝑇budget
+Require: 𝐶
+
+⊲ Time budget.
+⊲ Target constraint in power or latency.
+1: Randomly sample a configuration x0 to construct 𝑋train and obtain its
+
+system behavior 𝑦0 to construct 𝑌train.
+
+2: 𝑖 = 1
+3: while 𝑇budget > 0 do
+4:
+5:
+6:
+7:
+8:
+9:
+10:
+11:
+12:
+13:
+14:
+15:
+16:
+17:
+18:
+19:
+20:
+21:
+22:
+
+else
+
+else
+
+Train surrogate model using 𝑋train and 𝑌train.
+Select configuration x𝑖 based on acquisition function.
+Run experiment at x𝑖 and monitor its system behavior.
+𝛾𝑖 ← min 𝑌train.
+for each interval 𝑡 = 1, . . . , do
+if sample not finished then
+
+⊲ Update the existing best.
+
+Get current system behavior 𝑦𝑖𝑡 .
+Build censored regressor on 𝑋train, 𝑌train, x𝑖 , 𝑦𝑖𝑡 .
+Get predicted latency ˆ𝑦𝑖𝑡 for x𝑖 .
+if ˆ𝑦𝑖𝑡 ≥ 𝛾𝑖 then
+
+Early terminate experiment.
+Get current running time 𝑡𝑖𝑡 .
+𝑇budget ← 𝑇budget − 𝑡𝑖𝑡 .
+
+Get system behavior 𝑦𝑖· and constraint 𝑐𝑖 for x𝑖 .
+if 𝑐𝑖 ≤ 𝐶 then
+
+𝑋train ← 𝑋train
+
+(cid:208) x𝑖 , 𝑌train ← 𝑌train
+
+(cid:208) 𝑦𝑖·.
+
+𝑋train ← 𝑋train
+
+(cid:208) x𝑖 , 𝑌train ← 𝑌train
+
+(cid:208) inf.
+
+23:
+24:
+
+Get current running time 𝑡𝑖𝑡 .
+𝑇budget ← 𝑇budget − 𝑡𝑖𝑡 .
+
+𝑖 ← 𝑖 + 1.
+
+25:
+26: return x★ with the best system behavior from 𝑋train that meets the
+
+target constraint.
+
+3.6 Applying Cello to Optimization Problems
+Cello is a general framework that can augment existing SEML
+approaches by reducing the time cost per sample. We apply Cello
+to solve the following two optimization problems: (1) Latency-
+Under-Power: minimizing latency under a power constraint; and
+(2) Energy-Under-Latency: minimizing energy under a latency
+constraint.
+
+Algorithm 1 summarizes the procedure. In lines 4 and 5, Cello
+conducts Bayesian Optimization to select the configuration to run
+( A ). In line 6, Cello’s System Monitor observes the running con-
+figuration ( B ). In line 7, Cello updates the existing best system
+behavior (latency for Latency-Under-Power, energy for Energy-
+Under-Latency) from the collected samples. At each time interval, if
+the sample has not finished (line 9), Cello’s Censored Regressor ( C )
+predicts future behavior (lines 10 to 12). If the predicted behavior is
+worse than the existing best (line 13), Cello terminates the configu-
+ration ( D , line 14), and updates the time budget (line 16). If the ex-
+periment has terminated normally, Cello determines how to update
+the training set. If the configuration meets the target constraint—in
+either latency or power—(line 19), Cello adds this configuration
+and its true behavior to the training set for the next round (line 20).
+Otherwise, Cello adds this configuration and uses a extremely high
+value to replace its true behavior (line 22), which incorporates the
+knowledge that this configuration violates the target constraint by
+adding a discontinuous sample to the training set. Meanwhile, Cello
+
+updates the time budget (line 24) to make sure that there is enough
+time to go to the next round. Finally, Cello outputs the best config-
+uration that meets the target constraint (line 26). We implement
+Cello in Python with libraries including numpy [75], pandas [76],
+and scikit-learn [77]. For censored regression, we use an implemen-
+tation from the Accelerated Failure Time model in XGBoost library,
+which is a state-of-the-art implementation of censored regression
+fitted with the gradient boosting trees [72]. The code is released
+in https://anonymous.4open.science/r/cello-code-8512.
+
+4 EXPERIMENTAL SETUP
+4.1 Software Systems
+We use Apache Spark as our software system [66]. Each experi-
+ment has a master node and four worker nodes. We use a wide
+range of configuration parameters that reflect significant properties
+categorized by shuffle behavior, data compression and serializa-
+tion, memory management, execution behavior, networking, and
+scheduling (details in the software category of Table 1). We use the
+same set of parameters as prior work [16] slightly modified for the
+current version of HiBench Spark.
+
+We use 12 workloads (Table 2) from HiBench’s big data bench-
+mark suite [22]—a benchmark suite that is widely used in prior
+work [16, 78–80]. The workloads cover various domains includ-
+ing microbenchmarks, machine learning, websearch, and graph
+analytics.
+
+4.2 Hardware Systems
+We run experiments on the Chameleon configurable cloud comput-
+ing systems [81], where each node is a dual-socket system running
+Ubuntu 18.04 (GNU/Linux 5.4) with 2 Intel(R) Xeon(R) Gold 6126
+processors, 192 GB of RAM, hyperthreads and TurboBoost. Each
+socket has 12 cores/24 hyperthreads and a 20 MB last-level cache.
+The hardware parameters we optimize are in the hardware category
+of Table 1, which have been shown to have a significant affect on
+latency and power tradeoffs [82].
+
+4.3 Points of Comparison
+We compare a spectrum of approaches including random sampling
+(RS), Bayesian optimization (BO), Bayesian optimization with mea-
+sured early termination (BO-ST, BO-TC, BO-IM, BO-NN) and pre-
+dictive early termination (BO-GB), and ensemble Bayesian opti-
+mization (Bliss).
+• RS: randomly sample configurations and select the best configu-
+
+ration that meets the constraint.
+
+• BO: Bayesian optimization using random forest as the surro-
+gate model and expected improvement as the acquisition func-
+tion [10, 12, 13, 83]. We also use the same setting for the following
+approaches.
+
+• BO-ST: Bayesian optimization with measured early termination
+using the static termination threshold; i.e., terminate the experi-
+ment when the measured latency or energy is observed to reach
+the static termination threshold, and then drop the sample. The
+static threshold is the latency or energy of the initial sample be-
+cause it is the only prior knowledge we have to set this threshold.
+• BO-TC: Bayesian optimization with measured early termination
+by truncation; i.e., terminate the experiment when the measured
+
+Cello: Efficient Computer Systems Optimization with Predictive Early Termination and Censored Regression
+
+Conference’17, July 2017, Washington, DC, USA
+
+Table 1: Hardware and software configuration parameters tuned in the experiments.
+
+Category Configuration parameter
+
+e
+r
+a
+w
+d
+r
+a
+H
+
+e
+r
+a
+w
+
+t
+f
+o
+S
+
+cpu.freq
+uncore.freq
+hyperthreading
+n.sockets
+n.cores
+
+spark.reducer.maxSizeInFlight
+spark.shuffle.file.buffer
+spark.shuffle.sort.bypassMergeThreshold
+spark.speculation.interval
+spark.speculation.multiplier
+spark.speculation.quantile
+spark.broadcast.blockSize
+spark.io.compression.snappy.blockSize
+spark.kryoserializer.buffer.max
+spark.kryoserializer.buffer
+spark.driver.memory
+spark.executor.memory
+spark.network.timeout
+spark.locality.wait
+spark.task.maxFailures
+spark.shuffle.compress
+spark.memory.fraction
+spark.shuffle.spill.compress
+spark.broadcast.compress
+spark.memory.storageFraction
+
+Table 2: HiBench workloads.
+
+Range
+
+1.0–3.7
+1.0–2.4
+on, off
+1, 2
+1–12
+
+Description
+
+CPU frequency, in GHz.
+Uncore frequency, in GHz.
+Hyperthreading.
+Number of sockets.
+Number of cores per socket.
+
+Max size of map outputs to fetch from each reduce task, in MB.
+Size of the in-memory buffer for each shuffle file output stream, in KB.
+Avoid merge-sorting data if there is no map-side aggregation.
+
+24–128
+24–128
+100–1000
+100–1000 How often Spark will check for tasks to speculate, in millisecond.
+1–5
+0–1
+2–128
+24–128
+24-128
+24–128
+6–12
+6–16
+20–500
+1–10
+1–8
+false, true Whether to compress map output files.
+0–1
+false, true Whether to compress data spilled during shuffles.
+false, true Whether to compress broadcast variables before sending them.
+Amount of storage memory immune to eviction.
+0.5–1
+
+How many times slower a task is than median considered for speculation.
+Percentage of tasks to be complete before speculation is enabled.
+Size of each piece of a block for TorrentBroadcastFactory, in MB.
+Block size used in snappy, in KB.
+Maximum allowable size of Kryo serialization buffer, in MB.
+Initial size of Kryo’s serialization buffer, in KB.
+Amount of memory to use for the driver process, in GB.
+Amount of memory to use per executor process, in GB.
+Default timeout for all network interactions, in second.
+How long to launch a data-local task before giving up, in second.
+Number of task failures before giving up on the job.
+
+Fraction of (heap space–300 MB) used for execution and storage.
+
+Workload Data size Workload Data size
+
+als
+gbt
+linear
+nweight
+pca
+terasort
+
+0.6 GB
+2 GB
+48 GB
+0.9 GB
+4 GB
+3.2 GB
+
+bayes
+kmeans
+lr
+pagerank
+rf
+wordcount
+
+19 GB
+20 GB
+8 GB
+1.5 GB
+0.8 GB
+32 GB
+
+latency or energy is observed to be worse than the existing best,
+and then drop the configuration.
+
+• BO-IM: Bayesian optimization with measured early termination
+by imputation [17]; i.e., terminate the experiment when the mea-
+sured latency or energy is observed to be worse than the existing
+best, and then impute—i.e., replace missing data with predicted
+values—the unfinished configuration.
+
+• BO-NN: Neural model-based Bayesian optimization with mea-
+sured early termination and censored observations [18]; i.e., train
+the neural network with the Tobit loss function for the censored
+training data. The same neural network architecture and hy-
+perparameter settings are used in [18]. We use the same static
+threshold setting as the experiments in [18]. The threshold is the
+latency or energy of the initial sample because it is the only prior
+knowledge we have to set this threshold.
+
+• BO-GB: Bayesian optimization with predictive early termination
+by predicting with standard regression; i.e., terminate the exper-
+iment when the predicted latency or energy is worse than the
+existing best, and drop the configuration. We use gradient boost-
+ing trees as the standard regressor due to its high accuracy [65].
+This approach is novel to this paper, we include it to show the
+importance of using censored regression rather than standard
+regression for predicted early termination.
+
+• Bliss: ensemble Bayesian optimization [29]. Bliss reduces sam-
+ple collection time by determining when to update its surrogate
+model using predictions from that same surrogate. To the best of
+our knowledge, Bliss is the state-of-the-art of Bayesian optimiza-
+tion in configuration search for computer systems.
+
+• Cello: Bayesian optimization with predictive early termination
+
+by predicting with censored regression.
+
+4.4 Evaluation Methodology
+Following a methodology established in prior work on investigating
+Apache Spark systems [16], we create a set of 2000 configurations
+per workload, randomly sampled from both hardware and software
+configuration parameters. We run these configurations to record
+their latency and energy consumption. For reference, we used more
+than 50000 CPU hours to record this test dataset (and we will in-
+clude it as part of our open source release). We then give each
+of the above approaches a fixed amount of time to search a com-
+bined space of hardware and software configuration parameters
+and find solutions for two optimization problems: (1) Latency-
+Under-Power: minimizing latency under a power constraint; and
+
+Conference’17, July 2017, Washington, DC, USA
+
+Yi Ding, Alex Renda, Ahsan Pervaiz, Michael Carbin, and Henry Hoffmann
+
+(2) Energy-Under-Latency: minimizing energy under a latency
+constraint.
+
+We evaluate on a wide range of search time budgets such that
+at least one of the above approaches converges to the optimal
+solution. We set a range of constraints: the power and latency
+constraints are set as [10, 20, 30, 40, 50, 60, 70, 80, 90]-th percentiles
+of the distributions. For all approaches that measure progress of
+running samples, we set a time interval of 5 seconds; i.e., the system
+behavior is monitored every 5 seconds. The reported results are
+averaged over different constraints over 10 runs with different
+random seeds.
+
+For censored regression from the XGBoost library, we choose the
+extreme distribution for the loss function. We set num_boost_round,
+the parameter that controls the number of steps to fit gradient boost-
+ing trees in eq. (5) to minimize the loss (i.e., the point at which to
+early stop) to 20. We tune this parameter by generating predictions
+that are generally above the current elapsed latency and energy
+on one workload als dataset, and use this same value on all other
+datasets without additional tuning. For each distinct trial on each
+dataset, we run cross validation for distribution_scale with the
+value range of [0.2, 0.3, 0.4] and learning_rate with the value
+range of [0.2, 0.25, 0.3] and report the best results.
+
+4.5 Evaluation Metric
+RE. We use relative error (RE) between the result from each ap-
+proach and the optimal for evaluation:
+
+RE =
+
+|𝑌pred − 𝑌opt|
+|𝑌opt|
+
+,
+
+(6)
+
+where 𝑌pred is the best value found by the approach, and 𝑌opt is the
+optimal measured value. Lower RE is better.
+
+5 EXPERIMENTAL EVALUATION
+We evaluate the following research questions (RQs):
+• RQ1: How well does Cello perform? Cello reduces latency by
+1.19–1.90× for Latency-Under-Power (Figure 4 and 5) and energy
+by 1.18–2.35× for Energy-Under-Latency (Figure 6 and 7).
+
+• RQ2: Is prediction or measurement better for early termination?
+Cello’s predictive early termination outperforms measured early
+termination approaches by terminating much earlier while pro-
+ducing more accurate predictions (§5.2).
+
+• RQ3: How is censored regression beneficial to Cello? Cello’s
+censored regression reduces prediction error (as mean squared
+error) for latency and energy by 60% and 82% over standard
+regression for Latency-Under-Power and Energy-Under-Latency
+(Figure 8).
+
+• RQ4: How many samples are explored? By combining censored
+regression and predictive early termination, Cello both explores
+more samples and improves search results compared to other
+baselines (§5.4).
+
+• RQ5: What is the overhead? Within the same amount of search
+time (learning overhead included), Cello produces the best results
+by both predicting accurately (§5.3) and updating quickly (0.3
+seconds per sample, §5.5).
+
+5.1 RQ1: How well does Cello perform?
+Figure 4 and 6 show the latency and energy results of different ap-
+proaches as a function of different search time budgets for Latency-
+Under-Power and Energy-Under-Latency, respectively, where the
+x-axis is the search time, and the y-axis is the latency or energy
+(lower is better). We compare the summarized results averaged over
+all search times in Figure 5 and 7, and compute the relative error
+(RE) by comparing to the optimal value (Optimal) in Table 3, where
+Optimal is the best value found through brute force search. We
+can see that compared to other approaches, Cello finds the con-
+figuration with the lowest latency and energy at almost all search
+times for almost all workloads. The major exceptions are lr and
+rf in Latency-Under-Power, and als and bayes in Energy-Under-
+Latency, where Bliss outperforms Cello at some points. It is not
+surprising since with numerous local optima in the tremendous
+search space, no single method will dominate. Despite that, Cello
+still outperforms prior work in the majority of cases and gets much
+better results on average. In particular, we find that on average:
+
+Table 3: Summarized results averaged over all workloads for
+each approach. Lower RE is better.
+
+Latency-Under-Power
+
+Energy-Under-Latency
+
+RE (%)
+
+# samples
+
+RE (%)
+
+# samples
+
+55
+RS
+52
+BO
+51
+BO-ST
+48
+BO-TC
+BO-IM 51
+BO-NN 94
+127
+BO-GB
+42
+Bliss
+20
+Cello
+
+23
+24
+26
+30
+91
+19
+385
+36
+44
+
+46
+36
+31
+32
+31
+54
+72
+31
+16
+
+25
+28
+32
+41
+69
+21
+378
+31
+50
+
+• Cello achieves 20% and 16% REs for Latency-Under-Power and
+Energy-Under-Latency respectively (Table 3), which represent
+1.19× and 1.18× speedups compared to the best baseline Bliss,
+and 1.90× and 2.35× speedups compared to the weakest baseline
+BO-GB.
+
+• BO underperforms all approaches with early termination except
+BO-GB, which indicates the benefits of early terminations in
+SEML. The reasons that BO-GB performs poorly will be discussed
+in §5.3.
+
+• As the state-of-the-art Bayesian optimization approach for con-
+figuration optimization, Bliss under-performs Cello in most work-
+loads for several reasons. First, Bliss does not incorporate early
+termination; it runs a few rounds as BO in the beginning and then
+starts using predictions to update the surrogate model, which
+means that it does not reduce the cost of collecting samples dur-
+ing early rounds. Second, Bliss uses its surrogate model—i.e.,
+standard regression—to predict, which leads to less accurate pre-
+diction compared to censored regression (more details in §5.3).
+Finally, Bliss updates its surrogate alternating between using
+predictions and measured system behavior, which produces less
+accurate model updates. In contrast, Cello combines censored
+regression and early termination based on predicted behavior to
+
+Cello: Efficient Computer Systems Optimization with Predictive Early Termination and Censored Regression
+
+Conference’17, July 2017, Washington, DC, USA
+
+Figure 4: Latency results averaged over all power constraints for Latency-Under-Power (lower is better).
+
+Figure 5: Latency results averaged over all search time budgets for Latency-Under-Power (lower is better).
+
+reduce search costs. When running for a fixed time budget, Cello
+explores more configurations than Bliss (# sample columns in
+Table 3), and thus generally achieves better results.
+
+100200300400500600700800Time (s)1020Latency (s)als100200300400500600700800Time (s)101520Latency (s)bayes20040060080010001200Time (s)2030Latency (s)gbt50100150200250300Time (s)68Latency (s)kmeans20040060080010001200Time (s)2030Latency (s)linear100200300400500Time (s)81012Latency (s)lr100200300400500600700Time (s)101520Latency (s)nweight100200300400500Time (s)7.510.012.5Latency (s)pagerank100200300400500600700800900Time (s)152025Latency (s)pca50100150200250300Time (s)468Latency (s)rf200400600800100012001400Time (s)203040Latency (s)terasort100200300400500Time (s)81012Latency (s)wordcountRSBOBO-STBO-TCBO-IMBO-NNBO-GBBlissCello010203040alsbayesgbtkmeanslinearlrmeannweightpagerankpcarfterasortwordcountMeanWorkloadsLatency (s)RSBOBO−STBO−TCBO−IMBO−NNBO−GBBlissCelloOptimalConference’17, July 2017, Washington, DC, USA
+
+Yi Ding, Alex Renda, Ahsan Pervaiz, Michael Carbin, and Henry Hoffmann
+
+Figure 6: Energy results averaged over all latency constraints for Energy-Under-Latencys (lower is better).
+
+Figure 7: Energy results averaged over all search time budgets for Energy-Under-Latency (lower is better).
+
+5.2 RQ2: Is prediction or measurement better
+
+for early termination?
+
+Here, we focus on comparing predictive early termination (Cello)
+to measured early termination (BO-ST, BO-TC, BO-IM and BO-NN)
+
+to determine if the former significantly improves early termination
+methods. In Figure 5 and 7 , Cello has 1.24–1.61× and 1.24–1.34×
+
+200300400500600700800Time (s)100150200Energy (J)als200300400500600700800Time (s)50100Energy (J)bayes40060080010001200Time (s)50100Energy (J)gbt100150200250300Time (s)4060Energy (J)kmeans40060080010001200Time (s)4060Energy (J)linear150200250300350400450500Time (s)6080100Energy (J)lr200300400500600700Time (s)50100Energy (J)nweight150200250300350400450500Time (s)255075Energy (J)pagerank200300400500600700800Time (s)100150200Energy (J)pca100150200250300Time (s)4060Energy (J)rf400600800100012001400Time (s)100200Energy (J)terasort150200250300350400450500Time (s)5075Energy (J)wordcountRSBOBO-STBO-TCBO-IMBO-NNBO-GBBlissCello050100150200250alsbayesgbtkmeanslinearlrmeannweightpagerankpcarfterasortwordcountMeanWorkloadsEnergy (J)RSBOBO−STBO−TCBO−IMBO−NNBO−GBBlissCelloOptimalCello: Efficient Computer Systems Optimization with Predictive Early Termination and Censored Regression
+
+Conference’17, July 2017, Washington, DC, USA
+
+speedups over BO-ST, BO-TC, BO-IM and BO-NN for Latency-
+Under-Power and Energy-Under-Latency respectively. Cello out-
+performs other measured early termination approaches because it
+terminates poor samples much earlier using the accurate predic-
+tions from censored regression. Therefore, given the same amount
+of the search time budget, Cello also evaluate more samples than
+BO-ST, BO-TC, and BO-NN from Table 3, which reflects the fact that
+Cello terminates more samples earlier. Although BO-IM evaluates
+more samples than Cello, it underperforms Cello, which suggests
+that it is terminating both early and accurately that improve results,
+not just terminating early. These results demonstrate the benefits of
+predictive early termination over measured early termination; how-
+ever, the next section shows that achieving these benefits requires
+an appropriate predictive model.
+
+5.3 RQ3: How is censored regression beneficial
+
+to Cello?
+
+Here, we analyze the results of BO-GB to Cello. BO-GB uses early
+termination, but based on a standard regression model rather than
+Cello’s censored regression. Although BO-GB has predictive early
+termination, it achieves the worst results. This poor result is due to
+the low prediction accuracy from standard regression when training
+on censored data. To illustrate this, we compare the prediction accu-
+racy of each selected sample between BO-GB’s standard regression
+(gradient boosting trees) and Cello’s censored regression.
+
+We monitor workload execution and predict its latency at each
+time interval (§4.4). The censoring threshold for censored regres-
+sion is thus the elapsed latency observed at each time interval.
+We compute the mean squared error (MSE) between predicted la-
+tency and true latency. Figure 8 shows the average MSE over all
+time intervals, where the x-axis is the workload, the y-axis is MSE
+(lower is better), and the last column, Mean, is the arithmetic mean
+over all workloads. Censored regression almost always has much
+lower MSE than standard regression, with 60% and 82% reductions
+for Latency-Under-Power and Energy-Under-Latency respectively.
+Standard regression has worse prediction accuracy because BO-GB
+terminates all samples throughout the execution and thus does not
+update the surrogate model at all. These results suggest that it is
+important to make accurate predictions so that the poor configura-
+tions can be quickly identified. Censored regression achieves high
+accuracy by considering both uncensored (finished) and censored
+(running) samples, while standard regression only takes uncensored
+(finished) samples into account.
+
+high overhead for model updates–over 11 seconds per sample
+(§5.5)—and thus a significant portion of its time is spent on sur-
+rogate updates instead of searching new configurations.
+
+• BO-GB selects the most samples; in Table 3, BO-GB selects 385
+and 378 samples for Latency-Under-Power and Energy-Under-
+Latency respectively. It is because BO-GB terminates all samples
+in the first time interval based on its predictions, and does not
+update the surrogate model at all. More results can be found
+in §5.3.
+
+• Cello selects 44 and 50 samples for Latency-Under-Power and
+Energy-Under-Latency respectively, which are more than RS, BO,
+BO-ST, BO-TC, BO-NN, and Bliss, while fewer than BO-IM and
+BO-GB. It indicates that increasing the number of samples is not
+the key to achieving the best results, but selecting more useful
+samples matters. Cello is such an example that combines early
+termination and censored regression to search more high-quality
+samples.
+
+5.5 RQ5: What is the overhead?
+We report the learning overhead of processing each sample, includ-
+ing predicting future behavior and updating the surrogate. Figure 9
+and 10 show the overhead of processing each sample for different
+approaches for Latency-Under-Power and Energy-Under-Latency
+respectively, where the x-axis is the workload, the y-axis is the
+overhead, and the last column Mean is the arithmetic mean over all
+workloads. We use the same setting for neural network training as
+in [18] for BO-NN, and BO-NN has the highest overhead; i.e., over 11
+seconds on average. To better visualize other methods properly, we
+cap the y-axis at 1 second. BO-IM has the second largest overhead
+due to the high overhead of imputing samples using the Expected-
+maximization algorithm [17]. The Expected-maximization algo-
+rithm is an iterative method and thus needs numerous steps to
+converge [84]. Cello has the third largest overhead because it uses
+the gradient boosting trees—which is an ensemble method—to fit
+the loss function of censored regression. Nevertheless, Cello’s over-
+head (0.3 seconds on average) is negligible compared to the cost
+of collecting each sample (22.3 seconds on average), which is key
+for its applicability to the efficient computer systems optimization
+problems. All results in this section include learning overhead for
+all approaches, and Cello still produces the best results, showing
+that the overhead can be negligible compared to making good deci-
+sions about early termination to explore more high-quality samples
+in the same amount of time.
+
+5.4 RQ4: How many samples are explored?
+Table 3 summarizes the average number of samples selected for each
+approach. Note that since all approaches are given the same time to
+explore, exploring more samples is generally better, provided those
+samples produce useful information for updating the model. We
+find that:
+• Within the same time budgets, BO selects fewer samples than
+others (except BO-NN) as BO does not use early termination to
+save extra time for more samples.
+
+• BO-NN selects the fewest samples compared to others; 19 and
+21 on average for for Latency-Under-Power and Energy-Under-
+Latency respectively. The reason is that BO-NN has a surprisingly
+
+6 DISCUSSION
+To understand the impact of each configuration parameter on sys-
+tem design, we visualize the SHAP values of the parameters with
+the best energy under 50-th latency constraint for Energy-Under-
+Latency selected by Cello on als and bayes workloads in Figure 11
+and 12, respectively. SHAP (SHapley Additive exPlanations) is a
+state-of-the-art approach to interpret the output of machine learn-
+ing models [85], which visualizes parameters contributing to push
+the model output from the base value (i.e., the average model output
+over the training data we passed) to the model output.
+
+For als in Figure 11, n.socket and cpu.freq have the largest
+effects (with contributing value −41.87 and −37.46) that push the
+
+Conference’17, July 2017, Washington, DC, USA
+
+Yi Ding, Alex Renda, Ahsan Pervaiz, Michael Carbin, and Henry Hoffmann
+
+Figure 8: MSEs for Latency-Under-Power (left) and Energy-Under-Latency (right). Lower is better.
+
+Figure 9: Overhead of processing each sample for Latency-Under-Power. Lower is better.
+
+Figure 10: Overhead of processing each sample for Energy-Under-Latency. Lower is better.
+
+energy prediction lower from the base value to the predictive value.
+The other high-influence parameters are shuffle.sort.bypassMergeThreshold,
+uncore.freq, hyperthreading. For bayes in Figure 12, uncore.freq
+and n.sockets have the largest effects (with contributing value
+−27.69 and −23.53) that push the energy prediction lower from
+the base value to the predictive value. The other high-influence
+parameters are cpu.freq, n.cores, shuffle.file.buffer, etc..
+
+Two key points can be seen from these examples. First, both hard-
+
+ware (e.g., uncore.freq) and software (e.g., shuffle.sort.bypassMergeThreshold)
+parameters influence the system behavior, and thus both types of
+parameters should be tuned to meet the optimization goal. Sec-
+ond, same parameters have different effects on different workloads,
+which suggests that the optimal configuration is workload depen-
+dent. Therefore, we should be careful about the prior knowledge
+obtained from the existing workloads since information learned for
+one workload might not transfer directly to a new workload.
+
+7 LIMITATIONS
+We recognize the limitations of this work as follows:
+• The outcome of predictive early termination and censored re-
+gression from Cello depends on the SEML framework. We chose
+
+Figure 11: SHAP values for the als workload.
+
+to implement Cello by adding these components to Bayesian op-
+timization because it has proven to provide high-quality samples.
+Future work can explore how Cello can be generalized to other
+learning frameworks.
+
+• It is challenging to determine the search time budget in advance
+to make sure that the search results converge to the optimal.
+There has been work investigating this topic in the machine
+
+05101520alsbayesgbtkmeanslinearlrnweightpagerankpcarfterasortwordcountMeanWorkloadsMSEStandard regressionCensored regression0100200300alsbayesgbtkmeanslinearlrnweightpagerankpcarfterasortwordcountMeanWorkloadsMSEStandard regressionCensored regression0.000.250.500.751.00alsbayesgbtkmeanslinearlrnweightpagerankpcarfterasortwordcountMeanWorkloadsOverhead (s)RSBOBO−STBO−TCBO−IMBO−NNBO−GBBlissCello0.000.250.500.751.00alsbayesgbtkmeanslinearlrnweightpagerankpcarfterasortwordcountMeanWorkloadsOverhead (s)RSBOBO−STBO−TCBO−IMBO−NNBO−GBBlissCello403020100SHAP valuen.socketscpu.freqshuffle.sort.bypassMergeThresholduncore.freqhyperthreadingbroadcast.blockSizeshuffle.compressSum of 18 other featuresn.socketscpu.freqshuffle.sort.bypassMergeThresholduncore.freqhyperthreadingbroadcast.blockSizeshuffle.compressSum of 18 other features41.8737.4614.8511.655.152.552.081.75Cello: Efficient Computer Systems Optimization with Predictive Early Termination and Censored Regression
+
+Conference’17, July 2017, Washington, DC, USA
+
+[9] Engin Ïpek, Sally A McKee, Rich Caruana, Bronis R de Supinski, and Martin
+Schulz. Efficiently exploring architectural design spaces via predictive modeling.
+ACM SIGOPS Operating Systems Review, 40(5):195–206, 2006.
+
+[10] Omid Alipourfard, Hongqiang Harry Liu, Jianshu Chen, Shivaram Venkataraman,
+Minlan Yu, and Ming Zhang. Cherrypick: Adaptively unearthing the best cloud
+configurations for big data analytics. In Proceedings of the 14th USENIX Conference
+on Networked Systems Design and Implementation, NSDI’17, page 469–482, USA,
+2017. USENIX Association. ISBN 9781931971379.
+
+[11] Yi Ding, Nikita Mishra, and Henry Hoffmann. Generative and multi-phase learn-
+ing for computer systems optimization. In Proceedings of the 46th International
+Symposium on Computer Architecture, pages 39–52, 2019.
+
+[12] Luigi Nardi, David Koeplinger, and Kunle Olukotun. Practical design space
+exploration. In 2019 IEEE 27th International Symposium on Modeling, Analysis,
+and Simulation of Computer and Telecommunication Systems (MASCOTS), pages
+347–358. IEEE, 2019.
+
+[13] Tirthak Patel and Devesh Tiwari. Clite: Efficient and qos-aware co-location
+of multiple latency-critical jobs for warehouse scale computers. In 2020 IEEE
+International Symposium on High Performance Computer Architecture (HPCA),
+pages 193–206, 2020. doi: 10.1109/HPCA47549.2020.00025.
+
+[14] Paula Petrica, Adam M Izraelevitz, David H Albonesi, and Christine A Shoemaker.
+Flicker: A dynamically adaptive architecture for power limited multicore sys-
+tems. In Proceedings of the 40th Annual International Symposium on Computer
+Architecture, pages 13–23, 2013.
+
+[15] Shivaram Venkataraman, Zongheng Yang, Michael Franklin, Benjamin Recht,
+and Ion Stoica. Ernest: Efficient performance prediction for large-scale advanced
+analytics. In 13th USENIX Symposium on Networked Systems Design and Imple-
+mentation (NSDI 16), pages 363–378, 2016.
+
+[16] Zhibin Yu, Zhendong Bei, and Xuehai Qian. Datasize-aware high dimensional
+configurations auto-tuning of in-memory cluster computing. In Proceedings of the
+Twenty-Third International Conference on Architectural Support for Programming
+Languages and Operating Systems, pages 564–577, 2018.
+
+[17] Frank Hutter, Holger Hoos, and Kevin Leyton-Brown. Bayesian optimization
+
+with censored response data. arXiv preprint arXiv:1310.1947, 2013.
+
+[18] Katharina Eggensperger, Kai Haase, Philip Müller, M. Lindauer, and F. Hut-
+ter. Neural model-based optimization with right-censored observations. ArXiv,
+abs/2009.13828, 2020.
+
+[19] James L Powell. Censored regression quantiles. Journal of econometrics, 32(1):
+
+143–155, 1986.
+
+[20] Rupert Miller and Jerry Halpern. Regression with censored data. Biometrika, 69
+
+(3):521–531, 1982.
+
+[21] Stephen Portnoy. Censored regression quantiles. Journal of the American Statis-
+
+tical Association, 98(464):1001–1012, 2003.
+
+[22] Shengsheng Huang, Jie Huang, Yan Liu, Lan Yi, and Jinquan Dai. Hibench:
+A representative and comprehensive hadoop benchmark suite. In Proc. ICDE
+Workshops, pages 41–51, 2010.
+
+[23] Kashi Venkatesh Vishwanath and Nachiappan Nagappan. Characterizing cloud
+computing hardware reliability. In Proceedings of the 1st ACM symposium on
+Cloud computing, pages 193–204, 2010.
+
+[24] Adam Belay, George Prekas, Ana Klimovic, Samuel Grossman, Christos Kozyrakis,
+Ix: A protected dataplane operating system for high
+and Edouard Bugnion.
+throughput and low latency. In 11th USENIX Symposium on Operating Systems
+Design and Implementation (OSDI 14), pages 49–65, 2014. doi: 10.1145/2997641.
+[25] Dana Van Aken, Andrew Pavlo, Geoffrey J Gordon, and Bohan Zhang. Automatic
+database management system tuning through large-scale machine learning. In
+Proceedings of the 2017 ACM International Conference on Management of Data,
+pages 1009–1024, 2017.
+
+[26] Zhaoxia Deng, Lunkai Zhang, Nikita Mishra, Henry Hoffmann, and Frederic T
+Chong. Memory cocktail therapy: a general learning-based framework to opti-
+mize dynamic tradeoffs in nvms. In Proceedings of the 50th Annual IEEE/ACM
+International Symposium on Microarchitecture, pages 232–244, 2017.
+
+[27] Burr Settles. From theories to queries: Active learning in practice. In Active
+Learning and Experimental Design workshop In conjunction with AISTATS 2010,
+pages 1–18, 2011.
+[28] Peter I Frazier.
+
+A tutorial on bayesian optimization.
+
+arXiv preprint
+
+arXiv:1807.02811, 2018.
+
+[29] Rohan Basu Roy, Tirthak Patel, Vijay Gadepally, and Devesh Tiwari. Bliss: auto-
+tuning complex applications using a pool of diverse lightweight learning models.
+In Proceedings of the 42nd ACM SIGPLAN International Conference on Programming
+Language Design and Implementation, pages 1280–1295, 2021.
+
+[30] Lisha Li, Kevin Jamieson, Giulia DeSalvo, Afshin Rostamizadeh, and Ameet
+Talwalkar. Hyperband: A novel bandit-based approach to hyperparameter opti-
+mization. The Journal of Machine Learning Research, 18(1):6765–6816, 2017.
+[31] Jeff Rasley, Yuxiong He, Feng Yan, Olatunji Ruwase, and Rodrigo Fonseca. Hy-
+perdrive: Exploring hyperparameters with pop scheduling. In Proceedings of the
+18th ACM/IFIP/USENIX Middleware Conference, pages 1–13, 2017.
+
+[32] Kevin Swersky, Jasper Snoek, and Ryan Prescott Adams. Freeze-thaw bayesian
+
+Figure 12: SHAP values for the bayes workload.
+
+learning community [86, 87]. Although it is out of scope in this
+paper, it is interesting to explore the combination of Cello and
+this direction.
+
+• The improper setting of num_boost_round, the parameter that
+controls the number of training steps can result in poor prediction
+accuracy. Future work can explore more systematic ways to set
+this parameter, or incorporate its regularizing effect into the loss
+function.
+
+8 CONCLUSION
+This paper presents Cello, a systematic approach to reduce the
+cost of samples through predictive early termination and censored
+regression. Evaluations show that Cello improves the system out-
+comes compared to a wide range of existing SEML and early termi-
+nation techniques. Finally, we hope that Cello can inspire future
+research directions on reducing time cost of sample collection rather
+than the number of samples, and other applications of censored
+regression in computer systems research.
+
+REFERENCES
+[1] Tianyin Xu, Long Jin, Xuepeng Fan, Yuanyuan Zhou, Shankar Pasupathy, and
+Rukma Talwadker. Hey, you have given me too many knobs!: understanding and
+dealing with over-designed configuration in system software. In Proceedings of
+the 2015 10th Joint Meeting on Foundations of Software Engineering, pages 307–319,
+2015.
+
+[2] Alexei Colin, Emily Ruppel, and Brandon Lucia. A reconfigurable energy storage
+architecture for energy-harvesting devices. In Proceedings of the Twenty-Third
+International Conference on Architectural Support for Programming Languages and
+Operating Systems, pages 767–781, 2018.
+
+[3] Marcel Blöcher, Lin Wang, Patrick Eugster, and Max Schmidt. Switches for hire:
+resource scheduling for data center in-network computing. In Proceedings of
+the 26th ACM International Conference on Architectural Support for Programming
+Languages and Operating Systems, pages 268–285, 2021.
+
+[4] Nikita Mishra, Huazhe Zhang, John D. Lafferty, and Henry Hoffmann. A prob-
+abilistic graphical model-based approach for minimizing energy under perfor-
+mance constraints. In Proceedings of the Twentieth International Conference on
+Architectural Support for Programming Languages and Operating Systems, ASP-
+LOS’15, pages 267–281, New York, NY, USA, 2015. ISBN 9781450328357.
+
+[5] Nikita Mishra, Connor Imes, John D. Lafferty, and Henry Hoffmann. Caloree:
+Learning control for predictable latency and low energy. In Proceedings of the
+Twenty-Third International Conference on Architectural Support for Programming
+Languages and Operating Systems, ASPLOS’18, pages 184–198, New York, NY,
+USA, 2018. ISBN 9781450349116.
+
+[6] Herodotos Herodotou, Yuxing Chen, and Jiaheng Lu. A survey on automatic
+parameter tuning for big data processing systems. ACM Comput. Surv., 53(2),
+April 2020. ISSN 0360-0300.
+
+[7] Drew D Penney and Lizhong Chen. A survey of machine learning applied to
+
+computer architecture design. arXiv preprint arXiv:1909.12373, 2019.
+
+[8] Yiying Zhang and Yutong Huang.
+
+"learned": Operating systems. Operating
+
+optimization. arXiv preprint arXiv:1406.3896, 2014.
+
+Systems Review, 53(1):40–45, 2019.
+
+302520151050SHAP valueuncore.freqn.socketscpu.freqn.coresshuffle.file.bufferreducer.maxSizeInFlightio.compression.snappy.blockSizeSum of 18 other featuresuncore.freqn.socketscpu.freqn.coresshuffle.file.bufferreducer.maxSizeInFlightio.compression.snappy.blockSizeSum of 18 other features27.6923.5316.87.015.083.933.468.46Conference’17, July 2017, Washington, DC, USA
+
+Yi Ding, Alex Renda, Ahsan Pervaiz, Michael Carbin, and Henry Hoffmann
+
+[33] Tobias Domhan, Jost Tobias Springenberg, and Frank Hutter. Speeding up auto-
+matic hyperparameter optimization of deep neural networks by extrapolation
+of learning curves. In Twenty-fourth international joint conference on artificial
+intelligence, 2015.
+
+[34] Aaron Klein, Stefan Falkner, Jost Tobias Springenberg, and Frank Hutter. Learning
+
+curve prediction with bayesian neural networks. In ICLR, 2017.
+
+[35] Dmitry Ponomarev, Gurhan Kucuk, and Kanad Ghose. Reducing power re-
+quirements of instruction scheduling through dynamic allocation of multiple
+datapath resources. In Proceedings. 34th ACM/IEEE International Symposium on
+Microarchitecture. MICRO-34, pages 90–101. IEEE, 2001.
+
+[36] Seungryul Choi and Donald Yeung. Learning-based smt processor resource
+In 33rd International Symposium on Computer
+
+distribution via hill-climbing.
+Architecture (ISCA’06), pages 239–251. IEEE, 2006.
+
+[37] Benjamin C Lee, David M Brooks, Bronis R de Supinski, Martin Schulz, Karan
+Singh, and Sally A McKee. Methods of inference and learning for performance
+modeling of parallel applications.
+In Proceedings of the 12th ACM SIGPLAN
+symposium on Principles and practice of parallel programming, pages 249–258,
+2007.
+
+[38] Benjamin C Lee, Jamison Collins, Hong Wang, and David Brooks. Cpr: Com-
+posable performance regression for scalable multiprocessor models. In 2008 41st
+IEEE/ACM International Symposium on Microarchitecture, pages 270–281. IEEE,
+2008.
+
+[39] Jose F Martinez and Engin Ipek. Dynamic multicore resource management: A
+
+machine learning approach. IEEE micro, 29(5):8–17, 2009.
+
+[40] David C Snowdon, Etienne Le Sueur, Stefan M Petters, and Gernot Heiser. Koala:
+In Proceedings of the 4th ACM
+
+A platform for os-level power management.
+European conference on Computer systems, pages 289–302, 2009.
+
+[41] Ryan Cochran, Can Hankendi, Ayse K Coskun, and Sherief Reda. Pack & cap: adap-
+tive dvfs and thread packing under power caps. In 2011 44th Annual IEEE/ACM
+International Symposium on Microarchitecture (MICRO), pages 175–185. IEEE,
+2011.
+
+[42] Xiao Zhang, Rongrong Zhong, Sandhya Dwarkadas, and Kai Shen. A flexible
+framework for throttling-enabled multicore management (temm). In 2012 41st
+International Conference on Parallel Processing, pages 389–398. IEEE, 2012.
+[43] Srinath Sridharan, Gagan Gupta, and Gurindar S Sohi. Holistic run-time par-
+allelism management for time and energy efficiency. In Proceedings of the 27th
+international ACM conference on International conference on supercomputing, pages
+337–348, 2013.
+
+[44] Adam J Oliner, Anand P Iyer, Ion Stoica, Eemil Lagerspetz, and Sasu Tarkoma.
+Carat: Collaborative energy diagnosis for mobile devices. In Proceedings of the
+11th ACM Conference on Embedded Networked Sensor Systems, pages 1–14, 2013.
+[45] Yuhao Zhu and Vijay Janapa Reddi. High-performance and energy-efficient
+In 2013 IEEE 19th International
+
+mobile web browsing on big/little systems.
+Symposium on High Performance Computer Architecture (HPCA), 2013.
+
+[46] Yanqi Zhang, Weizhe Hua, Zhuangzhuang Zhou, Ed Suh, and Christina Delim-
+itrou. Sinan: Data-driven resource management for interactive microservices. In
+Workshop on ML for Computer Architecture and Systems (MLArchSys), June 2020.
+[47] Zhan Shi, Xiangru Huang, Akanksha Jain, and Calvin Lin. Applying deep learning
+to the cache replacement problem. In Proceedings of the 52nd Annual IEEE/ACM
+International Symposium on Microarchitecture, pages 413–425, 2019.
+
+[48] Zhan Shi, Akanksha Jain, Kevin Swersky, Milad Hashemi, Parthasarathy Ran-
+ganathan, and Calvin Lin. A hierarchical neural model of data prefetching. In
+Proceedings of the 26th ACM International Conference on Architectural Support for
+Programming Languages and Operating Systems, pages 861–873, 2021.
+
+[49] Gerald Tesauro. Reinforcement learning in autonomic computing: A manifesto
+
+and case studies. IEEE Internet Computing, 11(1):22–30, 2007.
+
+[50] Jonathan A Winter, David H Albonesi, and Christine A Shoemaker. Scalable
+thread scheduling and global power management for heterogeneous many-core
+architectures. In 2010 19th International Conference on Parallel Architectures and
+Compilation Techniques (PACT), pages 29–39. IEEE, 2010.
+
+[51] Kenzo Van Craeynest, Aamer Jaleel, Lieven Eeckhout, Paolo Narvaez, and Joel
+Emer. Scheduling heterogeneous multi-cores through performance impact estima-
+tion (pie). In 2012 39th Annual International Symposium on Computer Architecture
+(ISCA), pages 213–224. IEEE, 2012.
+
+[52] Benjamin C Lee and David M Brooks. Accurate and efficient regression modeling
+for microarchitectural performance and power prediction. ACM SIGOPS operating
+systems review, 40(5):185–194, 2006.
+
+[53] Engin Ipek, Onur Mutlu, José F. Martínez, and Rich Caruana. Self-optimizing
+memory controllers: A reinforcement learning approach. In Proceedings of the
+35th Annual International Symposium on Computer Architecture, ISCA’08, pages
+39–50, USA, 2008. ISBN 9780769531748.
+
+[54] Ramazan Bitirgen, Engin Ipek, and Jose F Martinez. Coordinated management
+of multiple interacting resources in chip multiprocessors: A machine learning
+approach. In 2008 41st IEEE/ACM International Symposium on Microarchitecture,
+pages 318–329. IEEE, 2008.
+
+[55] Christophe Dubach, Timothy M Jones, Edwin V Bonilla, and Michael FP O’Boyle.
+A predictive model for dynamic microarchitectural adaptivity control. In 2010
+43rd Annual IEEE/ACM International Symposium on Microarchitecture, pages
+
+485–496. IEEE, 2010.
+
+[56] Christina Delimitrou and Christos Kozyrakis. Quasar: Resource-efficient and qos-
+aware cluster management. In Proceedings of the 19th International Conference
+on Architectural Support for Programming Languages and Operating Systems,
+ASPLOS’14, pages 127–144, New York, NY, USA, 2014. ISBN 9781450323055.
+[57] Christina Delimitrou and Christos Kozyrakis. Paragon: Qos-aware scheduling
+for heterogeneous datacenters. In Proceedings of the Eighteenth International
+Conference on Architectural Support for Programming Languages and Operating
+Systems, ASPLOS’13, pages 77–88, New York, NY, USA, 2013. ISBN 9781450318709.
+[58] Elvira Teran, Zhe Wang, and Daniel A Jiménez. Perceptron learning for reuse
+prediction. In 2016 49th Annual IEEE/ACM International Symposium on Microar-
+chitecture (MICRO), pages 1–12. IEEE, 2016.
+
+[59] Leeor Peled, Uri Weiser, and Yoav Etsion. A neural network prefetcher for
+arbitrary memory access patterns. ACM Transactions on Architecture and Code
+Optimization (TACO), 16(4):1–27, 2019.
+
+[60] Eshan Bhatia, Gino Chacon, Seth Pugsley, Elvira Teran, Paul V Gratz, and Daniel A
+Jiménez. Perceptron-based prefetch filtering. In 2019 ACM/IEEE 46th Annual
+International Symposium on Computer Architecture (ISCA), pages 1–13. IEEE, 2019.
+[61] Elba Garza, Samira Mirbagher-Ajorpaz, Tahsin Ahmad Khan, and Daniel A
+Jiménez. Bit-level perceptron prediction for indirect branches. In 2019 ACM/IEEE
+46th Annual International Symposium on Computer Architecture (ISCA), pages
+27–38. IEEE, 2019.
+
+[62] Rahul Bera, Konstantinos Kanellopoulos, Anant Nori, Taha Shahroodi, Sreenivas
+Subramoney, and Onur Mutlu. Pythia: A customizable hardware prefetching
+In MICRO-54: 54th Annual
+framework using online reinforcement learning.
+IEEE/ACM International Symposium on Microarchitecture, pages 1121–1137, 2021.
+[63] Leeor Peled, Shie Mannor, Uri Weiser, and Yoav Etsion. Semantic locality and
+context-based prefetching using reinforcement learning. In 2015 ACM/IEEE 42nd
+Annual International Symposium on Computer Architecture (ISCA), pages 285–297.
+IEEE, 2015.
+
+[64] Benjamin C Lee and David Brooks. Applied inference: Case studies in microarchi-
+tectural design. ACM Transactions on Architecture and Code Optimization (TACO),
+7(2):1–37, 2010.
+
+[65] Tianqi Chen and Carlos Guestrin. Xgboost: A scalable tree boosting system. In
+Proceedings of the 22nd acm sigkdd international conference on knowledge discovery
+and data mining, pages 785–794, 2016. doi: 10.1145/2939672.2939785.
+
+[66] Apache spark. https://spark.apache.org/docs/2.2.3/configuration.html.
+[67] Mapreduce. https://hadoop.apache.org/docs/r1.2.1/mapred_tutorial.html.
+[68] Cassandra. hhttps://cassandra.apache.org/_/index.html.
+[69] Hbase. https://hbase.apache.org/.
+[70] Frank Hutter, Holger H Hoos, and Kevin Leyton-Brown. Sequential model-based
+optimization for general algorithm configuration. In International conference on
+learning and intelligent optimization, pages 507–523. Springer, 2011.
+
+[71] Leo Breiman. Random forests. Machine learning, 45(1):5–32, 2001.
+[72] Avinash Barnwal, Hyunsu Cho, and Toby Hocking. Survival regression with
+
+accelerated failure time model in xgboost. ArXiv, abs/2006.04920, 2020.
+
+[73] Robert McCulloch and Peter E Rossi. An exact likelihood analysis of the multi-
+
+nomial probit model. Journal of Econometrics, 64(1-2):207–240, 1994.
+[74] Christopher M Bishop. Pattern recognition. Machine learning, 128(9), 2006.
+[75] Charles R. Harris, K. Jarrod Millman, Stéfan J van der Walt, Ralf Gommers,
+Pauli Virtanen, David Cournapeau, Eric Wieser, Julian Taylor, Sebastian Berg,
+Nathaniel J. Smith, Robert Kern, Matti Picus, Stephan Hoyer, Marten H. van
+Kerkwijk, Matthew Brett, Allan Haldane, Jaime Fernández del Río, Mark Wiebe,
+Pearu Peterson, Pierre Gérard-Marchant, Kevin Sheppard, Tyler Reddy, Warren
+Weckesser, Hameer Abbasi, Christoph Gohlke, and Travis E. Oliphant. Array
+programming with numpy. Nature, 585:357–362, 2020.
+
+[76] The pandas development team. pandas-dev/pandas: Pandas, February 2020.
+[77] F. Pedregosa, G. Varoquaux, A. Gramfort, V. Michel, B. Thirion, O. Grisel, M. Blon-
+del, P. Prettenhofer, R. Weiss, V. Dubourg, J. Vanderplas, A. Passos, D. Courna-
+peau, M. Brucher, M. Perrot, and E. Duchesnay. Scikit-learn: Machine learning
+in Python. Journal of Machine Learning Research, 12:2825–2830, 2011.
+
+[78] Yuzhao Wang, Lele Li, You Wu, Junqing Yu, Zhibin Yu, and Xuehai Qian. Tpshare:
+a time-space sharing scheduling abstraction for shared cloud via vertical labels.
+In 2019 ACM/IEEE 46th Annual International Symposium on Computer Architecture
+(ISCA), pages 499–512. IEEE, 2019.
+
+[79] Subho S Banerjee, Saurabh Jha, Zbigniew Kalbarczyk, and Ravishankar K Iyer.
+Bayesperf: minimizing performance monitoring errors using bayesian statistics.
+In Proceedings of the 26th ACM International Conference on Architectural Support
+for Programming Languages and Operating Systems, pages 832–844, 2021.
+[80] Yi Ding, Ahsan Pervaiz, Michael Carbin, and Henry Hoffmann. Generalizable and
+interpretable learning for configuration extrapolation. In Proceedings of the 29th
+ACM Joint Meeting on European Software Engineering Conference and Symposium
+on the Foundations of Software Engineering, pages 728–740, 2021.
+
+[81] Kate Keahey, Jason Anderson, Zhuo Zhen, Pierre Riteau, Paul Ruth, Dan Stanzione,
+Mert Cevik, Jacob Colleran, Haryadi S. Gunawi, Cody Hammock, Joe Mambretti,
+Alexander Barnes, François Halbach, Alex Rocha, and Joe Stubbs. Lessons learned
+from the chameleon testbed. In Proceedings of the 2020 USENIX Annual Technical
+Conference (USENIX ATC ’20). USENIX Association, July 2020.
+
+Cello: Efficient Computer Systems Optimization with Predictive Early Termination and Censored Regression
+
+Conference’17, July 2017, Washington, DC, USA
+
+[82] Huazhe Zhang and Henry Hoffmann. Maximizing performance under a power
+cap: A comparison of hardware, software, and hybrid techniques. ACM SIGPLAN
+Notices, 51(4):545–559, 2016.
+
+[83] Junjie Chen, Ningxin Xu, Peiqi Chen, and Hongyu Zhang. Efficient compiler
+In 2021 IEEE/ACM 43rd International
+
+autotuning via bayesian optimization.
+Conference on Software Engineering (ICSE), pages 1198–1209. IEEE, 2021.
+[84] Todd K Moon. The expectation-maximization algorithm. IEEE Signal processing
+
+magazine, 13(6):47–60, 1996.
+
+[85] Scott M Lundberg and Su-In Lee. A unified approach to interpreting model
+predictions. Advances in neural information processing systems, 30, 2017.
+[86] Romy Lorenz, Ricardo P Monti, Ines R Violante, Aldo A Faisal, Christoforos
+Anagnostopoulos, Robert Leech, and Giovanni Montana. Stopping criteria for
+boosting automatic experimental design using real-time fmri with bayesian
+optimization. arXiv preprint arXiv:1511.07827, 2015.
+
+[87] Vu Nguyen, Sunil Gupta, Santu Rana, Cheng Li, and Svetha Venkatesh. Regret
+for expected improvement over the best-observed value and stopping condition.
+In Asian Conference on Machine Learning, pages 279–294. PMLR, 2017.
+
+

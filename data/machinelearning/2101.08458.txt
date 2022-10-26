@@ -1,0 +1,1689 @@
+UNIT: Unifying Tensorized Instruction Compilation
+
+Jian Weng∗†, Animesh Jain†, Jie Wang∗†, Leyuan Wang†, Yida Wang†, Tony Nowatzki∗
+
+∗University of California, Los Angeles, USA
+
+†Amazon Web Services, USA
+
+{jian.weng,jiewang,tjn}@cs.ucla.edu
+
+{janimesh,wangleyu,wangyida}@amazon.com
+
+1
+2
+0
+2
+
+r
+a
+
+M
+8
+2
+
+]
+L
+P
+.
+s
+c
+[
+
+3
+v
+8
+5
+4
+8
+0
+.
+1
+0
+1
+2
+:
+v
+i
+X
+r
+a
+
+it
+
+Abstract—Because of
+
+the increasing demand for intensive
+computation in deep neural networks, researchers have developed
+both hardware and software mechanisms to reduce the compute
+and memory burden. A widely adopted approach is to use
+mixed precision data types. However,
+is hard to beneﬁt
+from mixed precision without hardware specialization because
+of the overhead of data casting. Recently, hardware vendors
+offer tensorized instructions specialized for mixed-precision tensor
+operations, such as Intel VNNI, Nvidia Tensor Core, and ARM
+DOT. These instructions involve a new computing idiom, which
+reduces multiple low precision elements into one high precision
+element. The lack of compilation techniques for this emerging
+idiom makes it hard to utilize these instructions. In practice, one
+approach is to use vendor-provided libraries for computationally-
+intensive kernels, but this is inﬂexible and prevents further
+optimizations. Another approach is to manually write hardware
+intrinsics, which is error-prone and difﬁcult for programmers.
+Some prior works tried to address this problem by creating
+compilers for each instruction. This requires excessive efforts
+when it comes to many tensorized instructions.
+
+In this work, we develop a compiler framework, UNIT, to
+unify the compilation for tensorized instructions. The key to this
+approach is a uniﬁed semantics abstraction which makes the
+integration of new instructions easy, and the reuse of the analysis
+and transformations possible. Tensorized instructions from dif-
+ferent platforms can be compiled via UNIT with moderate effort
+for favorable performance. Given a tensorized instruction and a
+tensor operation, UNIT automatically detects the applicability of
+the instruction, transforms the loop organization of the operation,
+and rewrites the loop body to take advantage of the tensorized
+instruction. According to our evaluation, UNIT is able to target
+various mainstream hardware platforms. The generated end-to-
+end inference model achieves 1.3× speedup over Intel oneDNN
+on an x86 CPU, 1.75× speedup over Nvidia cuDNN on an Nvidia
+GPU, and 1.13× speedup over a carefully tuned TVM solution
+for ARM DOT on an ARM CPU.
+
+I. INTRODUCTION
+
+Dense tensor operations like matrix multiplication (Matmul)
+and convolution (Conv) have long been the workhorses in
+many domains, including deep learning workloads [14]. The
+popularity of deep learning means that aggressively optimizing
+these operations has a high payoff. Essentially, Matmul and
+Conv are a series of multiply-accumulate (MAC) operations,
+which perform accumulation over a number of elementwise
+multiplications.
+
+To capture the reduction behavior and perform it more
+efﬁciently, recent general-purpose processors offer native tensor
+operation specialized instructions (hereinafter referred to as
+tensorized instructions), like Intel VNNI [2], Nvidia Tensor
+Core [5], and ARM DOT [1]. Unlike the conventional SIMD
+
+∗†
+
+Work done during Jian and Jie’s internship at AWS.
+
+instructions, after performing elementwise arithmetic opera-
+tions, these instructions introduce a “horizontal computation” to
+accumulate elementwise results. Further, tensorized instructions
+are often mixed-precision, meaning that elementwise operations
+use less precise and lower bitwidth operands (e.g., fp16 and
+int8), while accumulation occurs with higher bitwidth, where
+it is needed. This offers a good balance between data width
+and precision that is generally sufﬁcient for deep learning
+workloads [24], [18], and enables the use of quantized data
+types.
+
+Mixed-precision is difﬁcult to express in a single SIMD
+instruction, because the output vector width is different than the
+input vector width. In most ISAs this paradigm requires multi-
+ple SIMD instructions to express. In a tensorized instruction, by
+deﬁnition there are fewer outputs, so allocating more bitwidth
+to them for the output vector is natural. In addition, tensorized
+instructions sometimes reuse the same inputs multiple times,
+which reduces the required register ﬁle bandwidth. Overall,
+tensorized instructions offer signiﬁcant advantages over SIMD
+for executing MACs.
+
+While promising, the absence of appropriate compilation
+techniques limit c the applicability of these tensorized instruc-
+tions. Conventional SIMD instructions are vector instructions,
+so industry standard compilers only try parallelizing the
+innermost
+is difﬁcult for the high-
+level language programmer to express the compute ﬂow in
+a tensorization-friendly way and hint the compiler to try
+tensorization upon a loop nest, because the dependency of
+reduction is more complicated and error-prone.
+
+loops. In addition,
+
+it
+
+In practice, there are normally two options to leverage
+tensorized instructions. One way is to call the vendor-provided
+libraries such as Intel oneDNN [6], Nvidia cuBLAS and
+cuDNN [4], which provides highly optimized performance
+in some pre-deﬁned single kernels using tensorized instruc-
+tions [17], [44]. However, it also brings inﬂexibility when
+it comes to new workloads or when further performance
+exploitation is desired. The other option is to manually write
+assembly intrinsics, which sets a high bar to ordinary developers
+and hence lacks productivity. Some prior works tried to solve
+this problem by developing a compiler [35], [36] for each
+instruction. This requires too much effort when there are
+many tensorized instructions, both within and across hardware
+platforms.
+Our Goal: Although different processors may provide different
+tensorized instructions, in the context of deep learning work-
+loads, we observe that these instructions essentially handle a
+similar compute pattern, i.e., elementwise multiplication and
+
+ 
+ 
+ 
+ 
+ 
+ 
+then horizontal accumulation. They primarily differ in the
+number of elementwise computation lanes and the accepting
+data types. Therefore, we aim to develop a uniﬁed approach
+to compile these tensorized instructions on multiple platforms
+to optimize the tensor operations in deep learning workloads.
+Our techniques are extensible to the tensorized instructions
+with other data types and operations as well.
+Challenges: There are several challenges to attain a uniﬁed
+compilation pipeline:
+
+• Instructions Integration: Instead of building a new spe-
+cialized compiler for each new instruction, it is desirable
+to create a uniﬁed and extensible compilation ﬂow;
+
+• Detecting the applicability: Given a tensorized instruction,
+a ﬁrst question is whether and how this instruction can be
+applied to the target tensor operation, which may require
+loop reorganization to make it applicable;
+
+• Code rewriting: When applicable, the compiler must
+determine how the loops involved should be rewritten
+by the tensorized instruction, and how the loops should
+be rearranged to achieve high performance.
+
+Our Insight: We envision that the key to addressing these
+three challenges is to have a uniﬁed semantics abstraction for
+tensorized instructions so that the analysis and transformation
+can also be uniﬁed.
+
+This paper presents UNIT, an end-to-end compilation
+pipeline to surmount the above three challenges. UNIT takes
+the tensorized instructions (e.g., Intel VNNI instructions on
+CPUs, or Nvidia Tensor Core instructions on GPUs) and a
+deep learning model as input, lowers the tensor operations of
+the model into loop-based IRs to identify the tensorizable com-
+ponents, and inserts the tensorized instructions by transforming
+and rewriting the loop. It achieves high performance for tensor
+operations, and consequently, model inference. To the best
+of our knowledge, this is the ﬁrst work to tackle tensorized
+instruction compilation and optimization with a uniﬁed solution.
+UNIT not only achieves high performance for single tensor
+operations, but also provides desirable model inference latency
+in practice.
+Key Results: According to our evaluation, UNIT is expressive
+enough to target many tensorized instructions on multiple
+hardware platforms, including Intel VNNI, Nvidia Tensor
+Core, and ARM DOT. The generated programs for end-to-end
+model inference are 1.3× and 1.75× faster than the solutions
+backed up by Intel oneDNN and Nvidia cuDNN on CPU
+and GPU, respectively. In addition, UNIT can be extended
+to new tensorized instructions with moderate effort. Although
+we designed UNIT to target Intel CPUs and Nvidia GPUs,
+on an ARM Cortex A-72 CPU with DOT instructions, UNIT
+achieves up to 1.13× speedup against a carefully manual tuned
+solution.
+
+To sum up, our contribution is an end-to-end compilation
+pipeline of tensorized instructions for deep learning workloads,
+which includes:
+
+• A uniﬁed abstraction for tensorized instructions.
+• An algorithm that detects the applicability of these
+
+tensorized instructions.
+
+Fig. 1: Performance comparison on Nvidia V100-SXM2 between fp32 and
+fp16 without mixed precision instruction support.
+
+• A rewriting and tuning mechanism that looks for favorable
+loop transformations of the tensor operations to plug in
+the tensorized instructions for high performance.
+
+Paper Organization: We ﬁrst
+introduce the background
+and challenges of tensorized compilation in Section II. The
+design of UNIT is presented in Section III. We explain the
+implementation details in Section IV. We clarify our experiment
+methodology in Section V, and evaluate our work in Section VI.
+Finally, we discuss the related work in Section VII.
+
+II. BACKGROUND
+
+UNIT is an end-to-end compilation pipeline capable of
+automatically mapping tensorized instructions to the deep
+learning tensor operations. It deﬁnes the tensorized instruction’s
+semantics using a suitable intermediate representation (IR) and
+inserts them in proper places of the program of tensor opera-
+tions. In this section, we give an overview of popular mixed
+precision tensorized instructions, followed by the limitations
+of existing solutions in automatic mapping of these tensorized
+instructions. Finally, we discuss the background of tensor
+domain speciﬁc language and the multi-level intermediate
+representation.
+
+A. Mixed Precision Tensorized Instructions
+
+Deep learning is computationally expensive, requiring sub-
+stantial compute and memory resources. As deep learning be-
+comes more pervasive, researchers are designing both software
+and hardware techniques to reduce the compute and memory
+burden. A widely adopted approach in this context is using
+mixed precision for expensive operations, e.g., convolution or
+dense operations [24], [18]. In practice, this means representing
+32-bit ﬂoating point (fp32) operands with a lower bitwidth
+datatype - 16-bit ﬂoating point numbers (fp16) or 8/16-bit
+integer numbers (int8, int16). To keep the accuracy in
+check, it is helpful to accumulate the results in higher precision
+(fp32 or int32). This type of mixed precision computation
+is often called quantization for integer values [18]. In this
+paper, we will always use mixed precision for brevity.
+
+While using mixed precision data types reduces memory
+footprint, it might not necessarily lead to performance im-
+provement. To investigate this, we conducted an experiment
+to compare the performance of Nvidia cuDNN performance
+for fp16 and fp32 in the absence of Nvidia mixed precision
+tensorized instructions (Tensor Core). As shown in Figure 1, we
+
+resnet-18resnet-50resnet-50_v1binception-bninception-v3resnet-101resnet-152mobilenet-v1mobilenet-v2geomean0.00.51.0Relative PerformancecuDNN(fp32)cuDNN (fp16) w/o Tensor CoreConventional loop vectorizers in general-purpose compilers
+like GCC and LLVM mainly focus on either analyzing the
+innermost loop body or combining instructions in the unrolled
+loop bodies. When it comes to the horizontal reduction idiom,
+these compilers often reorder the computation and generate
+epilogue reduction, preventing us from using the tensorized
+instructions.
+
+There have been some recent works in compiling programs
+to leverage tensorized instructions. PolyDL [36] generates
+CPU programs for convolution kernels in neural networks
+that call a GEMM micro-kernel using Intel VNNI instructions.
+Bhaskaracharya et al. [35] generate CUDA programs for matrix
+computation leveraging Nvidia Tensor Core. However, these
+works are limited to one platform and its speciﬁc instruction,
+which lacks generalizability. A generic solution to handle
+tensorized instructions from multiple platforms together is
+still missing.
+
+C. Multi-Level Intermediate Representation
+
+Compilers often have multiple levels of intermediate repre-
+sentation (IR) to express the program; each level is designed to
+enable different analyses and transformations. In this section,
+we describe the background of a tensor domain speciﬁc
+language (DSL) and the multi-level IR.
+
+1) Graph-Level IR: Deep learning compilers like TVM [10],
+Glow [34], and XLA [43] adopt a graph-level IR to represent
+a deep learning model as a directed acyclic graph (DAG)
+of operations. This graph-level IR is useful for inter-tensor-
+operation optimization, like tensor shape padding, operation
+fusion, and choosing the proper data layout [23]. Our tensorized
+analysis relies on tensor padding so that loops can be tiled
+by the number of lanes of the instruction perfectly. However,
+this IR has little knowledge about the implementation of each
+tensor operation. When compiling a graph-level IR, each node
+of the DAG will be dispatched to its implementation in tensor
+DSL as explained next.
+
+2) Tensor DSL: Tensor domain-speciﬁc languages, like
+Halide [31], TVM [10], and Tensor Comprehension [37],
+have been developed to productively and portably express
+tensor programs while enabling efﬁcient performance tuning.
+As shown in Figure 4 and Figure 5, programs written in
+tensor DSLs follow this paradigm: Users ﬁrst declare the
+tensors and the loop variables, and then the computation is
+described by expressions involving the declared tensors and
+loop variables. These DSLs also provide interfaces to split,
+reorder, and annotate loops without affecting the computation
+semantics for performance tuning.
+
+All the information gathered from the tensor DSL frontend
+will be stored in a tensor Op data structure,
+including
+the declared tensors, loop variables, expressions, and loop
+manipulation.
+
+3) Tensor IR: Each tensor Op is then lowered to Tensor IR,
+which is an imperative program IR with additional constraints:
+All the loops are canonical (starting from 0, and increased by
+1 each time), and all the array operations are restricted (i.e., an
+element cannot be accessed by two different pointers). These
+
+Fig. 2: The semantics of Intel VNNI and Nvidia Tensor Core. The text beside
+is the name of the corresponding LLVM intrinsic.
+
+observe that blindly using mixed precision leads to substantial
+slowdown because of the overhead of casting between two
+data types.
+
+Therefore, mainstream hardware vendors (Intel, ARM and
+Nvidia) have introduced mixed precision tensorized instructions
+to achieve better performance. These instructions add mixed
+precision arithmetic support where operands are of lower
+precision while the accumulation happens in higher precision,
+potentially leading to 2× - 4× speedup. The most popular
+examples of these tensorized instructions are Intel VNNI, ARM
+DOT and Nvidia Tensor Core. We will discuss the semantics
+of these operations in Section III.
+
+Hardware vendors have a long history of adding new
+instructions to accelerate important applications. However, the
+mixed precision tensorized instructions introduce a unique
+idiom - horizontal accumulation. These tensorized instructions
+typically conduct a sequence of elementwise multiplications
+governed by a memory access pattern, followed by a horizontal
+accumulation. The accumulation is termed horizontal because
+all values to be accumulated are present in the same vector
+register. For example, as it is shown in Figure 2(a), Intel VNNI
+executes a dot product of two vectors, each having 4 int8
+elements, while performing the accumulation in int32. We
+observe a similar pattern, though with different numbers of
+entries and data types, for Nvidia Tensor Core (in Figure 2(b))
+and ARM DOT instructions (this is omitted, because it is
+similar to VNNI).
+
+B. Limitations of Existing Solutions
+
+Though tensorized instructions seem promising, their adop-
+tion pace is limited because of the absence of an automatic
+technique that can detect and use these instructions seamlessly.
+Currently, their usage in the deep learning domain is limited
+to hardware vendor libraries like Intel oneDNN and Nvidia
+cuDNN, which may provide high performance for the pre-
+deﬁned operations but are inﬂexible as discussed in Section I.
+Similarly, conventional loop vectorizers ﬁnd it hard to exploit
+the proﬁtability of these tensorized instructions, as they are
+not designed to work with the horizontal reduction idiom.
+
+…c15a60b60×+b61×b62×b63×dst15a61a62a63++u8x64i8x64i16x32i16x32(a) Intel VNNI  x86.avx512.pbpdusd(b) Nvidia Tensor Core nvvm.wmma.m16n16k16.mma.row.row.f32.f32+=×A: 16×16
+fp16B: 16×16
+fp16C: 16×16
+fp32c0a0b0×+b1×b2×b3×dst0a1a2a3++Fig. 3: The overview of our framework, UNIT.
+
+two properties enable making strong assumptions for analysis
+and transformation. Our work conducts analysis on the tensor
+Op data structure level and then performs transformation on the
+tensor IR. Although the tensor IR provides essentially identical
+information for analysis, as discussed above, it is easier to
+reorganize the loops via the tensor Op data structure.
+
+4) Low-Level IR: The tensor IR is lowered to a general-
+purposed low-level IR like LLVM, after all the specialized
+analysis and transformations on the tensor IR are done, to get
+ready for assembly code generation.
+
+III. UNIFIED TENSORIZATION
+Our goal is to automatically tensorize1 mixed-precision
+deep learning tensor operations across a variety of hardware
+platforms. We resolve the challenges discussed in Section I by
+presenting UNIT with the following techniques:
+
+1) Tensorized Instruction in Tensor DSL: To abstract the
+diverse tensorized instructions on different hardware
+platforms, we leverage the existing tensor DSL to
+represent their semantics.
+
+2) Applicability Inspection: To determine if and how a
+tensorized instruction can be applied to a tensor operation,
+we developed an analysis pass in the Inspector component
+of UNIT, which analyzes the tensor Op data structure
+of both the instruction and the operation. The result of
+analysis will guide the loop reorganization and instruction
+injection.
+
+3) Code Rewriter: Once the tensorized instruction is deter-
+mined applicable, the Rewriter reorganizes the loop nests
+in accordance with the Inspector so that the innermost
+loop nests resemble the tensorized instruction and are
+ready to be replaced. Finally, it sets up the tuning space
+for the remaining loop nests to exploit high performance.
+These components of UNIT together enable a uniﬁed compi-
+lation ﬂow to simplify the mapping of tensorized instructions
+across a variety of hardware platforms. In the rest of this section,
+the details of each of the above steps will be discussed.
+
+A. Semantics Abstraction - Tensor DSL
+
+In order to unify the compilation of tensorized instructions
+from different platforms and keep the system open to integrate
+new instructions, the ﬁrst question to answer is how to have a
+
+1We coin the word to mean rewrite and optimize a given code by the
+
+tensorized instruction.
+
+Fig. 4: Tensorized instructions as abstracted in the tensor DSL.
+
+uniﬁed description of the semantics of tensorized instructions.
+As explained in Section II, we employ ubiquitous tensor DSL
+and tensor IR to solve the abstraction problem. All mixed
+precision tensorized instructions perform some elementwise
+operations for vectors, followed by a horizontal reduction. Each
+tensorized instruction, therefore, can be regarded as a small
+tensor operation program written in the tensor DSL.
+
+Figure 4(a) shows how an Intel VNNI instruction is described
+in the tensor DSL. Three source operands of Intel VNNI are
+512-bit registers. Two of them are 64 lanes of unsigned 8-bit
+integers (uint8) and signed 8-bit integers (int8), and the
+other one is 16 lanes of signed 32-bit integers (int32), which
+correspond to the tensors a, b, c we deﬁned. The arithmetic
+behavior is deﬁned by the loop variables and the expression
+of d[i]. Here we annotate that loop i is data parallel, since
+these 16 elements are independent from each other; loop j is
+reduction since for every independent element it sums up 4
+elements along with this loop. A similar loop pattern appears in
+the other tensor operations shown in Figure 5. The description
+of ARM DOT, shown in Figure 4(b), is similar to Intel VNNI,
+with a different number of lanes and data types.
+
+Nvidia Tensor Core, on the other hand, performs a 163 square
+matrix multiplication as shown in Figure 4(c). Comparing with
+(a) and (b), a key difference is that it requires the accumulator
+register to be the same as the addition register (note the +=).
+This is due to the data type opaqueness of the Tensor Core
+instruction, which prevents us from giving arbitrary initial
+values for the accumulators.
+
+We describe the semantics of each tensorized instruction in
+tensor DSL. The deep learning compiler pipeline parses the
+operation into tensor Op, which preserves tensor information
+like the expression tree, the loop trip count, and the array
+buffers. This information is essential for the analysis and
+transformation passes in Inspector and Rewriter.
+
+B. Applicability Detection - Inspector
+
+To determine if a tensorized instruction can be applied to a
+tensor operation, the Inspector pass uses a two-step approach.
+It ﬁrst determines if (part of) the tensor operation program and
+
+Tensor Operation Prog.Hardware TargetInspectorRewriterTensor. Inst.Intel x86ARMNVIDIASection III.ASection III.BSection III.CXFormTunea, b = tensor((64,),u8), tensor((64,),i8)c, d = tensor((16,), i32), tensor((16,), i32)i, j = loop_axis(0,16), reduce_axis(0,4)d[i] = c[i] + sum(i32(a[i*4+j])*i32(b[i*4+j]))(a) Intel VNNI  x86.avx512.pbpdusda, b = tensor((16,),i8), tensor((16,),i8)c, d = tensor((4,), i32), tensor((4,), i32)i, j = loop_axis(0,4), reduce_axis(0,4)d[i] = c[i] + sum(i32(a[i*4+j])*i32(b[i*4+j]))(b) ARM DOT  arm.neon.sdot.v4i32.v16i8a, b = tensor((16,16),fp16), tensor((16,16),fp16)i, j = loop_axis(0,16), loop_axis(0,16)k = reduce_axis(0,16)c[i,j] += fp32(a[i,k]) * fp32(b[k,j])nvvm.wmma.m16n16k16.mma.row.row.f32.f32(c) Nvidia Tensor Corefunction INSPECT(a,b)
+
+if a.type=b.type then
+
+if isleaf(a)∧isleaf(b) then
+if a is not bound then
+
+bind[a]:=b
+
+else if bind[a](cid:54)=b then
+
+return False
+
+end if
+return True
+
+else if isarith(a), isarith(b) then
+cond:=a.opcode=b.opcode
+cond:=cond∧Inspect(a.lhs, b.lhs)
+cond:=cond∧Inspect(a.rhs, b.rhs)
+return cond
+
+end if
+
+end if
+return False
+
+end function
+
+Algorithm 1: Determine the isomorphism between expression trees. a is for
+the instruction, and b is for the operation.
+
+This analysis also ﬁnds a mapping from the operands in the
+tensor program to the operands in the tensorized instruction.
+As we explained, tensor operands in the tensorized instruction
+are the abstraction for registers. Therefore, a register cannot
+correspond to multiple data sources. This property still requires
+further checks, which will be explained in the next section.
+
+2) Array Access Isomorphism: Once compute isomorphism
+is determined, the next concern is how the data are fed to this
+instruction. The enforcement explained in the last subsection
+already determines each register operand only corresponds to
+one array in the tensor operation. On top of this, we need to
+determine each element in the operand tensor corresponds to
+only one memory address in the tensor program when mapping
+to the tensorized instruction. To map a tensor program to a
+tensorized instruction, we need to know which loop levels are
+tensorized. We enumerate the loop levels to be tensorized, and
+these loop levels will be mapped to loops in the tensorized
+instruction. Note that only loops with the same annotation
+(data parallel or reduction) can be mapped to each other. Then
+we check if this enumerated mapping is feasible, by scanning
+each pair of operand correspondence determined in the last
+paragraph. If the operand in the tensor program is a constant,
+we just skip it2. If the operand is a memory operation, we
+inspect the index expressions of both memory operations in
+the operation and instruction. We deﬁne:
+
+• A is the set of loop variables to be mapped to the
+
+tensorized instruction.
+
+• B is the set of loop variables of the tensorized instruction.
+• f : A (cid:55)→ B is the mapping we enumerate.
+• S(u) := {x|x is loop variable in the index expression u}
+• S(cid:48)(u) := {f (x)|x ∈ S(u) ∩ A}
+
+2If it is a constant, the correspondence was already checked in the last
+
+section. This register corresponds to this constant.
+
+Fig. 5: An example of applying Intel VNNI to Conv using UNIT.
+
+the instruction can be arithmetically equivalent by checking a
+form of isomorphism between their associated expression trees.
+After that, it inspects the data access pattern to conﬁrm the
+assembly operands can be prepared so as to guide the Rewriter
+transformation.
+
+1) Compute Isomorphism: Algorithm 1 shows the algorithm
+we adopt to determine the isomorphism of two expression trees.
+It recursively traverses both trees and matches the data type
+and opcode of each pair of nodes. Figure 5(b).1 shows that
+the two trees of convolution and pbpdusd (an Intel VNNI
+instruction) are in exactly the same topology and data type, so
+these two programs are arithmetically isomorphic.
+
+…// Convolution in tensor DSLa,b = tensor((H,W,C), u8),tensor((R,S,K,C),i8)k,rc = loop_axis(0,K), reduce_axis(0,C)x,y = loop_axis(0,H-R+1), loop_axis(0,W-S+1)r,s = reduce_axis(0,R), reduce_axis(0,S)c[x,y,k]+= i32(a[x+r,y+s,rc])*i32(b[r,s,k,rc])(b).1 Arithmetic Isomorphismfor (x=0; x<(H-R)+1; ++x) for (y=0; y<(W-S)+1; ++y)  for (ko=0; ko<K; ko+=16)   for (r=0; r<R; ++r)    for (s=0; s<S; ++s)     for (co=0; co<C; co+=4)      #pragma tensorize      for (ki=0; ki<16; ++ki)       for (ci=0; ci<4; ++ci) {        k=ko+ki, rc=co+ci;     c[x,y,k] += a[x,y,rc]*b[r,s,k,rc]; }(c) Code Transformation:(a). Algorithm Description(b).2 Data Access Isomorphism=d[i]:i32+:i32*:i32c[i]:i32VNNI:=c[x,y,k]:i32+:i32*:i32a[x+r,y+s,rc]:u8c[x,y,k]:i32Conv:Two trees are exactly the same topology, opcodes, and data type.cast:i32b[r,s,k,rc]:icast:i32b[i*4+j]:i8a[i*4+j]:u8cast:i32cast:i32for (x=0; x<(H-R)+1; ++x)  for (y=0; y<(W-S)+1; ++y)    for (k=0; k<K; ++k)      for (r=0; r<R; ++r)        for (s=0; s<S; ++s)          for (rc=0; rc<C; ++rc)           c[x,y,k] += a[x,y,rc]*b[r,s,k,rc]; Reorganize the loops in DSL primitives.{x,y,k}     →{i}  ⊆{i}{x,y,k}     →{i}  ⊆{i}{x,y,r,s,rc}→{j}  ⊆{i,j}{r,s,k,rc}  →{i,j}⊆{i,j}c[x,y,k]d[i]k→irc→jc[x,y,k]c[i]a[x+r,y+s,rc]b[r,s,k,rc]a[i*4+j]b[i*4+j]c[x,y,ko:16]x16(a[x,y,co:4])a[r,s,k+0,co:4])a[r,s,k+1,co:4])a[r,s,k+15,co:4])d=pbpdusd(a,b,c);c[x,y,ko:16]f:A→BIndex: uIndex: vS(u)                 S’(u)    ⊆S(v)x86.avx512.pbpdusdA mapping is considered feasible, if every pair of memory
+operation’s index expressions (u, v), where u is from the
+operation and v is from the instruction, holds S(cid:48)(u) ⊆ S(v).
+Figure 5(b).2 shows an example of inspection. If S(cid:48)(u) is
+a subset of S(v), this means the data loaded by the tensor
+operation should be broadcast along with the loop variables
+that do not exist in S(v) to ﬁll all the register lanes. If not,
+this means each register lane corresponds to multiple memory
+addresses under this mapping, which is not realistic for code
+generation, so we should try another enumeration.
+
+If there are multiple feasible mappings, we leave this as
+a dimension of code tuning space. Once this mapping is
+determined, it will guide the further loop transformation and
+code generation.
+
+C. Code Transformation - Rewriter
+
+There are three phases in the code transformation: loop
+reorganization, tensorized instruction replacement, and tuning.
+1) Loop Reorganization: As discussed in Subsection III-B,
+the inspector selects the loop levels to be executed by the given
+instruction. To get poised for code generation, as shown in
+Figure 5(c), we need to tile these loops and reorder them to the
+innermost loop levels so that those innermost loops perform
+exactly the same semantics as the instruction. As we explained,
+tensor DSL provides the capability to reorganize the loops
+nests easily.
+
+2) Tensorized Instruction Replacement: After identifying
+the code region to be replaced by a tensorized instruction, the
+code generator should prepare each operand of this instruction.
+It is difﬁcult to fully automate the operand preparation for
+different platforms because of their diverse execution models
+and assembly formats. Therefore, we formalize a uniﬁed
+programming interface to compiler developers to manually
+specify the rule of operand generation. In this interface, each
+loop variable to be replaced, and their coefﬁcients in the index
+expression are exposed. For example, as shown in Figure 5(c),
+by analyzing the strides and trip count of ki, and ci, the
+array access c[x,y,c] will be transformed to a 16-lane
+vector; a[x,y,rc] will be vectorized along with c by 4,
+and broadcast along with ki by 16; b[r,s,k,c] will be
+vectorized along with ci by 4, and unrolled and concatenated
+along with ki.
+
+3) Tuner: All the other loop levels that are not involved in
+instruction rewriting can be reorganized to tune the performance.
+Here, we develop strategies to optimize the performance of
+tensor programs on both CPU and GPU. The generic philosophy
+is to exploit both ﬁne- and coarse-grained parallelism. We
+also developed specialized strategies because of the different
+execution models and memory hierarchy.
+CPU Tuning: On CPU, data-parallel loops are distributed to
+multiple threads to achieve coarse-grained parallelism. On the
+other hand, the loop-carried dependence in reduction loops
+introduces RAW hazards in the execution pipeline. To avoid this
+penalty, and achieve instruction-level parallelism, we reorder
+and unroll a small degree of data parallel loops below the
+innermost reduction loop.
+
+Fig. 6: Accumulating a p×p “square window” avoids loop-carried data
+dependences, and reuses buffered submatrices.
+
+The tuning space of CPU involves two dimensions, the
+degree of unrolling and parallelization. We enumerate these
+two parameters and proﬁle the execution time to search for the
+best one. If the unrolling degree is too small, there will not
+be enough independent instructions to ﬁll in the idle penalty
+cycles caused by RAW hazards. If it is too large, it will cause
+I-cache misses. Similarly, the number of threads can neither
+be too few or too many. If it is too few, the computing cores
+would have insufﬁcient utilization and memory latency would
+not be hidden. Too many threads introduce context switching
+overhead. We rely on the tuning process to look for the best
+combination.
+GPU Tuning: On GPU, coarse-grained parallelism is achieved
+by distributing the data parallel loops across the streaming
+multiprocessors. Similar to CPU, ﬁne-grained parallelism is
+also achieved by reordering and unrolling a small degree of
+data parallel loops to avoid the pipeline penalty caused by
+loop-carried dependences. Moreover, on GPU, data reuse is
+explicitly managed by the software. Therefore, as it is shown
+in Figure 6, we adopt an outer-product style matrix multiply
+accumulation to reuse the buffered submatrices.
+
+Besides the generic optimization, we also developed opti-
+mization mechanisms specialized for DNN kernels. Among
+popular DNN models, there are many layers with relatively
+small width and height and deep channels. We apply dimension
+fusion to layers with small width and height – these two
+dimensions are fused into one to save the redundant padding. In
+
+// a[n,k], b[k,m], c[n,m]Buffer<fp16,16,16> A, B;Buffer<fp32,16,16> C;for (i=0; i<n; i+=16) for (j=0; j<m; j+=16)  for (r=0; r<k; r+=16) {   A = Load(a[i:16,r:16]);   B = Load(b[r:16,j:16]);   C += TensorCore(A, B); }  Store(c[i:16,j:16], C);// a[n,k], b[k,m], c[n,m]for (i=0; i<n; i+=16*p) for (j=0; j<m; j+=16*p)  for (r=0; r<k; r+=16) {   Buffer<fp16,16,16> A[p], B[p];   Buffer<fp32,16,16> C[p][p];   for (x=0; x<p; ++x) {    A[x] = Load(a[i+x*16:16,r:16]);    B[x] = Load(b[r:16,j+x*16:16]); }   for (x=0; x<p; ++x)    for (y=0; y<p; ++y)      C[x][y] += TensorCore(a[x],b[y]); }   for (x=0; x<p; ++x)    for (y=0; y<p; ++y)     Store(c[i+x*16,j+y*16], C[x][y];); }(a) Direct Accumulation- No data reuse.- Loop carried dependences.+ Each buﬀered submatrix reused p times.+ Loop carried dependences hidden by p×p accumulation.(b) "p×p Outer Product" Accumulation•Split
+•Reorder
+•Unrolladdition, we apply split reduction to layers with deep channels.
+For a reduction loop with large trip count, we can split it and
+parallelize each split segment on threadIdx. After all the
+segments are done, we synchronize the threads and reduce the
+splitted segments in the shared memory.
+
+IV. IMPLEMENTATION
+
+In this section, we will discuss technical details in our
+implementation. UNIT is implemented by extending Apache
+TVM [10], a full-stack deep learning compiler, with tensorized
+instruction support. We leverage TVM’s tensor DSL, tensor
+Op, tensor IR infrastructure, and the tuning infrastructure
+mechanisms [11], [23] to generate high performance kernels. In
+addition, implementing UNIT on top of TVM enables end-to-
+end model inference with other optimizations such as operator
+fusion, in addition to tensorization.
+
+A. Inspector
+
+The inspector pass is implemented by analyzing TVM’s
+ComputeOp data structure. This matches the expression tree
+of both the instruction and program and enumerates mappings
+between the loop variables. We enumerate the loops from the
+tensor’s innermost dimension to outermost dimension, and
+greedily return the ﬁrst eligible one because of the better
+potential data locality for inner dimensions. The enumerated
+mapping provides us with the correspondence of loop variables
+between the instructions and the tensor operations.
+
+B. Rewriter
+
+These following steps will be performed by the rewriter:
+1) According to the loop correspondence analyzed by the
+inspector, we reorganize the loops to be tensorized by
+tiling these loops by the trip counts of the corresponding
+loops in the instruction, and reorder them to be the
+innermost loops. These loops will be annotated by a
+tensorize pragma to hint the instruction injection.
+2) Based on the strategies discussed in Section III-C, we
+reorganize the loops above not involved in instruction
+rewriting to tune the performance.
+
+3) We lower the manipulated loop nest to the tensor IR, and
+replace the loop body annotated with the tensorize
+pragma with the target instructions, as shown in Fig-
+ure 5(c).
+
+Fig. 7: The code sketch of CPU tuning.
+
+parallelized. Loops between these two points will be executed
+in serialized order. Loops after the second breaking point will
+be reordered to the innermost and unrolled.
+GPU Tuning: As it is discussed in the last paragraph of
+Section III-C, both coarse-grained and ﬁne-grained parallelism
+optimizations are applied on data-parallel loops, so there is a
+tradeoff between them: data reuse is increased by increasing
+the unrolling degree (each buffered submatrix is reused p
+times), but the coarse-grained parallelism is decreased. Also, a
+large unrolling degree may overwhelm the register resources.
+Therefore, the key to generic optimization is to choose a proper
+unrolling degree.
+
+On the other hand, greedily applying each specialized
+optimization does not always improve the performance. Though
+dimension fusion may save the memory trafﬁc, it also intro-
+duces software overhead on data rearrangement. Similarly,
+though splitting the reduction loop introduces more parallelism,
+it also introduces thread synchronization overhead and register
+pressure. We enumerate each parameter, including the degree
+of reduction parallelization and whether to fuse the width and
+height dimensions, and then apply these transformations to
+the program and proﬁle the performance to determine which
+transformation leads to the best performance.
+
+V. METHODOLOGY
+
+Steps 1 and 2 are achieved by invoking TVM scheduling
+primitives on the tensor DSL level, and step 3 is a tensor IR
+transformation pass.
+
+Next, we discuss the implementation of the tuning strategies
+
+discussed in the last section.
+CPU Tuning: The code sketch of tuned CPU code is shown
+in Figure 7. To implement the tuning we discussed in Sec-
+tion III-C, we enumerate two breaking points on the data
+parallel loop nest, which deﬁne how the loop levels are
+parallelized and unrolled. A breaking point is deﬁned by a
+loop level and tiling factor, giving more ﬂexibility to the
+division. Loops before the ﬁrst breaking point, will be fused and
+
+A. Target Hardware Platforms
+
+We assess UNIT on three hardware platforms:
+
+Intel x86 CPU: We use Amazon EC2 C5.12xlarge instance
+as our x86 platform with 24-core Intel Xeon Platinum 8275CL
+CPU @3.00GHz (codename: Cascade Lake) and 96GB mem-
+ory.
+ARM CPU: We use Amazon EC2 M6g.8xlarge instance as our
+ARM platform with AWS Graviton2 CPU, which features 32-
+core ARM Cortex-A72 CPU @2.30GHz and 128GB memory.
+Nvidia GPU: We use Amazon EC2 P3.2xlarge instance as our
+GPU platform with Nvidia Tesla V100 SXM2 GPU that has
+16GB host memory.
+
+for (ax0=0; ax0<ext0; ++ax0)  ...    for (axn=0; axn<extn; ++axn)      // Reduce Loops      for (r0=0; r0<extr0; ++r0)        ...          for (rm=0; r1<ext_rm; ++rm)            tensorized-instruction;parallel (fused=0; fused<fused_ext; ++fused)  for (serial=0; serial<serial_ext; ++serial)    for (r0=0; r0<extr0; ++r0)      ...      for (rm=0; r1<ext_rm; ++rm) {        tensorized-instruction.0;        tensorized-instruction.1;        ... }  (a) Loop Organization After Tensorization(b) Tuned Code Sketchfuse and parallelreorder and unrollserialized exec.break pointsFig. 8: Quantized network inference (bs=1) accelerated by Intel VNNI.
+
+Fig. 9: Mixed precision network inference (bs=1) accelerated by Tensor Core.
+
+B. Software Frameworks
+
+3) Can UNIT be extended to support new hardware plat-
+
+Code Generation: All programs implemented in Apache TVM
+are emitted to LLVM IR for code generation. We choose LLVM-
+10 as our backend, and to be compatible, we use CUDA-10.0
+as the NVPTX linker and runtime.
+Baseline: We use vendor-provided libraries for baseline per-
+formance of operators whenever possible. Speciﬁcally, Intel
+oneDNN v1.6.1 and Nvidia cuDNN 7.6.5 are used as our
+CPU and GPU baselines, respectively. For end-to-end model
+inference, we looked for the best available solutions with
+those libraries, which was MXNet integrated with oneDNN for
+CPU and TVM integrated with cuDNN for GPU. Another set
+of baselines is the manually written implementation. To this
+end, we use the existing TVM solutions for Intel and ARM
+CPUs, which involve heavy engineering effort to carefully write
+intrinsics to use Intel VNNI and ARM DOT instructions. We
+did not ﬁnd a manually written Tensor Core implementation
+that covers our evaluated workloads.
+
+C. Workloads
+
+DNN Models: All DNN models are from the MXNet Model
+Zoo and converted to TVM’s graph IR, Relay [32], for
+quantization [19], layout transformation, and data padding.
+All these models adopt NCHW[x]c data layout [23] for the
+data and KCRS[y]k[x]c for the kernel. Here N denotes the
+batch size, C denotes the input channels, H and W are the width
+and height of the input image, and [x]c denotes that the
+original C is split by x. Similarly, K denotes the number of
+output channels, R and S are the height and width of the kernel,
+and [y]k denotes the original dimension K is split by y. [x]
+equals to the number of lanes of the instruction output, and
+[y] equals to the width of reduction.
+
+In the evaluation, we target the N=1 cases, because it is hard
+to optimize but critical for inference use cases. Comparing
+with batched cases where N>1, we cannot reuse the kernel
+tensor across samples, or exploit the parallelism brought by
+the data-parallel batching dimension.
+
+VI. EVALUATION
+
+Our evaluation of UNIT attempts to answer these questions:
+1) What is the performance of the end-to-end deep learning
+model inference powered by tensorized instructions?
+2) How does each optimization technique that UNIT uses
+
+impact the performance?
+
+forms and tensor operations?
+
+A. End-to-End Performance
+
+In this subsection, we show the UNIT end-to-end effective-
+ness on Intel x86 and Nvidia GPU processors for tensorizing
+mixed precision instructions. For Intel x86 experiments, we use
+MXNet integrated with Intel oneDNN (referred to as MXNet-
+oneDNN) as the baseline. Another comparison of ours is TVM
+with manually written schedules using Intel’s VNNI instruction.
+The ﬁndings of this experiment are shown in Figure 8.
+
+We observe that UNIT achieves signiﬁcant speedup com-
+pared to MXNet-oneDNN. Note that Intel oneDNN has access
+to manually written schedules that have been aggressively
+optimized and tuned by domain experts. We also observe
+that TVM overall achieves better performance than MXNet-
+oneDNN, but has suboptimal performance on resnet50 and
+resnet50b, which were heavily tuned by oneDNN engineers.
+On the other hand, UNIT outperforms both baselines, by 1.3×
+over MXNet-oneDNN and by 1.18× over TVM.
+
+Next, we test the efﬁcacy of UNIT on utilizing Nvidia
+Tensor Core instructions for Nvidia GPUs. For the baseline,
+we integrate TVM with cuDNN, which has access to manually
+written aggressively tuned Tensor Core schedules. The ﬁndings
+of this experiment are shown in Figure 9. We observe that
+UNIT consistently achieves better performance than cuDNN
+with a mean speedup of 1.75× and up to 2.2×.
+
+B. Optimization Implications
+
+In this subsection, we focus on the convolution operators
+of the DNN models to perform an in-depth analysis of the
+impact of different optimization techniques used by UNIT’s
+Rewriter. This is essentially an ablation study, showing how
+important different parts of UNIT are. There are 148 different
+convolution workloads (i.e., convolution with different feature
+map sizes, kernel sizes, strides, etc.) in the models, out of
+which we choose 16 representative convolution layers. These
+kernels cover diverse input shapes and strides. Other workloads
+behave similarly in the ablation study. We summarize the
+characteristics, namely, convolution attributes, like shapes,
+strides, etc., of the selected workloads in Table I.
+Intel x86 servers: As we discussed in Section III-C, we have
+two breaking points in CPU scheduling. The loop nests before
+the ﬁrst breaking point are parallelized and the loop nests
+after the second breaking point are unrolled, while the ones
+in between the breaking point are executed serially. As loop
+
+resnet-18resnet-50resnet-50_v1binception-bninception-v3resnet-101resnet-152mobilenet-v1mobilenet-v2geomean0.00.51.01.52.0Relative PerformanceMxNet w/ oneDNNTVMUNITresnet-18resnet-50resnet-50_v1binception-bninception-v3resnet-101resnet-152mobilenet-v1mobilenet-v2geomean0.00.51.01.52.02.5Relative PerformancecuDNN (fp16) w/ Tensor CoreUNITnests can either be parallelized or unrolled (remaining one
+is serialized), we have a search space represented by the
+tuning pairs. Rewriter tunes this search space to generate a
+high-performance kernel. In this experiment, we incrementally
+measure the performance improvements brought by paralleliz-
+ing, unrolling and tuning. The ﬁndings of this experiment are
+shown in Figure 10, normalizing the speedup to Intel oneDNN
+execution latency.
+
+First we fuse outer loop nests such that the loop bound
+of the fused loop nest is < 3000, and measure the latency
+of the resulting kernel (shown by Parallel). Then, we take
+the remaining loop nests, and tile and unroll them such the
+unrolling factor is < 8, and measure this performance (shown
+by +Unroll). Finally, instead of setting the limits as 3000 and 8,
+we tune the search space and measure performance (shown by
++Tune), getting the ﬁnal latency UNIT achieves. We observe
+that Parallel and Unroll together is responsible for most of the
+speedup. The additional speedup introduced by Tuning is quite
+small. It turns out that more than half of the kernels get the
+optimal performance on the ﬁrst tuning pair (i.e. 3000 and 8),
+and more than 95% of the kernels get the optimal performance
+within the ﬁrst 8 tuning pairs.
+
+CPU does poorly on workloads #1 and #4, because their
+output shapes (OH/OW) can neither be perfectly tiled nor fully
+unrolled. Inherited from TVM, loop residues are handled the by
+guarding it with a likely clause, which results in an if-branch
+that harms the performance.
+Nvidia GPU servers: As discussed in Section III-C, we
+employ three optimizations on GPU: generic coarse- and ﬁne-
+grained parallelism, fusing width and height to save memory
+bandwidth, and parallelizing the reduction dimension. In this
+subsection, we study the impact of these optimizations on the
+performance. We show the ﬁndings in Figure 11, normalizing
+the speedup to Nvidia cuDNN.
+
+According to our evaluation, any unrolling degree (p in
+Figure 6) larger than 2 may overwhelm the registers, so
+we use p=2 to apply the generic optimization. The generic
+optimization already beat cuDNN in most cases (shown by
+Generic). Then, depending on the height and width values,
+Rewriter fuses the height and width dimensions to save memory
+bandwidth (shown by +FuseDim). Then, we split the reduction
+dimension K by 64 and measure the performance (+SplitK).
+Finally, we let Rewriter to choose the sizes for these 3
+optimizations and measure performance (shown by +Tune).
+
+We observe that SplitK leads to the maximal speedup, as
+it leads to signiﬁcant parallelism and keeps the Tensor Cores
+busy. More than 70% of the kernels can get high performance
+by employing fusion and parallelizing the reduction dimension.
+Similar to CPUs, the additional speedup by tuning is small.
+
+UNIT cannot outperform cuDNN on #1 and #15, because
+the strided data accesses lead to less data locality. However,
+since these adversarial cases (both CPU and GPU) only occupy
+a very small portion among all these models, we can still
+outperform vendor-provided libraries because of the generality
+of our optimization.
+
+Fig. 10: The performance impact of the code space exploration.
+
+Fig. 11: The performance impact of the code space exploration.
+TABLE I
+CHARACTERISTICS OF THE SELECTED CONVOLUTION LAYERS.
+
+1
+
+2
+
+3
+
+4
+
+5
+
+6
+
+7
+
+8
+
+9
+
+10 11 12 13 14 15 16
+
+C
+IHW 35 9
+K
+3
+R=S 3
+Stride 2
+1
+OHW 17 7
+
+288 160 1056 80 128 192 256 1024 128 576 96 1024 576 64 64 608
+
+7
+
+73 16 16 16 14 16 14 16 14 14 29 56 14
+384 224 192 192 128 192 256 512 160 192 128 256 128 96 128 192
+3
+1
+
+1
+1
+3
+1
+1
+1
+71 14 14 14 14 14 14 14 14 14 27 28 14
+
+1
+1
+7
+
+1
+2
+
+3
+1
+
+3
+1
+
+3
+1
+
+3
+1
+
+3
+1
+
+1
+1
+
+1
+1
+
+1
+1
+
+C. Extensibility
+
+We evaluate the extensibility of UNIT in two aspects: to new
+hardware platforms and to new deep learning tensor operations.
+We observe that by just representing the semantics of the new
+tensorized instruction in tensor DSL, UNIT can easily extend
+to new tensorized instructions and tensor operations.
+New Hardware Platforms: To demonstrate the capability of
+extending to new hardware platforms, we apply UNIT to an
+ARM CPU supporting the ARM DOT instruction. To the
+best of our knowledge, there is a lack of a deep learning
+framework with well-integrated ARM backend library support.
+In the absence of a framework baseline, we choose TVM
+compiling to ARM Neon assembly as the baseline (shown by
+TVM-NEON). Additionally, we ﬁnd that TVM has manually-
+written schedules using ARM DOT instructions, which forms
+our second comparison baseline (shown by TVM-Manual).
+Note that in contrast to UNIT’s automatic approach, this is a
+manually written schedule requiring intense engineering efforts.
+Finally, we represent the semantics of ARM DOT instruction in
+UNIT’s tensor DSL and use UNIT to compile the models. The
+ﬁndings of this experiment are shown in Figure 12, showing
+normalized speedup compared to the TVM-Neon baseline. The
+results show that UNIT consistently outperforms both TVM-
+NEON and TVM-Manual, proving UNIT’s effectiveness in
+extending to new hardware platforms.
+3D Convolution: We test UNIT on 3D convolution operation
+for mapping Intel VNNI tensorized instructions. Note that this
+does not require any changes from UNIT perspective; we are
+just giving a new input (tensor-level IR for conv3d) to UNIT.
+
+1234567891011121314151601234Relative PerformanceoneDNNParallel+Unroll+Tune123456789101112131415160123Relative PerformancecuDNNGeneric+FuseDim+SplitK+Tune(DAE) architectures [21], [30], [26], [41], [13], [42], [40].
+Computation and data access are decoupled and specialized
+separately. The computation is ofﬂoaded onto a programmable
+data path and data access is encoded in hardware intrinsics and
+executed on specialized address generation unit (AGU). UNIT
+adopts a reversed approach, it matches computation on a ﬁxed
+data path, and analyzes data access fed to the data path.
+Polyhedral model: Many prior works have built program
+analysis and transformation frameworks based on the polyhedral
+model for tensor programs [20], [36], [35], [15], [37], [12],
+[25], [38]. Loop Tactics [9] is one representative work which
+matches the pre-deﬁned computation patterns in the polyhedral
+IR and transforms the matched patterns to optimized programs.
+UNIT distinguishes itself from Loop Tactics in: 1) Compared
+with the schedule tree [39] in the polyhedral model, the
+tensor DSL provides more information such as loop reduction
+properties and operand types; 2) UNIT provides an end-
+to-end solution including auto-tuning to obtain the optimal
+performance, whereas Loop Tactics requires the optimized
+schedules to be provided manually.
+Deep learning frameworks: UNIT is complementary to the
+existing deep learning frameworks. Existing frameworks such
+as Tensorﬂow [8], PyTorch [7], and MXNet [3] rely on vendor-
+crafted libraries to support the new tensor intrinsics. TVM [10]
+requires code re-writing at the user side. UNIT is able to
+handle new operators which might not be covered by the
+vendor libraries and spare the user from having to perform
+manual re-writing. We have demonstrated the effectiveness of
+the methodology of UNIT based on TVM. Similar technique
+can be applied to other frameworks to further boost their
+performance.
+
+VIII. CONCLUSION
+Deep learning has prompted hardware vendors to add
+specialized tensorized instructions for dense tensor operations.
+These instructions perform “horizontal reduction” accumulate
+elementwise computation. While promising, introducing this
+new idiom complicates its general purpose applicability, as one
+has to rely on hand-written kernels to gain high performance
+brought by these instructions. In this paper, we introduce UNIT,
+a uniﬁed compilation pipeline, that represents the tensorized
+instructions from different hardware platforms using the same
+IR, then automatically detects the applicability of the tensorized
+instructions in a given tensor operation, transforms the loop
+nest to enable easy mapping of the tensorized instruction, and
+ﬁnally rewrites the loop body with the tensorized instructions.
+UNIT enables automatic tensorized instruction compilation
+over a variety of hardware platforms like Intel/ARM CPUs and
+Nvidia GPUs. Our analysis shows that UNIT achieves 1.3×
+speedup over oneDNN (VNNI instruction), 1.75× over cuDNN
+(Tensor Core instruction), and 1.13× over the manually written
+ARM intrinsics in TVM (DOT instruction).
+
+ACKNOWLEDGEMENTS
+
+This work is supported by NSF grant CCF-1751400 and Mu
+
+Li’s team at Amazon Web Services.
+
+Fig. 12: The performance of ARM on model inference.
+
+Fig. 13: The performance of each layer on res18-3d.
+
+To evaluate this extensibility, we take all the 2D convolutions
+from Resnet18 and manually convert them to 3D convolutions.
+We then apply UNIT on these kernels and show the speedup
+compared to oneDNN baseline in Figure 13. We observe that
+UNIT easily extends to 3D convolution, as it has comparable
+performance for many convolution kernels, with an average of
+1.2× speedup.
+
+VII. RELATED WORK
+
+Compilation support for hardware intrinsics: There exists
+a large body of literature on compilation support for various
+hardware intrinsics [33], [20], [27], [29], [16], [22], [28],
+[15], [36], [35]. Existing production compilers such as GCC
+and LLVM implement auto-vectorization to leverage SIMD
+intrinsics. Prior works such as [20], [33] propose various
+approaches to further improve the performance of the auto-
+vectorizer. These approaches cannot be extended to support
+tensor computation intrinsics which introduce “horizontal
+computation” within each lane. TVM [10] implements an
+extensible interface to support new hardware intrinsics that
+are not limited to SIMD instructions. However, programmers
+need to transform the program to match the behavior of the
+intrinsics and declare the lowering rule for the intrinsics prior
+to compilation. TVM will match the computation and replace
+it with the code snippets that call the target hardware intrinsics.
+Compared to TVM, UNIT performs the code detection and
+transformation automatically. This achieves higher ﬂexibility
+and productivity. There are some prior works that, similar
+to UNIT, also perform program transformation and code
+generation automatically for tensor computation [36], [35].
+However, these are limited to one platform or certain intrinsics
+and hence are not as ﬂexible as UNIT.
+Decoupled Computation and Data Access: The analysis
+pass of UNIT is inspired by the decoupled-access execute
+
+resnet-18resnet-50resnet-50_v1binception-bninception-v3resnet-101resnet-152mobilenet-v1mobilenet-v2geomean02468Relative Performance12.610.015.4TVM-NEONTVM-ManualUNIT012345678910gmean0.00.20.40.60.81.01.2Relative Performance2.02.42.0oneDNNUNITAPPENDIX
+
+2) Hardware Dependencies:
+
+A. Abstract
+
+This guide describes how to set up UNIT compilation
+infrastructure and run the workloads we discussed in Section VI.
+This guide provides instructions to:
+
+• Set up the experiment environment for UNIT through
+
+Docker.
+
+• Run end-to-end inference model shown in Figure 8, 9,
+
+and 12.
+
+• Run the experiments to demonstrate the effects of our
+
+tuning strategies shown in Figure 10, and 11.
+
+• Run the 3D-convolution results shown in Figure 13.
+
+are
+
+Our
+
+experiments
+
+conducted on Amazon EC2
+c5.12xlarge for Intel VNNI, p3.2xlarge for Nvidia
+TensorCore, and m6g.8xlarge for ARM VDOT. To down-
+load and install our infrastructure, approximately 32GB of
+disk is required. We provide Dockerfile to set up the
+environment, and scripts to automatically run the experiments
+and plot the ﬁgures.
+
+B. Artifact Checklist
+
+• Program: As it is demonstatrated in Section V, we use
+nine typical DNN models, including ResNet, ImageNet,
+and MobileNet.
+
+• Compilation: We need speciﬁc versions of TVM to run
+our experiments and baselines. They are included in the
+zip release.
+
+• Data set: The test data is included in our zip release.
+• Runtime environment: We run our artifact all on Ubuntu
+18.04. For GPU, Nvidia GPU driver and additional runtime
+for Docker should be installed.
+
+• Hardware: We run our experiments on AWS
+EC2
+Intel
+VNNI, p3.2xlarge for Nvidia TensorCore, and
+m6g.8xlarge for ARM DOT.
+
+instances — c5.12xlarge
+
+for
+
+• Execution: We provide scripts to run our experiments
+discussed in Section VI. It takes 2 hours to compile the
+models in Figure 8, half an hour to compile the models in
+Figure 9, and 1.4 hours to compile the models in Figure 12.
+It takes half an hour to run the experiments in Figure 10,
+and 11.
+
+• Output: Our scripts both run the experiments and plot
+
+the ﬁgures in PDF ﬁles.
+
+• Experiments: The results reported in our paper are
+generated by a physical machine, but in this artifact
+evaluation they all run on a virtual machine in Docker.
+Performance ﬂuctuation may happen because of the
+overhead of virtualization.
+
+C. Description
+
+1) How Delivered: Download our Dockerﬁle, scripts, and
+
+model test data at https://doi.org/10.5281/zenodo.4420522.
+
+• AVX512_VNNI: This is available on Intel CPUs with
+Cascadelake architecture. In this work, we use AWS EC2
+c5.12xlarge. The CPU model is Intel(R) Xeon(R)
+Platinum 8275CL CPU @3.00GHz. The rate is $2.04/hour,
+and it
+takes approximately one hour to set up the
+environment and 5 hours to run all the related experiments.
+• TensorCore: This is avaiable on Nvidia GPUs with
+TensorCore extension. In this work, we use AWS EC2
+p3.2xlarge. The GPU model is Tesla V100. Please
+install the GPU driver. The rate is $3.06/hour, and it
+takes approximately 1 hour to set up the environment, and
+another one hour run all the related experiments.
+
+• ARM VDOT: This is available on ARM CPU v8.2 with
+dotprod extension. In this work, we use AWS EC2
+m6g.8xlarge. The CPU model is Amazon Graviton 2.
+The rate is $1.232/hour, and it takes 1 hour to set up the
+environment and run the experiments.
+
+3) Software Dependencies: All our software dependences
+are installed automatically in Docker. Refer to this link for
+Docker installation. When setting up the last step of the the
+package repository, do choose the proper tab for your CPU
+platform (x86 or ARM). Refer to this to install Docker that
+runs Nvidia GPU. Nvidia Docker requires GPU driver installed,
+use this command to install:
+
+$ sudo apt-get install nvidia-driver-455
+
+D. Installation
+
+Unzip the downloaded ﬁle, and there are three sub-zips —
+tensorcore.zip, vnni.zip, and arm.zip to evaluate
+the three platform we discussed in this paper.
+
+E. Experiment Workﬂow
+
+1) GPU: We run the TensorCore experiment on an AWS
+
+EC2 p3.2xlarge instance.
+
+• After building the docker image, an image hash value will
+
+be generated in the console log:
+
+$ unzip tensorcore.zip && cd tensorcore
+$ sudo docker build . # 20 mins to build
+$ sudo docker run -tid --runtime=nvidia <image>
+$ sudo docker attach <container>
+
+• After entering the container, the experiment scripts are
+
+all in $HOME directory:
+
+$ cd $HOME
+
+• To replicate experiments run in Figure 9, and 11:
+
+$ bash run_e2e.sh # Fig.9: e2e.pdf
+$ bash run_ablation.sh # Fig.11: gpu-dse.pdf
+
+• It takes half an our to run these two scripts. Both the
+experiments and data plotting are done in these two scripts.
+Use these commands to take the generated PDF out of
+the container and look at them:
+
+$ <ctrl-p><ctrl-q> # Temporarily detach
+$ sudo docker cp <container>:/root/e2e.pdf gpu-
+
+e2e.pdf
+
+$ sudo docker cp <container>:/root/gpu-dse.pdf .
+
+2) CPU: We run the Intel VNNI experiment on an AWS
+EC2 c5.12xlarge instance. It is also used to cross-compile
+ARM target.
+
+• After building the docker image, an image hash value will
+
+be generated in the console log:
+
+$ unzip vnni.zip && cd vnni
+$ sudo docker build .
+$ sudo docker run -tid <image>
+$ sudo docker attach <container>
+
+• After entering the container, the experiment scripts are
+
+all in $HOME directory:
+
+$ cd $HOME
+
+• To replicate experiments run in Figure 8, 10, and 13:
+
+$ bash run_e2e.sh # Fig.8: e2e.pdf
+$ bash run_ablation.sh # Fig.10: cpu-dse.pdf
+$ bash run_3d.sh # Fig.13: conv3d.pdf
+
+• It takes about 2.5 hours to run these experiments, and you
+can use the following commands to take out these plotted
+ﬁgures and look at them:
+
+$ <ctrl-p><ctrl-q> # Temporarily detach
+$ sudo docker cp <container>:/root/e2e.pdf .
+$ mv e2e.pdf cpu-e2e.pdf # Avoid conflict
+$ sudo docker cp <container>:/root/gpu-dse.pdf .
+$ sudo docker cp <container>:/root/conv3d.pdf .
+
+• Use the following script to run ARM target compilation:
+
+$ bash run_arm.sh
+
+takes about
+
+It
+two hours to get all models com-
+piled on ARM. The compiled models will be in
+$HOME/arm-base and $HOME/arm-unit.
+• Copy the compiled model to the ARM machine:
+
+$ scp -i key.pem -r arm-unit <arm-machine>:~
+$ scp -i key.pem -r arm-base <arm-machine>:~
+$ ssh -i key.pem <arm-machine>
+
+• Set up the ARM environment and run the experiments on
+
+ARM machine:
+
+$ unzip arm.zip && cd arm
+$ mv ../arm-unit .
+$ mv ../arm-base .
+$ sudo docker build .
+$ sudo docker run -tid <image>
+$ sudo docker attach <container>
+$ cd $HOME && bash run_e2e.sh
+<ctrl-p> <ctrl-q>
+$ sudo docker cp \
+
+<container>:/root/baseline.result .
+
+$ sudo docker cp \
+
+<container>:/root/tensorize.result .
+
+• Bring these two .result ﬁles to a x86 machine, and
+
+plot the graph:
+
+$ python plot_e‘2e.py baseline.result tensorize.
+
+result
+
+# Fig. 13
+$ mv e2e.pdf arm-e2e.pdf
+
+F. Evaluation and Expected Result
+
+Finally, we have these PDF ﬁles:
+• Figure 8, 9, and 12 should be compared against
+cpu-e2e.pdf, gpu-e2e.pdf, and arm-e2e.pdf.
+– The ARM results reported in this paper were gener-
+ated by an old version of TVM. The performance is
+improved in the newer version. We will ﬁx this in
+camera ready.
+
+• Figure 10, and 11 should be compared against
+
+cpu-dse.pdf, and gpu-dse.pdf.
+
+• Figure 13 should be compared against conv3d.pdf.
+
+REFERENCES
+
+[1] Exploring
+
+the
+
+Arm
+
+dot
+
+product
+
+instructions.
+
+https://community.arm.com/developer/tools-software/tools/b/tools-
+software-ides-blog/posts/exploring-the-arm-dot-product-instructions,
+2017.
+
+[2] Introduction
+
+to
+
+Intel
+
+deep
+
+generation
+
+on
+sec-
+ond
+processors.
+https://software.intel.com/content/www/us/en/develop/articles/introduction-
+to-intel-deep-learning-boost-on-second-generation-intel-xeon-
+scalable.html, 2019.
+
+learning
+
+scalable
+
+boost
+
+Xeon
+
+Intel
+
+[3] Apache MXNet | a ﬂexible and efﬁcient library for deep learning.
+
+https://mxnet.apache.org/versions/1.6/, 2020.
+
+[4] Nvidia
+
+CUDA®
+
+deep
+
+neural
+
+network
+
+library
+
+(cuDNN).
+
+https://developer.nvidia.com/cudnn, 2020.
+
+[5] Nvidia tensor cores. https://www.nvidia.com/en-us/data-center/tensor-
+
+cores/, 2020.
+
+[6] oneAPI deep neural network library (oneDNN). https://github.com/oneapi-
+
+src/oneDNN, 2020.
+
+[7] Pytorch. https://pytorch.org/, 2020.
+[8] Tensorﬂow. https://www.tensorﬂow.org/, 2020.
+[9] Lorenzo Chelini, Oleksandr Zinenko, Tobias Grosser, and Henk Corpo-
+raal. Declarative loop tactics for domain-speciﬁc optimization. ACM
+Transactions on Architecture and Code Optimization (TACO), 16(4):1–25,
+2019.
+
+[10] Tianqi Chen, Thierry Moreau, Ziheng Jiang, Lianmin Zheng, Eddie Yan,
+Haichen Shen, Meghan Cowan, Leyuan Wang, Yuwei Hu, Luis Ceze,
+et al. TVM: An automated end-to-end optimizing compiler for deep
+learning. In 13th USENIX Symposium on Operating Systems Design and
+Implementation (OSDI 18), pages 578–594, 2018.
+
+[11] Tianqi Chen, Lianmin Zheng, Eddie Yan, Ziheng Jiang, Thierry Moreau,
+Luis Ceze, Carlos Guestrin, and Arvind Krishnamurthy. Learning to
+optimize tensor programs. In Advances in Neural Information Processing
+Systems, pages 3389–3400, 2018.
+
+[12] Jason Cong and Jie Wang. PolySA: Polyhedral-based systolic array
+In 2018 IEEE/ACM International Conference on
+
+auto-compilation.
+Computer-Aided Design (ICCAD), pages 1–8. IEEE, 2018.
+
+[13] Vidushi Dadu and Tony Nowatzki. Towards general purpose acceleration
+by exploiting common data-dependence forms. In Proceedings of the
+52nd Annual IEEE/ACM International Symposium on Microarchitecture,
+2019.
+
+[14] J. Deng, W. Dong, R. Socher, L. Li, Kai Li, and Li Fei-Fei. ImageNet:
+A large-scale hierarchical image database. In 2009 IEEE Conference on
+Computer Vision and Pattern Recognition, pages 248–255, 2009.
+[15] Andi Drebes, Lorenzo Chelini, Oleksandr Zinenko, Albert Cohen, Henk
+Corporaal, Tobias Grosser, Kanishkan Vadivel, and Nicolas Vasilache.
+TC-CIM: Empowering tensor comprehensions for computing-in-memory.
+In IMPACT 2020-10th International Workshop on Polyhedral Compilation
+Techniques, 2020.
+
+[16] Alexandre E Eichenberger, Peng Wu, and Kevin O’brien. Vectorization
+for simd architectures with alignment constraints. Acm Sigplan Notices,
+39(6):82–93, 2004.
+
+[17] Qingchang Han, Yongmin Hu, Fengwei Yu, Hailong Yang, Bing Liu,
+Peng Hu, Ruihao Gong, Yanfei Wang, Rui Wang, Zhongzhi Luan, and
+Depei Qian. Extremely low-bit convolution optimization for quantized
+neural network on modern computer architectures. In ICPP ’20: 49th
+International Conference on Parallel Processing - ICPP, 2020.
+
+[18] Benoit Jacob, Skirmantas Kligys, Bo Chen, Menglong Zhu, Matthew
+Tang, Andrew G. Howard, Hartwig Adam, and Dmitry Kalenichenko.
+Quantization and training of neural networks for efﬁcient journal. CoRR,
+abs/1712.05877, 2017.
+
+[19] Animesh Jain, Shoubhik Bhattacharya, Masahiro Masuda, Vin Sharma,
+and Yida Wang. Efﬁcient execution of quantized deep learning models:
+A compiler approach. arXiv preprint arXiv:2006.10226, 2020.
+
+[20] Martin Kong, Richard Veras, Kevin Stock, Franz Franchetti, Louis-Noël
+Pouchet, and Ponnuswamy Sadayappan. When polyhedral transformations
+meet SIMD code generation. In Proceedings of the 34th ACM SIGPLAN
+conference on Programming language design and implementation, pages
+127–138, 2013.
+
+[21] Hyoukjun Kwon, Ananda Samajdar, and Tushar Krishna. MAERI:
+Enabling ﬂexible dataﬂow mapping over DNN accelerators via reconﬁg-
+urable interconnects. SIGPLAN Not., 53(2):461–475, March 2018.
+[22] Samuel Larsen and Saman Amarasinghe. Exploiting superword level
+parallelism with multimedia instruction sets. Acm Sigplan Notices,
+35(5):145–156, 2000.
+
+[23] Yizhi Liu, Yao Wang, Ruofei Yu, Mu Li, Vin Sharma, and Yida Wang.
+Optimizing CNN model inference on CPUs. In 2019 USENIX Annual
+Technical Conference (USENIX ATC 19), pages 1025–1040, Renton, WA,
+July 2019. USENIX Association.
+
+[24] Paulius Micikevicius, Sharan Narang, Jonah Alben, Gregory F. Diamos,
+Erich Elsen, David García, Boris Ginsburg, Michael Houston, Oleksii
+Kuchaiev, Ganesh Venkatesh, and Hao Wu. Mixed precision training.
+CoRR, abs/1710.03740, 2017.
+
+[25] MLIR. Multi-level IR compiler framework. https://mlir.llvm.org.
+[26] Tony Nowatzki, Vinay Gangadhar, Newsha Ardalani, and Karthikeyan
+Sankaralingam. Stream-dataﬂow acceleration. In 2017 ACM/IEEE 44th
+Annual International Symposium on Computer Architecture (ISCA), 2017.
+[27] Dorit Nuzman and Richard Henderson. Multi-platform auto-vectorization.
+In Proceedings of the International Symposium on Code Generation and
+Optimization, CGO ’06, page 281–294, USA, 2006. IEEE Computer
+Society.
+
+[28] Dorit Nuzman, Ira Rosen, and Ayal Zaks. Auto-vectorization of
+interleaved data for SIMD. In Michael I. Schwartzbach and Thomas
+Ball, editors, Proceedings of the ACM SIGPLAN 2006 Conference on
+Programming Language Design and Implementation, Ottawa, Ontario,
+Canada, June 11-14, 2006, pages 132–143. ACM, 2006.
+
+[29] Phitchaya Mangpo Phothilimthana, Archibald Samuel Elliott, An Wang,
+Abhinav Jangda, Bastian Hagedorn, Henrik Barthels, Samuel J Kaufman,
+Vinod Grover, Emina Torlak, and Rastislav Bodik. Swizzle inventor:
+In Proceedings of the
+data movement synthesis for GPU kernels.
+Twenty-Fourth International Conference on Architectural Support for
+Programming Languages and Operating Systems, pages 65–78, 2019.
+
+[34] Nadav Rotem, Jordan Fix, Saleem Abdulrasool, Summer Deng, Roman
+Dzhabarov, James Hegeman, Roman Levenstein, Bert Maher, Satish
+Nadathur, Jakob Olesen, Jongsoo Park, Artem Rakhov, and Misha
+Smelyanskiy. Glow: Graph lowering compiler techniques for neural
+networks. CoRR, abs/1805.00907, 2018.
+
+[30] Raghu Prabhakar, Yaqi Zhang, David Koeplinger, Matt Feldman, Tian
+Zhao, Stefan Hadjis, Ardavan Pedram, Christos Kozyrakis, and Kunle
+Olukotun. Plasticine: A reconﬁgurable architecture for parallel paterns.
+In 2017 ACM/IEEE 44th Annual International Symposium on Computer
+Architecture (ISCA), 2017.
+
+[31] Jonathan Ragan-Kelley, Connelly Barnes, Andrew Adams, Sylvain Paris,
+Frédo Durand, and Saman Amarasinghe. Halide: A language and
+compiler for optimizing parallelism, locality, and recomputation in
+image processing pipelines. In Proceedings of the 34th ACM SIGPLAN
+Conference on Programming Language Design and Implementation,
+PLDI ’13, pages 519–530, New York, NY, USA, 2013. ACM.
+
+[32] Jared Roesch, Steven Lyubomirsky, Logan Weber, Josh Pollock, Marisa
+Kirisame, Tianqi Chen, and Zachary Tatlock. Relay: A new IR for
+machine learning frameworks. In Proceedings of the 2nd ACM SIG-
+PLAN International Workshop on Machine Learning and Programming
+Languages, MAPL 2018, page 58–68, New York, NY, USA, 2018.
+Association for Computing Machinery.
+
+[33] Ira Rosen, D. Nuzman, and A. Zaks. Loop-aware SLP in GCC. pages
+
+131–142, 01 2007.
+
+[35] Vinod Grover Somashekaracharya G. Bhaskaracharya, Julien Demouth.
+Automatic kernel generation for Volta tensor cores. arXiv preprint
+arXiv:2006.12645, 2020.
+
+[36] Sanket Tavarageri, Alexander Heinecke, Sasikanth Avancha, Gagandeep
+Goyal, Ramakrishna Upadrasta, and Bharat Kaul. PolyDL: Polyhedral
+optimizations for creation of high performance DL primitives. arXiv
+preprint arXiv:2006.02230, 2020.
+
+[37] Nicolas Vasilache, Oleksandr Zinenko, Theodoros Theodoridis, Priya
+Goyal, Zachary DeVito, William S Moses, Sven Verdoolaege, Andrew
+Adams, and Albert Cohen.
+Tensor comprehensions: Framework-
+agnostic high-performance machine learning abstractions. arXiv preprint
+arXiv:1802.04730, 2018.
+
+[38] Sven Verdoolaege, Juan Carlos Juega, Albert Cohen, Jose Ignacio Gomez,
+Christian Tenllado, and Francky Catthoor. Polyhedral parallel code
+generation for CUDA. ACM Transactions on Architecture and Code
+Optimization (TACO), 9(4):1–23, 2013.
+
+[39] Sven Verdoolaege, Serge Guelton, Tobias Grosser, and Albert Cohen.
+Schedule trees. In International Workshop on Polyhedral Compilation
+Techniques, Date: 2014/01/20-2014/01/20, Location: Vienna, Austria,
+2014.
+
+[40] Z. Wang and T. Nowatzki. Stream-based memory access specialization for
+general purpose processors. In 2019 ACM/IEEE 46th Annual International
+Symposium on Computer Architecture (ISCA), pages 736–749, 2019.
+
+[41] J. Weng, S. Liu, V. Dadu, Z. Wang, P. Shah, and T. Nowatzki. DSAGEN:
+Synthesizing programmable spatial accelerators. In 2020 ACM/IEEE
+47th Annual International Symposium on Computer Architecture (ISCA),
+pages 268–281, 2020.
+
+[42] J. Weng, S. Liu, Z. Wang, V. Dadu, and T. Nowatzki. A hybrid systolic-
+dataﬂow architecture for inductive matrix algorithms. In 2020 IEEE
+International Symposium on High Performance Computer Architecture
+(HPCA), pages 703–716, 2020.
+
+[43] XLA Team. Xla - tensorﬂow, compiled, March 2017.
+[44] D. Yan, W. Wang, and X. Chu. Demystifying tensor cores to optimize
+half-precision matrix multiply. In 2020 IEEE International Parallel and
+Distributed Processing Symposium (IPDPS), pages 634–643, 2020.
+
+

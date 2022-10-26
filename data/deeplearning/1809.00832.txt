@@ -1,0 +1,2649 @@
+Improving the Expressiveness of
+Deep Learning Frameworks with Recursion†
+
+Eunji Jeong∗, Joo Seong Jeong∗, Soojeong Kim, Gyeong-In Yu, Byung-Gon Chun‡
+Seoul National University
+{ejjeong, joosjeong, soojeong kim, gyeongin, bgchun}@snu.ac.kr
+
+8
+1
+0
+2
+
+p
+e
+S
+4
+
+]
+
+G
+L
+.
+s
+c
+[
+
+1
+v
+2
+3
+8
+0
+0
+.
+9
+0
+8
+1
+:
+v
+i
+X
+r
+a
+
+Abstract
+Recursive neural networks have widely been used by re-
+searchers to handle applications with recursively or hierarchi-
+cally structured data. However, embedded control ﬂow deep
+learning frameworks such as TensorFlow, Theano, Caffe2, and
+MXNet fail to efﬁciently represent and execute such neural net-
+works, due to lack of support for recursion. In this paper, we add
+recursion to the programming model of existing frameworks by
+complementing their design with recursive execution of dataﬂow
+graphs as well as additional APIs for recursive deﬁnitions. Un-
+like iterative implementations, which can only understand the
+topological index of each node in recursive data structures, our
+recursive implementation is able to exploit the recursive rela-
+tionships between nodes for efﬁcient execution based on parallel
+computation. We present an implementation on TensorFlow and
+evaluation results with various recursive neural network models,
+showing that our recursive implementation not only conveys the
+recursive nature of recursive neural networks better than other
+implementations, but also uses given resources more effectively
+to reduce training and inference time.
+
+1
+
+Introduction
+
+Recursive neural networks have widely been used by researchers
+to handle applications with recursively or hierarchically struc-
+tured data, such as natural language processing [27, 25, 3] and
+scene parsing [23, 25, 22, 13].
+
+In order to implement such models, embedded control ﬂow
+deep learning frameworks (in short, embedded control ﬂow
+frameworks), such as TensorFlow [1], Theano [30], Caffe2 [6],
+and MXNet [4], embed control ﬂows within dataﬂow graphs,
+i.e., the control ﬂow is represented as a type of operation of
+the dataﬂow graph, which can trigger conditional execution or
+iterative computation. However, the programming model pro-
+posed by such frameworks fails to efﬁciently represent and ex-
+ecute neural networks with recursive structures. The designs
+of these frameworks do not consider recursive models and in-
+stead urge users to either write their models with iterative con-
+
+† Appeared in EuroSys ’18
+* Both authors contributed equally to the paper
+‡ Corresponding author
+
+structs [29] or completely unroll models without exploiting con-
+trol ﬂow at all [28, 18]. Meanwhile, non-embedded control ﬂow
+deep learning frameworks (in short, non-embedded control ﬂow
+frameworks) such as PyTorch [20] or DyNet [19] allow users to
+deﬁne control ﬂows from the client-side, creating new computa-
+tion graphs for all possible control ﬂow paths of a model. This
+approach trades performance for programmability, losing opti-
+mization opportunities because each graph is usually executed
+only once.
+
+An important example of recursive neural networks is the
+TreeLSTM [27] model, a tree-shaped network with recur-
+sively deﬁnable nodes, demanding complicated execution mech-
+anisms. In existing frameworks, the TreeLSTM network is han-
+dled by either statically unrolling the full network graph before-
+hand [20, 19], or using a single LSTM cell to iteratively com-
+pute all intermediate nodes [1, 30]. For the former case, it is
+difﬁcult to process multiple data instances together because the
+tree structure differs for each instance. For the latter case, the
+iterative execution is inherently sequential and thus is incapable
+of computing multiple nodes in parallel.
+
+In this paper, we introduce recursive deﬁnitions into the pro-
+gramming model of existing embedded control ﬂow frame-
+works [1, 6, 4, 30], adding ﬁrst-class support for recursion. By
+allowing users to directly express recursive deﬁnitions in appli-
+cation code with enhanced programmability, models with recur-
+sive data structures such as trees or graphs can be written with-
+out requiring users to use a separate complex API to express
+the control ﬂow [15]. Also, optimization opportunities can be
+exploited to boost performance, such as concurrently executing
+child nodes in tree structures that have no dependencies between
+each other.
+
+We make recursive deﬁnitions possible by introducing a spe-
+cial graph operation, InvokeOp, that abstracts the execution of
+a SubGraph. Users can incorporate recursion in models by
+invoking a SubGraph within the InvokeOp that abstracts the
+same SubGraph. The framework handles the execution of an
+InvokeOp as the initiation of a new SubGraph containing a bun-
+dle of inner operations, which are treated the same as the original
+running operations.
+
+We implemented support for recursively deﬁned dataﬂow
+graphs on TensorFlow [1], a widely used deep learning (DL)
+
+1
+
+ 
+ 
+ 
+ 
+ 
+ 
+framework. To show the expressive power and the performance
+of recursive graphs, we implemented three applications using
+our framework: sentiment analysis with the TreeRNN [25],
+RNTN [26], and TreeLSTM [27] models. For every model, we
+succeeded in capturing the recursive semantics of the computa-
+tion graph, and achieved competitive performance compared to
+other state-of-the-art deep learning frameworks such as Tensor-
+Flow [1] and PyTorch [20].
+
+The rest of the paper is organized as follows. Section 2 ex-
+plains the limitations of existing embedded control ﬂow frame-
+works regarding recursive models, and Section 3 provides a
+high-level API for efﬁciently representing such recursive mod-
+els. Section 4 describes the design aspects of our framework,
+and Section 5 presents the implementation details. Section 6
+presents evaluation results on various applications. Section 7
+covers related work and Section 8 concludes.
+
+2 Motivation
+
+2.1 Embedded Control Flow Frameworks and
+
+Their Limitations
+
+Modern deep learning frameworks use directed acyclic graphs
+(DAGs) to represent mathematical computations of deep learn-
+ing applications and the execution order of such computations.
+The vertices of graphs represent the mathematical operations,
+while the edges represent the dependencies between two oper-
+ations. An edge from operation a to operation b implies that
+the output of a is fed into b as the input value. As the execu-
+tion order between any two operations in the computation graph
+is statically determined, it is a non-trivial task to represent dy-
+namic control ﬂow within computations, such as conditionally
+executing only a part of the graph, or jumping to a nonadjacent
+operation.
+
+Based on how to handle dynamic control ﬂow, we can di-
+vide deep learning frameworks into two categories: embedded
+control ﬂow frameworks and non-embedded control ﬂow frame-
+works. Embedded control ﬂow frameworks such as Tensor-
+Flow [1] and Theano [30] include control ﬂow concepts inside
+the computation graph. They deﬁne special kinds of control ﬂow
+operations to embed the control ﬂow within the graph. This way,
+a single computation graph is able to express multiple control
+ﬂow paths. Since these frameworks can build a single graph and
+execute it repeatedly, aggressive performance optimization can
+be done while hiding the optimization overhead.
+
+On the other hand, non-embedded control ﬂow frameworks
+including PyTorch [20], DyNet [19], and Chainer [31] do not
+represent the control ﬂow inside the computation graph. Instead,
+they create a new static computation graph for every activated
+control ﬂow. This approach enables fast prototyping and easy
+development of various deep neural networks. However, this
+approach leaves little room to optimize the performance of com-
+putation graph execution, because each graph gets executed only
+once.
+
+Embedded control ﬂow frameworks. In embedded control
+ﬂow frameworks, graph vertices represent not only arithmetic
+
+operations (e.g., Add or MatMul) and data transformations (e.g.,
+Concat), but also data-dependent control ﬂow mechanisms.
+Conditional expressions are often made available by many em-
+bedded control ﬂow frameworks. A predicate is expected as the
+ﬁrst input argument, and two other operation groups as the true
+and false inputs. Based on the predicate value, only one of
+the two operation groups are executed and passed to the out-
+put operation. Another useful control ﬂow construct in existing
+deep learning frameworks is the iterative loop construct, namely
+the while loop operation in TensorFlow and the Scan operator
+in Theano. This kind of API enables adding a group of opera-
+tions, referred to as a loop body, to be executed multiple times
+iteratively. Conditional expressions are usually used with loop
+constructs to denote the termination condition of the loop body.
+By planting dynamic control ﬂow inside the computation
+graph and thus decoupling the client-side code execution from
+computation graph execution, frameworks can exploit paral-
+lelism while executing jobs by handling mutually independent
+operations in a concurrent manner, and can also exploit graph
+optimization techniques for faster execution that would other-
+wise be impossible for non-embedded control ﬂow frameworks.
+This paper will focus on embedded control ﬂow frameworks,
+building up on the provided optimizations to produce maximum
+performance.
+
+Limitations of embedded control ﬂow frameworks. The
+computation graphs of embedded control ﬂow frameworks do
+not fully cover every possible control ﬂow construct, however.
+Designing recursive neural networks efﬁciently using embedded
+control ﬂow of iterative loop constructs is difﬁcult. Not only
+is it unclear how to parallelize independent operations with it-
+erative loops, recursion and iteration are fundamentally differ-
+ent and thus converting one into another involves a nontrivial
+conversion process [14, 8, 7]. The following subsection shows
+an example demonstrating the difﬁculties of designing recursive
+neural networks with just loop constructs.
+
+2.2 Example: TreeLSTM
+
+The long short-term memory [9] (LSTM) cell is a block of func-
+tions that is well-known for its ability to “remember” past com-
+putations of a neural network, and is often used for networks that
+process data of sequential characteristics such as text data with
+sentence structures.
+
+TreeLSTM [27] is a widely used recursive neural network
+based on LSTMs that is known to perform well for applications
+with tree-shaped data instances such as parse trees for natural
+language processing and hierarchical scene parsing [25]. In an
+ordinary linear recursive neural network, LSTM cells are placed
+sequentially regardless of the input data structure. On the other
+hand, in the TreeLSTM model, LSTM cells are combined to
+form a tree, mimicking the shape of the input data tree. Sen-
+timent analysis is often used as an application of the TreeLSTM.
+For example, with movie review sentences and the correspond-
+ing ratings as training input data and labels, the TreeLSTM net-
+work can be trained to predict the sentiment of each movie re-
+view sentence.
+
+2
+
+states = array ()
+
+2.3 Recursion in Embedded Control Flow
+
+1
+2
+3
+4
+5
+6
+7
+8
+9
+10
+11
+12
+13
+14
+15
+16
+17
+
+def compute leaf (idx ):
+
+curr state = lstm(embed (tree. leaves [idx ]))
+
+states . insert (idx , curr state)
+
+def compute internal (idx):
+
+left idx , right idx = tree. children [idx]
+
+left state = states .get( left idx )
+
+right state = states .get( right idx )
+curr state = lstm( left state , right state )
+
+states . insert (idx , curr state)
+
+for loop( range( num leaves), compute leaf )
+
+for loop( range( num internals ), compute internal )
+
+root state = states [ root idx ]
+
+Figure 1: Iterative implementation of the TreeLSTM model in
+pseudocode.
+
+There are two approaches to implement this TreeLSTM net-
+work with current deep learning frameworks, both having its
+own limitations.
+
+The ﬁrst approach is unrolling the whole tree structure to the
+computation graph, so that LSTM cells are duplicated for each
+tree node. To train multiple trees with this approach, however, a
+new graph must be created for all input training instances. Not
+only does this result in an excessive amount of graph objects
+and signiﬁcant construction overhead, the effect of compile-time
+graph optimization is near zero as all graphs are used only once.
+
+The second approach is using iterative control ﬂow operations
+provided by frameworks. Figure 1 shows pseudocode of an it-
+erative implementation of the TreeLSTM model. In this imple-
+mentation, a single LSTM cell can be used multiple times for
+multiple input data instances. After the leaf nodes are processed
+sequentially in Line 14, the internal nodes with their dependen-
+cies resolved get processed in Line 15.
+In order for this ap-
+proach to work, the input tree must be preprocessed so that its
+nodes are assigned with topologically sorted indices, i.e., exe-
+cuting the tree nodes in an iterative manner does not violate the
+computational dependencies. Since the recursive nature of the
+tree structure cannot be directly represented by iteration, it is
+difﬁcult to write and understand this code.
+
+The process of topologically sorting the tree nodes loses the
+parent-child node relationships of the tree, and thus the iterative
+implementation can only view the tree nodes as a linearly or-
+dered list. A recursive formulation, on the other hand, would
+be able to utilize the information on parent-child relationships to
+concurrently execute nodes, and is inherently more suitable for
+representing recursive neural networks, preserving their recur-
+sive nature.
+
+3
+
+Frameworks
+
+The drawbacks of the unrolling method and the iterative method
+suggest the need for a more effective and intuitive solution to
+implement TreeLSTMs, and recursive neural networks in gen-
+eral. We propose that recursively deﬁning and executing recur-
+sive neural networks is a simple yet powerful approach.
+
+Recursive execution of computation graphs has many similar-
+ities with recursive invocation of functions in general program-
+ming languages. Recursive function invocation in programming
+languages is supported by allowing a function to call itself inside
+the function body. This is usually more complicated than exe-
+cuting non-recursive functions, since when parsing the source
+code of a recursive function, the recursive function call must be
+processed before the parsing of the function gets ﬁnished.
+
+Inspired by the concept of functions and function invocations,
+we propose to design similar ideas in embedded control ﬂow
+frameworks to support recursive execution. First, a program-
+ming interface for deﬁning a subset of the computation graph
+that will be executed recursively is required. Then, an invoca-
+tion operation inside the graph subset is also needed, to trigger
+the recursive execution of the graph subset. No modern embed-
+ded control ﬂow framework supports these functionalities and,
+at the same time, is able to train a recursive neural network, to
+the best of our knowledge.
+
+Our observations above suggest that an implementation of re-
+cursion, for embedded control ﬂow frameworks, must satisfy
+two conditions. First, recursion must be expressible as part of a
+valid computation graph. Despite the fact that recursion implies
+the usage of a call stack of arbitrary length, the graph representa-
+tion of recursion must be ﬁnite and executable by the framework.
+The graph representation of recursion corresponds to the recur-
+sive function deﬁnition; the deﬁnition simply denotes what com-
+putation is involved and how the recursion occurs, while not ac-
+tually running the function. Moreover, this representation must
+be usable together with other non-recursive parts of the compu-
+tation graph (Section 3.1).
+
+Second, an operation included in a recursive computation
+graph must be able to trigger the surrounding computation graph
+recursively. The operation triggering the recursive graph execu-
+tion corresponds to the function invocation, which can further
+unfold the computation until the recursion termination condition
+is satisﬁed (Section 3.2).
+
+3 Programming Model
+
+In this section, we describe our modiﬁcations to the program-
+ming model of existing embedded control ﬂow frameworks, as
+well as how they are translated into dataﬂow graph components.
+
+3.1 Unit of Recursion: SubGraph
+
+It is infeasible to implement the dynamism and recurrences of
+recursive computations using the static components of dataﬂow
+graphs provided by existing embedded control ﬂow frameworks.
+
+In response to this shortcoming, we ﬁrst propose an abstrac-
+tion, SubGraph, that represents basic recursive blocks and, at
+the same time, can be used in conjunction with existing opera-
+tions to create a dataﬂow graph with recursive computations.
+
+SubGraphs are created by grouping operations of a given
+computation graph that will be executed recursively. SubGraphs
+represent fractions of a dataﬂow graph. Executing a SubGraph
+refers to executing the operations that belong to that SubGraph.
+The inputs and outputs of operations that are connected to
+outer operations (operations that reside outside of the current
+SubGraph) are assigned as inputs and outputs of the SubGraph
+itself. During execution, the inputs of a SubGraph are passed to
+the corresponding inner operations, while operation outputs that
+must be shipped out to outer operations are passed as SubGraph
+outputs. A SubGraph can be regarded as a function in general
+programming languages.
+
+Additionally, we allow SubGraphs to invoke other Sub-
+Graphs. A SubGraph invocation within an outer SubGraph is
+connected to the other inner operations to form an inner dataﬂow
+graph, just as the outer SubGraph is connected to outer oper-
+ations. A SubGraph invocation in a SubGraph simply implies
+that there is yet another group of operations to be executed at that
+particular graph position. Coming back to the function analogy,
+placing a SubGraph invocation within a SubGraph is identical
+to calling a function within another function.
+
+More importantly, a SubGraph may recursively invoke itself.
+This aspect makes possible the deﬁnition of a recursive compu-
+tation; we deﬁne a recursive block as a SubGraph and insert a
+invocation to itself in the same SubGraph.
+
+Figure 2 shows the recursive implementation of the Tree-
+LSTM model, with details omitted for brevity. After deﬁning
+a SubGraph for the TreeLSTM model in Line 2, we reuse the
+deﬁnition in Lines 10-11 to complete the recursive tree structure
+of the model. Notice how a conditional expression is used (if in
+Line 14) to separate the base case from the recursive case. Com-
+paring with Figure 1, this recursive version follows the deﬁnition
+of the TreeLSTM model more clearly; the recursive nature of the
+tree structure is explicitly represented in this implementation.
+
+3.2 Recursion in Dataﬂow Graphs: InvokeOp
+
+While SubGraphs provide a convenient way to deﬁne recursive
+computations, the framework is still left with the task of actually
+executing the operations gathered as SubGraphs. However, as
+SubGraph operations are expected to be executed in a recursive
+fashion, an additional mechanism for “re-executing” the opera-
+tions of SubGraphs repeatedly (until some termination condition
+is met) is required. To this end, we introduce a new operation
+named InvokeOp.
+
+An InvokeOp is an operation that takes a set of tensors as
+input, runs an associated SubGraph (i.e., executes the inner op-
+erations of the SubGraph) with the provided inputs, and returns
+the resulting tensors as output. InvokeOps are execution ob-
+jects instantiated from SubGraph invocations; as SubGraphs
+are semantically close to function deﬁnitions, InvokeOps can
+be considered as function calls to the functions speciﬁed by
+
+1
+2
+3
+4
+5
+6
+7
+8
+9
+10
+11
+12
+13
+14
+15
+16
+17
+18
+
+# TreeLSTM : index( int32) −> hidden state ( Tensor )
+with SubGraph () as TreeLSTM :
+
+idx = TreeLSTM . input ( int32)
+
+def compute leaf node ():
+
+return LSTM( embed( tree. leaves [ idx]))
+
+def compute internal node ():
+
+left idx , right idx = tree. children [idx]
+
+left state = TreeLSTM ( left idx )
+right state = TreeLSTM ( right idx )
+
+return LSTM( left state , right state )
+
+TreeLSTM . output (if( is leaf node ( idx),
+
+compute leaf node ,
+compute internal node ))
+
+root state = TreeLSTM ( root idx )
+
+Figure 2: Recursive implementation of the TreeLSTM model
+with SubGraph deﬁnitions. After declaring the start of a
+SubGraph in Line 2, we indicate the inputs of the SubGraph
+in Line 3. The body of the SubGraph is deﬁned in Lines 5-
+16, while recursive calls are made on Lines 10-11. Note that
+SubGraph outputs must be given as in Lines 14-16. The com-
+pleted SubGraph deﬁnition can now be used in Line 18.
+
+SubGraphs. As such, it is possible for a single SubGraph to
+be associated with more than one InvokeOp.
+
+Despite the special property of having an associated
+SubGraph, an InvokeOp is fundamentally the same as other op-
+erations such as Add or MatMul, and is generally treated as an
+ordinary operation. The difference with other operations comes
+from the operation kernel implementation; instead of performing
+a mathematical calculation, an InvokeOp abstracts the execution
+of an entire SubGraph. This difference also affects a process
+called automatic differentiation, a core functionality provided by
+modern deep learning frameworks for training models. Instead
+of calculating mathematical derivates of some numerical func-
+tion like other operations, the framework must take into account
+the associated SubGraph of an InvokeOp. We will discuss this
+further in Section 4.2.2.
+
+3.3 TreeLSTM with SubGraphs & InvokeOps
+
+Figure 3 portrays an example on how InvokeOps are used to
+represent the TreeLSTM (Section 2.2) model with recursion. A
+completely unrolled depiction of the model for a full binary tree
+is shown in Figures 3(a) and 3(b). It is not hard to observe that
+the model can be expressed using recursion: the embed oper-
+ation and the LSTM cell at the leaves form the base case (Fig-
+ure 3(a)), while the two-input LSTM cell at the intermediate notes
+corresponds to the recursive case (Figure 3(b)).
+
+Merging the base case and the recursive case into a SubGraph
+with a conditional branch (if), we now have a concise represen-
+
+4
+
+tation of the TreeLSTM model, as shown in Figure 3(c). Note
+that the condensed SubGraph is able to represent TreeLSTMs of
+arbitrary height or shape, and not just a single particular struc-
+ture. InvokeOps are inserted at all inner recursive call points.
+
+4 System Design
+
+LSTM
+
+In this section, we discuss various system design aspects for sup-
+porting the recursive programming model of the previous sec-
+tion.
+
+Our design complements existing embedded control ﬂow
+frameworks with additional APIs for declaring recursive graphs
+and core changes for executing such recursive graphs. Mod-
+els declared using the SubGraph API from Section 3 are trans-
+formed into a dataﬂow graph containing InvokeOps. In turn,
+the framework core engine runs the resulting graph with the
+same mechanism used to run non-recursive graphs, accessing
+additional graph and value cache structures when dealing with
+InvokeOps. The design does not involve any implementation
+details of a particular framework, and can be applied to any
+DL framework that incorporates control ﬂows in computation
+graphs.
+
+4.1 Graph Execution
+
+LSTM
+
+LSTM
+
+LSTM
+
+LSTM
+
+LSTM
+
+LSTM
+
+embed
+
+embed
+
+embed
+
+embed
+
+(a)
+
+LSTM
+
+LSTM
+
+LSTM
+
+LSTM
+
+LSTM
+
+LSTM
+
+LSTM
+
+4.1.1 Background: Execution Model of Existing Frame-
+
+embed
+
+embed
+
+embed
+
+embed
+
+works
+
+The execution model of embedded control ﬂow frameworks can
+be characterized by three components: the client who builds and
+submits dataﬂow graphs to the framework, the master which
+parses the given graphs and schedules the execution of opera-
+tions, and one or more workers that carry out the actual compu-
+tation of the operations. The master coordinates the execution
+of operations on the workers, running operations in an order that
+respects the inter-operation dependencies.
+
+Steps (1)-(3) of Figure 4 displays an illustration of the execu-
+tion model, with only one worker shown for simplicity. When
+the master ﬁrst analyzes the input dataﬂow graph, operations that
+require no inputs are enqueued directly into the ready queue of
+the worker, whereas operations that need at least one input are
+put on standby. Next, execution threads of the worker’s execu-
+tion thread pool grab operations from the operation queue and
+perform the computation for those operations in parallel. When
+an execution thread ﬁnishes running an operation, the master
+checks the waiting operations that have a dependency on the
+completed operation, and enqueues operations whose dependen-
+cies have all been resolved to the ready queue. This process is
+repeated until all operations have been processed.
+
+4.1.2 Recursive Execution
+
+The execution mechanism for executing a recursively deﬁned
+dataﬂow graph is no different from the mechanism for execut-
+ing non-recursive graphs. This is possible because the execution
+of an InvokeOp mimics the initiation of a new dataﬂow graph,
+with the exception of reusing the same master scheduler as well
+
+5
+
+(b)
+
+InvokeOp
+
+leaf?
+
+if
+
+T
+
+F
+
+LSTM
+
+LSTMLSTM
+
+embed
+
+InvokeOp
+
+InvokeOp
+
+(c)
+
+Figure 3: An illustration of how an unrolled computation graph
+of the TreeLSTM model (a, b) can be transformed into a recur-
+sive graph with InvokeOps (c). The base case, depicted in the
+boxes of (a), and the recursive case, indicated by the boxes in
+(b), can be combined to succinctly describe the model as a re-
+cursive SubGraph as shown in (c). InvokeOps have been added
+at the appropriate places to mark the points where a recursive
+function call to the SubGraph must occur.
+
+Worker
+
+Ready
+Queue
+
+(3)
+
+Execution
+Thread Pool
+
+(4)
+
+SubGraph
+
+Waiting
+Operations
+
+Operation
+
+InvokeOp
+
+Client
+
+(2)
+
+(2)
+
+(1)
+
+Master
+
+Graph Parser
+
+Figure 4: The execution model of embedded control ﬂow frame-
+works with InvokeOps. (1) After the client initiates the job with
+a dataﬂow graph, (2) the master decomposes the graph into op-
+erations and places them into either the ready queue or the wait-
+ing line of the worker, depending on the number of unresolved
+inputs. (3) Operations are dequeued from the queue by idle ex-
+ecution threads, while new operations are enqueued when input
+dependencies are resolved. (4) When an InvokeOp gets exe-
+cuted, its associated SubGraph is passed to and processed by
+the master, similar to step (1). Only one worker is shown for the
+sake of clarity.
+
+as the same worker ready queues, as illustrated in step (4) of Fig-
+ure 4. When an InvokeOp becomes executable and is dequeued
+by an execution thread, the graph associated with the InvokeOp
+is processed by the master, similar to how a graph submitted by
+the client is parsed by the master. Operations that are immedi-
+ately ready to be run are enqueued into the ready queue, behind
+the existing operations. Likewise, operations that have at least
+one unresolved input dependency are added to the waiting list,
+together with other previous standby operations.
+
+This design allows recursive dataﬂow graphs to be processed
+on existing embedded control ﬂow frameworks without dras-
+tic changes. Recursive graphs can enjoy graph optimizations
+supplied by such frameworks and achieve good performance
+while providing intuitive, recursive APIs at the same time. In
+fact, from the framework’s point of view, a recursive graph is
+the more general representation, while non-recursive graphs are
+simply special cases which have no recursive SubGraphs and
+InvokeOps.
+
+It is also worth noting that performing priority scheduling
+of operations instead of simple FIFO scheduling may possibly
+yield signiﬁcant effects on the execution time of recursive com-
+putation graphs, depending on the inter-operation dependencies
+of the given recursive model. For example, if the model con-
+tains a SubGraph whose inner operation must be processed in
+order for many outer operations to be enqueued into the ready
+queue, then a scheduling decision of processing inner operations
+before others would lead to a shorter execution time overall. Al-
+
+though this is an interesting problem, it is usually not an issue
+for servers with many parallel computation threads to spare and
+thus we leave this as future work.
+
+Graph execution stack. When a function is invoked in pro-
+gramming languages, the language runtime maintains a call
+stack to record the call history and relevant information. This
+enables the program to correctly return from the callee function
+to the corresponding caller function, and also provides help-
+ful information to programmers such as backtrace information
+when an exception occurs while executing the function. A simi-
+lar process of keeping track of the SubGraph invocation history
+is required for the recursive graph execution engine. However,
+the caller-callee relationship of InvokeOps cannot be managed
+with a linear stack, because an InvokeOp can branch out into
+multiple child InvokeOps in parallel. Rather, the relationship is
+maintained as a tree, where each InvokeOp holds a pointer to its
+parent InvokeOp (i.e., return location).
+
+4.2 Graph Backpropagation
+
+4.2.1 Background: Automatic Differentiation
+
+Neural networks are normally trained via the backpropagation
+algorithm [21]. Backpropagation calculates the errors of all op-
+eration output values, by ﬁrst comparing the ﬁnal outputs of
+a neural network with expected ground-truth values (labels) to
+compute output errors, and then propagating the output errors
+all the way back up to the input according to the chain rule. The
+calculated errors – often referred to as gradients – are used to
+update model parameters so that operation outputs are pushed
+towards the expected values.
+
+Backpropagation of a simple linear network is shown in Fig-
+ure 5(a). Starting from operation op1, all forward operations
+op1, op2, and op3 are computed in succession to produce val-
+ues a, b, and c, respectively. The ﬁnal output c is checked with
+the expected value c* to produce the loss value E, as well as
+the gradient of E with respect to c, denoted as dE/dc. Next,
+the other gradients are generated one by one, this time through
+the backpropagation line of operations, op3-grad, op2-grad, and
+op1-grad.
+
+Note that in order to calculate a certain gradient, both the pre-
+vious gradient and the corresponding forward value are required.
+For instance, the gradient dE/db is computed with the previous
+gradient dE/dc and the forward value b (op3-grad). Likewise,
+dE/db and a are used to compute dE/da (op2-grad). This results
+in a ﬁnal dataﬂow graph where a forward operation shares its in-
+puts with its backpropagation equivalent (e.g. op2 and op2-grad
+both take a as input). As a precaution to prevent values from be-
+ing invalidated (released from memory) before being consumed
+by all dependent operations, DL frameworks always keep all op-
+eration outputs as valid data until that particular iteration termi-
+nates.1
+
+Automatic differentiation. Deep learning frameworks re-
+lieve users from the burden of manually inserting backpropaga-
+
+1Technically, we could recompute the forward operation values during
+backpropagation instead of retaining them to save memory. However, this in-
+curs a signiﬁcant increase in training time and is generally not preferred.
+
+6
+
+op1
+
+a
+
+op2
+
+b
+
+op3
+
+a
+
+b
+
+op1-grad
+
+dE / da
+
+op2-grad
+
+dE / db
+
+op3-grad
+
+label
+
+c
+
+c*
+
+loss
+
+dE / dc
+
+Feedforward
+
+Backpropagation
+
+(a)
+
+op1
+
+op2
+
+op3
+
+op1-grad
+
+op2-grad
+
+op3-grad
+
+InvokeOp
+
+InvokeOp
+
+Feedforward
+
+Backpropagation
+
+(b)
+
+Figure 5: Backpropagation of dataﬂow graphs with and with-
+(a) A simple linear feedforward network is
+out InvokeOps.
+shown on the left, while the backpropagation side of the same
+network is shown on the right. All gradient operations receive
+previous gradient values from its gradient predecessor as well
+as the original feedforward value from the feedforward network.
+(b) An InvokeOp and its gradient operation for backpropaga-
+tion are shown on the left and right, respectively. Notice how
+(a) and (b) are structurally very similar, except for the enclosing
+InvokeOps.
+
+tion operations, with the help of a process called automatic dif-
+ferentiation. In the case of embedded control ﬂow frameworks,
+after a user submits a feedforward neural network to the frame-
+work, the framework automatically adds all operations required
+for computing gradients to the given dataﬂow graph. Maintain-
+ing a catalogue of predeﬁned gradient operations, the framework
+backtracks along the feedforward path and adds the correspond-
+ing gradient for each and every feedforward operation. The re-
+sulting computation graph can then be processed by the frame-
+work for execution. As setting up the backpropagation path is
+usually much more tedious than deﬁning the forward path, the
+automatic differentiation process is very helpful for users and
+currently supported by all deep learning frameworks.
+
+4.2.2 Recursive Backpropagation
+
+Backpropagation of a recursive dataﬂow graph is similar to
+backpropagation of a non-recursive dataﬂow graph. The only
+
+7
+
+nontrivial issue is how to deﬁne and calculate gradients for
+InvokeOps. As the feedforward output of an InvokeOp is the
+execution output of its associated SubGraph, naturally the gra-
+dient of an InvokeOp is also generated from the gradients of the
+associated SubGraph.
+
+During automatic differentiation, we inspect the SubGraphs
+associated with InvokeOps and perform automatic differentia-
+tion on them as well. For each SubGraph, we collect the gradi-
+ent operations that were inserted by automatic differentiation. At
+this point, it is possible to simply add the inserted gradient op-
+erations to the backpropagation path of the computation graph.
+However, in case the SubGraph was used for recursion, the gra-
+dients for the inner recursive computations would not be gen-
+erated and thus backpropagation would be returning incorrect
+results.
+
+Instead, we wrap each set of gradient operations from
+SubGraphs with yet another SubGraph.
+If a feedforward
+SubGraph contains a recursive invocation to itself, then its cor-
+responding backpropagation SubGraph will also hold a recur-
+sive invocation, at the same position. Later, InvokeOps are in-
+serted at SubGraph invocation points for both the feedforward
+SubGraph and the backpropagation SubGraph to complete the
+computation graph.
+Figure 5(b)
+
+illustrates how a gradient operation of an
+InvokeOp is formed. The associated SubGraph is shown in
+the inner side of the feedforward InvokeOp, while the corre-
+sponding gradient operations of the SubGraph are shown inside
+the backpropagation InvokeOp. Carrying over operation out-
+puts from the feedforward phase to the backpropagation phase
+is done by connecting the outputs and inputs of the relevant op-
+erations, same as in Section 4.2.1.
+
+5 Implementation
+
+We implemented our framework atop TensorFlow [1] 1.3.0.
+Framework changes, including the kernel implementation of
+InvokeOp as well as internal data structures, were done in the
+C++ core, while client-side APIs for recursive deﬁnitions are
+exposed in Python. Here, we describe several implementation
+issues of our framework.
+Forward declaration.
+
+In embedded control ﬂow frame-
+works, all operations must have well-deﬁned inputs and out-
+puts before they are used (comparable to function signatures in
+programming languages). InvokeOps are not exceptions; the
+framework does not allow the creation of a recursive InvokeOp
+unless the operation deﬁnition for the recursive call is speci-
+ﬁed beforehand. This rule can be bypassed by using forward
+declarations for InvokeOps that are recursively deﬁned; when
+a SubGraph is deﬁned, we ﬁrst predeclare an empty InvokeOp
+that has the same signature as the SubGraph, and later “register”
+the SubGraph deﬁnition to the empty InvokeOp. Note that this
+procedure is automatically done by the framework, and is not
+exposed to users. Gradients for backpropagation are deﬁned in
+a similar manner, with the operation declaration coming before
+the actual deﬁnition.
+
+Backpropagation cache implementation. As described in
+
+InvokeOp
+
+InvokeOp
+
+HashTable
+
+LSTMLSTM
+
+Invoke
+Op
+
+Invoke
+Op
+
+LSTM-
+grad
+
+Invoke
+-grad
+
+Invoke
+-grad
+
+concurrent
+addition
+
+concurrent
+retrieval
+
+Feedforward
+
+Backpropagation
+
+Figure 6: Concurrent hash table being used between multi-
+ple forward and backward executions of the same operation
+(InvokeOp).
+
+Section 4.2, operation output values from the feedforward phase
+must be retained until backpropagation and be fed into the cor-
+responding gradient operations. For non-recursive computation
+graphs, embedded control ﬂow frameworks would accomplish
+this simply by holding a feedforward value entry for each re-
+quired operation and later passing the values to the appropriate
+gradient operations. Unfortunately, for recursive graphs, an op-
+eration within a SubGraph may be called more than one time
+across multiple recursions. Multiple output values generated
+during multiple executions must all be passed to the correspond-
+ing gradient operation, without losing their topological position
+information.
+
+We resolve this issue by maintaining a concurrent hash table
+for storing and fetching operation output values of SubGraphs.
+Figure 6 describes the whole procedure of passing multiple feed-
+forward output values from InvokeOps. A hash table is exter-
+nally generated and managed per SubGraph, and a unique hash
+entry key is used to distinguish table entries. During the feed-
+forward phase, we store all output values of InvokeOp instances
+that come from the SubGraph in the table. An InvokeOp’s key
+is deﬁned by combining the InvokeOp’s topological position
+within the SubGraph with the key of the parent InvokeOp, guar-
+anteeing uniqueness. By using a concurrent hash table, multiple
+instances of the same operation in the graph can concurrently
+access and update the hash table.
+
+Next, during backpropagation, we perform a hash table
+lookup for each gradient operation of the InvokeOp instances
+and feed the stored value as input. This enables feedforward
+output values to be retained and correctly retrieved for backprop-
+agation. While the concurrent insert operations may incur minor
+overhead, the lookup operations are thread-safe and are negli-
+gible. Is it notable that using a simple queue or stack to store
+activation values is inadequate, as the order of enqueue and de-
+queue operations or push and pop operations is not deterministic
+and thus output values may be directed to the wrong gradient
+operation.
+
+Outer reference. It is common for a recursive SubGraph to
+not refer to the external input values explicitly, but rather im-
+plicitly. For instance, a static value that is required for all lev-
+els of recursion of a SubGraph should not be included as an
+
+input of the SubGraph, as the value does not change anyway.
+Nonetheless, the TensorFlow framework regards a SubGraph
+and the outer graph as two separate graphs and is unable to
+understand the identities of such implicit external values un-
+less they are speciﬁed as actual operation inputs. Therefore,
+when a SubGraph is created, we analyze the operations to check
+whether there are any external inputs that have not already been
+speciﬁed as the SubGraph’s inputs and add them to the input
+list.
+
+Implementation on other frameworks. Recursively deﬁned
+SubGraphs and InvokeOps can be implemented on not only
+TensorFlow but any other embedded control ﬂow DL frame-
+works as well, with the computation graph and the operations as
+its elements. A SubGraph can be provided as an abstraction that
+is similar to the framework’s original graph structure but con-
+tains only a subset of all operations to mark a recursion block.
+An InvokeOp can be implemented as a new kind of user-deﬁned
+operation type, which recursively executes a SubGraph.
+
+For instance, Caffe2 [6] uses a NetDef protocol buffer as
+its computation graph, and allows feeding NetDefs as inputs
+to operators. By extending NetDefs to recursively represent
+subgroups of operators, we can create a Caffe2 version of
+InvokeOp that receives such subgroups as inputs and executes
+them. Theano [30] provides the Scan operator which abstracts
+the execution of a loop in a single operator. Although the Scan
+operator is usually used to express iterative control ﬂow, the con-
+cept of maintaining a separate graph isolated from the main com-
+putation graph ﬁts well with SubGraphs and is a good starting
+point for implementing recursive computations.
+
+6 Evaluation
+
+We evaluate our framework while focusing on the performance
+beneﬁts of the recursive nature of the framework, mostly made
+possible by exploitation of parallelism in recursive neural net-
+works.
+
+6.1 Experimental Setup
+
+Applications. We implemented a variety of neural network
+models from the recursive neural network family, namely
+the aforementioned TreeLSTM [27] model as well as the
+TreeRNN [25] and the RNTN [26] model. All models were
+trained and tested to perform sentiment analysis on the Large
+Movie Review [16] dataset, where data instances are sentences
+in the form of binary parse trees. For this dataset, we used a pre-
+trained network (for each model) to label all nodes. For all mod-
+els, we used the same hyperparameters as the ones suggested
+in the original papers. We also considered smaller batch sizes
+to investigate the performance trends of our framework without
+mixing in additional performance gains obtainable from batch-
+ing instances.
+
+Frameworks. Along with our implementation of recursive
+dataﬂow graphs (built on TensorFlow 1.3.0), we also imple-
+mented neural networks on other frameworks, including Tensor-
+Flow [1] (TF 1.3.0) without recursive graphs, which allows an
+
+8
+
+)
+s
+/
+s
+e
+c
+n
+a
+t
+s
+n
+i
+(
+
+t
+u
+p
+h
+g
+u
+o
+r
+h
+T
+
+150
+
+100
+
+50
+
+0
+
+(a) TreeRNN
+
+2
+.
+5
+2
+1
+
+7
+.
+9
+2
+1
+
+6
+.
+6
+4
+
+1
+.
+4
+
+3
+.
+7
+1
+
+1
+
+1
+.
+8
+3
+
+3
+.
+4
+
+9
+.
+5
+5
+
+3
+.
+4
+
+10
+
+25
+
+Batch size
+
+Recursive
+
+Iterative
+
+Unrolling
+
+(b) RNTN
+
+(c) TreeLSTM
+
+)
+s
+/
+s
+e
+c
+n
+a
+t
+s
+n
+i
+(
+
+t
+u
+p
+h
+g
+u
+o
+r
+h
+T
+
+60
+
+40
+
+20
+
+0
+
+8
+.
+4
+4
+
+8
+.
+0
+4
+
+2
+.
+9
+3
+
+8
+.
+6
+2
+
+5
+.
+1
+
+5
+.
+1
+
+10
+
+25
+
+Batch size
+
+4
+.
+3
+2
+
+5
+.
+1
+
+1
+.
+8
+
+1
+
+)
+s
+/
+s
+e
+c
+n
+a
+t
+s
+n
+i
+(
+
+t
+u
+p
+h
+g
+u
+o
+r
+h
+T
+
+6
+
+4
+
+2
+
+0
+
+8
+.
+4
+
+5
+.
+2
+
+0
+.
+2
+
+2
+.
+4
+
+0
+.
+4
+
+5
+.
+5
+
+6
+.
+3
+
+0
+.
+2
+
+0
+.
+2
+
+1
+
+10
+
+25
+
+Batch size
+
+Figure 7: Training throughput for the TreeRNN, RNTN, and TreeLSTM models with the Large Movie Review dataset. Numbers
+are shown for our recursive implementation, TensorFlow’s iterative implementation, and PyTorch’s static unrolling implementation.
+Our recursive implementation outperforms the other frameworks for all models and all batch sizes except when training TreeLSTM
+with a batch size of 25, at which point the amount of system resources is insufﬁcient to completely parallelize the computation. We
+did not observe any signiﬁcant performance gain for the static unrolling approach when the batch size was increased.
+
+Recursive
+
+Iterative
+
+Unrolling
+
+(a) TreeRNN
+
+(b) RNTN
+
+(c) TreeLSTM
+
+)
+s
+/
+s
+e
+c
+n
+a
+t
+s
+n
+i
+(
+
+t
+u
+p
+h
+g
+u
+o
+r
+h
+T
+
+800
+
+600
+
+400
+
+200
+
+0
+
+9
+.
+3
+9
+6
+
+3
+.
+7
+2
+4
+
+0
+.
+2
+5
+5
+
+3
+.
+0
+7
+2
+
+6
+.
+7
+
+8
+.
+6
+
+10
+
+25
+
+Batch size
+
+0
+.
+9
+5
+1
+
+8
+.
+5
+9
+
+1
+
+5
+.
+6
+
+)
+s
+/
+s
+e
+c
+n
+a
+t
+s
+n
+i
+(
+
+t
+u
+p
+h
+g
+u
+o
+r
+h
+T
+
+500
+
+400
+
+300
+
+200
+
+100
+
+0
+
+4
+.
+9
+9
+3
+
+6
+.
+1
+2
+3
+
+7
+.
+8
+9
+
+6
+.
+2
+
+2
+.
+9
+1
+
+1
+
+1
+.
+9
+6
+
+10
+
+5
+.
+2
+
+Batch size
+
+4
+.
+1
+3
+1
+
+25
+
+7
+.
+2
+
+)
+s
+/
+s
+e
+c
+n
+a
+t
+s
+n
+i
+(
+
+t
+u
+p
+h
+g
+u
+o
+r
+h
+T
+
+300
+
+200
+
+100
+
+0
+
+9
+.
+9
+6
+2
+
+9
+.
+7
+1
+2
+
+4
+.
+1
+8
+
+5
+.
+3
+
+2
+.
+9
+1
+
+1
+
+3
+.
+9
+4
+
+10
+
+5
+.
+3
+
+Batch size
+
+1
+.
+2
+7
+
+25
+
+8
+.
+2
+
+Figure 8:
+Inference throughput for the TreeRNN, RNTN, and TreeLSTM models with the Large Movie Review dataset. Mea-
+surements are presented for our recursive implementation, TensorFlow’s iterative implementation, and PyTorch’s static unrolling
+implementation. Our recursive implementation outperforms the other frameworks for all models and all batch sizes.
+
+iterative way of programming, and PyTorch [20] (PTH 0.3.1),
+which only supports the static unrolling technique. Since na-
+tive TensorFlow does not support recursive deﬁnitions, we used
+TensorFlow’s control ﬂow operators to train the neural networks
+in an iterative fashion, as shown in Section 2. For PyTorch,
+we dynamically create a new graph structure for each sentence.
+Although implementing the static unrolling technique on Ten-
+sorFlow is possible, the graph generation overhead tends to be
+very large; instead, we use PyTorch for the unrolling technique,
+which incurs negligible graph construction overhead.
+
+Hardware speciﬁcation. All numbers reported in this pa-
+per were retrieved from experiment results on a single machine
+of two 18-core Intel Xeon E5-2695 @ 2.10 GHz processors
+with 256GB RAM, unless otherwise speciﬁed. We also used an
+NVIDIA Titan X GPU for certain models. Unlike other common
+neural networks such as convolutional models, the unstructured
+input data of recursive neural networks makes it difﬁcult to ex-
+ploit the full computational power of GPUs. Thus, we use GPUs
+only if they introduce performance gain compared to CPU-only
+
+execution. Our implementation and TensorFlow showed greater
+performance on CPUs, while PyTorch performed better on a
+GPU.
+
+6.2 Throughput and Convergence Time
+
+We start our analysis by measuring the training and inference
+throughputs with the recursive, iterative, and static unrolling im-
+plementations.
+
+Training throughput. Figure 7 shows the throughput of
+training the TreeRNN, RNTN, and TreeLSTM models using the
+Large Movie Review dataset with recursive, iterative, and static
+unrolling implementations. The models were trained with batch
+sizes of 1, 10, and 25.2
+
+Thanks to the parallelism exploited by recursive dataﬂow
+graphs, our implementation outperforms other implementations
+for the TreeRNN and RNTN models at all batch sizes, by up to
+
+2The original TreeRNN, RNTN, and TreeLSTM papers state that using a
+
+batch size of 25 yielded the best model.
+
+9
+
+(a) Validation accuracy for TreeRNN
+
+(b) Validation accuracy for RNTN
+
+(c) Validation accuracy for TreeLSTM
+
+100
+
+90
+
+80
+
+70
+
+60
+
+50
+
+)
+
+%
+
+(
+
+y
+c
+a
+r
+u
+c
+c
+A
+
+100
+
+90
+
+80
+
+70
+
+60
+
+50
+
+)
+
+%
+
+(
+
+y
+c
+a
+r
+u
+c
+c
+A
+
+Recursive
+Iterative
+
+100
+
+90
+
+80
+
+70
+
+60
+
+50
+
+)
+
+%
+
+(
+
+y
+c
+a
+r
+u
+c
+c
+A
+
+Recursive
+Iterative
+
+Recursive
+Iterative
+
+0
+
+460
+
+1774
+
+0
+
+2208
+
+7783
+
+0
+
+1372
+
+1870
+
+Time (s)
+
+Time (s)
+
+Time (s)
+
+Figure 9: Validation accuracy for the binary sentiment classiﬁcation task with (a) TreeRNN, (b) RNTN, and (c) TreeLSTM models.
+Results are shown for training each model with the recursive and iterative implementations, using the Large Movie Review dataset.
+The time to reach 93% accuracy for each setup is also plotted, showing that the recursive implementation converges faster for all
+models.
+
+3.3x improved throughput over the iterative implementation, and
+30.2x improved throughput over the static unrolling approach.
+Note that the performance gap between the recursive and itera-
+tive approach for the TreeRNN model is bigger than that of the
+RNTN model. This is due to the fact that the TreeRNN model
+involves much less computation in its recursive function body
+compared to the RNTN model, therefore having bigger room for
+performance optimization via computation parallelization. We
+will further discuss the effectiveness of parallelization in Sec-
+tion 6.3.
+
+For the TreeLSTM model, our implementation performs bet-
+ter than other frameworks at batch sizes 1 and 10. On the other
+hand, at a batch size of 25, our implementation is slower than
+the iterative implementation. Generally, recursion has additional
+overheads compared to iteration, including passing around argu-
+ments and return values, caller and callee context setup, etc. We
+also have additional overheads related to backpropagation, as
+discussed in previous sections. Consequently, our recursive im-
+plementation exhibits excessively high resource utilization for
+computing large batches, making the throughput lower than the
+iterative computation.
+
+Inference throughput.
+
+Inference refers to the process of
+computing the operation output values of the feedforward phase,
+stopping before backpropagation. Aside from training through-
+put, inference throughput is also a useful metric for computing
+the performance of a neural network, indicating how quickly a
+deployed model can process unseen data, e.g., in serving sys-
+tems.
+
+Figure 8 shows the inference throughput, with identical envi-
+ronments with the previous experiments on training throughput.
+Our framework demonstrates throughput up to 5.4x higher than
+the iterative implementation, and 147.9x higher than the static
+unrolling approach. Unlike training throughput, our recursive
+implementation greatly dominates other implementations, since
+our framework can fully utilize the given resources and the addi-
+tional overheads introduced by backpropagation are not present.
+Convergence. We also measured how the accuracy of the
+model increases as the training progresses, in Figure 9. Since our
+implementation calculates numerically identical results as the it-
+
+t
+u
+p
+h
+g
+u
+o
+r
+h
+t
+
+g
+n
+i
+n
+i
+a
+r
+T
+
+)
+s
+/
+s
+e
+c
+n
+a
+t
+s
+n
+i
+(
+
+30
+
+20
+
+10
+
+0
+
+7.34x
+
+3.65x
+
+1.85x
+
+1.00x
+
+1
+
+2
+
+4
+
+8
+
+Number of machines
+
+Figure 10: Training throughput for the TreeLSTM model on our
+recursive implementation, using varying numbers of machines
+for data parallelism. The performance increases almost linearly
+as more machines are used for training.
+
+erative implementation, the accuracy improvement per epoch is
+the same. However, thanks to our higher throughput, training
+with our framework results in faster convergence than the itera-
+tive implementation.
+
+Training throughput with multiple machines. One way to
+overcome the resource limitations is scaling out to multiple ma-
+chines. Figure 10 shows how the training throughput for the
+TreeLSTM model on our recursive implementation changes, as
+the number of machines used in training gradually grows from 1
+to 8. Utilizing the well-known data parallelism technique [12],
+the training throughput improves almost linearly up to 8 ma-
+chines.
+
+6.3 Analysis of Recursive Graphs:
+
+Parallelization
+
+The performance difference between the iterative and recursive
+implementation of the same recursive neural network mainly
+comes from the parallelization of recursive operations. In this
+subsection, we analyze how the performance varies depending
+on various aspects related to parallelization.
+
+10
+
+250
+
+200
+
+150
+
+100
+
+50
+
+0
+
+)
+s
+
+m
+
+(
+
+e
+m
+
+i
+t
+
+g
+n
+i
+n
+i
+a
+r
+T
+
+Recursive
+Iterative
+
+60
+
+50
+
+40
+
+30
+
+20
+
+10
+
+0
+
+)
+s
+
+m
+
+(
+
+i
+
+e
+m
+T
+e
+c
+n
+e
+r
+e
+f
+n
+I
+
+Recursive
+Iterative
+
+0
+
+100
+
+200
+
+0
+
+100
+
+200
+
+Number of words
+
+Number of words
+
+Figure 11: Time taken for processing each data instance, in the
+TreeLSTM model using the Large Movie Review dataset. The
+bold lines represent the average time for each speciﬁc sentence
+length in the whole dataset, and the enclosing colored areas rep-
+resent the range of time taken to process the speciﬁc length of
+sentences. No batching is used for this experiment. As the num-
+ber of words inside a data instance increases, our recursive im-
+plementation outperforms the iterative implementation thanks to
+the parallelized execution of tree cells. For inference, the com-
+putation load is low enough for the framework to utilize system
+resources without hitting the resource limit, and the processing
+time of the recursive implementation is O(logN), where N is the
+number of words.
+
+Sentence length. A close inspection of the training time per
+data instance sorted by sentence length gives us interesting re-
+sults. As shown in Figure 11, the time required for processing a
+single sentence generally increases as sentences become longer,
+regardless of whether the implementation is based on native Ten-
+sorFlow or our recursive implementation. This is an expected
+phenomenon, because longer sentences form larger tree struc-
+tures consisting of more cells which require more computation.
+However, there is a clear difference in the increasing slope;
+the training time grows at a steeper slope for TensorFlow than
+that of our implementation. This is because the recursive im-
+plementation allows tree cells to be processed concurrently,
+whereas the iterative TensorFlow implementation is only capa-
+ble of processing one tree cell at a time. Theoretically, our im-
+plementation is able to process a tree structure consisting of N
+cells in O(logN) time (native TensorFlow requires O(N) time),
+though the parallelization effect is diminished by the framework
+overhead and therefore the performance is more close to a linear
+trend rather than a logarithmic trend. On inference workloads
+with much less resource needs, the trend is clearly closer to a
+logarithmic scale.
+
+Balancedness of trees. To analyze the inﬂuence of tree bal-
+ancedness on training throughput on our recursive implementa-
+tion, we prepared several modiﬁed versions of the Large Movie
+Review dataset, that contain the same sentences as the original
+dataset but have different parse tree shapes. Speciﬁcally, we pre-
+pared 1) a balanced dataset consisting of only complete binary
+trees, 2) a moderate dataset that contains moderately balanced
+binary trees, and 3) a linear dataset comprising only extremely
+unbalanced binary trees.
+
+Batch size
+
+Throughput (instances/s)
+Balanced Moderate Linear
+
+1
+10
+25
+
+46.7
+125.2
+129.7
+
+27.3
+78.2
+83.1
+
+7.6
+22.7
+45.4
+
+Table 1: Throughput for the TreeRNN model implemented with
+recursive dataﬂow graphs, using datasets of varying tree bal-
+ancedness. The balanced dataset exhibits highest throughput
+thanks to the high degree of parallelization, but at the same time
+does not improve as well as the linear dataset when the batch
+size increases from 1 to 25, because there is only a small room
+of performance improvement left, w.r.t parallelization.
+
+Table 1 shows the throughput of training the TreeRNN model
+using these three datasets. For all batch sizes, the training
+throughput on the balanced dataset is the highest, while the
+throughput on the linear dataset is the lowest. This trend oc-
+curs because the maximum possible execution concurrency of a
+tree is affected by the balancedness of the tree. A full binary
+tree of N cells can be processed concurrently with at most N+1
+2
+threads, because all N+1
+leaf nodes are mutually independent.
+2
+On the other hand, an extremely unbalanced binary tree can be
+processed with only one or two threads at a time due to the lin-
+earity of the tree. As a result, our implementation can train input
+data of balanced trees with greater throughput than input data of
+unbalanced trees.
+
+Resource Utilization. Another interesting fact in Table 1 is
+that the training throughput on the linear dataset scales better
+than the throughput on the balanced dataset, as the batch size
+increases. For the balanced dataset, the recursive implementa-
+tion efﬁciently utilizes many threads to process the data even at
+a small batch size of 1, and thus increasing the batch size leads
+to a relatively small speed boost. On the contrary, for the linear
+dataset, the recursive implementation fails to efﬁciently make
+use of CPU resources and thus the performance gain provided
+by increasing the batch size is relatively high.
+
+6.4 Comparison with Folding
+
+The performance improvement of our recursive framework dis-
+cussed in previous subsections comes from executing multiple
+tree nodes in parallel. On the other hand, another approach for
+efﬁciently executing recursive neural networks exists: identify-
+ing concurrently executable nodes and batching them into a sin-
+gle node to be run on GPUs. We refer to this technique as fold-
+ing, following the name of a framework, TensorFlow Fold [15],
+that implements this technique.
+
+The folding technique hardly suffers from resource limita-
+tions, as GPUs are very efﬁcient in batching computations.
+However, batching multiple nodes leads to overheads that are not
+present in other approaches. Due to the various tree structures
+in the input data, the batching decision must be done in a depth-
+wise manner, thus the ungrouping and regrouping of tree nodes
+across multiple depths lead to numerous memory reallocations
+
+11
+
+Batch
+size
+
+Throughput (instances/s)
+
+Inference
+
+Training
+
+Iter Recur
+
+Fold
+
+Iter Recur
+
+Fold
+
+1
+10
+25
+
+19.2
+49.3
+72.1
+
+81.4
+217.9
+269.9
+
+16.5
+52.2
+61.6
+
+2.5
+4.0
+5.5
+
+4.8
+4.2
+3.6
+
+9.0
+37.5
+54.7
+
+Table 2: Throughput for processing the TreeLSTM model on
+our recursive framework, Fold’s folding technique, and Tensor-
+Flow’s iterative approach, with the Large Movie Review dataset.
+The recursive approach performs the best on inference with ef-
+ﬁcient parallel execution of tree nodes, while the folding tech-
+nique shows better performance on training thanks to its GPU
+exploitation.
+
+and copies. Moreover, folding is applicable only if the tree struc-
+ture of the input data is known before executing the computation;
+for dynamically structured models the folding technique cannot
+be implemented. Here, we discuss and compare our recursive
+framework with the folding technique. Experiment results for
+folding were obtained using the TensorFlow Fold framework.
+
+6.4.1 Statically Structured Models
+
+Table 2 compares the throughput of performing inference and
+training on the TreeLSTM model using our implementation, the
+iterative approach, and the folding technique. The amount of
+resources is sufﬁcient for executing forward computations, and
+therefore our framework outperforms the folding technique for
+the inference task with up to 4.93x faster throughput. Unlike
+folding, the recursive approach does not have any overheads re-
+garding batch regrouping, since the calculated values can be di-
+rectly passed between caller and callee SubGraphs.
+
+However, when the resource usage is high, not every sched-
+uled tree node in the worker ready queue can be executed con-
+currently, even if the dependencies have been fully resolved.
+While the scalability of the recursive approach is limited by this
+drawback for the training task, the folding technique can exploit
+the GPU and scales better. As a result, the folding technique per-
+forms better than the recursive approach for the training task. We
+can improve the performance of the recursive approach by con-
+ditionally deciding whether to batch the operations or not similar
+to the folding technique, and we leave this as future work.
+
+6.4.2 Dynamically Structured Models
+
+While the models presented in the previous sections demand
+support for dynamic control ﬂow, there is yet another collection
+of models that boast an even greater degree of dynamism, in
+which the model structure is gradually formed depending on in-
+termediate values calculated from prior steps. Top-down TreeL-
+STM [33] (TD-TreeLSTM) is a dynamic model proposed for
+sentence completion and dependency parsing. When a trained
+model receives root node information as an input, the model
+can generate child nodes based on the information and com-
+
+Batch size
+
+Throughput (instances/s)
+
+Iterative Recursive
+
+Folding
+
+1
+64
+
+0.30
+0.34
+
+5.59
+9.30
+
+Not supported
+
+Table 3: Throughput for evaluating the TD-TreeLSTM model
+on our recursive framework and TensorFlow’s iterative imple-
+mentation, on batch sizes of 1 and 64.3 Being able to execute
+tree nodes in parallel lets our framework perform better than the
+iterative approach. Fold’s folding technique is inapplicable to
+the TD-TreeLSTM model.
+
+pletes the rest of the tree sentence. The decision of generating
+a child node or stopping tree expansion is conditionally made
+based on the computed value of the current node at runtime, so
+the structure of the complete tree is not known before actually
+executing the graph. DRNN [2] is a neural network model that
+can generate tree-structured data from sequences, and therefore
+the tree structure in unknown before graph execution, similar to
+TD-TreeLSTM. The Hierarchical Mixtures of Experts [11, 24]
+model has a similar structure, where the whole tree structure is
+decided at runtime. The network structure of HMRNN [5] is
+also dynamically determined by the intermediate computation
+values.
+
+Our framework performs well for such dynamic models. Ta-
+ble 3 shows the throughput of the sentence completing task with
+the TD-TreeLSTM model. Our implementation performs better
+than the iterative approach by up to 18.6x, since multiple tree
+nodes are executed in parallel. For this kind of model, tech-
+niques that rely on heavy preprocessing of input data to batch
+operations (folding) are ineffective because the model structures
+are unknown until the main computation. We note that it is im-
+possible to express such models using the API provided by the
+Fold framework.
+
+7 Related Work
+
+Embedded control ﬂow frameworks. DL frameworks with a
+computation graph comprised of control ﬂow operators along
+with the mathematical operators to represent a DL job are called
+embedded control ﬂow frameworks [1, 30, 6, 4]. This class of
+frameworks does not use the programming language’s control
+ﬂow support (e.g., Python’s if clause) for representing dynamic
+control ﬂow. Instead, they provide certain primitives for embed-
+ding dynamic control ﬂow in the dataﬂow graph; the framework
+cores evaluate a boolean expression and decide what to apply for
+the next operation at graph execution time.
+
+Although our implementation is based on the embedded con-
+trol ﬂow framework TensorFlow [1], the key difference is the
+ability to express recursive functions. In our implementation, a
+user can deﬁne an arbitrary function and use it as an operation to
+compose a graph. The arbitrary function can call another func-
+tion including itself without restriction, allowing recursive deﬁ-
+
+3We follow the suggestions of the original TD-TreeLSTM paper to use a
+
+batch size of 64.
+
+12
+
+nitions of functions. TensorFlow and Theano [30] also let users
+write user-deﬁned functions, but do not support recursion; the
+user must not create a cycle of dependencies between functions.
+Non-embedded control ﬂow frameworks. Unlike embed-
+ded control ﬂow frameworks, PyTorch [20], DyNet [19], and
+Chainer [31] do not embed control ﬂow operators inside their
+computation graphs. Rather, the computation occurs along with
+the dynamic control ﬂow of the host language, removing the
+need to embed the control ﬂow operators inside the computation
+graph. In other words, these non-embedded control ﬂow frame-
+works behave just like numerical computation libraries such as
+NumPy [32] and MKL [10], so one can directly exploit the un-
+derlying language’s abilities for handling conditional branches,
+loops, and recursive functions. Thanks to this behavior, a user
+can easily build a prototype of a new neural network architecture
+or optimization algorithm.
+
+However, since neural networks are usually trained for numer-
+ous steps until they converge, non-embedded control ﬂow frame-
+works suffer from repetitive construction of graphs composed
+of hundreds or thousands of nodes, resulting in substantial ob-
+ject creation and removal overhead. More importantly, embed-
+ded control ﬂow frameworks employ graph compilation tech-
+niques like operation fusion or in-place operation conversion to
+optimize execution, but non-embedded control ﬂow frameworks
+cannot since they do not reuse the graphs.
+
+Recursive dataﬂow graphs are designed to provide a similar
+level of programmability to non-embedded control ﬂow frame-
+works, without losing optimization opportunities by using an
+embedded control ﬂow framework (TensorFlow) to declare com-
+putations with recursion.
+
+Other frameworks with recursion support. TensorFlow
+Fold [15], a library for handling models with dynamic computa-
+tion, allows recursion for writing computation graphs. Fold pro-
+vides a number of new APIs for creating and managing blocks
+(sets of low-level operations). A block behaves as a scheduling
+unit to enable dynamic batching of different computation graphs.
+Using these blocks, Fold constructs an execution loop that re-
+sembles recursion and starts running the loop from base cases,
+wiring intermediate results to the appropriate positions for sub-
+sequent recursive cases. From the perspective of programmabil-
+ity, Fold provides a whole new set of functional programming
+style APIs to preprocess input data and build the computation
+graph. It is required to mix the control ﬂow API of Fold and the
+computational API of TensorFlow to represent a complete DL
+job, which is not a trivial task. Also, since the structure and exe-
+cution order of the computation graph becomes completely dif-
+ferent after graph preprocessing, it becomes impossible to pin-
+point the location of errors on failures, resulting in poor debug-
+gability.
+
+On the other hand, our framework adds a simple abstrac-
+tion, SubGraph, to the programming model to support recur-
+sion. SubGraphs can be used with existing operations anal-
+ogously and does not import any additional execution details
+other than those already provided by the underlying embed-
+ded control ﬂow framework. Moreover, the ﬁnal computation
+graph of InvokeOps retains the original position information of
+
+SubGraphs, allowing the same debugging experience as the un-
+derlying framework.
+
+CIEL [17] is a dynamic task (operator) creation framework
+that allows users to declare data processing jobs recursively. The
+operators of CIEL are relatively more coarse-grained compared
+to DL frameworks, which means the number of recursion calls
+is not large. The different granularity comes from the character-
+istics of the target domain; CIEL targets batch processing appli-
+cations, whereas recursively deﬁned graphs were designed for
+deep learning. More fundamentally, CIEL cannot be integrated
+with modern DL frameworks because CIEL does not consider
+DL-speciﬁc mechanisms such as backpropagation or typed op-
+erator deﬁnitions, which are highly important for DL applica-
+tions.
+
+8 Conclusion
+
+In this paper, we have introduced recursive declarations and re-
+cursive execution mechanisms for running recursive neural net-
+works on top of existing embedded control ﬂow frameworks.
+With recursively deﬁned computation graphs, recursive neural
+networks can be implemented in a fashion that better portrays
+the recursion aspect, and be executed efﬁciently by letting the
+framework exploit parallel execution of computations, both of
+which were very difﬁcult to achieve on existing frameworks due
+to the lack of support for recursion. To achieve this goal, we
+designed and implemented a programming model and a run-
+time execution model, including automatic differentiation sup-
+port for deep learning jobs. We have demonstrated the expres-
+sive power and performance of recursive graphs by implement-
+ing various recursive neural network models using our program-
+ming model and comparing them with iterative and unrolling im-
+plementations, showing that recursive graphs outperform other
+approaches signiﬁcantly.
+
+Acknowledgement
+
+This research was supported by the MSIT (Ministry of Science
+and ICT), Korea, under the SW Starlab support program (IITP-
+2018-R0126-18-1093) supervised by the IITP (Institute for In-
+formation & communications Technology Promotion), and by
+the ICT R&D program of MSIT/IITP (No.2017-0-01772, De-
+velopment of QA systems for Video Story Understanding to pass
+the Video Turing Test).
+
+References
+
+[1] M. Abadi et al. TensorFlow: A system for large-scale ma-
+
+chine learning. In OSDI, 2016.
+
+[2] D. Alvarez-Melis and T. S. Jaakkola. Tree-structured de-
+In ICLR,
+
+coding with doubly-recurrent neural networks.
+2017.
+
+[3] S. R. Bowman, J. Gauthier, A. Rastogi, R. Gupta, C. D.
+Manning, and C. Potts. A fast uniﬁed model for parsing
+and sentence understanding. In ACL, 2016.
+
+13
+
+[21] D. E. Rumelhart, G. E. Hinton, and R. J. Williams. Learn-
+ing Representations by Back-propagating Errors, 1986.
+Nature, 323, 6088, 533–536.
+
+[22] A. Sharma, O. Tuzel, and D. W. Jacobs. Deep hierarchical
+parsing for semantic segmentation. In CVPR, 2015.
+
+[23] A. Sharma, O. Tuzel, and M.-Y. Liu. Recursive context
+propagation network for semantic scene labeling. In NIPS,
+2014.
+
+[24] N. Shazeer, A. Mirhoseini, K. Maziarz, A. Davis, Q. Le,
+G. Hinton, and J. Dean. Outrageously large neural net-
+works: The sparsely-gated mixture-of-experts layer.
+In
+ICLR, 2017.
+
+[25] R. Socher, C. C.-Y. Lin, A. Y. Ng, and C. D. Manning.
+Parsing natural scenes and natural language with recursive
+neural networks. In ICML, 2011.
+
+[26] R. Socher, A. Perelygin, J. Wu, J. Chuang, C. D. Manning,
+A. Ng, and C. Potts. Recursive deep models for semantic
+In EMNLP,
+compositionality over a sentiment treebank.
+2013.
+
+[27] K. S. Tai, R. Socher, and C. D. Manning.
+
+Improved
+semantic representations from tree-structured long short-
+term memory networks. In ACL, 2015.
+
+[28] TensorFlow.
+
+2018.
+https://www.tensorflow.org/versions/master/
+tutorials/recurrent.
+
+Recurrent Neural Networks,
+
+[29] TensorFlow Whitepaper. Implementation of Control Flow
+
+in TensorFlow. 2017.
+
+[30] Theano Development Team. Theano: A Python Frame-
+work for Fast Computation of Mathematical Expressions,
+2016. arXiv preprint arXiv:1605.02688.
+
+[31] S. Tokui, K. Oono, S. Hido, and J. Clayton. Chainer: a
+next-generation open source framework for deep learning.
+In Workshop on Machine Learning Systems in NIPS, 2015.
+
+[32] S. V. D. Walt, S. C. Colbert, and G. Varoquaux. The
+NumPy Array: a Structure for Efﬁcient Numerical Com-
+putation, 2011. Computing in Science & Engineering, 13,
+2, 22-30.
+
+[33] X. Zhang, L. Lu, and M. Lapata. Top-down tree long short-
+
+term memory networks. In NAACL, 2016.
+
+[4] T. Chen, M. Li, Y. Li, M. Lin, N. Wang, M. Wang, T. Xiao,
+B. Xu, C. Zhang, and Z. Zhang. MXNet: A ﬂexible and
+efﬁcient machine learning library for heterogeneous dis-
+tributed systems. In Workshop on Machine Learning Sys-
+tems in NIPS, 2015.
+
+[5] J. Chung, S. Ahn, and Y. Bengio. Hierarchical multiscale
+
+recurrent neural networks. In ICLR, 2017.
+
+[6] Facebook. Caffe2, 2017. https://caffe2.ai.
+
+[7] A. Filinski. Recursion from Iteration, 1994. Lisp and Sym-
+
+bolic Computation, 7, 1, 11-37.
+
+[8] D. P. Friedman and M. Wand. Essentials of Programming
+
+Languages. MIT Press, 2008.
+
+[9] S. Hochreiter and J. Schmidhuber. Long Short-Term Mem-
+
+ory, 1997. Neural Computation, 9, 8, 1735–1780.
+
+[10] Intel Corporation.
+Manual. 2009.
+
+Intel Math Kernel Library Reference
+
+[11] M. I. Jordan and R. A. Jacobs. Hierarchical Mixtures of
+Experts and the EM Algorithm, 1994. Neural Computa-
+tion, 6, 2, 181–214.
+
+[12] M. Li, D. G. Andersen, J. W. Park, A. J. Smola, A. Ahmed,
+V. Josifovski, J. Long, E. J. Shekita, and B.-Y. Su. Scaling
+distributed machine learning with the parameter server. In
+OSDI, 2014.
+
+[13] L. Lin, G. Wang, R. Zhang, R. Zhang, X. Liang, and
+W. Zuo. Deep structured scene parsing by learning with
+image descriptions. In CVPR, 2016.
+
+[14] Y. A. Liu and S. D. Stoller. From recursion to iteration:
+
+What are the optimizations? In PEPM, 2000.
+
+[15] M. Looks, M. Herreshoff, D. Hutchins, and P. Norvig.
+Deep learning with dynamic computation graphs. In ICLR,
+2017.
+
+[16] A. L. Maas, R. E. Daly, P. T. Pham, D. Huang, A. Y. Ng,
+and C. Potts. Learning word vectors for sentiment analysis.
+In ACL, 2011.
+
+[17] D. G. Murray, M. Schwarzkopf, C. Smowton, S. Smith,
+A. Madhavapeddy, and S. Hand. CIEL: A universal execu-
+tion engine for distributed data-ﬂow computing. In NSDI,
+2011.
+
+[18] MXNet. RNN Cell API, 2018.
+
+https : / / mxnet .
+
+incubator.apache.org/api/python/rnn.html.
+
+[19] G. Neubig et al. DyNet: The Dynamic Neural Network
+
+Toolkit, 2017. arxiv preprint arXiv:1701.03980.
+
+[20] A. Paszke, S. Gross, S. Chintala, G. Chanan, E. Yang,
+Z. DeVito, Z. Lin, A. Desmaison, L. Antiga, and A. Lerer.
+Automatic differentiation in pytorch. In Autodiff Workshop
+in NIPS, 2017.
+
+14
+
+

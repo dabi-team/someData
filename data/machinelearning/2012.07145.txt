@@ -1,0 +1,1530 @@
+Learning to Schedule Halide Pipelines for the GPU
+
+Luke Anderson*1, Andrew Adams2, Karima Ma1, Tzu-Mao Li1, and Jonathan Ragan-Kelley1
+
+1MIT CSAIL
+2Adobe
+
+0
+2
+0
+2
+c
+e
+D
+3
+1
+
+]
+L
+P
+.
+s
+c
+[
+
+1
+v
+5
+4
+1
+7
+0
+.
+2
+1
+0
+2
+:
+v
+i
+X
+r
+a
+
+Abstract
+We present a new algorithm to automatically generate high-
+performance GPU implementations of complex imaging and
+machine learning pipelines, directly from high-level Halide
+algorithm code. It is fully automatic, requiring no schedule
+templates or hand-optimized kernels, and it targets a diverse
+range of computations which is signiﬁcantly broader than
+existing autoschedulers.
+
+We address the scalability challenge of extending previous
+approaches to schedule large real world programs, while en-
+abling a broad set of program rewrites that take into account
+the nested parallelism and memory hierarchy introduced by
+GPU architectures.
+
+We achieve this using a hierarchical sampling strategy that
+groups programs into buckets based on their structural simi-
+larity, then samples representatives to be evaluated, allowing
+us to explore a large space by only considering a subset of the
+space, and a pre-pass that ‘freezes’ decisions for the lowest
+cost sections of a program, allowing more time to be spent on
+the important stages. We then apply an efﬁcient cost model
+combining machine learning, program analysis, and GPU
+architecture knowledge. Our method scales combinatorially
+better with respect to the deeper nested parallelism required
+by GPUs compared to previous work. We evaluate its perfor-
+mance on a diverse suite of real-world imaging and machine
+learning pipelines. We demonstrate results that are on average
+1.66×faster than existing automatic solutions (up to 5×), and
+competitive with what the best human experts were able to
+achieve in an active effort to beat our automatic results.
+
+1. Introduction
+
+There is an increasing demand for high-performance array
+programs for imaging and machine learning code. These pro-
+grams manipulate arrays with many stages of deeply nested
+loops. Writing high-performance array programs on GPUs
+typically involves non-trivial trade-offs between parallelism,
+memory locality, and recomputation. Some optimization
+choices include splitting and reordering loops in various con-
+ﬁgurations and assigning them to GPU blocks and threads,
+fusing different stages into a single GPU kernel, and caching
+intermediate results in shared memory for better locality. Man-
+ually implementing these options is highly time-consuming,
+as they often involve making global changes to the program
+structure, and it is difﬁcult to predict ahead of time whether a
+change will be beneﬁcial to performance.
+
+*lukea@mit.edu
+
+Our goal is to automatically optimize programs that extend
+into the tens or hundreds of stages of computation. We build
+on Halide, a domain-speciﬁc compiler that decouples the al-
+gorithm – what we compute – from the the schedule – how
+we compute it. This separation makes it easier to explore
+different schedules for a given algorithm but ﬁnding high-
+performance schedules remains a challenge. The space of
+possible schedules for these programs is extremely large so we
+cannot feasibly compile and benchmark all of them. We need
+a solution that can explore a large search space efﬁciently and
+evaluate the performance of potential options without needing
+to compile and benchmark programs excessively.
+
+Previous approaches to automatically optimizing array pro-
+grams have achieved impressive results for programs in their
+scope, but face a scalability problem when applied directly
+to programs with a larger scheduling space. Adams et al.’s
+Halide autoscheduler [2] focuses on CPU schedules and its
+algorithm does not scale to evaluate all the nested parallel
+tiling options for GPUs. Sioutas et al.’s Halide GPU sched-
+uler [20] only uses block level tiling and does not consider
+optimizations such as register blocking. Polyhedral compilers
+also focus on a limited set of scheduling options. Other tensor
+optimization work (e.g., AutoTVM [7], Tensor Comprehen-
+sion [24], FlexTensor [27], and TASO [12]) focuses on neural
+networks with high arithmetic intensity and dense connections,
+where computation can be easily broken up into individual
+components (such as a convolution layer). This allows them
+to explore a large scheduling space on a single operator.
+
+We aim to efﬁciently explore a rich space of schedules and
+achieve high performance on a broad range of applications. To
+solve the scalability problem, we apply two strategies. First,
+we use a pre-pass where the program is autoscheduled with
+a restricted set of search options and the cheapest stages of
+computation are identiﬁed by a learned cost model. These
+stages have their schedule options ‘frozen’: they will retain
+the same schedule and not be considered as part of the regular
+autoscheduling process. Second, we introduce a hierarchical
+sampling strategy that allows us to explore a large space of
+possible schedules by only considering a subset of options
+substantially smaller than the entire space. We use a structural
+hash to group schedules that share a similar structural orga-
+nization and evaluate only representatives of each group. As
+a result, we are able to enumerate a rich space schedules of
+while making it possible to search the larger space efﬁciently.
+
+Even with our hierarchical sampling, there are still too
+many schedules for us to compile and benchmark. We employ
+
+ 
+ 
+ 
+ 
+ 
+ 
+an efﬁcient cost model to search for the best schedule. To
+generalize to a broad range of applications, our cost model
+combines program analysis and machine learning – we extract
+features that capture the architectural intricacies required to
+predict performance of GPU programs, and feed these features
+into a lightweight neural network. Our cost model allows
+us to evaluate tens of thousands of schedules in a second,
+while compiling and benchmarking even one of them can take
+seconds or even minutes.
+
+We explore the trade-off between compile time and per-
+formance. Our scheduler operates in three modes. In One
+Shot mode, we generate a batch of N samples and take the
+best according to the cost model. This requires no compil-
+ing or benchmarking. In Top 5 mode we generate a batch of
+N samples and of the fastest k according to the cost model,
+return the actual best after compiling and benchmarking. In
+autotuning mode batches of samples are generated, compiled,
+benchmarked and used to retrain a cost model for as long as
+desired.
+
+Our paper contributes:
+
+• A new automatic scheduling algorithm that scales asymptot-
+ically better than prior work by using hierarchical sampling,
+making it possible to efﬁciently explore a large, rich space
+of GPU schedules.
+
+• A set of schedule features that capture the architectural in-
+tricacies required to predict performance of GPU programs.
+• A GPU cost model that combines the schedule features from
+program analysis with machine learning. We train the model
+on a large set of random pipelines and a hold-one-out set of
+real world application programs.
+
+• State of the art results on a suite of real world imaging and
+machine learning pipelines. We outperform the state of the
+art GPU autoscheduler [20] with a geomean speedup of
+1.21× in One Shot mode, 1.31× in Top 5 mode, and 1.66×
+with autotuning. Autotuning, we obtain results (0.98×)
+competitive with what the best human experts were able to
+achieve in an active effort to beat our automatic results.
+
+2. Why is There a Scalability Problem?
+
+Consider a program consisting of a chain of stencils, where
+each point to be computed depends on a stencil of points
+from a previous stage of the program (Figure 1). This com-
+putation pattern is common in deep learning architectures
+(e.g., a sequence of depthwise separable convolution layers),
+image processing algorithms, and physics simulation. How
+would you implement this program for high performance on
+the GPU? Any implementation will need to balance the trade
+off between memory locality, redundant recomputation, and
+parallelism.
+
+Separate Kernels The simplest approach is to schedule
+each stage of the chain in a separate kernel. In this case, both
+intermed and output will be computed in separate kernels:
+
+allocate intermed
+
+Figure 1: A small Stencil Chain with two 3×3 Stencils. Each
+point of the output accesses a 3×3 window of intermed, each
+point of which in turns accesses a 3×3 window of the input.
+Neighboring points of intermed and output access overlap-
+ping points of the preceding step, which can lead to redundant
+recomputation or reloading of shared values, depending on
+the schedule.
+Implementing this pipeline efﬁciently requires
+balancing recompute against parallelism and memory locality
+when mapping to GPU resources in space and time.
+
+for col, row in intermed.W, intermed.H @blocks
+compute intermed
+
+allocate output
+for col, row in output.W, output.H @blocks
+compute output
+
+Every point of intermed will be computed ﬁrst, and stored in
+global memory, then every point of output will be computed,
+loading them. As written, this implementation is inefﬁcient. It
+uses parallelism at the block level but makes no use of thread
+parallelism.
+
+Tiling the Blocks A more efﬁcient implementation would
+tile the blocks by splitting the outer loops into outer block
+loops and inner thread loops:
+
+allocate intermed
+for col_o, row_o in ?, ? @blocks
+for col_i, row_i in ?, ? @threads
+compute intermed
+
+allocate output
+for col_o, row_o in ?, ? @blocks
+for col_i, row_i in ?, ? @threads
+compute output
+
+But we now have choices for how big the tiles of each stage
+should be. As we consider more complex schedules, these
+choices will affect things like locality and redundant com-
+putation, but for now they mostly impact parallelism: Small
+tiles produce many blocks, but few threads per block—plenty
+of parallelism across streaming multiprocessors (SMs), but
+potentially too little thread parallelism within each to keep
+it busy. Large tiles make the opposite tradeoff: less (block)
+parallelism across SMs, and more (threads) within each one.
+16, 32, and 64 are typical choices for the innermost thread
+dimension, while powers of 2 are common choices for the
+remaining dimensions.
+
+Importantly, by introducing block tiling, we have created
+
+2
+
+inputintermedoutputO(T d) possible options to consider (where T is the number
+of tile sizes and d is the number of dimensions to tile, in this
+case 2). If the size of the iteration domain is small, the number
+of options is smaller. Larger arrays, especially if they have
+multiple dimensions, will have many more options. Large
+three- and four-dimensional tensor operations are common
+in image processing and machine learning. Even for this
+seemingly straightforward implementation, there are still many
+possibilities to consider.
+
+Tiling the Threads A further optimization we can consider
+is tiling the thread level, as well:
+
+allocate intermed
+for col_o, row_o in ?, ? @blocks
+for col_i, row_i in ?, ? @threads
+for col_ii, row_ii in ?, ? @serial, unrolled
+
+compute intermed
+
+allocate output
+for col_o, row_o in ?, ? @blocks
+for col_i, row_i in ?, ? @threads
+for col_ii, row_ii in ?, ? @serial, unrolled
+
+compute output
+
+Each thread is then responsible for computing a sub-tile’s
+worth of points, instead of just one. This gives coarser-grained
+parallel tasks, and provides opportunities to exploit input reuse
+(fetching shared values once and reusing them in registers)
+and instruction-level parallelism, especially if the serial sub-
+tiles are unrolled. But it also comes with tradeoffs: it reduces
+parallelism at the block and thread levels, and may increase the
+stride of memory accesses across threads, reducing bandwidth
+efﬁciency.
+
+Typical choices for thread tiling options are small constants,
+and the loops are often unrolled. This introduces a further
+O(T d) possible tiling options to consider. Critically, this com-
+pounds with the choices at the thread level, and introduces the
+major challenge of enumerating schedule options for GPUs:
+scalability. By attempting to exploit nested parallelism, the
+total number of options across both levels – and including
+fusion decisions – introduces a quadratic factor, becoming
+O((T d)2) = O(T 2d).
+
+Even for a modest number of tiling options and a small num-
+ber of dimensions, this total quickly grows into the hundreds
+or thousands – and these are only options for a single stage
+of the program. Real applications can have 100s of stages,
+many with 4 or more dimensions. For example, a 3 dimen-
+sion stencil chain with input size 1536x2560x8 can generate
+almost 3 million possible options, even for a chain of length
+14. And computing each stage in its own kernel is hardly the
+only option we need to consider to achieve high performance.
+
+Fusion Options The options we considered so far all exhibit
+poor memory locality: all intermediate values produced by
+intermed are computed and stored to slow global memory
+before any are used to compute output, at which point they
+have likely fallen out of cache. An alternative is to move
+
+(or fuse) the computation of intermed inside the loop nest of
+output:
+
+allocate output
+for col_o, row_o in ?, ? @blocks
+allocate intermed @shared_mem
+for col_i, row_i in ?, ? @threads
+for col_ii, row_ii in ?, ? @serial, unrolled
+
+compute intermed
+
+for col_i, row_i in ?, ? @threads
+for col_ii, row_ii in ?, ? @serial, unrolled
+
+compute output
+
+In doing so we improve memory locality, and the smaller in-
+termediate working set can be stored in faster local memories –
+shared memory if fused at the block level like here, or registers
+if fused one step further, all the way inside the thread level:
+
+allocate output
+for col_o, row_o in ?, ? @blocks
+for col_i, row_i in ?, ? @threads
+allocate intermed @registers
+for col_ii, row_ii in ?, ? @serial, unrolled
+
+compute intermed
+
+for col_ii, row_ii in ?, ? @serial, unrolled
+
+compute output
+
+However, these fusion choices come at the cost of redundant
+recomputation of all the points in intermed where the the
+stencil needed by output overlaps from one tile to the next
+(the orange region in Figure 1). Fusion introduces additional
+choices for the level in the loop nest at which to fuse each
+stage, and additional tiling options within those fused blocks,
+further exacerbating the scalability problem.
+
+The Cost of Evaluating an Option
+
+The space of choices we have to consider to optimize a pro-
+gram like this for the GPU is large, rapidly reaching into the
+millions for real programs. Fully compiling and benchmarking
+each choice is prohibitive, as it can take tens of seconds to
+minutes per choice. We therefore rely on a cheaper, but still
+rich cost model (Sec. 7.2) to more quickly evaluate choices.
+But even this is far from free: to accurately predict the perfor-
+mance of complex programs on complex hardware, it applies
+both a wide array of static analyses to extract performance-
+relevant features of a given choice, and a small deep neural
+network to compute the nonlinear mapping from these features
+to ultimate performance. Our cost model is highly optimized,
+but it still often takes tens of microseconds to evaluate – orders
+of magnitude more than simply enumerating a choice. And
+the cost function introduces an additional quadratic scalability
+challenge: the number of choices to evaluate grows with the
+number of stages in the program n, but the cost of evaluat-
+ing the cost model also grows with n, producing a total cost
+model evaluation time that scales with n2 × T 2d. In all, this
+makes it infeasible to directly optimize GPU schedules using
+the tree search techniques introduced by prior work [2], since
+autoschedule times increase substantially as programs grow.
+
+3
+
+3. Hierarchically Sampling the Search Space
+
+5. Overview of the Autoscheduler
+
+The space of options we want to consider is too large to fea-
+sibly explore and evaluate in its entirety. How can we efﬁ-
+ciently explore the space without featurizing and evaluating
+the cost model for all the possible states? Our key idea is
+that the search space can be partitioned into buckets based
+on structural similarity, and it is sufﬁcient to randomly select
+candidates from within each group as representatives to be fea-
+turized and evaluated by the cost model (Figure 2). Intuitively,
+the representatives chosen from each group should give some
+sense of the expected performance of the group as a whole i.e.
+the expected performance of a schedule with that same struc-
+tural layout. This approach stratiﬁes the search space based
+on fundamental structural changes to the program’s schedule.
+We compute the hash of each option up to a given depth
+(Figure 3), where the depth considered increases as the search
+process continues [2] (Section 6.5). For example, all options
+that have the same functions computed in their own kernels
+will have the same hash at depth 0, regardless of which other
+computations are fused into their kernels. But those same
+schedules may have different hash values at depth 1 if they
+have different computations at their block levels. At greater
+depth values, the hash function will take into account more
+levels of fusion: it becomes more ﬁne grained and more buck-
+ets result. Intuitively, this allows us to control the amount
+of variation amongst the options in each bucket: low depth
+values mean few buckets where the options may only share
+coarse structural similarity and greater depth values mean
+many buckets where the options share more ﬁne grained struc-
+tural similarity.
+
+When selecting representatives, we randomly choose only
+log2(B) options from each bucket (where B is the number of
+schedules within the bucket) to be featurized and evaluated
+by the cost model. This reduces the number of options we
+evaluate for each stage from O(T 2d) down to O(log2(T 2d)) =
+O(2d log2(T )), which makes it feasible to evaluate all the
+chosen representatives.
+
+Similar to Adams et al. [2] and many other autoschedulers,
+our algorithm consists of 3 major components. First, we
+enumerate a large space of plausible GPU schedules for a
+given Halide program. Second, we featurize the schedules and
+provide them to a learned cost model that predicts program
+run time. And third, we use a variant of beam search to
+explore the space of possible schedules. The beam search uses
+our hierarchical sampling strategy to make the search space
+exploration scalable and is guided by the cost model to search
+for the best performing programs. Our algorithm supports
+different modes of operation. It can be used to schedule a
+program quickly in a one-shot fashion, without any compiling
+or benchmarking. It can also be used for autotuning: we can
+generate many possible schedules, compile and benchmark
+them on the target GPU and use these programs to retrain the
+cost model, improving its ability to accurately predict program
+run times. This process can be repeated as desired.
+
+6. Our Search Algorithm
+
+We use a variant of beam search to guide the process of enu-
+merating options, selecting them using hierarchical sampling
+for evaluation by the cost model. It can be run for multiple
+passes, during which it uses information from previous passes
+to prioritize states to explore during the current pass. It main-
+tains a priority queue of k candidate states, each representing
+a partially scheduled loop nest. The beam search operates in 2
+phases for each Func.
+
+To help illustrate this process, we introduce a Halide
+pipeline based on our previous stencil chain example (sim-
+pliﬁed to use a 1D stencil across columns):
+
+Func intermed, output;
+intermed(x, y) = input(x-1, y)
++ input(x, y)
++ input(x+1, y);
+
+output(x, y) = intermed(x-1, y)
++ intermed(x, y)
++ intermed(x+1, y);
+
+4. Freezing Low Cost Stages
+
+Inspired by how human experts approach scheduling by fo-
+cusing their attention on the parts of the program they think
+will be the most costly, the second thing we do to improve
+scalability is to ‘freeze’ the lowest cost stages of the program
+and focus our attention on the higher cost stages. During a pre-
+pass that only considers options that compute stages in their
+own kernels or inline, we enumerate options as normal, using
+the hierarchical sampling strategy. For the resulting schedule
+produced, we examine the lowest cost stages according to the
+cost model and ‘freeze’ the options that were chosen for them.
+We then schedule the unfrozen stages without restriction. We
+‘freeze’ all but log2(N) stages, improving the scalability for
+programs with many stages.
+
+Halide will represent this algorithm as a directed acyclic
+graph of Funcs, where output is a consumer of producer
+intermed, which in turn is a consumer of in.
+
+The search begins with a completely unscheduled pipeline
+and makes decisions for each Func in the program in sequence,
+starting from the output. The schedule during this process is
+represented as a loop nest structure, where each level of the
+loop nest represents a given tiling. Every scheduling decision
+our algorithm makes transforms this loop nest, so we refer
+to this structure throughout as a natural way of describing
+this process. Different levels of the loop nest are labelled
+according to the type of parallelism they provide. The outer
+loops correspond to blocks. Immediately inside the outer block
+loops are thread loops, inside of which are serial loops.
+
+At this point we start enumerating possible options but none
+
+4
+
+Figure 2: Our Hierarchical Sampling Strategy. A large, rich space of candidate options are enumerated. They are then grouped
+into buckets based on their structural similarity. We sample log2(B) representatives from each bucket. The representatives from
+each bucket become the ﬁnal candidate states.
+
+but will likely exhibit poor memory locality. Its allocation will
+be stored in global memory, which is slow, and launching a
+separate kernel will incur some overhead. For Func output
+this is the only option, since it is the output of the program.
+
+For Funcs that are not outputs of the program (intermed),
+they can also be computed at the root level but there are ad-
+ditional options. Each of these Funcs can be computed at
+the block level of their consumer for better memory locality,
+since output can access a tile of intermed right after they are
+computed. We further place the allocation in shared memory,
+which is faster than global memory and L2 cache. However,
+as demonstrated in Section 2, fusing may introduce redundant
+recompute. There is also a hardware limit on the amount of
+shared memory available. If a Func is scheduled at this level,
+its loops will become thread loops.
+
+We can also compute the Func inside the thread level of its
+consumer. This further improves memory locality. Its allo-
+cation will be stored at the register level, which is the fastest
+type of memory. But this option may introduce signiﬁcant
+redundant recompute and sacriﬁces parallelism since it will
+be computed serially by a single thread. Register memory is a
+very limited resource and large and/or dynamic allocations at
+this level may introduce costly local memory spilling.
+
+The ﬁnal option is to inline the Func directly into its con-
+sumers. This option avoids storing memory altogether so
+exhibits the best memory locality but can easily introduce un-
+acceptable levels of redundant recompute. If a Func consists
+of a single stage and is called point-wise by its consumer,
+we always inline it. If a Func is cheap to compute, it will
+always be considered for inlining but may be rejected later if
+our featurization determines that the state requires excessive
+recomputation.
+
+Inline options and Funcs fused inside their producer’s thread
+
+loop are not considered for tiling.
+
+Next, we need to make decision 2 of tiling the functions.
+Funcs stored at the block level of their producer will be tiled
+immediately, since their tiling choice will have a signiﬁcant
+impact on the featurization and cost of their producer and
+
+Figure 3: Structural Hashing: we hash options up to a given
+depth to stratify our search. Here, two different schedules
+have the same structure at depth 1 (which only considers
+block-level choices), but different structure at depth 2 (which
+considers both block- and thread-level choices). Equal hashes
+at low depth indicate at least coarse grained structural simi-
+larity. Equal hashes at high depth values indicate more ﬁne
+grained structural similarity.
+
+of them are actually evaluated by the cost model until they are
+chosen by our hierarchical sampling.
+
+For each Func we make 2 decisions:
+
+1. Where in the currently scheduled loop nest should we com-
+
+pute this Func?
+
+2. How should we tile this Func?
+
+In the ﬁrst phase of the search process, we start by mak-
+ing decision 1. As described in Sec. 2, the options include
+computing the Func in its own kernel, fusing it into one of
+its consumers, or inlining it, all of which introduce a tradeoff
+between parallelism, locality, and redundant computation.
+
+The coarsest granularity is to compute it at the root level of
+the loop nest. This corresponds to launching the Func in its
+own separate kernel. It requires no redundant recomputation
+
+5
+
+Next Candidate ChoicesBucketsStructuralHashSampleRepresentativesCostBeam to expand(Top k)for y, x @blocks:  for yi, xi @threads:    ...Enumerate choices for next stageSame hash at depth 1Schedule 2Schedule 1for output y, x @block for output yi, xi @thread  for intermed yii, xii @serial, unrolled  for output yii, xii @serial, unrolledfor output y, x @block for intermed yi, xi @thread  for intermed yii, xii @serial, unrolled for output yi, xi @thread  for output yii, xii @serial, unrolledDifferent hash at depth 2other siblings that are fused at the same block. For them we
+enumerate serial loop sizes so they become a set of thread
+loops outside serial loops.
+
+6.1. Choosing Serial Loops
+
+First, we enumerate inner serial loop options. These options
+allow loaded points to be stored in registers for faster accesses
+and the goal is for them to be unrolled so inputs can be reused
+across the unrolled loops. We do not want them to be too
+large because they would then reduce the amount of paral-
+lelism available at the block and thread levels and potentially
+increase the stride of memory accesses, which can negatively
+impact memory efﬁciency by decreasing global memory coa-
+lescing and/or increasing shared memory bank conﬂicts. We
+enumerate serial tile sizes that are small powers of 2: 1, 2, 4,
+and 8 in each dimension. We also consider small odd tilings
+(3, 5, 7) if they will enable the resulting thread loop’s extent to
+be a multiple of the warp size (e.g. tiling an extent of 96 with
+a serial loop of size 3 would enable a thread loop of 32).
+
+At this point, the compute location has been chosen and
+candidates scheduled at their producer’s block have been tiled.
+If we decide to compute the Func in its own kernel, we
+defer its tiling to the second phase of the search to reduce the
+number of options to be enumerated in a single phase. At that
+point, it will be tiled into 3 levels. First, serial loops are chosen
+as above.
+
+6.2. Choosing Thread Loops
+
+After enumerating the serial loop options, we then enumerate
+thread loop options. Our goal in this step is to make effective
+use of thread parallelism while also ensuring an adequate
+number of blocks at the outer level. We enumerate thread loop
+sizes that encourage favourable warp sizes: 16, 32, 64 in the
+innermost loop dimension, and powers of 2 up to 16 in the
+other dimensions. We select as the innermost loop dimension
+the ﬁrst dimension with extent >= 16. If there are none, we
+use the ﬁrst dimension.
+
+6.3. Block Loops
+
+The remaining loop extents after choosing thread sizes will
+become the outer block loops. A good schedule should aim to
+have sufﬁcient parallelism (at least 2x the number of SMs on
+the GPU) to keep all the SMs busy and a balanced number of
+blocks that does not leave too many SMs idle.
+
+Tiling decisions are made depending on the Func’s chosen
+compute location. If computed at the root level, we enumerate
+all serial and thread loop options. If computed at the block
+level, we enumerate all serial loop options only: the outer loop
+after tiling becomes a thread loop and there is no need to tile
+it because it is already surrounded by a block loop. And if
+computed inside the thread loops, tilings are not enumerated:
+the resulting bounds of the Func are likely too small to make
+tiling worthwhile.
+
+6.4. Hierarchical Sampling
+
+At the end of each phase, once we have enumerated the search
+space options for a given Func, we want to featurize and
+evaluate them with the cost model. But as described in Section
+2, it’s not feasible to evaluate them all. Instead we apply our
+hierachical sampling strategy (Section 3).
+
+Before featurizing and evaluating the cost model, we or-
+ganize all the enumerated options into buckets based on a
+structural hash of their loop nest. We randomly sample repre-
+sentatives from each bucket. These ﬁnal selected options are
+then featurized and evaluated by the cost model and added to
+the beam.
+
+6.5. Avoiding Known Bad States
+
+The search algorithm can be run in multiple passes. During
+each pass, as candidate options are taken from the beam, we
+ﬁrst compute their structural hash up to the depth dictated by
+the current pass. If we have previously seen that hash and
+the cost model informed us that it’s not a promising state, we
+apply a cost penalty and move it back in the priority queue.
+Intuitively, this helps us avoid wasting time not just on the
+exact state under consideration, but all states that have the
+same hash. If we previously sampled a state as a representative
+during hierarchical sampling and it is evaluated poorly by the
+cost model, it will serve as a negative example for all the
+other members of its structural hash bucket and help guide us
+towards structural hashes that either show promise or have not
+yet been explored. When computing the hash, we use the pass
+index as the depth (Figure 3). This means that during earlier
+passes an equal hash value will indicate that 2 options have at
+least coarse grained structural similarity. During later passes,
+the depth increases and an equal hash value indicates more
+ﬁne grained similarity. Intuitively, in the earlier passes, we
+explore considering only coarse structure, then in later stages
+start to look at more ﬁne grained differences between options.
+Our results use samples with beam search (beam size 32 with
+5 passes), which will consider hashes up to depth 5, as well
+as greedy samples (beam size 1 with 1 pass), which will only
+consider hashes up to depth 1, i.e. the block level.
+
+6.6. Pruning
+
+The goal when enumerating the search space is to include as
+many plausibly good states as possible. We want to ensure we
+include serial tilings because register blocking and input reuse
+is an important optimization on some applications. We also
+want to ensure there are enough blocks to keep the SMs busy,
+while avoiding conﬁgurations that leave SMs idle, and enough
+warps to promote adequate latency hiding, while avoiding
+states that leave excess warp lanes idle. We prune states in the
+following situations:
+• States with excessive recompute, usually caused by inlining
+• States that leave too many SMs idle
+• States that exhibit poor warp lane utilization
+
+6
+
+• States that have serial extents that are too large to be unrolled
+• States with allocations at the thread level that are dynamic
+in size or too large and likely cannot be promoted from local
+memory to registers
+
+• States that exceed the GPU’s hardware limits, including
+states that use too many threads or too much shared memory.
+
+6.7. Lowering Optimizations
+
+Once a pipeline is fully scheduled, it is ready to be lowered to
+a concrete implementation.
+
+We apply two optimizations:
+
+• We stage producers (including ones inlined) at the thread
+level of their consumer. Their loaded points will be staged in
+an intermediate buffer, which will become register storage,
+allowing for faster reuse.
+
+• Any serial loops that have total extent less than 16 will be
+
+unrolled.
+
+7. Evaluating Schedules
+
+We design an efﬁcient cost model for evaluating the perfor-
+mance of a schedule on GPU. The cost model takes a set of
+features generated from a program, and feeds them into a
+light-weight neural network. We then train the cost model to
+predict the performance.
+
+We build our cost model on top of Adams et al.’s work [2].
+We compute both algorithm speciﬁc features and schedule
+speciﬁc features. We inherit Adams et al.’s algorithm spe-
+ciﬁc features, which are histograms of various arithmetic and
+memory operations over the entire algorithm.
+
+7.1. Features
+
+We extend Adams et al.’s schedule speciﬁc featurization to
+capture important characteristics of GPU architectures. These
+include features for capturing how the schedule uses the dif-
+ferent types of memory available on the GPU, how effectively
+it utilizes the GPU’s parallelism at the block and thread levels,
+and the level of occupancy it achieves. In Halide, a Func can
+have multiple update stages that write to the same memory
+buffer. The features are computed for each update stage of the
+computation.
+
+Memory access. We analyze the memory access pattern by
+looking at the strides of the array index access with respect to
+loop parameters. A suboptimal stride will typically result in
+poor coalescing at the global memory level or bank conﬂicts
+at the shared memory level. We use the stride to compute
+the number of global memory transactions or shared memory
+transactions required for each stage of the pipeline. We do this
+once for a representative regular warp of the stage and once
+again if there is a tail warp (when the loop size is not divisible
+by the warp size), which may exhibit different memory access
+behavior because its lanes might be underutilized. These
+memory access counts account for amortized loads that can be
+reused across unrolled inner serial loops and stores that can be
+
+moved outside the block of unrolled serial loops. In addition,
+we have a feature for the efﬁciency of loads and stores at both
+the global and shared levels. The efﬁciency is deﬁned as the
+ratio of bytes used to bytes actually loaded or stored. We
+also compute the memory footprint accessed at various levels
+of a given loop nest, including per iteration of the innermost
+serial loop, per thread, and per block. These footprints are
+delineated by memory type (global, shared, register). In the
+case of global and register memory, the memory footprint
+gives a hint to the cost model as to expected cache behavior
+and register pressure.
+
+Effective Parallelism To capture how effectively the GPU’s
+parallelism is used, we compute its number of blocks, number
+of warps per block, and number of threads. We compute each
+stage’s warp utilization, which measures how many threads
+of a stage’s warps are idle as a percentage of the number of
+threads in use across all stages computed at the block level. A
+low warp utilization indicates that a stage is fused alongside
+another stage at the block level in a way that sacriﬁces thread
+parallelism. We also compute the number of threads that
+are idle as a percentage of the total number of threads made
+available by the hardware.
+
+Occupancy We compute for each stage warp, block, and
+shared memory occupancy. We compute the ratio of maximum
+active warps to the maximum number of active warps hardware
+limit and the ratio of maximum active blocks to the maximum
+number of active blocks hardware limit. We also compute
+the ratio of shared memory to the hardware shared memory
+limit. We use this to compute how much block occupancy is
+impacted by shared memory usage.
+
+A complete list of our features is available in Appendix A.
+
+7.2. Cost model
+
+Once we have the features for each stage in the computation,
+we feed the features for each stage into a small neural network
+to predict a vector of coefﬁcients. We then use these coefﬁ-
+cients along with our features in a cost model to predict the
+performance per stage and sum over all stages. We inherit our
+cost model design from Adams et al.’s autoscheduler [2], but
+with more GPU-speciﬁc features and cost model components.
+Our network accepts as input the algorithm-speciﬁc and
+schedule-speciﬁc features, takes the logarithm of the schedule-
+speciﬁc features to compress the dynamic range, and feeds
+both of them into a fully-connected network to produce two
+embedding vectors. These two embeddings are then stacked
+together and passed into a fully-connected network to produce
+a vector of positive weights.
+
+These features and weights are then used for computing
+the following costs: compute, load, store, parallelism and
+working set. The compute cost accounts for the number of
+points computed and how effectively the warp lanes and SMs
+are utilized to compute them. The load and store costs differ-
+entiate between the different types of memory (global, shared,
+
+7
+
+One Shot:
+
+Top 5:
+
+Autotuned:
+
+Figure 4: We test our autoscheduler in three different modes,
+which trade increased compile time and the need to take
+ground-truth benchmarks for increased performance. One
+Shot uses the cost model alone to rank choices. Top 5 com-
+piles and benchmarks the top 5 choices as ranked by the cost
+model. Autotuned iteratively compiles and benchmarks sam-
+pled programs, ﬁne-tuning the cost model to the speciﬁc ap-
+plication as it goes.
+
+register). They take into account memory access patterns and
+the footprints of memory loaded and stored at various levels
+of the loop nests. The parallelism cost estimates the number
+of kernels and blocks launched. The working set cost captures
+register pressure and cache usage. The learned coefﬁcients
+are applied as weights to each of these cost components. Full
+details are available in Appendix B.
+
+7.3. Training Procedure
+
+We train our cost model on a combination of random pipelines
+constructed from common image processing and machine
+learning operation building blocks [2]. Additionally, for each
+app in our test suite we train in a hold-one-out fashion: every
+other app contributes samples to the target app’s training set.
+
+8. Results
+
+We evaluate our autoscheduler on a diverse set of 17 imaging
+and machine learning programs, including 15 applications
+from the Halide repository: bilateral grid, local laplacian,
+non-local means, lens blur, camera pipe, a 32-stage stencil
+chain, Harris corner detection, histogram equalize, max ﬁlter,
+unsharp mask, interpolate, a neural network conv layer with
+ReLU activation, SGEMM (Single ﬂoat precision General Ma-
+trix Multiply), an IIR blur, BGU (bilateral guided upsampling).
+To this we added a depthwise-separable convolution [23], and
+
+8
+
+a learned demosaicing algorithm based on Li et al. [13].
+
+We compare our autoscheduler against the best Halide
+schedules experts are capable of writing by hand, using the
+entire scheduling language. Our experts iteratively improved
+these schedules during the course of this work using the best
+runtimes found by the autoscheduler as a target to beat (but
+without looking at the generated schedules), so they repre-
+sent a very high bar. In many cases these human schedules
+substantially improve on the ones found in the Halide reposi-
+tory, which were used as-is by prior work. We also compare
+to the best existing Halide GPU autoscheduler [20]. We use
+our technique in 3 different modes of operation, which trade
+off compile time and the ability to benchmark for quality of
+results:
+
+One Shot For each application, we generate 80 samples
+using a cost model trained on random pipelines and all ap-
+plications beside the one being tested. We take the schedule
+ranked best by the cost model. No benchmarking is involved
+in selecting the schedule. This approach is directly comparable
+to Sioutas et al. [20], and can run in seconds.
+
+Top 5 Same as One Shot, but we consider the top 5 sched-
+ules according to the cost model, compile and benchmark
+them, and take the best. This is more representative of what a
+human might do – construct and benchmark several promising
+candidates – and it takes on the order of a minute.
+
+Autotuning We tune each application for 20 iterations, with
+80 samples per iteration. All 80 samples are compiled, bench-
+marked, and then used to retrain the model. This mode starts
+from random weights, so it does not beneﬁt from transfer
+learning from other applications or random pipelines, and is
+in fact slower than the above two modes on one application. A
+total of 1600 samples are generated for each application. We
+take the fastest schedule found during this process. This takes
+tens of minutes to a few hours, depending on the program.
+
+In all 3 modes of operation, we generate batches with 1
+beam search sample (beam size = 32, 5 passes) and 79 greedy
+samples (beam size = 1, 1 pass).
+
+8.1. Post-Compile Filtering
+
+For the One Shot and Top 5 cases, we apply additional post-
+compile ﬁltering: any samples that spill registers to local
+memory are removed from consideration. This performance
+cliff is hard to predict pre-compilation, because it depends on
+the vagaries of the underlying PTX compiler, which issues
+a warning when this happens. In one case (lens blur), all
+samples experienced register spilling. In this case we took the
+best sample that was within 50% of the least spilling.
+
+All our results were generated on an IBM AC922 with 2×20
+core Power9 CPUs and 4×NVIDIA V100 SXM2 cards with
+32GB of memory. While this is an unusual processor, in no
+case was the time spent on the CPU a signiﬁcant fraction of
+total runtime. All benchmarks were performed on a single
+V100 in isolation.
+
+Figure 5: Throughput relative to best schedule of the prior state-of-the-art GPU autoscheduler [20], our technique at three levels
+of compile time budget (from one shot with no benchmarking, to autotuning 1600 samples), and highly tuned human expert
+schedules. The benchmarks are a super-set of those in prior work [2, 20], and span a diverse set of imaging and learning
+programs from a few to several hundred stages. In all modes, our technique signiﬁcantly outperforms the prior state-of-the-art
+on average, and with full autotuning it matches the best human experts.
+
+8.2. Analysis
+
+We achieve a geomean speedup over Sioutas et al.[20] of
+1.21×in the One Shot case, 1.31×in the Top 5 case, and
+1.66×in the autotuning case. Our autotuned results are on
+par with our best known manual schedules (0.98×).
+
+Sioutas et al. generate code that fails to run on the conv
+layer, and performs poorly on several apps, especially those
+outside its test set (BGU, depthwise separable conv, and
+learned demosaic). Its single largest weakness is a search
+space issue with workloads that include matrix multiply or
+conv layer. A fast matrix multiplication contains an inner un-
+rolled block over a tile of O(MN) accumulators, which share
+the O(M + N) loads required to compute each term. Sioutas
+et al. do not consider this form of unrolling. On BGU, Sioutas
+et al.
+launch every step of a per-pixel 4x4 matrix solve as
+its own kernel. We suspect this is due to a weakness in the
+manually-designed cost model.
+
+8.3. Manual Schedules Outside the Search Space
+
+The manual schedules outperform our autoscheduler in several
+instances. For both the conv layer and IIR blur, the expert
+schedules split and unroll the reduction loops. In BGU and
+histogram equalization the manual schedules use atomic ﬂoat-
+ing point adds to memory to expose more data parallelism. In
+the conv layer, the IIR blur, the learned demosaic, and matrix
+multiply, the manual schedule uses warp-shufﬂe instructions
+to share data between the threads in a warp without requiring
+a full barrier across the entire thread block. These transfor-
+mations can have signiﬁcant performance advantages but are
+
+not currently in the search space of our autoscheduler. Other
+common patterns in the manual schedules not exploited by
+our autoscheduler are SIMD vectorization of load instructions
+to reduce the total number of memory transactions, and pre-
+staging of stencil inputs into shared memory to reduce the
+total number of loads to device memory.
+
+Despite operating without all of these features, the au-
+toscheduler was able to beat the manual schedules the majority
+of the time, and has geomean performance on par with our best
+efforts at manual schedules. The large gains come in the most
+complex, heterogeneous applications, which are intractably
+difﬁcult for humans to schedule.
+
+9. Related work
+
+Earlier work on automatic array program optimization fo-
+cused on afﬁne transformations of loop nests (e.g., PLUTO [5],
+Polly [8], and PPCG [25]). These works proposed that loop
+nests can be treated as polyhedra, and afﬁne loop transforma-
+tions can be treated as transformations on the polyhedra. This
+abstraction allows them to concisely express and explore many
+different loop optimizations, often in the form of solving an
+integer linear programming problem to minimize a simple cost
+function related to parallelism and locality.
+
+Halide [18, 19] takes a slightly different approach by deﬁn-
+ing a set of domain speciﬁc rewrites to a loop nest. This
+allows Halide to handle a generalized form of loop fusion
+(called compute_at and store_at in Halide), which is essen-
+tial, but was difﬁcult to express in prior polyhedral optimizers.
+Early automatic schedulers in Halide used genetic algorithms
+
+9
+
+Sioutas 2020One ShotTop 5AutotunedHuman ExpertOurs:0.000.250.500.751.00bilateral gridlocal laplaciannon-local meanslens blurcamera pipestencil chain (32 stages)harrishistogram equalizemax filter0.000.250.500.751.00unsharp maskinterpolateconv layermatrix multiplyIIR blurBGUdepthwise separable convlearned demosaicgeomeanover randomly generated schedules [19, 3]. PolyMage [16]
+combines ideas from the polyhedral literature and Halide, and
+develops an automatic scheduling technique using a heuristic
+cost model and a greedy stage grouping algorithm, and then
+compiling and benchmarking over different tile sizes. This
+was later extended with a richer cost model and better search
+algorithms [11]. A parallel line of work uses a similar heuris-
+tic cost model and greedy stage grouping to handle a broader
+range of algorithms and schedules in Halide [15, 21], and was
+recently extended to target GPUs [20]. Li et al. also developed
+a Halide GPU autoscheduler specialized to gradient code [13],
+which only considers trivial loop fusion.
+
+Adams et al. [2] noted that most previous approaches on
+automatically scheduling Halide programs focused on a rather
+restricted set of rewrites, and the heuristic cost models do
+not capture well the complexity of real machines. Adams et
+al. design a general search algorithm that can handle a broad
+set of scheduling rewrites, while developing a hybrid-manual-
+learning-based cost model that can learn the complexity of
+modern hardware while being efﬁcient. Unfortunately, as we
+discussed throughout the paper, Adams et al.’s approach does
+not scale well when applied to GPU architectures, due to the
+signiﬁcant increase of tiling options, and the lack of GPU-
+speciﬁc features and search pruning techniques. Adams et al.
+report preliminary GPU results that are 29%-33% faster than a
+baseline [13] that has been superseded by [20], which reports
+a 2×improvement over it.
+
+Recent tensor frameworks such as TensorFlow [1] and
+TVM [6] are equipped with graph rewrite systems to opti-
+mize the composition of coarse-grained operators. XLA [22]
+applies a set of template rewrites to the computation graph
+using heuristic rules. TASO [12] takes a superoptimization
+approach to this problem, and generates a large collection
+of graph rewrites from a small set of tensor relation axioms,
+and formally veriﬁes them. Others attack the problem using
+reinforcement learning agents [17]. These techniques focus on
+coarse-grained rewrites of large graphs, and not the detailed
+decisions of how to schedule the many dimensions within each
+coarse-grained operator or operator group.
+
+Complementary work focuses on optimizing individual ten-
+sor operators (or, equivalently, small local clusters as output
+by a higher-level graph rewriter). AutoTVM [7] automatically
+searches over parameters of hand-written schedule templates,
+using a reinforcement learning algorithm with a statistical
+cost model with gradient boosted trees or tree-based recurrent
+neural networks. FlexTensor [27] removes the need to manu-
+ally specify templates by directly enumerating from a set of
+Halide-like program rewrites. Tensor Comprehensions [24]
+employs polyhedral rewrites and autotuned tile sizes. Because
+these systems focus on neural network workloads, dominated
+by individual high arithmetic intensity kernels with limited
+opportunity for long-range fusion due to very large stencils
+in the channel dimensions, they are able to focus separately
+on small local computation graphs where scalability is less
+
+of a challenge. In contrast, we aim to schedule a broader set
+of programs made up of many, more diverse, and lower arith-
+metic intensity operations (such as the stencil chain). Fusing
+and jointly scheduling stages over long ranges is crucial to
+performance in these cases.
+
+Some previous works used machine learning in compiler
+optimization (e.g., [4, 9, 14]). In contrast to most approaches
+in this domain, our cost model operates on a more abstract
+loop representation, leverages explicit program analysis and
+GPU architecture knowledge.
+
+Concurrently with our work, Haj et al. [10] recently pro-
+posed a Halide autoscheduling algorithm using Monte Carlo
+tree search. Zheng et al. [26] propose a tensor optimization
+algorithm using program sampling similar to ours. These ap-
+proaches share a similar spirit to our work but with different
+focuses. Haj et al. focuses on CPU autoscheduling, without
+the scalability challenges we address, while Zheng et al. fo-
+cuses on individual deep learning kernels much like AutoTVM
+and FlexTensor. Both approaches focus exclusively on auto-
+tuning with benchmarking and long compilation time, while
+we also enable fast One Shot results.
+
+10. Limitations & Future Work
+
+Even though we consider a large space of schedules, the space
+of all Halide schedules is much larger still. We currently make
+tiling decisions on a per-Func basis, but could make those deci-
+sions for all the update stages in a Halide function. This would
+allow us to tile and unroll reduction variables (sequential loops
+that are not directly parallelizable) in update stages, which has
+proven an important optimization on applications like conv
+layer and IIR blur. Making tiling decisions on a per-stage ba-
+sis is likely also necessary to support parallelizing reductions
+(including the Halide scheduling options rfactor and atomic),
+which is an important optimization on histogram equalize.
+
+Register spilling often has large performance impacts on the
+GPU, but the spilling behavior of the downstream PTX com-
+piler can be unpredictable. Our cost model captures factors
+that estimate register pressure, but can sometimes fail to pre-
+dict machine-assembly-level optimizations. In our one-shot
+mode, we include a post-processing pass to remove programs
+with excessive register spilling. It would be useful to extend
+our cost model to predict register spilling more accurately.
+
+11. Conclusion
+
+We present a system for automatically scheduling Halide pro-
+grams on GPUs that scales to a large set of scheduling op-
+tions and complex pipelines. It generates code that matches
+experts’ best effort to beat it with unconstrained manual sched-
+ules, and signiﬁcantly outperforms the current state-of-the-art
+Halide GPU autoscheduler. We believe the key concepts of
+our method are likely useful for other array compilers outside
+of Halide.
+
+10
+
+References
+
+[1] Martín Abadi, Ashish Agarwal, Paul Barham, Eugene Brevdo, Zhifeng
+Chen, Craig Citro, Greg S. Corrado, Andy Davis, Jeffrey Dean,
+Matthieu Devin, Sanjay Ghemawat, Ian Goodfellow, Andrew Harp, Ge-
+offrey Irving, Michael Isard, Yangqing Jia, Rafal Jozefowicz, Lukasz
+Kaiser, Manjunath Kudlur, Josh Levenberg, Dandelion Mané, Rajat
+Monga, Sherry Moore, Derek Murray, Chris Olah, Mike Schuster,
+Jonathon Shlens, Benoit Steiner, Ilya Sutskever, Kunal Talwar, Paul
+Tucker, Vincent Vanhoucke, Vijay Vasudevan, Fernanda Viégas, Oriol
+Vinyals, Pete Warden, Martin Wattenberg, Martin Wicke, Yuan Yu,
+and Xiaoqiang Zheng. TensorFlow: Large-scale machine learning on
+heterogeneous systems, 2015. Software available from tensorﬂow.org.
+[2] Andrew Adams, Karima Ma, Luke Anderson, Riyadh Baghdadi, Tzu-
+Mao Li, Michaël Gharbi, Benoit Steiner, Steven Johnson, Kayvon
+Fatahalian, Frédo Durand, and Jonathan Ragan-Kelley. Learning to
+optimize halide with tree search and random programs. ACM Trans.
+Graph. (Proc. SIGGRAPH), 38(4), July 2019.
+
+[3] Jason Ansel, Shoaib Kamil, Kalyan Veeramachaneni, Jonathan Ragan-
+Kelley, Jeffrey Bosboom, Una-May O’Reilly, and Saman Amarasinghe.
+OpenTuner: An extensible framework for program autotuning.
+In
+Parallel Architectures and Compilation, pages 303–316. ACM, 2014.
+[4] Amir H Ashouri, William Killian, John Cavazos, Gianluca Palermo,
+and Cristina Silvano. A survey on compiler autotuning using machine
+learning. Computing Surveys, 51(5):96, 2018.
+
+[5] Uday Bondhugula, Albert Hartono, Jagannathan Ramanujam, and Pon-
+nuswamy Sadayappan. A practical automatic polyhedral parallelizer
+and locality optimizer. SIGPLAN Not. (Proc. PLDI), 43(6):101–113,
+2008.
+
+[6] Tianqi Chen, Thierry Moreau, Ziheng Jiang, Lianmin Zheng, Eddie
+Yan, Meghan Cowan, Haichen Shen, Leyuan Wang, Yuwei Hu, Luis
+Ceze, Carlos Guestrin, and Arvind Krishnamurthy. TVM: An auto-
+mated end-to-end optimizing compiler for deep learning. In Proceed-
+ings of the 13th USENIX Conference on Operating Systems Design
+and Implementation, OSDI’18, page 579–594, USA, 2018. USENIX
+Association.
+
+[7] Tianqi Chen, Lianmin Zheng, Eddie Yan, Ziheng Jiang, Thierry
+Moreau, Luis Ceze, Carlos Guestrin, and Arvind Krishnamurthy. Learn-
+ing to optimize tensor programs. In Advances in Neural Information
+Processing Systems, pages 3389–3400, 2018.
+
+[8] Tobias Grosser, Armin Groesslinger, and Christian Lengauer. Polly
+— performing polyhedral optimizations on a low-level intermediate
+representation. Parallel Processing Letters, 22(04):1250010, 2012.
+[9] Ameer Haj-Ali, Nesreen K Ahmed, Ted Willke, Yakun Sophia Shao,
+Krste Asanovic, and Ion Stoica. NeuroVectorizer: end-to-end vector-
+ization with deep reinforcement learning. pages 242–255, 2020.
+[10] Ameer Haj-Ali, Hasan Genc, Qijing Huang, William Moses, John
+Wawrzynek, Krste Asanovi´c, and Ion Stoica. ProTuner: Tuning pro-
+grams with Monte Carlo tree search. arXiv preprint arXiv:2005.13685,
+2020.
+
+[11] Abhinav Jangda and Uday Bondhugula. An effective fusion and tile
+size model for optimizing image processing pipelines. SIGPLAN Not.
+(Proc. PPoPP), 53(1):261–275, February 2018.
+
+[12] Zhihao Jia, Oded Padon, James Thomas, Todd Warszawski, Matei Za-
+haria, and Alex Aiken. TASO: Optimizing deep learning computation
+with automatic generation of graph substitutions. In Proceedings of
+the ACM Symposium on Operating Systems Principles (SOSP), page
+47–62. ACM, 2019.
+
+[13] Tzu-Mao Li, Michaël Gharbi, Andrew Adams, Frédo Durand, and
+Jonathan Ragan-Kelley. Differentiable programming for image pro-
+cessing and deep learning in Halide. ACM Trans. Graph. (Proc. SIG-
+GRAPH), 37(4):139:1–139:13, 2018.
+
+[14] Charith Mendis, Alex Renda, Saman Amarasinghe, and Michael
+Carbin. Ithemal: Accurate, portable and fast basic block throughput
+estimation using deep neural networks. In International Conference
+on Machine Learning, pages 4505–4515. PMLR, 2019.
+
+[15] Ravi Teja Mullapudi, Andrew Adams, Dillon Sharlet, Jonathan Ragan-
+Kelley, and Kayvon Fatahalian. Automatically scheduling halide image
+processing pipelines. ACM Trans. Graph. (Proc. SIGGRAPH), 35(4),
+2016.
+
+[16] Ravi Teja Mullapudi, Vinay Vasista, and Uday Bondhugula. PolyMage:
+Automatic optimization for image processing pipelines. SIGPLAN Not.
+(Proc. ASPLOS), 43(1):429–443, 2015.
+
+[17] Aditya Paliwal, Felix Gimeno, Vinod Nair, Yujia Li, Miles Lubin,
+Pushmeet Kohli, and Oriol Vinyals. Reinforced genetic algorithm
+learning for optimizing computation graphs. In Proceedings of the
+International Conference on Learning Representations (ICLR), 2020.
+
+[18] Jonathan Ragan-Kelley, Andrew Adams, Sylvain Paris, Marc Levoy,
+Saman Amarasinghe, and Frédo Durand. Decoupling algorithms from
+schedules for easy optimization of image processing pipelines. ACM
+Trans. Graph. (Proc. SIGGRAPH), 31(4), 2012.
+
+[19] Jonathan Ragan-Kelley, Connelly Barnes, Andrew Adams, Sylvain
+Paris, Frédo Durand, and Saman Amarasinghe. Halide: A language and
+compiler for optimizing parallelism, locality, and recomputation in im-
+age processing pipelines. SIGPLAN Not. (Proc. PLDI), 48(6):519–530,
+2013.
+
+[20] Savvas Sioutas, Sander Stuijk, Twan Basten, Henk Corporaal, and Lou
+Somers. Schedule synthesis for halide pipelines on gpus. ACM Trans.
+Archit. Code Optim., 17(3), 2020.
+
+[21] Savvas Sioutas, Sander Stuijk, Luc Waeijen, Twan Basten, Henk Corpo-
+raal, and Lou Somers. Schedule synthesis for Halide pipelines through
+reuse analysis. Trans. Archit. Code Optim., 16(2):10:1–10:22, 2019.
+
+[22] The XLA Team. XLA – TensorFlow compiled. https://developers.
+googleblog.com/2017/03/xla-tensorflow-compiled.html,
+2017. Accessed: 2020-08-19.
+
+[23] Vincent Vanhoucke. Learning visual representations at scale. ICLR
+
+invited talk, 1:2, 2014.
+
+[24] Nicolas Vasilache, Oleksandr Zinenko, Theodoros Theodoridis, Priya
+Goyal, Zachary DeVito, William S Moses, Sven Verdoolaege,
+Andrew Adams, and Albert Cohen.
+Tensor comprehensions:
+Framework-agnostic high-performance machine learning abstractions.
+arXiv:1802.04730, 2018.
+
+[25] Sven Verdoolaege, Juan Carlos Juega, Albert Cohen, José Igna-
+cio Gómez, Christian Tenllado, and Francky Catthoor. Polyhedral
+parallel code generation for cuda. Trans. Archit. Code Optim., 2013.
+
+[26] Lianmin Zheng, Chengfan Jia, Minmin Sun, Zhao Wu, Cody Hao Yu,
+Ameer Haj-Ali, Yida Wang, Jun Yang, Danyang Zhuo, Koushik Sen,
+et al. Ansor: Generating high-performance tensor programs for deep
+learning. arXiv preprint arXiv:2006.06762, 2020.
+
+[27] Size Zheng, Yun Liang, Shuo Wang, Renze Chen, and Kaiwen Sheng.
+FlexTensor: An automatic schedule exploration and optimization
+framework for tensor computation on heterogeneous system. In In-
+ternational Conference on Architectural Support for Programming
+Languages and Operating Systems (ASPLOS), pages 859–873, 2020.
+
+A. Featurization
+
+We use the following GPU speciﬁc features (basic features e.g.
+number of productions, total points computed, etc. are reused
+from [2]):
+num_scalars The total product of the loop extents
+points_computed_per_thread The number of points of this
+stage computed by each thread. The product of the inner serial
+loops for this stage
+unique_global_bytes_read_per_realization Number
+of
+unique bytes loaded from global memory to compute a single
+realization of this stage
+unique_shared_bytes_read_per_realization Number
+of
+unique bytes loaded from shared memory to compute a single
+realization of this stage
+unique_register_bytes_read_per_realization Number of
+unique bytes loaded from register memory to compute a single
+realization of this stage
+unique_global_lines_read_per_realization Number
+of
+contiguous lines loaded from global memory to compute a
+single realization of this stage
+unique_shared_lines_read_per_realization Number
+of
+contiguous lines loaded from shared memory to compute a
+single realization of this stage
+unique_register_lines_read_per_realization Number
+of
+contiguous lines loaded from register memory to compute a
+single realization of this stage
+
+11
+
+unique_global_bytes_read_per_thread Number of unique
+bytes loaded from global memory to compute a single thread
+of this stage
+unique_shared_bytes_read_per_thread Number of unique
+bytes loaded from shared memory to compute a single thread
+of this stage
+unique_register_bytes_read_per_thread Number
+of
+unique bytes loaded from register memory to compute a
+single thread of this stage
+unique_global_lines_read_per_thread Number of contigu-
+ous lines loaded from global memory to compute a single
+thread of this stage
+unique_shared_lines_read_per_thread Number of con-
+tiguous lines loaded from shared memory to compute a single
+thread of this stage
+unique_register_lines_read_per_thread Number of con-
+tiguous lines loaded from register memory to compute a single
+thread of this stage
+global_allocation_bytes_read_per_realization Total sum
+of global memory allocation bytes accessed compute a single
+realization of this stage
+shared_allocation_bytes_read_per_realization Total sum
+of shared memory allocation bytes accessed compute a single
+realization of this stage
+register_allocation_bytes_read_per_realization Total sum
+of register memory allocation bytes accessed compute a single
+realization of this stage
+global_bytes_at_task Number of bytes written by this stage
+to global memory per block
+shared_bytes_at_task Number of bytes written by this stage
+to shared memory per block
+register_bytes_at_task Number of bytes written by this
+stage to register memory per block
+global_innermost_bytes_at_task Number of bytes written
+by this stage to global memory per block, along the innermost
+storage dimension
+shared_innermost_bytes_at_task Number of bytes written
+by this stage to shared memory per block, along the innermost
+storage dimension
+register_innermost_bytes_at_task Number of bytes written
+by this stage to register memory per block, along the innermost
+storage dimension
+num_blocks Number of blocks used when computing this
+stage
+num_warps_per_block Total number of warps per block for
+this stage
+num_active_warps_per_block Number of warps per block
+for which this stage has at least 1 active thread
+num_threads_per_block Number of threads per block that
+are used for computing this stage
+expr_branching This stage’s Strahler number: the minimum
+number of registers required to evaluate this stage’s computa-
+tion
+block_occupancy Ratio of number of threads used to the
+
+hardware thread limit
+warp_lane_utilization The ratio of active threads used by
+this stage to the total number of active threads available (32 ×
+number of active warps)
+idle_lane_wastage The ratio of idle threads in active warps
+to the hardware thread limit
+num_shared_mem_loads_per_block Number of
+shared
+memory load transactions issued per block. Accounts for
+the number of bank conﬂicts of the access
+num_global_mem_loads_per_block Number of global
+memory loads transactions issued per block. Accounts for the
+coalescing of the access
+num_shared_mem_stores_per_block Number of shared
+memory stores transactions issued per block. Accounts for the
+bank conﬂicts of the access
+num_global_mem_stores_per_block Number of global
+memory stores transactions issued per block. Accounts for the
+coaleascing of the access
+shared_mem_store_efﬁciency Ratio of bytes stored to
+shared memory to total bytes transferred by shared memory
+store transactions
+shared_mem_load_efﬁciency Ratio of bytes needed by the
+stage from shared memory to total bytes transferred by shared
+memory load transactions
+global_mem_store_efﬁciency Ratio of bytes stored to global
+memory to total bytes transferred by global memory store
+transactions
+global_mem_load_efﬁciency Ratio of bytes needed by the
+stage from global memory to total bytes transferred by global
+memory load transactions
+working_set_at_thread Sum of the allocation sizes at the
+thread level. Hint as to register pressure
+shared_mem_occupancy For compute_ stages, ratio of total
+shared memory allocated at this stage’s block level to shared
+memory hardware limit
+shared_mem_block_limit_factor Ratio of maximum active
+blocks allowable with the amount of shared memory allocated
+to the maximum active block hardware limit
+max_warp_occupancy Ratio of maximum active warps to
+maximum active warp hardware limit
+max_block_occupancy Ratio of maximum active blocks to
+maximum active block hardware limit
+
+B. Cost Model Components
+
+In the following ci represents the ith coefﬁcient predicted by
+the neural network.
+
+Let select(cond, t, f) = if cond then t else f;
+
+compute_cost = select(inlined_calls == 0,
+
+num_scalars * c1,
+num_scalars * c3);
+
+num_threads = num_blocks * num_threads_per_block;
+points_computed = num_threads *
+
+points_computed_per_thread;
+
+12
+
++ cost_of_parallel_launches;
+
+cost_of_working_set = working_set * c9;
+
+cost = compute_cost + store_cost + load_cost +
+
+cost_of_malloc + cost_of_parallelism +
+cost_of_working_set;
+
+compute_cost += select(inlined_calls == 0,
+
+(points_computed * c19),
+(points_computed * c4));
+
+idle_core_wastage = ceil(num_tasks / num_cores)
+
+/ max(1, tasks_per_core);
+
+compute_cost *= idle_core_wastage;
+compute_cost /= select(inlined_calls == 0,
+
+1 - idle_lane_wastage, 1.f);
+
+load_cost = num_realizations *
+
+(c5 * unique_global_lines_read_per_realization
++ c16 * unique_shared_lines_read_per_realization
++ c8 * unique_register_lines_read_per_realization
++ c6 * unique_global_bytes_read_per_realization
++ c20 * unique_shared_bytes_read_per_realization
++ c7 * unique_register_bytes_read_per_realization
++ c18 * unique_global_lines_read_per_thread
++ c17 * unique_shared_lines_read_per_thread
++ c2 * unique_register_lines_read_per_thread
++ c13 * unique_global_bytes_read_per_thread
++ c11 * unique_shared_bytes_read_per_thread
++ c0 * unique_register_bytes_read_per_thread)
++ c10 * num_scalars * unique_bytes_read_per_point
++ c12 * num_scalars * unique_lines_read_per_point
++ c14 * num_tasks * unique_bytes_read_per_task
++ c15 * num_tasks * unique_lines_read_per_task;
+
+global_mem_load_cost = num_blocks *
+num_global_mem_loads_per_block;
+
+global_mem_load_cost *= select(inlined_calls == 0,
+
+1.f / global_mem_load_efficiency, 1);
+
+shared_mem_load_cost = num_blocks *
+num_shared_mem_loads_per_block;
+
+shared_mem_load_cost *= select(inlined_calls == 0,
+
+1.f / shared_mem_load_efficiency, 1);
+
+load_cost += global_mem_load_cost
++ shared_mem_load_cost;
+
+shared_mem_store_cost = c29 * num_blocks *
+num_shared_mem_stores_per_block;
+global_mem_store_cost = c21 * num_blocks *
+num_global_mem_stores_per_block;
+
+global_mem_store_cost *= select(inlined_calls == 0,
+
+1.f / global_mem_store_efficiency, 1);
+
+store_cost = shared_mem_store_cost
+
++ global_mem_store_cost;
+
+cost_of_false_sharing = select(inner_parallelism > 1,
+
+c22 * (num_scalars) /
+max(1, global_innermost_bytes_at_task), 0.0f);
+
+store_cost += cost_of_false_sharing;
+
+cost_of_malloc = c24 * num_realizations;
+
+cost_of_parallel_launches = num_productions *
+select(inner_parallelism > 1, c25, 0.0f);
+
+cost_of_parallel_tasks = num_productions *
+
+(inner_parallelism - 1) * c26;
+
+cost_of_parallelism = cost_of_parallel_tasks
+
+13
+
+

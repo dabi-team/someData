@@ -1,0 +1,1201 @@
+MIXED-PRECISION NEURAL NETWORK QUANTIZATION VIA
+LEARNED LAYER-WISE IMPORTANCE
+
+Chen Tang, Kai Ouyang
+Tsinghua University
+{tc20,oyk20}@mails.tsinghua.edu.cn
+
+Zhi Wang
+Tsinghua University
+wangzhi@sz.tsinghua.edu.cn
+
+Yifei Zhu
+Shanghai Jiao Tong Univerisy
+yifei.zhu@sjtu.edu.cn
+
+Wen Ji
+ICT, Chinese Academy of Sciences
+jiwen@ict.ac.cn
+
+Yaowei Wang
+PengCheng Laboratory
+wangyw@pcl.ac.cn
+
+Wenwu Zhu
+Tsinghua University
+wwzhu@tsinghua.edu.cn
+
+ABSTRACT
+
+The exponentially large discrete search space in mixed-precision quantization (MPQ) makes it hard
+to determine the optimal bit-width for each layer. Previous works usually resort to iterative search
+methods on the training set, which consume hundreds or even thousands of GPU-hours. In this
+study, we reveal that some unique learnable parameters in quantization, namely the scale factors in
+the quantizer, can serve as importance indicators of a layer, reflecting the contribution of that layer to
+the final accuracy at certain bit-widths. These importance indicators naturally perceive the numer-
+ical transformation during quantization-aware training, which can precisely and correctly provide
+quantization sensitivity metrics of layers. However, a deep network always contains hundreds of
+such indicators, and training them one by one would lead to an excessive time cost. To overcome
+this issue, we propose a joint training scheme that can obtain all indicators at once. It considerably
+speeds up the indicators training process by parallelizing the original sequential training processes.
+With these learned importance indicators, we formulate the MPQ search problem as a one-time in-
+teger linear programming (ILP) problem. That avoids the iterative search and significantly reduces
+search time without limiting the bit-width search space. For example, MPQ search on ResNet18
+with our indicators takes only 0.06 seconds. Also, extensive experiments show our approach can
+achieve SOTA accuracy on ImageNet for far-ranging models with various constraints (e.g., BitOps,
+compress rate). Code will be released soon.
+
+Keywords Mixed-Precision Quantization, Model Compression
+
+1
+
+Introduction
+
+Neural network quantization can effectively compress the size and runtime overhead of a network by reducing the
+bit-width of the network. Using an equal bit-width for the entire network, a.k.a, fixed-precision quantization, is
+sub-optimal because different layers typically exhibit different sensitivities to quantization [24, 4].
+It forces the
+quantization-insensitive layers to work at the same bit-width as the quantization-sensitive ones, missing the oppor-
+tunity further to reduce the average bit-width of the whole network.
+
+Mixed-precision quantization has thus become the focus of network quantization research, with its finer-grained quan-
+tization by allowing different bit-widths for different layers. In this way, the quantization-insensitive layers can use
+much lower bit-widths than the quantization-sensitive layers, thus providing more flexible accuracy-efficiency trade-off
+adjustment than the fixed-precision quantization. Finer-grained quantization also means exponentially larger search-
+
+PRIME AI paper
+
+ing space to search from. Suppose we have an L-layers network, each layer has n optional bit-widths for weights and
+activations, the resulting search space is n2L.
+
+Most of the prior works are search-based. HAQ [24] and AutoQ [20] utilize deep reinforcement learning (DRL) to
+search the bit-widths by modeling bit-width determination problem as a Markov Decision Process. However, due
+to the exploration-exploitation dilemma, most existing DRL-based methods require a significant amount of time to
+finish the search process. DNAS [25] and SPOS [13] apply Neural Architecture Search (NAS) algorithms to achieve
+a differentiable search process. As a common drawback of NAS, the search space needs to be greatly and manually
+limited in order to make the search process feasible, otherwise the search time can be quite high. In a word, the
+search-based approach is very time-consuming due to the need to evaluate the searched policy on the training set for
+multiple rounds (e.g., 600 rounds in [24])
+
+Different from these search-based approaches, some studies aim to define some “critics” to judge the quantization
+sensitivity of the layer. HAWQ [11] and HAWQ-v2 [10] employ second-order information (Hessian eigenvalue or
+trace) to measure the sensitivity of layers and leverage them to allocate bit-widths. MPQCO [6] proposes an efficient
+approach to compute the Hessian matrix and formulate a Multiple-Choice Knapsack Problem (MCKP) to determine
+the bit-widths assignment. Although these approaches reduce the searching time as compared to the search-based
+methods, they have the following defects:
+(1) Biased approximation. HAWQ and HAWQv2 approximate the Hessian information on the full-precision (unquan-
+tized) network to measure the relative sensitivity of layers. This leads to not only an approximation error in these
+measurements themselves, but more importantly, an inability to perceive the existence of quantization operations. A
+full-precision model is a far cry from a quantized model. We argue that using the information from the full-precision
+model to determine the bit-widths assignment of the quantized model is seriously biased and results in a sub-optimal
+searched MPQ policy.
+(2) Limited search space. MPQCO approximates their objective function with second-order Taylor expansion. How-
+ever, the inherent problem in its expansion makes it impossible to quantize the activations with mixed-precision, which
+significantly limits the search space. A limited search space means that a large number of potentially excellent MPQ
+policies cannot be accessed during searching, making it more likely to result in sub-optimal performance due to a large
+number of MPQ policies being abandoned. Moreover, MPQCO needs to assign the bit-witdhs of activations manually,
+which requires expert involvement and leaves a considerable room for improving search efficiency.
+
+To tackle these problems, we propose to allocate bit-widths for each layer according to the learned end-to-end im-
+portance indicators. Specifically, we reveal that the learnable scale factors in each layer’s quantization function (i.e.,
+quantizer), initially used to adjust the quantization mappings in classic quantization-aware training (QAT) [12, 17],
+can be used as the importance indicators to distinguish whether one layer is more quantization-sensitive than other
+layers or not. As we will discuss later, they can perceive the numerical error transfer process and capture layers’ char-
+acteristics in the quantization process (i.e., rounding and clamping) during QAT, resulting in a significant difference in
+the value of quantization-sensitive and insensitive layers. Since these indicators are learned end-to-end in QAT, errors
+that might arise from the approximation-based methods are avoided. Moreover, the detached two indicators of each
+layer for weights and activations allow us to explore the whole search space without limitation (e.g., only MPQ for
+weights).
+
+Besides, an L-layer network with n optional bit-widths for each layer’s weights and activations has M = 2 × L × n
+importance indicators. Separately training these M indicators requires M training processes, which is time-prohibitive
+for deep networks and large-scale datasets. To overcome this bottleneck, we propose a joint scheme to parallelize these
+M training processes in a once QAT. That considerably reduces the indicators training processes by M ×.
+
+Then, based on these obtained layer-wise importance indicators, we transform the original iterative MPQ search prob-
+lem into a one-time ILP-based mixed-precision search to determine bit-widths for each layer automatically. For
+example, a sensitive layer (i.e., larger importance) will receive a higher bit-width than an insensitive (i.e., smaller
+importance) layer. By this means, the time-consuming iterative search is eliminated, since we no longer need to use
+training data during the search. A concise comparison of our method and existing works is shown in Table 1.
+
+To summarize, our contributions are the following:
+
+• We demonstrate that a small number of learnable parameters (i.e., the scale factors in the quantizer) can
+act as importance indicators, to reflect the relative contribution of layers to performance in quantization.
+These indicators are learned end-to-end without performing time-consuming fine-tuning or approximating
+quantization-unaware second-order information.
+
+• We transform the original iterative MPQ search problem into a one-time ILP problem by leveraging the
+learned importance of each layer, increasing time efficiency exponentially without limiting the bit-widths
+
+2
+
+Table 1: A comparison of our method and existing works.
+Iterative search avoiding can significantly reduce the
+MPQ policy search time. Unlimited search space can provide more potentially excellent MPQ policies. Quantization-
+aware search can avoid the biased approximation on the full-precision model. Fully automatic bit-width assignment
+can effectively save human efforts and also reduce the MPQ policy search time. ∗: MPQCO only can provide the
+quantization-aware search for weights.
+
+PRIME AI paper
+
+Method
+Iterative search avoiding
+Unlimited search space
+Quantization-aware search
+
+No
+No
+Yes
+No
+Yes Yes
+Fully automatic bit-width assignment Yes Yes
+
+AutoQ DNAS HAWQ HAWQv2 MPQCO Ours
+Yes
+Yes
+Partial yes∗ Yes
+Yes
+
+Yes
+Yes
+No
+Yes
+
+Yes
+Yes
+No
+No
+
+Yes
+No
+
+No
+
+search space. Especially, we achieve about 330× MPQ policy search speedup compared to AutoQ on
+ResNet50, while preventing 1.7% top-1 accuracy drop.
+
+• Extensive experiments are conducted on a bunch of models to demonstrate the state-of-the-art results of our
+method. The accuracy gap between full-precision and quantized model of ResNet50 is further narrowed to
+only 0.6%, while the model size is reduced by 12.2×.
+
+2 Related Work
+
+2.1 Neural Network Quantization
+
+2.1.1 Fixed-Precision Quantization
+
+In
+Fixed-precision quantization [3, 28, 29, 1] focus on using the same bit-width for all (or most of) the layers.
+particular, [27] introduces a learnable quantizer, [7] uses the learnable upper bound for activations. [12, 17] proposes
+to use the learnable scale factor (or quantization intervals) instead of the hand-crafted one.
+
+2.1.2 Mixed-Precision Quantization
+
+To achieve a better balance between accuracy and efficiency, many mixed-precision quantization methods which search
+the optimal bit-width for each layer are proposed.
+
+Search-Based Methods. Search-based methods aim to sample the vast search space of choosing bit-width assignments
+more effectively and obtain higher performance with fewer evaluation times. [24] and [20] exploit DRL to determine
+the bit-widths automatically at a layer and kernel level. After that, [23] determines the bit-width by parametrizing
+the quantizer with the step size and dynamic range. Furthermore, [14] repurposes the Gumbel-Softmax estimator
+into a smooth estimator of a pair of quantization parameters. In addition, many NAS-based methods have emerged
+recently [25, 26, 4, 13]. They usually organize the MPQ search problem as a directed acyclic graph (DAG) and
+make the problem solvable by common optimization methods (e.g., stochastic gradient descent) through differentiable
+NAS-based algorithms.
+
+Criterion-Based Methods. Different from exploration approaches, [11] introduces automatically find the mixing-
+[10] selects the bit-width based on Pareto
+precision settings based on the second-order sensitivity of the model.
+frontier. Furthermore, [6] reformulates the problem as a MCKP and proposes a greedy search algorithm to solve it
+efficiently. The successful achievement of criterion-based methods is that they reduce search costs greatly, but causing
+a biased approximation or limited search space as we discussed above.
+
+2.2 Indicator-Based Model Compression
+
+Measuring the importance of layers or channels using learned (e.g., scaling factors of batch normalization layers) or
+approximated indicators are seen as promising work thanks to its excellent efficiency and performance. Early pruning
+work [18] uses second-derivative information to make a trade-off between network complexity and accuracy. [19]
+pruning the unimportant channels according to the corresponding BN layer scale factors. [5] sums the scale factors of
+BN layer to decide which corresponding convolution layer to choose in NAS search process. However, quantization is
+inherently different from these studies due to the presence of numerical precision transformation.
+
+3
+
+PRIME AI paper
+
+3 Method
+
+In this section, we first review the convention QAT and its quantizer. Next, we discuss and demonstrate empirically
+that the scale factors in the quantizer can act as the importance indicators to indicate the quantization sensitivity of
+each layer. Also, we propose a joint training method that obtains all importance indicators at once to avoid unnecessary
+training sessions. Finally, based on these learned importance indicators, we reformulate the MPQ search problem as a
+one-time ILP problem, thus eliminating the inefficient iterative evaluation on the whole training set.
+
+3.1 Understand the Role of Scale Factor in Quantizer
+
+Quantization maps the continuous values to discrete values. The uniform quantization function (a.k.a quantizer) under
+b bits in QAT maps the input f loat32 activations and weights to the homologous quantized values [0, 2b − 1] and
+[−2b−1, 2b−1 − 1]. The quantization functions Qb(·) that quantize the input values v to quantized values vq can be
+expressed as follows:
+
+vq = Qb(v; s) = round(clip(
+
+, minb, maxb)) × s,
+
+(1)
+
+v
+s
+
+where minb and maxb are the minimum and maximum quantization value [2, 12]. For activations, minb = 0 and
+maxb = 2b − 1. For weights, minb = −2b−1 and maxb = 2b−1 − 1. s is a learnable scalar parameter used to adjust
+the quantization mappings, called the step-size scale factor. For a network, each layer has two distinct scale factors in
+the weights and activations quantizer, respectively.
+
+To understand the role of the scale factor, we consider a toy quantizer example under b bits and omit the clip(·)
+function. Namely,
+
+vq = round(
+
+) × s = ˆvq × s,
+
+(2)
+
+v
+s
+
+where ˆvq is the quantized integer value on the discrete domain.
+
+Obviously, for two continuous values vi and vj (vi ̸= vj), their quantized integer values
+0 < |vi − vj| ≤ s
+that more different continuous values are mapped to the same quantized value.
+
+(cid:12)
+(cid:12)
+(cid:12) = 0 if and only if
+2 . Thus s actually controls the distance between two adjacent quantized values. A larger s means
+
+i − ˆvq
+ˆvq
+
+(cid:12)
+(cid:12)
+(cid:12)
+
+j
+
+3.2 From Accuracy to Layer-wise Importance
+
+w , b(l)
+
+Suppose we have an L-layer network with full-precision parameter tensor W, each layer has n optional bit-widths
+B = {b0, ..., bn−1} for activation and weights of each layer, respectively. The bit-width combination of weights and
+activations (b(l)
+l=0 is the bit-width combination
+for the whole network, and we use WS to denote the quantized parameter tensor. All possible S construct the search
+space A. Mixed-precision quantization aims to find the appropriate bit-width combination (i.e., searched MPQ policy)
+S ∗ ∈ A for the whole network to maximize the validation accuracy ACCval, under certain constraints C (e.g., model
+size, BitOps, etc.). The objective can be formalized as follows:
+
+a ∈ B. Thus S = {(b(l)
+
+a ) for layer l is b(l)
+
+w ∈ B and b(l)
+
+w , b(l)
+
+a )}L
+
+S ∗ = arg max
+S∼Γ(A)
+
+ACCval(f (x; S, WS ), y)
+
+s.t. WS = arg min
+
+W
+
+Ltrain(f (x; S, W), y)
+
+BitOps(S) ≤ C
+
+(3)
+
+(3a)
+
+(3b)
+
+where f (·) denotes the network, L(·) is the loss function of task (e.g., cross-entropy), x and y are the input data and
+labels, Γ(A) is the prior distribution of S ∈ A. For simplicity, we omit the data symbol of training set and validation
+set, and the parameter tensor of quantizer. This optimization problem is combinatorial and intractable, since it has an
+extremely large discrete search space A. As above, although it can be solvable by DRL or NAS methods, the time
+cost is still very expensive. This is due to the need to evaluate the goodness of a specific quantization policy S on the
+training set to obtain metrics Ltrain iteratively to guide the ensuing search. As an example, AutoQ [20] needs more
+than 1000 GPU-hours to determine a final quantization strategy S ∗ [6].
+
+Therefore, we focus on replacing the iterative evaluation on the training set with some once-obtained importance
+score of each layer. In this way, the layer-wise importance score indicates the impact of quantization between and
+
+4
+
+PRIME AI paper
+
+within each layer on the final performance, thus avoiding time-consuming iterative accuracy evaluations. Unlike the
+approximated Hessian-based approach [11, 10], which is imperceptible to quantization operations or limits the search
+space [6], we propose to learn the importance in the Quantization-Aware Training.
+
+3.3 Learned Layer-wise Importance Indicators
+
+To end-to-end learn the importance of layers, there are two options, depending on whether the probe is inserted outside
+or inside the quantizer.
+
+The scale factor of BN layer. A straightforward method is to apply the scale factors (a.k.a γ) of BN layers, as in
+prior pruning [18, 19] and NAS [5] studies. In this way, the summed scale factors of a BN layer implicitly indicate
+the importance the previous convolution layer. However, the affine transformation of BN layer is produced after the
+quantization process, which means it cannot directly capture the variation of quantization.
+
+The scale factor of quantizer. Quantization mapping is critical for a quantized layer since it decides how to use confined
+quantization levels, and improper mapping is harmful to the performance [17]. As shown in Equation 1, during QAT,
+the scale factor of the quantizer in each layer is trained to adjust the corresponding quantization mapping properly at
+a specific bit-width. This means that it can naturally capture certain quantization characteristics to describe the layers
+due to its controlled quantization mapping being optimized directly by the task loss.
+
+Figure 1: Illustration of distribution for two example layers, both under 2 bits quantization. The grey dashed line
+separates the different quantization levels (i.e., 22 = 4 quantized values {q0, q1, q2, q3} for 2 bits). For example, the
+continuous values in green and red region are quantized to the same quantization level q1 and q2, respectively. The
+first layer has less variance, resulting a smaller scale factor value. In contrast, the second layer has large variance, thus
+a wider range of continuous values are quantized to the same quantization level.
+
+As an example, we consider two layers with well-trained s and weights (i.e.,, both in a local minimum after a
+quantization-aware training). As shown in Figure 1, 2 bits quantization has 4 quantized values, dividing the origi-
+nal continuous distribution into corresponding quantization levels. As we discussed in § 3.1, the continuous values in
+a uniform range fall into the same quantization level, the specific range is controlled by the scale factor s of this layer.
+For the first layer, since it has less variance after training, a smaller scale factor is given. But for the second layer, its
+large variance makes the scale factor also increase. In other words, for the second layer, a wider range of different
+continuous values are shared the same quantization level. For example, while the green region in layer 1 and layer 2
+are both quantized to the value q1, the green region of layer 2 contains a much broader continuous range. In extreme
+cases, this extinguishes the inherent differences of original continuous values, thus reducing the expressiveness of the
+quantized model [22]. The only way to improve performance is to give more quantization levels to those layers that
+have large scale factors, namely, increasing their bit-width.
+
+Therefore, the numerically significant difference in the scale factors of heterogeneous layers can properly assist us to
+judge the sensitivity of layer. Moreover, the operation involved in the scale factor takes place in the quantizer, which
+allows it to be directly aware of quantization. Last but not least, there are two quantizers for activations and weights
+for a layer, respectively, which means that we can obtain the importance of weights and activations separately. In
+contrast, we cannot get the importance of weights through the BN layer since it only acts on activations.
+
+3.3.1 Feasibility Verification
+
+Despite the success of indicator-based methods for model compression [5, 18, 19] to avoid a time-consuming search
+process, to the best of our knowledge, there is no literature to demonstrate that the end-to-end learned importance
+indicators can be used for quantization. To verify the scale factors of quantizer can be used for this purpose, we
+conduct a contrast experiment for MobileNetv1 [16] on ImageNet [9] as follows.
+
+5
+
+0.60.40.20.00.20.40.6x01234q1q2q0q3Layer 00.60.40.20.00.20.40.6xq0q3q1q2Layer 1PRIME AI paper
+
+Figure 2: Results of the contrast experiment of MobileNetv1 on ImageNet. “•” and “⋆” respectively indicate that the
+DW-conv layer or the PW-conv layer is quantized. Different colors indicate that different layers are quantized. Large
+labels indicate that the quantization bit-width is set to 4 bits and small labels of 2 bits.
+
+In the MobileNet family, it is well-known that the depth-wise convolutions (DW-convs) have fewer parameters than
+the point-wise convolutions (PW-convs); thus, the DW-convs are generally more susceptible to quantization than PW-
+convs [14, 22]. Therefore, we separately quantized the DW-conv and PW-conv for each of the five DW-PW pairs in
+MobileNetv1 to observe whether the scale factors of the quantizer and accuracy vary. Specifically, we quantized each
+layer in MobileNetv1 to 2 or 4 bits to observe the accuracy degradation. Each time we quantized only one layer to low
+bits while other layers are not quantized and updated, i.e., we quantized 20 (5 × 2 × 2) networks independently. If the
+accuracy of layer li degrades higher when the quantization level changes from 4 bits to 2 bits than layer lj, then li is
+more sensitive to quantization than lj. In addition, the input channels and output channels of these five DW-PW pairs
+are all 512. Namely, we used the same number of I/O channels to control the variables. The results of the controlled
+variable experiment are shown in Figure 2. Based on the results, we can draw the following conclusions:
+
+When the quantization bit-width decreases from 4 to 2 bits, the accuracy degradation of PW-convs is much lower than
+that of DW-convs, which consists of the prior knowledge that DW-convs are very sensitive. Meanwhile, the values of
+scale factors of all PW-convs are prominent smaller than those of DW-convs under the same bit-width. That indicates
+the values of scale factor of whose sensitive layers are bigger than whose insensitive layers, which means the scale
+factor’s value can adequately reflect the quantization sensitivity of the corresponding layer. Namely, the kind of layer
+with a large scale factor value is more important than the one with a small scale factor.
+
+3.3.2 Initialization of the Importance Indicators
+
+Initializing the scale factors with the statistics [2, 12] of each layer results in the different initialization for each
+layer. We verify whether the factors still show numerical differences by the same initialization value scheme to erase
+this initialization difference. That is, for each layer, we empirically initialize each importance indicator of bit b by
+sb = 0.1 × 1
+b since we observed the value of factor is usually quite small (≤ 0.1) and increases as the bit-width
+decreases.
+
+As shown in Figure 3, after training of early instability, the scale factor still showed a significant difference at the end
+of training. That means the scale factor can still function consistently when using the same initialization for each layer.
+Nevertheless, we find that, compared to the same initialization value scheme, initialization with statistics [2, 12] can
+speedup and stabilize the training process compared to the same initialization value strategy for each layers, thus we
+still use the statistics initialization scheme in our experiments.
+
+Figure 3: The importance value of four layers for ResNet18.
+
+6
+
+0.020.040.060.080.100.12Value of Scale Factor0.00.20.40.60.81.0Normalized Accuracy DegradationDW-PW Pair01234Bit-width4 Bit2 BitPW-convDW-convPW-convDW-conv0100200300Training Step0.0000.0250.0500.0750.100Valuelayer2.1.conv16 bits5 bits4 bits3 bits2 bits0100200300Training Step0.0000.0250.0500.0750.100Valuelayer2.1.conv26 bits5 bits4 bits3 bits2 bits0100200300Training Step0.0000.0250.050Valuelayer3.1.conv16 bits5 bits4 bits3 bits2 bits0100200300Training Step0.0000.0250.050Valuelayer3.1.conv26 bits5 bits4 bits3 bits2 bitsPRIME AI paper
+
+3.4 One-time Training for Importance Derivation
+
+Suppose the bit-width options for weights and activations are B = {b0, ..., bn−1}, there are M = 2×L×n importance
+indicators for an L-layers network. Training these M indicators separately requires M training sessions, which induces
+huge extra training costs. Therefore, we propose a joint training scheme to obtain importance indicators of all layers
+corresponding n bit-width options B at once training.
+
+Specifically, we use a bit-specific importance indicator instead of the original notion s in Equation 1 for each layer.
+That is, for the weights and activaions of layer l, we use the notion s(l)
+a,j as the importance indicator for bi ∈ B
+of weights and bj ∈ B of activations. In this way, n different importance indicators can exist for each layer in a single
+training session. It is worth noting that the importance indicator parameters are only a tiny percentage of the overall
+network parameters, thus do not incur too much GPU memory overhead. For example, for ResNet18, if there are 5
+bit-width options per layer, we have M = 2 × 19 × 5 = 190, while the whole network has more than 30 million
+parameters.
+
+w,i and s(l)
+
+At each training step t, we first perform n times forward and backward propagation corresponding to n bit-width
+options (i.e., respectively using same bit-width bk ∈ B, k = 0, .., n − 1 for each layer), and inspired by one-shot
+NAS [13, 8] we then introduce one randomly bit-width assignment process for each layer to make sure different bit-
+widths in different layers can communicate with each other. We define the above procedure as an atomic operation of
+importance indicators update, in which only the gradients are calculated n + 1 times, but the importance indicators are
+not updated during the execution of the operation. After that, we aggregate the above gradients and use them to update
+the importance indicators.
+
+We show in Figure 4 all the layer importance indicators obtained by this method in a single training session. We
+observe that the top layers always show a higher importance value, indicating that these layers need to be allocated a
+higher bit-width.
+
+Interestingly, we also find that training importance indicators only (i.e., freezing the network weights during training)
+are almost identical to training the entire network to produce the final experimental results. That may be because there
+is no need to rely on the weights and the accuracy associated with the weights for evaluating the layer importance.
+
+(a) ResNet18
+
+(b) ResNet50
+
+Figure 4: The weights and activations importance indicators for ResNet18 and ResNet50.
+
+3.5 Mixed-Precision Quantization Search Through Layer-wise Importance
+
+Now, we consider using these learned importance indicators to allocate bit-widths for each layer automatically. Since
+these indicators reflect the corresponding layer’s contribution to final performance under certain bit-width, we no
+longer need to use iterative accuracy to evaluate the bit-width combination.
+
+As shown in Figure 2, the DW-convs always have a higher importance score than PW-convs, and the importance score
+rise when bit-width reduce, then DW-convs should be quantized to higher bit-width than PW-convs, e.g., 2 bits for
+PW-convs and 4 bits for DW-convs. For layer l, we use a binary variable x(l)
+i,j representing the bit-width combination
+(b(l)
+a ) = (bi, bj) that bi bits for weights and bj bits for activations, whether it is selected or not. Under the given
+constraint C, our goal is to minimize the summed value of the importance indicator of every layer. Based on that, we
+reformulate the mixed-precision search into a simple ILP problem as Equation 4:
+
+w , b(l)
+
+arg min
+{x(l)
+i,j }L
+
+l=0
+
+L
+(cid:88)
+
+l=0
+
+(s(l)
+
+a,j + α × s(l)
+
+w,a) × x(l)
+
+i,j
+
+7
+
+(4)
+
+0369121518Layer index0.0000.0250.0500.0750.100Learned importanceLayer-wise Importance of Weights6 Bits5 Bits4 Bits3 Bits2 Bits0369121518Layer index0.00.20.40.6Learned importanceLayer-wise Importance of Acts6 Bits5 Bits4 Bits3 Bits2 Bits0612182430364248Layer index0.0000.0250.0500.0750.100Learned importanceLayer-wise Importance of Weights6 Bits5 Bits4 Bits3 Bits2 Bits0612182430364248Layer index0.00.10.20.30.4Learned importanceLayer-wise Importance of Acts6 Bits5 Bits4 Bits3 Bits2 Bitss.t.
+
+(cid:88)
+
+(cid:88)
+
+x(l)
+i,j = 1
+
+i
+(cid:88)
+
+j
+
+BitOps(l,
+
+(cid:88)
+
+(cid:88)
+
+x(l)
+i,j) ≤ C
+
+l
+vars x(l)
+
+i,j ∈ {0, 1}
+
+i
+
+j
+
+PRIME AI paper
+
+(4a)
+
+(4b)
+
+(4c)
+
+where Equation 4a denotes only one bit-width combination selected for layer l, Equation 4b denotes the summed
+BitOps of each layer constrains by C. Depending on the deployment scenarios, it can be replaced with other con-
+straints, such as compression rate. α is the hyper-parameter used to form a linear combination of weights and activa-
+tions importance indicators. Therefore, the final bit-width combination of the whole network S ∗ can be obtained by
+solving Equation 4.
+
+Please note that, since Equation 4 do not involve any training data, we no longer need to perform iterative evaluations
+on the training set as previous works. Thus the MPQ policy search time can be saved exponentially. We solve this ILP
+by a python library PuLP [21], elapsed time of the solver for ResNet18 is 0.06 seconds on an 8-core Apple M1 CPU.
+More details about MPQ policy search efficiency please refer § 4.3.
+
+4 Experiments
+
+In this section, we conduct extensive experiments with the networks ResNet18/50 [15] and the lightweight network
+MobileNetv1 [16] on ImageNet [9] classification. We compare our method with the fixed-precision quantization
+methods including PACT [7], PROFIT [22], LQ-Net [27], and layer-wise mixed-precision quantization methods Au-
+toQ [20], HAQ [24], SPOS [13], DNAS [25], BP-NAS [26], MPDNN [23], HAWQ [11], HAWQv2 [10] and MPQCO
+[6].
+
+4.1 Experimental Setups
+
+For each layer, we use the bit-width options B ={2,3,4,5,6} for its weights and activation. We use the pre-trained
+model as initialization and keep the first and last layer at 8 bits. Based the method in § 3.4, we train 5 epochs for
+ResNet18 and MobileNet and 1 epoch for ResNet50, both with 0.01 learning rate (LR). Then, we extract the layer-
+wise importance indicators to apply mixed-precision search upon different constraints according to Equation 4. The
+hyper-parameter α for ResNet18, ResNet50, MobileNetv1 is 3.0, 2.0, 1.0 respectively. After searching, we quantize
+the models with the searched policies and finetuning them 90 epochs, both using the cosine LR scheduler and the SDG
+optimizer with 0.04 LR and 2.5 × 10−5 weight-decay, the first 5 epochs are used for warm-up.
+
+4.2 Mixed-Precision Quantization Performance Effectiveness
+
+To verify the SOTAs accuracy we achieved, we compare our method with existing SOTAs quantization methods on
+ResNet18, ResNet50 and MobileNetv1.
+
+4.2.1 ResNet18
+
+In Table 2, we show the results of three BitOps (computation cost) constrained MPQ schemes, i.e., 2.5W3A of 19.81G
+BitOps, 3W3A of 23.07G BitOps and 4W4A of 33.05G BitOps.
+
+Firstly, we observe that in 3-bits level (i.e., 23.07G BitOps) results. We achieve a least absolute top-1 accuracy
+drop than all methods. Please note that the accuracy of our initialization full-precision (FP) model is only 69.6%,
+which is about 1% lower than some MPQ methods such as SPOS and DNAS. To make a fair comparison, we also
+provide a result initializing by a higher accuracy FP model (i.e., 70.5%). At this time, the accuracy of the quantized
+model improves 0.7% and reaches 69.7%, which surpasses all existing methods, especially DNAS 1.0% while DNAS
+uses a 71.0% FP model as initialization. It is noteworthy that a 2.5W3A (i.e., 19.81G BitOps) result is provided to
+demonstrate that our method causes less accuracy drop even with a much strict BitOps constraint.
+
+Secondly, in 4-bits level results (i.e., 33.05G BitOps), we also achieve a highest top-1 accuracy than prior arts whether
+it is fixed-precision quantization method or mixed-precision quantization method. A result initialized by a higher FP
+precision model is also provided for a fair comparison.
+
+8
+
+Table 2: Results for ResNet18 on ImageNet with BitOps constraints. “W-bits” and “A-bits” indicate bit-width of
+weights and activations respectively. “MP” means mixed-precision quantization. “Top-1/Quant” and “Top-1/FP”
+indicates the top-1 accuracy of quantized and Full-Precision model. “Top-1/Drop” = “Top-1/FP” − “Top-1/Quant”.
+
+PRIME AI paper
+
+Method W-bits A-bits Top-1/Quant Top-1/FP Top-1/Drop BitOps (G)
+PACT
+LQ-Net
+Nice
+AutoQ
+SPOS
+DNAS
+Ours
+Ours
+Ours
+PACT
+LQ-Net
+Nice
+SPOS
+
+3
+3
+3
+3MP
+3MP
+3MP
+2.5MP
+3MP
+3MP
+4
+4
+4
+4MP
+MPDNN 4MP
+4MP
+AutoQ
+DNAS
+4MP
+MPQCO 4MP
+4MP
+4MP
+
+Ours
+Ours
+
+3
+3
+3
+3MP
+3MP
+3MP
+3MP
+3MP
+3MP
+4
+4
+4
+4MP
+4MP
+4MP
+4MP
+4MP
+4MP
+4MP
+
+23.09
+23.09
+23.09
+-
+21.92
+25.38
+19.81
+23.07
+23.07
+33.07
+33.07
+33.07
+31.81
+-
+-
+33.61
+-
+33.05
+33.05
+
+70.4
+70.3
+69.8
+69.9
+70.9
+71.0
+69.6
+69.6
+70.5
+70.4
+70.3
+69.8
+70.9
+70.2
+69.9
+71.0
+69.8
+69.6
+70.5
+
+68.1
+68.2
+67.7
+67.5
+69.4
+68.7
+68.7
+69.0
+69.7
+69.2
+69.3
+69.8
+70.5
+70.0
+68.2
+70.6
+69.7
+70.1
+70.8
+
+-2.3
+-2.1
+-2.1
+-2.4
+-1.5
+-2.3
+-0.9
+-0.6
+-0.8
+-1.2
+-1.0
+0
+-0.4
+-0.2
+-1.7
+-0.4
+-0.1
+0.5
+0.3
+
+4.2.2 ResNet50
+
+In Table 3, we show the results that not only perform a BitOps constrainted MPQ search but also set a model size
+constraint (i.e., 12.2 × compression rate).
+
+Table 3: Results for ResNet50 on ImageNet with BitOps and compression rate constraints. “W-C” means weight
+compression rate, the size of original full-precision model is 97.28 (MB). “Size” means quantized model size (MB).
+
+Method W-bits A-bits Top-1/Quant Top-1/Full Top-1/Drop. W-C Size (M)
+PACT
+LQ-Net
+
+3
+3
+
+3
+3
+8
+8
+
+DeepComp 3MP
+3MP
+
+HAQ
+
+BP-NAS 4MP 4MP
+AutoQ
+4MP 3MP
+HAWQ MP MP
+HAWQv2 MP MP
+MPQCO 2MP 4MP
+3MP 4MP
+
+Ours
+
+75.3
+74.2
+75.1
+75.3
+76.7
+72.5
+75.5
+75.8
+75.3
+76.9
+
+76.9
+70.3
+76.2
+76.2
+77.5
+74.8
+77.3
+77.3
+76.1
+77.5
+
+-1.6
+-2.1
+-1.1
+-0.9
+-0.8
+-2.3
+-1.8
+-1.5
+-0.8
+-0.6
+
+10.67× 9.17
+10.67× 9.17
+10.41× 9.36
+10.57× 9.22
+11.1× 8.76
+
+-
+
+-
+
+12.2× 7.99
+12.2× 7.99
+12.2× 7.99
+12.2× 7.97
+
+We can observe that our method achieves a much better performance than PACT, LQ-Net, DeepComp, and HAQ, under
+a much smaller model size (i.e., more than 9MB vs. 7.97MB). In addition, the accuracy degradation of our method is
+smaller than the criterion-based methods HAWQ, HAWQv2 and MPQCO, which indicates that our quantization-aware
+search and unlimited search space is necessary for discovering a well performance MPQ policy.
+
+4.2.3 MobileNetv1
+
+In Table 4, we show the results of two BitOps constrainted including a 3-bits level (5.78G BitOps) and a 4-bits level
+(9.68G BitOps). Especially in the 4-bit level result, we achieve a meaningful accuracy improvement (up to 4.39%)
+compared to other MPQ methods.
+
+In Table 5, we show the weight only quantization results. We find that the accuracy of our 1.79MB model even
+surpasses that of the 2.12M HMQ model.
+
+9
+
+Table 4: Results for MobileNetv1 on ImageNet with
+BitOps constraints. “W-b” and “A-b” means weight and
+activation bit-widths. “Top-1” and “Top-5” represent top-
+1 and top-5 accuracy of quantized model respectively. “B
+(G)” means BitOps (G).
+Method W-b
+PROFIT
+PACT
+HMQ
+HAQ
+HAQ
+Ours
+Ours
+
+Top-5 B (G)
+9.68
+88.41
+14.13
+87.84
+-
+-
+-
+87.85
+-
+89.69
+5.78
+89.11
+9.68
+90.38
+
+Top-1
+69.05
+67.51
+69.30
+67.45
+70.40
+69.48
+71.84
+
+A-b
+4
+4
+4MP
+4MP
+4MP
+3MP
+4MP
+
+4
+6
+3MP
+4MP
+6MP
+3MP
+4MP
+
+PRIME AI paper
+
+Table 5: Weight only quantization results for
+MobileNetv1 on ImageNet.
+“W-b” means
+weight bit-widths. “S (M)” means quantized
+model size (MB).
+
+Method
+DeepComp
+HAQ
+HMQ
+Ours
+PACT
+DeepComp
+HAQ
+HMQ
+Ours
+
+W-b
+3MP
+3MP
+3MP
+3MP
+8
+4MP
+4MP
+4MP
+4MP
+
+Top-1
+65.93
+67.66
+69.88
+71.57
+70.82
+71.14
+71.74
+70.91
+72.60
+
+Top-5
+86.85
+88.21
+-
+90.30
+89.85
+89.84
+90.36
+-
+90.83
+
+S (M)
+1.60
+1.58
+1.51
+1.79
+4.01
+2.10
+2.07
+2.12
+2.08
+
+4.3 Mixed-Precision Quantization Policy Search Efficiency
+
+Here, we compare the efficiency of our method to other SOTAs MPQ algorithms with unlimited search space (i.e.,
+MPQ for both weights and activations instead of weights only MPQ, layer-wise MPQ instead of block-wise).
+
+The time consumption of our method consists of 3 parts. Namely, 1) Importance indicators training. 2) MPQ policy
+search. 3) Quantized model fine-tuning. The last part is necessary for all MPQ algorithms while searching the MPQ
+policy is the biggest bottleneck (e.g., AutoQ needs more than 1000 GPU-hours to determine the final MPQ policy),
+thus we mainly focus on the first two parts.
+
+4.3.1 Comparison with SOTAs on ResNet50
+
+The time consumption of the first part is to leverage the federative training technique (see § 3.4) to get importance
+indicators for all layers and their corresponding bit-widths, but it only needs to be done once. It needs to train the
+network about 50 minutes (using 50% data of training set) on 4 NVIDIA A100 GPUs (i.e., 3.3 GPU-hours). The time
+consumption of the second part is to solve the ILP problem. It consumes 0.35 seconds on a six-core Intel i7-8700 (at
+3.2 GHz) CPU, which is negligible.
+
+Hence, suppose we have different z devices with diverse computing capabilities to deploy, our method consumes
+50 + 0.35 × 1
+
+60 × z minutes to finish the whole MPQ search processes.
+
+Compared with the search-based approach, AutoQ [20] needs 1000 GPU-hours to find the final MPQ policy for a
+single device, which means it needs 1000z GPU-hours to search MPQ policies for these z devices. Thus we achieve
+about 330z× speedup and obtain a higher accuracy model simultaneously.
+
+Compared with the criterion-based approach, HAWQv2 [10] takes 30 minutes on 4 GPUs to approximate the
+Hessian trace. The total time consumption of HAWQv2 for these z devices is 30 + c × 1
+60 × z minutes, and c is the
+time consumption for solving a Pareto frontier based MPQ search algorithm with less than 1 minute. Thus if z is large
+enough, our method has almost the same time overhead as HAWQv2. If z is small, e.g., z = 1, our method only needs
+a one-time additional 20-minute investment for the cold start of first part, but resulting in a significant accurate model
+(i.e., 1.1% top-1 accuracy improvement).
+
+4.4 Ablation Study
+
+Table 6: Ablation study for MobileNetv1 on ImageNet.
+
+Method W-bits A-bits Top-1/Quant Top-5/Quant BitOps
+
+Ours
+Ours
+Ours-R
+
+3MP
+4MP
+4MP
+
+3MP
+4MP
+4MP
+
+69.48
+71.84
+65.25
+
+89.11
+90.38
+86.15
+
+5.78
+9.68
+9.68
+
+In Figure 2 and its analysis, we empirically verify that the layers with bigger scale factor values are more sensitive
+to quantization when their quantization bit-width is reduced. Based on this observation, we propose our ILP-based
+MPQ policy search method. However, an intuitive question is what if we reverse the correlation between scale factors
+
+10
+
+PRIME AI paper
+
+and sensitivity. Namely, what if we gave the layers with smaller scale factor values more bit-widths instead of fewer
+bit-widths. And, what if we gave the layers with bigger scale factor values fewer bit-widths instead of more bit-widths.
+
+The result is shown in Table 6, we use “Ours-R” to denote the result of reversed bit-width assignment manner; “Ours”
+results come from Table 4 directly to represent the routine (not reversed) bit-width assignment manner.
+
+We observe that “Ours-R” has 6.59% top-1 accuracy lower than our routine method under the same BitOps constraint.
+More seriously, it has 4.23% absolute accuracy gap between “Ours-R” (with 4-bits level constrainted, i.e., 9.68 BitOps)
+and a 3-bits level (i.e., 5.78G BitOps) routine result. Such a colossal accuracy gap demonstrates that our ILP-based
+MPQ policy search method is reasonable.
+
+4.5 Bit-width Assignment Visualization
+
+We visualize the bit-width assignment for MobileNet and ResNet50 in Figure 5 to understand the behavior of our
+method. We can observe that the top layers tend to be assigned more bit-widths due to their extraction of low-level
+features. In particular, in MobileNet, DW-convs are assigned higher bit-width due to their sensitivity to quantization.
+Thus, we can conclude that our method does achieve not only better performance and but also a reasonable bit-width
+assignment through the learned importance indicators.
+
+Figure 5: Bit-width for MobileNet and ResNet50.
+
+5 Conclusion
+
+In this paper, we propose a novel MPQ method that leverages the unique parameters in quantization, namely the scale
+factors in the quantizer, as the importance indicators to assign the bit-width for each layer. We demonstrate the associ-
+ation between these importance indicators and the quantization sensitivity of layers empirically. We conduct extensive
+experiments to verify the effectiveness of using these learned importance indicators to represent the contribution of
+certain layers under specific bit-width to the final performance, as well as to demonstrate the rationality of the bit-width
+assignment obtained by our method. For example, on ResNet50, compared to the search-based method AutoQ, our
+method saves 330× MPQ policy search time for a single device. Compared to the criterion-based method HAWQv2
+and MPQCO, our method improve 1.1% and 1.6% top-1 accuracy on ImageNet.
+
+References
+
+[1] Baskin, C., Zheltonozhkii, E., Rozen, T., Liss, N., Chai, Y., Schwartz, E., Giryes, R., Bronstein, A.M., Mendel-
+son, A.: Nice: Noise injection and clamping estimation for neural network quantization. Mathematics 9(17),
+2144 (2021)
+
+[2] Bhalgat, Y., Lee, J., Nagel, M., Blankevoort, T., Kwak, N.: Lsq+: Improving low-bit quantization through
+learnable offsets and better initialization. In: Proceedings of the IEEE/CVF Conference on Computer Vision and
+Pattern Recognition Workshops. pp. 696–697 (2020)
+
+[3] Cai, Z., He, X., Sun, J., Vasconcelos, N.: Deep learning with low precision by half-wave gaussian quantization.
+In: Proceedings of the IEEE conference on computer vision and pattern recognition. pp. 5918–5926 (2017)
+[4] Cai, Z., Vasconcelos, N.: Rethinking differentiable search for mixed-precision neural networks. In: Proceedings
+
+of the IEEE/CVF Conference on Computer Vision and Pattern Recognition. pp. 2349–2358 (2020)
+
+[5] Chen, B., Li, P., Li, B., Lin, C., Li, C., Sun, M., Yan, J., Ouyang, W.: Bn-nas: Neural architecture search
+with batch normalization. In: Proceedings of the IEEE/CVF International Conference on Computer Vision. pp.
+307–316 (2021)
+
+[6] Chen, W., Wang, P., Cheng, J.: Towards mixed-precision quantization of neural networks via constrained op-
+timization. In: Proceedings of the IEEE/CVF International Conference on Computer Vision. pp. 5350–5359
+(2021)
+
+11
+
+0510152025Layer Index6420246Bit-widthBit-width for MobileNetv1DW weightsPW weightsDW actsPW acts01020304050Layer Index6420246Bit-widthBit-width for ResNet50WeightsActivationsPRIME AI paper
+
+[7] Choi, J., Wang, Z., Venkataramani, S., Chuang, P.I.J., Srinivasan, V., Gopalakrishnan, K.: Pact: Parameterized
+
+clipping activation for quantized neural networks. arXiv preprint arXiv:1805.06085 (2018)
+
+[8] Chu, X., Zhang, B., Xu, R.: Fairnas: Rethinking evaluation fairness of weight sharing neural architecture search.
+In: Proceedings of the IEEE/CVF International Conference on Computer Vision. pp. 12239–12248 (2021)
+[9] Deng, J., Dong, W., Socher, R., Li, L.J., Li, K., Fei-Fei, L.: Imagenet: A large-scale hierarchical image database.
+
+In: 2009 IEEE conference on computer vision and pattern recognition. pp. 248–255. Ieee (2009)
+
+[10] Dong, Z., Yao, Z., Cai, Y., Arfeen, D., Gholami, A., Mahoney, M.W., Keutzer, K.: Hawq-v2: Hessian aware
+trace-weighted quantization of neural networks. In: Advances in neural information processing systems (2020)
+[11] Dong, Z., Yao, Z., Gholami, A., Mahoney, M.W., Keutzer, K.: Hawq: Hessian aware quantization of neural
+networks with mixed-precision. In: Proceedings of the IEEE/CVF International Conference on Computer Vision.
+pp. 293–302 (2019)
+
+[12] Esser, S.K., McKinstry, J.L., Bablani, D., Appuswamy, R., Modha, D.S.: Learned step size quantization. In:
+
+International Conference on Learning Representations (2020)
+
+[13] Guo, Z., Zhang, X., Mu, H., Heng, W., Liu, Z., Wei, Y., Sun, J.: Single path one-shot neural architecture search
+
+with uniform sampling. In: European Conference on Computer Vision. pp. 544–560. Springer (2020)
+
+[14] Habi, H.V., Jennings, R.H., Netzer, A.: Hmq: Hardware friendly mixed precision quantization block for cnns. In:
+Computer Vision–ECCV 2020: 16th European Conference, Glasgow, UK, August 23–28, 2020, Proceedings,
+Part XXVI 16. pp. 448–463. Springer (2020)
+
+[15] He, K., Zhang, X., Ren, S., Sun, J.: Deep residual learning for image recognition. In: IEEE Conference on
+
+Computer Vision and Pattern Recognition (CVPR). pp. 770–778 (2016)
+
+[16] Howard, A.G., Zhu, M., Chen, B., Kalenichenko, D., Wang, W., Weyand, T., Andreetto, M., Adam, H.: Mo-
+bilenets: Efficient convolutional neural networks for mobile vision applications. arXiv preprint arXiv:1704.04861
+(2017)
+
+[17] Jung, S., Son, C., Lee, S., Son, J., Han, J.J., Kwak, Y., Hwang, S.J., Choi, C.: Learning to quantize deep networks
+by optimizing quantization intervals with task loss. In: Proceedings of the IEEE/CVF Conference on Computer
+Vision and Pattern Recognition. pp. 4350–4359 (2019)
+
+[18] LeCun, Y., Denker, J.S., Solla, S.A.: Optimal brain damage. In: Advances in neural information processing
+
+systems. pp. 598–605 (1990)
+
+[19] Liu, Z., Li, J., Shen, Z., Huang, G., Yan, S., Zhang, C.: Learning efficient convolutional networks through
+network slimming. In: Proceedings of the IEEE international conference on computer vision. pp. 2736–2744
+(2017)
+
+[20] Lou, Q., Guo, F., Kim, M., Liu, L., Jiang, L.: Autoq: Automated kernel-wise neural network quantization. In:
+
+International Conference on Learning Representations (2020)
+
+[21] Mitchell, S., OSullivan, M., Dunning, I.: Pulp: a linear programming toolkit for python. The University of
+
+Auckland, Auckland, New Zealand p. 65 (2011)
+
+[22] Park, E., Yoo, S.: Profit: A novel training method for sub-4-bit mobilenet models. In: European Conference on
+
+Computer Vision. pp. 430–446. Springer (2020)
+
+[23] Uhlich, S., Mauch, L., Cardinaux, F., Yoshiyama, K., Garcia, J.A., Tiedemann, S., Kemp, T., Nakamura, A.:
+Mixed precision dnns: All you need is a good parametrization. In: International Conference on Learning Repre-
+sentations (2020)
+
+[24] Wang, K., Liu, Z., Lin, Y., Lin, J., Han, S.: Haq: Hardware-aware automated quantization with mixed precision.
+In: Proceedings of the IEEE/CVF Conference on Computer Vision and Pattern Recognition. pp. 8612–8620
+(2019)
+
+[25] Wu, B., Wang, Y., Zhang, P., Tian, Y., Vajda, P., Keutzer, K.: Mixed precision quantization of convnets via
+
+differentiable neural architecture search. arXiv preprint arXiv:1812.00090 (2018)
+
+[26] Yu, H., Han, Q., Li, J., Shi, J., Cheng, G., Fan, B.: Search what you want: Barrier panelty nas for mixed precision
+
+quantization. In: European Conference on Computer Vision. pp. 1–16. Springer (2020)
+
+[27] Zhang, D., Yang, J., Ye, D., Hua, G.: Lq-nets: Learned quantization for highly accurate and compact deep neural
+networks. In: Proceedings of the European conference on computer vision (ECCV). pp. 365–382 (2018)
+[28] Zhou, A., Yao, A., Guo, Y., Xu, L., Chen, Y.: Incremental network quantization: Towards lossless cnns with
+
+low-precision weights. arXiv preprint arXiv:1702.03044 (2017)
+
+[29] Zhou, S., Wu, Y., Ni, Z., Zhou, X., Wen, H., Zou, Y.: Dorefa-net: Training low bitwidth convolutional neural
+
+networks with low bitwidth gradients. arXiv preprint arXiv:1606.06160 (2016)
+
+12
+
+

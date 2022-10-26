@@ -1,0 +1,1402 @@
+0
+2
+0
+2
+
+c
+e
+D
+4
+1
+
+]
+
+G
+L
+.
+s
+c
+[
+
+2
+v
+8
+1
+5
+0
+1
+.
+6
+0
+0
+2
+:
+v
+i
+X
+r
+a
+
+Improving Post Training Neural Quantization:
+Layer-wise Calibration and Integer Programming
+
+Itay Hubara †◦∗ Yuri Nahshan †∗ Yair Hanani †∗
+Ron Banner † Daniel Soudry ◦
+
+†Habana Labs – An Intel company 1, Caesarea, Israel,
+◦Department of Electrical Engineering - Technion, Haifa, Israel
+
+{ihubara, ynahshan, yhanani, rbanner}@habana.ai
+{daniel.soudry}@gmail.com
+
+Abstract
+
+Lately, post-training quantization methods have gained considerable attention, as
+they are simple to use, and require only a small unlabeled calibration set. This
+small dataset cannot be used to ﬁne-tune the model without signiﬁcant over-ﬁtting.
+Instead, these methods only use the calibration set to set the activations’ dynamic
+ranges. However, such methods always resulted in signiﬁcant accuracy degradation,
+when used below 8-bits (except on small datasets). Here we aim to break the 8-bit
+barrier. To this end, we minimize the quantization errors of each layer separately
+by optimizing its parameters over the calibration set. We empirically demonstrate
+that this approach is: (1) much less susceptible to over-ﬁtting than the standard
+ﬁne-tuning approaches, and can be used even on a very small calibration set; and
+(2) more powerful than previous methods, which only set the activations’ dynamic
+ranges. Furthermore, we demonstrate how to optimally allocate the bit-widths
+for each layer, while constraining accuracy degradation or model compression by
+proposing a novel integer programming formulation. Finally, we suggest model
+global statistics tuning, to correct biases introduced during quantization. Together,
+these methods yield state-of-the-art results for both vision and text models. For
+instance, on ResNet50, we obtain less than 1% accuracy degradation — with 4-bit
+weights and activations in all layers, but the smallest two. We open sourced our
+code 2.
+
+1
+
+Introduction
+
+The pursuit of advanced Deep Neural Networks (DNNs) causes researchers to construct deeper and
+wider networks, making them expensive to use in terms of power and time. This increases the need
+for efﬁcient implementations of these networks. Efﬁcient networks reduce cloud-vendor costs and
+make it possible to run them on low-power devices such as smartphones and wearable devices. The
+most common off-the-shelf approach to improving network efﬁciency is quantization, which reduces
+the numerical precision of the network and its complexity and memory footprint.
+
+DNN quantization techniques can be classiﬁed as either post-training or quantization-aware training
+(QAT) techniques (Han et al., 2015; Courbariaux et al., 2015; Hubara et al., 2017; Zhou et al., 2016).
+Although QAT techniques, in general, achieve better results, there are important real-world scenarios
+in which they are not applicable. These are the cases where the training data is sensitive or simply
+unavailable at the time of deployment. For instance, when off-the-shelf or legacy models are being
+
+∗Equal contribution.
+2https://github.com/itayhubara/CalibTIP
+
+ 
+ 
+ 
+ 
+ 
+ 
+used, or when medical records are involved. Therefore, much attention has recently been dedicated to
+post-training quantization methods (Nagel et al., 2019; Banner et al., 2018; Zhao et al., 2019), which
+can be more easily applied in practice. These methods allow for network quantization to happen
+seamlessly when deployed, without requiring additional information from the user except a small
+unlabeled calibration set.
+
+Unfortunately, post-training quantization below 8-bit always incurs signiﬁcant accuracy degradation
+and in some cases even higher numerical precision is required. In this paper, our goal is to break
+this barrier by distilling all the information the pre-trained model and calibration set encode. Our
+goal is to ﬁnd an optimal scheme for current state of the art hardware which usually support 16,8,4
+bits data types with per-channel quantization of the weights. To that end, we suggest a three-stage
+pipeline that consists of methods applied solely on a small calibration set to reduce the local error
+introduced during the quantization process (e.g., round-off errors) followed by integer programming
+to determine the bit-width of different layers so that the overall accuracy degradation is minimized.
+Even without using mixed-precision, the suggested method is much less prone to over-ﬁtting than
+current methods and yields best in class results for 8-bits Mobilenet-V2 and BERT-base trained
+on ImageNet and SQuAD1.1 datasets, respectively. Our paper suggests several contributions for
+mixed-precision post-training quantization:
+
+1. AdaQuant: A layer-by-layer optimization method that minimizes the error between the
+quantized layer output and the full-precision layer output. This method can consume only a
+small calibration dataset from training data without overﬁtting. In a comprehensive study,
+we show that AdaQuant deﬁnes a new state-of-the-art for post-training quantization on
+several networks and tasks, including vision models (Resnet18, Resnet50, MobilenetV2)
+and language (BERT).
+
+2. Integer programming: As some parts of the network may allow lower precision compared
+to other layers, we suggest an integer-linear programming based approach for determining
+the precision level of different layers. This method aims at maximizing either the expected
+speedup or savings in power consumption without violating a predeﬁned constraint on
+network accuracy degradation or compression.
+
+3. Batch-norm tuning: Following quantization we observe an inherent bias in the mean and
+the variance of batch norm statistics. We show that by employing the re-estimated statistics
+in batch normalization, much of the quantized network degradation can be recovered.
+
+4. Light and Advanced pipelines: We analyze the advantages and disadvantages of each
+of the given methods and suggest two pipelines: (1) light pipeline that does not require a
+backward pass, thus can be invoked even on inference-only hardware; and (2) Advanced
+pipeline that includes also AdaQuant and bias tuning.
+
+2 Related work
+
+There has been a signiﬁcant effort to accelerate inference via quantization (Courbariaux et al., 2015;
+Han et al., 2015; Rastegari et al., 2016; Zhou et al., 2017). These works involve re-training in order
+to compensate for the degradation due to the quantization process. Post-training quantization, on the
+other hand is applied to a model after it was trained. Thus, it avoids re-training and as such it is much
+simpler to use. However, naively quantizing a full-precision model to INT4 or lower to accelerate
+computation usually incurs signiﬁcant accuracy degradation (Krishnamoorthi, 2018; Jacob et al.,
+2018).
+
+AdaQuant: A recent post-training quantization method (Nagel et al., 2020), termed AdaRound,
+suggested optimizing the rounding policy. Instead of using the predominant rounding-to-nearest
+approach, they suggest formulating a per-layer quadratic optimization problem to optimize the round-
+off error. Our proposed method, AdaQuant, takes another step and relaxes AdaRound’s implicit
+constraint which forces the quantized weights to be within ±1 of their round-to-nearest value. This
+is done by optimizing the weights and quantization parameters of each layer separately, over the
+calibration set, to minimize the MSE between the layer’s original and quantized outputs. As oppose to
+AdaRound we apply AdaQuant to ﬁnd optimal quantization not only to weights but also to activations.
+In addtion we suggest two ﬂavors for AdaQuant: (1) parallel-AdaQuant suited for mixed precision
+setting; (b) sequential-adaquant which suited for ﬁxed conﬁguration.
+
+2
+
+Integer programming: Early work by Lin et al. (2016) used a convex optimization formulation
+which results in a simple greedy compression scheme. Aﬂalo et al. (2020) used a combinatorial
+optimization approach for network pruning. Their problem was formulated as a Knapsack problem
+that optimizes the trade-off between the channels importance and their associated computational cost.
+Cai et al. (2020) ﬁnds a mixed-precision conﬁguration with a guaranteed Pareto efﬁcient allocation
+with respect to model size and accuracy degradation. While this provides a "best-effort" standard
+(e.g., the conﬁguration cannot be further compressed without hurting accuracy), it does not suggest
+which of all possible outcomes is best. To the best of our knowledge, this work is the ﬁrst to formalize
+a generic integer program, which can easily be adapted to various types of models and requirements
+with a clear objective and constraints.
+
+Batch norm tuning: Finkelstein et al. (2019) were the ﬁrst to recognize that a signiﬁcant source of
+degradation is a shift in the mean activation value. They show a simple method to compensate for
+this bias by updating the bias terms. Nagel et al. (2019) suggest to equalize the weight ranges in the
+network and correct biases in the error that are introduced during quantization .Recently Sun et al.
+(2019) suggested batch norm tuning for FP8 models. Here we detail how to perform this procedure on
+a per-channel quantized (PCQ) model with fused batch-norm layers. The procedure is light as it only
+requires to invoke the quantized model few times (on the calibration set) and adjust the quantization
+parameters.Moreover after retuning the BN layers can be reabsorbed which reduces the inference
+complexity. To the best of our knowledge we are the ﬁrst to suggest it.
+
+3 Optimizing The Quantization Pipeline
+
+In most post-training quantization settings, a model and a small unlabeled calibration set are given.
+To avoid overﬁtting the calibration set, most studies utilize it only to extract the network’s internal
+statistics, which is later used to set the quantization parameters.
+
+Here we suggest using the calibration set much more extensively to tune the model while avoiding
+over-ﬁtting the data. In the following subsections, we detail three different optimization methods over
+the calibration set: (1) AdaQuant, a layerwise optimization of weights and quantization parameters;
+(2) an integer programming formulation for a mixed-precision setting; and (3) Batch Normalization
+Tuning (BNT), for tuning the model’s internal statistics to match the numerical precision setting. We
+discuss the strengths and weaknesses of each method and suggest an optimization ﬂow that exploits
+all the additive merits and leads to state-of-the-art results.
+
+3.1 AdaQuant - Layerwise Optimization over the Calibration Set
+
+Several researchers suggested per-tensor optimization to reduce quantization error by minimizing
+some form of MSE objective between the quantized and the full-precision tensor X (either weights
+or activations). They look for an optimized quantization step size ˆ∆ obtained by
+
+ˆ∆ = arg min
+
+∆
+
+||X − Q∆(X)||2;
+
+Q∆(X) = ∆ ·
+
+(cid:25)
+
+,
+
+(cid:22) X
+∆
+
+(1)
+
+where Q(·) is the quantization function. Although these methods are fast and easy to use, they often
+result in an inferior solution — the loss in eq. 1 is sub-optimal, as it penalizes all the quantization errors
+equally. However, the loss should penalize more quantization errors which affect the classiﬁcation.
+Accordingly, researchers suggested Quantization-Aware-Training (QAT) methods to ﬁx this error by
+training the entire model at once. However, those methods have three limitations: (a) they require
+the large training set to avoid over-ﬁtting, (b) they approximate the back-propagation gradients
+through discrete function (the quantizer) and (c) they have high computational and memory footprints.
+We suggest a modiﬁed objective for per-layer joint optimization of the weights and quantization
+parameters.
+
+(cid:16) ˆ∆w, ˆ∆x, ˆV
+
+(cid:17)
+
+= arg min
+∆w,∆x,V
+
+||W X − Q∆w (W + V ) · Q∆x (X)||2,
+
+(2)
+
+where V is a continuous variable added to W and the quantized network weights are deﬁned as
+(W + ˆV ). In this new objective the quantized tensor is not required to be "close" to the
+Wq = Q ˆ∆w
+original tensor, as in eq. 1, thus beneﬁting from the ﬂexibility that Quantization-Aware-Training
+methods have. Yet, it can be executed in parallel over all layers and is much less prone to over-ﬁtting.
+
+3
+
+Moreover, under a ﬁxed conﬁguration we can optimize the model globally and infer the error between
+layers. Thus, instead of running AdaQuant on all layers in parallel we can run it sequentially and ﬁx
+the error induced by quantaizing former layers. Thus, Eq. 2 changes to:
+
+(cid:16) ˆ∆wl, ˆ∆xl , ˆVl
+
+(cid:17)
+
+= arg min
+∆wl ,∆xl ,Vl
+Xq = σ(Q∆wl−1
+
+||WlXl − Q∆wl
+
+(Wl + Vl) · Q∆xl
+
+(X q
+
+l )||2,
+
+(Wl−1 + Vl−1) · Q∆xl
+
+(X q
+
+l−1))
+
+(3)
+
+(4)
+
+where σ(·) is some activation function.
+
+Note, that sequential AdaQuant should not be applied before the bit allocation was set as it optimize
+over noisy input obtain from predecessor quantized layers. We evaluate both ﬂavors of adaquant
+(named, AdQuant and sequential-AdaQuant and detail our ﬁnding in section 5.1. We note that
+AdaQuant also optimizes over biases and offsets and optimized fused conv-bn-relu layers when
+present; these were removed from the formulation in Equation 2 for simplicity.
+
+Size of calibration set Perhaps surprisingly,
+although we experiment with a very small cal-
+ibration set, no over-ﬁtting is observed. Let us
+examine a simple fully connected layer W ∈
+RM ×N . The input and output are of sizes N
+and M , respectively. For each output we have
+B equations and N separate parameters (i.e.,
+with no overlap in parameters between different
+outputs). Therefore if B (cid:28) N we generically
+have an inﬁnite amount of solutions and we can
+overﬁt the data. If B (cid:29) N then we might un-
+derﬁt the data. Thus, the size of the calibra-
+tion set required for AdaQuant should roughly
+be O(N ). A similar derivation for convolution
+layers reveals that the calibration size should
+have B ≥ Ci·k2
+HW samples to avoid over-ﬁtting,
+where B is the number of unique samples, k
+is the convolution’s kernel size, Ci and Co is
+the number of input and output channels respec-
+tively and H, W represent height and width. In
+ﬁg. 1 we compare AdaQuant to current state-of-
+the-art methods including QAT with knowledge
+distillation (QAT-KLD) (Kim et al., 2019) and
+AdaRound (Nagel et al., 2020). For each method, we measured the top-1 accuracy with respect to the
+number of samples in the calibration set over ﬁve runs and present the mean and standard deviation.
+As can be seen, AdaQuant is superior to previous methods and speciﬁcally excels on small calibration
+sets. Remarkably, AdaQuant does not overﬁt even when optimized on a single image. Additional
+details can be found in section A and D of the Appendix.
+
+Figure 1: Comparison of different optimization
+methods over ResNet-50 quantized to 4 bit except
+the ﬁrst and the last layers which were kept in
+8bit. Even optimizing on a single image drastically
+improves the results but as expected have a high
+variance (red bar). The variance decreases rapidly
+as calibration set size increases.
+
+3.2 Per-layer bit allocations with integer programming
+
+AdaQuant signiﬁcantly enhances network accuracy at lower bit widths. However, it is often not
+sufﬁcient by itself to attain acceptable accuracy. Therefore, in practical use cases, the user would
+like to balance between accuracy and performance (e.g., power and speed), by setting several layers
+to higher precision. Our high-level goal in this section would be to optimize the overall network
+performance while maintaining a predeﬁned accuracy degradation or a model compression constraint.
+
+In the following, we provide an integer-programming (IP) formulation for optimizing per-layer bit
+allocations. Depending on the needs, our performance metrics P would be either the execution time
+of the network or its power consumption. Also, with every layer quantization, there is an associated
+quantization error that affects the training loss L. We chose the latter to be our penalty metric. Integer
+programming is applied in those situations where a given problem can clearly be represented in
+the form of a linear relationship between different decision variables. Unlike other previous works
+on compression, it attains a global optimum. For example, Lin et al. (2016) suggested a convex
+
+4
+
+100101102103Calibration set size (log scale)020406080AccuracyFP32Naive min-maxAdaQuantAdaRoundQAT-KLDoptimization problem, but the constraints and the objective are not linear. This typically has a drastic
+impact on convergence time, and the quality of the results since the Simplex method can no longer be
+applied (Van Doormaal & Raithby, 1984).
+
+l and X n
+
+Basic formulation We are given a neural network with L layers. For each layer l, we have weights
+Wl that need to be multiplied with activations of the previous layer Xl−1. Such lower bit width
+multiplications can be executed by quantizing the weights and activations to achieve higher throughput
+and energy-efﬁcient solutions. Let W k
+l−1 represent a quantized version of Wl and Xl−1 to
+k and n bits, respectively. For each layer i, a low-bit width multiplication W k
+l−1 results in a
+l
+loss degradation ∆Lk,n
+l with respect to the original product
+Wl · Xl−1. This performance improvement measure needs to be additive and sum up to a total beneﬁt
+in end-to-end network performance (e.g., power, model size, etc.). Our goal would be to maximize
+the total performance improvement without exceeding the total network degradation ∆L.
+We now turn to solve the above problem using an integer program. We deﬁne a binary variable I k,n
+,
+which is set to one if and only if the weights W k
+l−1 at layer l;
+otherwise we set the indicator to zero i.e., I k,n
+l = 0. Then, the basic bit allocation problem can be
+formulated as follows:
+
+l are multiplied with the activations X n
+
+and in performance improvement ∆Pk,n
+
+· X n
+
+l
+
+l
+
+Maximize
+
+Subject to
+
+L−1
+(cid:88)
+
+l=0
+(cid:88)
+
+l
+
+∆Pl
+
+∆Ll ≤ ∆L,
+
+∀l ∈ {1, ..., L} :∆Pl =
+
+I k,n
+l
+
+· ∆Pk,n
+l
+
+, ∆Ll =
+
+(cid:88)
+
+k,n
+
+I k,n
+l
+
+· ∆Lk,n
+l
+
+(cid:88)
+
+k,n
+
+∀l ∈ {1, ..., L} :
+
+(cid:88)
+
+k,n
+
+l = 1, I k,n
+I k,n
+
+l ∈ {0, 1}
+
+(5a)
+
+(5b)
+
+(5c)
+
+(5d)
+
+The objective function (3a) maximizes the total performance improvement. Constraints (3b) and
+(3c) ensure that the total degradation in loss and the total improvements in performance due to the
+quantization of layer l to k-bit-weights and n-bit-activations would be ∆Ll and ∆Pl, respectively.
+Equation (3d) states that the restriction on total degradation of ∆L is obeyed and ensures that only
+one conﬁguration (of quantized weights and activation) per layer is selected.
+
+3.3 Batch Normalization Tuning
+
+A common practice is fusing BN layers into their predecessor weight layers before applying post-
+training quantization to reduce the amount of Multiply-Accumulate (MAC) operations. However, the
+reduction in bit-width after quantization can cause the model’s internal statistics to deviate further
+from those of the full precision model. To compensate for this deviation, we suggest updating BN
+statistics. First, we need to reconstruct the BN layers then re-tune the BN layers’ statistics (by a few
+iterations of running-mean to re-collect the statistics). Finally, re-absorb (re-fuse) the BN layers into
+the weight layers (this is possible only in a per-channel weights quantization setting, which is the
+current standard). Next, we give more details on each phase.
+
+Reconstructing BN layers Assume the original (pre-fusing) BN parameters γo, βo and (cid:15) are known,
+as is usually the case. We would like to initialize µ, σ2, as well as the BN parameters γr and βr (r for
+"reconstructed") so that the reconstructed BN
+
+BNr(x) = γr
+
+√
+
+x − µ
+σ2 + (cid:15)
+
++ βr ≈ x
+
+(6)
+
+will re-adjust the model statistics. To do so, ﬁrst we initialize the reconstructed BN layers by setting
+the following parameters (denoted by r):
+
+µ = βr = βo;
+
+σ2 = γ2
+(7)
+o
+so that BNr(x) = x. Then, we update µ and σ2 by collecting running mean and running variance
+on the calibration data. We stress that the BN parameters, γr, βr, do not change while applying BN
+tuning, as we only invoke forward propagation.
+
+o + (cid:15)
+
+; γr = (cid:112)γ2
+
+5
+
+Re-fusing BN layers Due to the per-channel quantization setting we use, the collected statistics
+can be fused back into the current quantization scale as follows:
+
+W (cid:48)
+
+i = Wi
+
+γr
+σ
+
+;
+
+b(cid:48)
+i =
+
+γr
+σ
+
+(bi − µ) + βr;
+
+∆(cid:48)
+
+wi
+
+=
+
+γr
+σ
+
+∆wi
+
+(8)
+
+Thus, in addition to the regular BN fusion, the quantization step is adjusted by γrσ−1. Additional
+details are given in section B of the Appendix .
+
+Bias tuning Much like Finkelstein et al. (2019), we suggest to apply a global bias-tuning procedure
+on the ﬁnal mixed-precision model by applying quantization-aware training to minimize the Knowl-
+edge Distillation (KD) loss (which does not require labels). Since we restrict the trainable variables
+to be the biases only, we can train only on the calibration set without experiencing overﬁtting.
+
+4 Quantization Flow
+
+Past years have seen the rapid development of efﬁcient deployment techniques (Nagel et al., 2019;
+Haroush et al., 2019). Deployment ﬂows can vary based on the user setting such as hardware
+constraints, deployment time and task/dataset availability. While some users are willing to pay at
+initialization the time and effort to gain another fraction of accuracy, others require a simple and fast
+solution. We address this by suggesting two novel pipelines, light and advanced. Our pipelines are
+designed to the current, most common setting: per-channel quantization with a small calibration set.
+
+Our light pipeline requires three steps: (1) Fuse layers and deﬁne quantization parameters; (2) Find
+optimal mixed-precision conﬁguration using IP; and (3) Use BN tuning to correct the internal statistics.
+We note that all steps do not require back-propagation and thus are very light and fast. In addition to
+the light setting, in the advanced pipeline we apply AdaQuant to reduce each layer’s output distortion
+from its full precision counterpart before invoking the IP algorithm. A detail comparison between the
+two pipeline is given in table-1. Models that were optimized using AdaQuant to different bit-widths
+can be seamlessly stitched thus having the ability to create an optimized model in a mixed precision
+setting. Subsequently, global methods such as tuning both BN statistics and the layers’ biases can
+be applied to reduce a Knowledge Distillation loss. Although there are additional post-training
+quantization techniques that could be potentially combined with our methods, such as bias correction
+(Banner et al., 2018), equalization (Meller et al., 2019), and outlier channel splitting (Zhao et al.,
+2019), we did not ﬁnd it necessary: our results demonstrate that our relatively simple pipeline yields
+state of the art accuracy on both vision and text models, even without combining such methods. In
+the following sections we show our ﬁndings and give an ablation study that highlights the importance
+of each method and their combination.
+
+AdaQuant Mixed-Precision (IP) BN tuning Bias Tuning
+×
+Light-Pipeline
+Heavy-Pipeline (cid:88)
+
+×
+(cid:88)
+Table 1: Comparison between light and advanced pipelines.
+
+(cid:88)
+(cid:88)
+
+(cid:88)
+(cid:88)
+
+5 Experiments
+
+In this section, we demonstrate our methods and pipelines on several models and datasets. We
+ﬁrst start by analyzing image recognition models such as ResNet18/50, MobileNet-V2, which were
+trained over the ImageNet dataset. Next, we demonstrate our method robustness by applying it on
+question answering task using the popular BERT model (Devlin et al., 2018), which was ﬁne-tuned
+on SQuAD1.1 dataset (Rajpurkar et al., 2016). In all our experiments, we used a small calibration
+set taken from the training dataset. Unless stated otherwise, we applied asymmetric per-channel
+quantization (i.e. GEMLOWP Wu et al. (2016)) with quantized offset (i.e., zero point). Next, we
+analyze each method’s strengths and weaknesses separately and argue for its validity. Additional
+implementation details can be found in section and the code are given in sections D E of the Appendix.
+
+6
+
+5.1 AdaQuant
+
+Recently several researchers suggested different types of MSE optimization. In most cases, the
+optimization was done per-tensor (i.e., for the weights and activations separately). Here we argue
+that by optimizing both quantization parameters and the weights jointly we can reduce the MSE
+even further and hence improve the accuracy as demonstrated in ﬁg. 2b. In contrast to AdaRound
+(Nagel et al., 2020) which restricted the change of the weights to be within ±1 we allow the weights
+to change as needed. As can be seen in ﬁg. 2a the weights indeed change their quantized value by
+more than one. Since our pipeline is focused on the mixed-precision setting we optimize each layer
+separately to enable maximum ﬂexibility when stitching the optimized models. Under that setting
+AdaQuant can be performed in parallel across all layers. However, since most recent papers do not
+show full compression-accuracy curves and only a few attempt 4-bit compression, we also compare
+our results to common ﬁxed conﬁgurations using our sequential-AdaQuant ﬂavor. While sequential
+AdaQuant cannot be parallelized or used for the mixed-precision setting it yields best-in-class results
+for all models tested as can be seen in table-2 and 3. For instance, on the extensively studied 8bit
+MobileNet-V2 (MobileNet-V2) topology we achieved 71.6% top-1 accuracy — less than 0.5%
+degradation compared to the full precision counterparts (71.9%).
+
+ACIQ* (Banner et al., 2018)
+DFQ* (Nagel et al., 2019)
+AdaQuant
+Sequential-AdaQuant
+FP32
+
+RN-34 RN-50 RN-101 RNext-50
+RN-18
+69.1
+64.5%
+N/A
+57.1%
+70.3% 73.7% 74.4%
+67.4%
+69.4%
+71.7% 75.1% 75.5%
+71.97% 73.3% 77.2% 77.3%
+
+N/A
+N/A
+74.0
+75.6%
+79.22%
+
+68.1% 68.1
+64.5% N/A
+
+Inc-V3
+60.4
+N/A
+72.6%
+73.4%
+77.4%
+
+Table 2: INT-4 quantization of weights and activations. Top-1 score over imagenet dataset for
+different post-training quantization methods. All layers were quantized to 4-bit except ﬁrst and last
+layers which were set to 8-bit. Methods marked with (*) were implemented according to the paper.
+In all our experiments we apply per-channel quantization of the weights.
+
+min-max
+DFQ (Nagel et al., 2019)
+ZeroQ (Cai et al., 2020)
+AdaQuant
+Sequential-AdaQuant
+FP32
+
+MobileNet-V2 BERT-Base-SQuad1.1
+(F1)
+(top-1)
+87.83%
+70.9%
+N/A
+71.2%
+N/A
+72.91%
+88.35%
+73.03%
+88.45%
+72.94%
+88.81%
+73.03%
+
+Table 3: INT-8 quantization of weights and activations. A comparison with DFQ and naive quan-
+tization methods (which uses the channel’s full dynamic range). In all our experiments we apply
+per-channel quantization of the weights and quantized all layers to 8-bit.
+
+Testing the strength of this method on both vision and text topologies resulted in state-of-the-art results.
+As can be seen in table 3, on BERT-base model over SQuAD1.1 dataset (BERT-Base-SQuAD1.1)
+we managed to obtain 88.45% F1 score using just AdaQuant — less than 0.5% of its full precision
+counterpart (81.3%). Throughout our experiments, we avoided using any augmentation technique
+and follow the known validation set prepossessing. s
+
+5.2
+
+Integer Programming
+
+Our Integer programming formulation requires us to have two quantities per-layer: (1) loss degrada-
+tion and; (2) performance improvement. Obtaining those quantities requires to invoke the model over
+a small calibration set L times (once per layer) and measure the loss degradation and the performance
+gain. In our experiments, we set the performance value to be the number of parameters, but this
+measure could be changed to any additive measure. In all experiments, we used 1000 samples from
+the training set as our calibration set. Our setting considers only a mixture of 8-bit and 4-bit layers;
+to further test IP capabilities, we investigate a mixture of 2-4-8 bits as well. Unfortunately, since
+
+7
+
+(a)
+
+(b)
+
+Figure 2: AdaQuant vs. AdaRound. (a) A histogram of ∆W distribution. AdaRound restricts this
+additive term to be ∆W = ±1. Relaxing this constraint provides a more powerful optimization. (b)
+Ablation study on parameters optimization for ResNet50 over ImageNet. AdaRound is based exclu-
+sively on weight optimization, while AdaQuant optimizes the weights, biases, and other quantization
+parameters jointly.
+
+2-bits quantization in post-training setting results in high degradation, the IP algorithm chose only
+mixture of 4-8 bits for compression ratio higher than 12.5%. Yet for 12.5% compression ratio, IP
+method found that by setting one layer to 2-bits while setting 8 smaller layers to 8-bits accuracy gains
+over 5.5% with respect to uniform 4-bit quantization. Also, by allowing a less hardware friendly
+setting where numerical precision can have the form of any integer between 2-8, yields the highest
+compression-accuracy ratio (ﬁg. 3 - relaxed advanced pipeline).
+
+5.3 Batch-Norm Tuning
+
+Batch-Norm Tuning (BNT) has a signiﬁcant advantage, as it does not require weight optimization.
+Since BNT is applied by invoking the entire model, we must apply it only after setting the mixed-
+precision bit-width conﬁguration. This is the case for all global optimization methods including
+bias-tuning. Notably, BNT requires only a few (at most 10) forward passes over the calibration
+set and yield signiﬁcant gains (ﬁg. 3). In this study, we applied BNT on models trained with BN
+layers only. However, it might be possible to extend this method to models without BN layers by
+reconstructing it from the statistics. We encourage the reader to investigate this path.
+
+5.4 Full pipeline and ablation study
+
+Although several researchers suggested different methods for post-training mixed-precision quantiza-
+tion, none offer their code. Each paper focuses on a different quantization setting (e.g., quantizing
+only the weights, per-tensor quantization, etc.). Therefore, to demonstrate our pipeline strength, we
+created two different baselines based on common practices:
+
+• Greedy-accuracy: recent studies suggested measuring each layer sensitivity and, based on
+
+the compression target, reduce the precision for the most robust layers.
+
+• Greedy-compression: the complementary greedy approach (Lin et al., 2016) to sort the
+layers by their number of parameters and increase the precision of the layers from the
+smallest to the largest layer until the compression budget is reached.
+
+Surprisingly, although the size of the layer should correlate with its sensitivity to quantization, the
+two greedy methods yield entirely different conﬁgurations. Investigating the conﬁguration greedy-
+compression found that sorting by compression correlates with the location of the layers in the model.
+In most vision models, the layers closer to the input have fewer parameters. This aligns with current
+common practice (Banner et al., 2018). Notably, even when not combined with any other technique,
+the IP method obtained the best bit-width conﬁgurations stressing its importance.
+
+8
+
+86420246W quantized100101102103104105weightbiasweight+biasqparamsall60.062.565.067.570.072.575.077.580.0AccuracyNext, we turn to consider the light and advanced pipelines. Under challenging compression rates,
+our light-pipeline results highlight the importance of BN tuning. As can be seen in our experiment
+ﬁg. 3, by merely invoking the model at inference mode for a few iterations and ﬁxing the intermediate
+statistics, one can recover more than 1.5% of the accuracy (73.7% v.s 75.37%). As expected,
+by applying the advanced pipeline, one can obtain state-of-the-art accuracy. Arguably, our most
+impressive results are at 0.13% compression rate in which we managed to stay within 1% of the full
+precision accuracy while converting 96% of the model to 4-bit. For the challenging MobileNet-V2
+we managed to switch 25% of the layers to 4bit (weights and activations) while maintaining less
+than 2% degradation; Additionally, we achieved, for the ﬁrst time, reasonable top-1 accuracy of 65%
+when almost the entire model is in 4-bit.
+
+(a) MobileNet-V2
+
+(b) ResNet-18
+
+(c) ResNet-50
+
+Figure 3: Ablation study over ResNet-50/18 and MobileNet-V2 - compression-accuracy curves. Our
+advanced pipeline is consist of AdaQuant, IP-mixed-precision, BN-tuning and bias-tuning. Our
+light pipeline consists of only IP-mixed-precision, BN-tuning. The relaxed advanced pipeline
+appears in c is similar to the advance pipeline but allows the integer-programming to choose any
+bit-width between 2-8 and not just 4-bit or 8-bit. The compression ratio is measured as the ratio
+between the compressed model and the full-precision (32-bit) mode thus 0.25 compression rate
+indicate that the entire model uses 8-bit precision and respectively for 4-bit the compression rate is
+0.125
+
+9
+
+0.140.160.180.200.220.24compression ratio3040506070Accuracyadvanced pipelinelight pipelineipgreedy (compression)greedy (accuracy)0.140.160.180.200.220.24compression ratio6566676869Accuracyadvanced pipelinelight pipelineipgreedy (compression)greedy (accuracy)0.120.140.160.180.200.220.24compression ratio717273747576Accuracyadvanced pipelinelight pipelineipgreedy (compression)greedy (accuracy)relaxed advanced pipelineReferences
+
+Aﬂalo, Y., Noy, A., Lin, M., Friedman, I., and Zelnik, L. Knapsack pruning with inner distillation.
+
+arXiv preprint arXiv:2002.08258, 2020.
+
+Banner, R., Nahshan, Y., Hoffer, E., and Soudry, D. Aciq: Analytical clipping for integer quantization
+
+of neural networks. 2018.
+
+Cai, Y., Yao, Z., Dong, Z., et al. Zeroq: A novel zero shot quantization framework. arXiv preprint
+
+arXiv:2001.00281, 2020.
+
+Choukroun, Y., Kravchik, E., Yang, F., and Kisilev, P. Low-bit quantization of neural networks for
+efﬁcient inference. In 2019 IEEE/CVF International Conference on Computer Vision Workshop
+(ICCVW), pp. 3009–3018. IEEE, 2019.
+
+Courbariaux, M., Bengio, Y., and David, J.-P. Binaryconnect: Training deep neural networks with
+binary weights during propagations. In Advances in neural information processing systems, pp.
+3123–3131, 2015.
+
+Devlin, J., Chang, M.-W., Lee, K., and Toutanova, K. Bert: Pre-training of deep bidirectional
+
+transformers for language understanding. arXiv preprint arXiv:1810.04805, 2018.
+
+Finkelstein, A., Almog, U., and Grobman, M. Fighting quantization bias with bias. arXiv preprint
+
+arXiv:1906.03193, 2019.
+
+Han, S., Mao, H., and Dally, W. J. Deep compression: Compressing deep neural networks with
+
+pruning, trained quantization and huffman coding. arXiv preprint arXiv:1510.00149, 2015.
+
+Haroush, M., Hubara, I., Hoffer, E., and Soudry, D. The knowledge within: Methods for data-free
+
+model compression. arXiv preprint arXiv:1912.01274, 2019.
+
+Hubara, I., Courbariaux, M., Soudry, D., El-Yaniv, R., and Bengio, Y. Quantized neural networks:
+Training neural networks with low precision weights and activations. The Journal of Machine
+Learning Research, 18(1):6869–6898, 2017.
+
+Jacob, B., Kligys, S., Chen, B., et al. Quantization and training of neural networks for efﬁcient
+integer-arithmetic-only inference. In Proceedings of the IEEE Conference on Computer Vision and
+Pattern Recognition, pp. 2704–2713, 2018.
+
+Kim, J., Bhalgat, Y., Lee, J., Patel, C., and Kwak, N. Qkd: Quantization-aware knowledge distillation.
+
+arXiv preprint arXiv:1911.12491, 2019.
+
+Krishnamoorthi, R. Quantizing deep convolutional networks for efﬁcient inference: A whitepaper.
+
+arXiv preprint arXiv:1806.08342, 2018.
+
+Lin, D., Talathi, S., and Annapureddy, S. Fixed point quantization of deep convolutional networks.
+
+In International conference on machine learning, pp. 2849–2858, 2016.
+
+Meller, E., Finkelstein, A., Almog, U., and Grobman, M. Same, same but different-recovering neural
+network quantization error through weight factorization. arXiv preprint arXiv:1902.01917, 2019.
+
+Nagel, M., Baalen, M. v., Blankevoort, T., and Welling, M. Data-free quantization through weight
+equalization and bias correction. In Proceedings of the IEEE International Conference on Computer
+Vision, pp. 1325–1334, 2019.
+
+Nagel, M., Amjad, R. A., van Baalen, M., Louizos, C., and Blankevoort, T. Up or down? adaptive
+
+rounding for post-training quantization. arXiv preprint arXiv:2004.10568, 2020.
+
+Rajpurkar, P., Zhang, J., Lopyrev, K., and Liang, P. Squad: 100,000+ questions for machine
+
+comprehension of text. arXiv preprint arXiv:1606.05250, 2016.
+
+Rastegari, M., Ordonez, V., Redmon, J., and Farhadi, A. Xnor-net: Imagenet classiﬁcation using
+binary convolutional neural networks. In European conference on computer vision, pp. 525–542.
+Springer, 2016.
+
+10
+
+Sun, X., Choi, J., Chen, C.-Y., et al. Hybrid 8-bit ﬂoating point (hfp8) training and inference for deep
+neural networks. In Advances in Neural Information Processing Systems, pp. 4901–4910, 2019.
+
+Van Doormaal, J. P. and Raithby, G. D. Enhancements of the simple method for predicting incom-
+
+pressible ﬂuid ﬂows. Numerical heat transfer, 7(2):147–163, 1984.
+
+Wu, Y., Schuster, M., Chen, Z., et al. Google’s neural machine translation system: Bridging the gap
+
+between human and machine translation. arXiv preprint arXiv:1609.08144, 2016.
+
+Zhao, R., Hu, Y., Dotzel, J., De Sa, C., and Zhang, Z. Improving neural network quantization without
+retraining using outlier channel splitting. In International Conference on Machine Learning, pp.
+7543–7552, 2019.
+
+Zhou, A., Yao, A., Guo, Y., Xu, L., and Chen, Y. Incremental network quantization: Towards lossless
+
+cnns with low-precision weights. arXiv preprint arXiv:1702.03044, 2017.
+
+Zhou, S., Wu, Y., Ni, Z., et al. Dorefa-net: Training low bitwidth convolutional neural networks with
+
+low bitwidth gradients. arXiv preprint arXiv:1606.06160, 2016.
+
+11
+
+A Size of calibration set
+
+Fully Connected layers Let’s assume that we have weights of size W ∈ RM ×N and input and
+output are of sizes N and M respectively. Recalling Eq. 2 and setting Y = W X and W (cid:48) = W + V
+results in:
+
+(cid:16) ˆ∆w(cid:48), ˆ∆x, ˆV
+
+(cid:17)
+
+= arg min
+∆w,∆x,V
+
+||Y − Q∆w(cid:48) (W (cid:48)) · Q∆x (X)||2,
+
+For simplicity we assume that ∆x is ﬁxed and deﬁne Xq = Q∆x (X), Wq = Q∆w(cid:48) (W (cid:48)). Therefore,
+if we have B unique samples, then the problem we aim to solve have the following structure:
+
+
+
+w11
+
+
+
+
+· · ·
+wM 1
+
+... w1N
+. . .
+· · ·
+... wM N
+
+
+
+
+
+x11
+
+
+
+
+
+
+
+· · ·
+xN 1
+
+x1B
+
+...
+. . .
+· · ·
+... xN B
+
+
+
+
+
+y11
+
+
+ =
+
+
+
+
+· · ·
+yM 1
+
+...
+. . .
+...
+
+
+
+
+
+
+y1B
+
+· · ·
+yM B
+
+which translates to:
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+w11x11
+w11x11
+
+w1N xN 1
+w1N xN 2
+
+...
+...
+. . .
+... wM N xN B
+Notice that in the above equations, for each output we have a different set of parameters, therefore
+we can examine each output separately. For a single output we are in scalar linear regression with
+N parameters and B equations. If B ≥ N we are under-parameterized, and if B < N we are
+over-parameterized.
+
+y11
+y12
+...
+yM B
+
+· · ·
+wM 1x1B
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+· · ·
+
+=
+
+Convolution layers layers Similarly, for convolution layers with Co output channels, Ci input
+channels, and kernel size k each element of the output is a dot product of Ci · k · k parameters.
+We have in total Co × H × W outputs where H, W is the output height and width. Thus we need
+B ≥ Ci·k2
+
+HW samples to avoid over-ﬁtting, where B is the number of unique samples.
+
+B Reconstruction and re-fusing of Batch Normalization
+
+In this section, we provide more details on Batch Normalization reconstruction and re-fusing proce-
+dure.
+
+Reconstructing BN layers: Consider a Batch Normalization layer with parameters γo, βo that
+fused into previous convolutional layer weight and bias. Fusing batch normalization layer transforms
+weights and bias as following:
+
+W (cid:48)
+
+i = Wi
+
+γo
+σ
+
+;
+
+b(cid:48)
+i =
+
+γo
+σ
+
+(bi − µ) + βo;
+
+(B.9)
+
+To reconstruct the batch normalization, we would like to initialize µ, σ2, as well as the BN parameters
+γr and βr (r for "reconstructed") so that the reconstructed BN is approximately identity ﬁg. B.1.
+
+BNr(x) = γr
+
+√
+
+x − µ
+σ2 + (cid:15)
+
++ βr ≈ x
+
+(B.10)
+
+To do so, ﬁrst we initialize the reconstructed BN layers by setting the following parameters (denoted
+by r):
+
+µ = βr = βo;
+
+σ2 = γ2
+o
+
+γr = (cid:112)γ2
+
+o + (cid:15)
+
+(B.11)
+
+so that BNr(x) = x.
+Now, we can update µ and σ2 by collecting running mean and running variance on the calibration
+data. We stress that the BN parameters, γr, βr, do not change while applying BN tuning, as we only
+invoke forward propagation.
+
+12
+
+Figure B.1
+
+Re-fusing BN layers: After BNT phase we need to fuse Batch Normalization layer again into
+convolution weights and bias. Regular batch normalization fusing will cause degradation due to
+quantization of the weights. To resolve this issue we can leverage per-channel quantization setting
+we use.
+
+Denote swi, zwi scale and zero point of the weigh, the quant/dequant operation deﬁned as:
+
+Wq = swi
+
+
+
+
+
+(cid:36)
+
+W
+swi
+
+−
+
+(cid:22) zwi
+swi
+
+(cid:25)(cid:39)
+
++
+
+(cid:25)
+
+(cid:22) zwi
+swi
+
+
+
+
+
+(B.12)
+
+We can fuse parameters of the batch normalization layer as following:
+
+Finally we can show that transformations eq. (B.13) equivalent to γr
+σr
+
+W (cid:48)
+
+s(cid:48)
+wi
+
+i = Wi
+γr
+σx
+
+=
+
+;
+
+γr
+σx
+swi ;
+
+b(cid:48)
+i =
+
+γr
+σr
+
+z(cid:48)
+wi
+
+=
+
+γr
+σx
+
+zwi
+
+(bi − µx) + βr
+
+Wq
+
+
++
+
+(cid:39)
+
+
+
+(cid:25)(cid:39)
+
+(cid:22) zwi
+swi
+
+(cid:39)
+
+(cid:36)
+
+z(cid:48)
+wi
+s(cid:48)
+wi
+
+
+
+
+
+
+(cid:25)
+
+
+
++
+
+(cid:22) zwi
+swi
+
+W (cid:48)
+
+q = s(cid:48)
+wi
+
+
+
+
+
+
+
+
+
+
+
+W (cid:48)
+s(cid:48)
+wi
+
+(cid:36)
+
+−
+
+z(cid:48)
+wi
+s(cid:48)
+wi
+
+
+
+(cid:36)
+
+swi
+
+
+
+W
+swi
+
+−
+
+Wq
+
+=
+
+=
+
+γr
+σr
+
+γr
+σr
+
+(B.13)
+
+(B.14)
+
+C Additive loss assumption for integer-programming
+
+Suppose the loss function of the network L depends on a certain set of variables (weights, activations,
+etc.), which we denote by a vector v. We would like to measure the effect of adding quantization
+noise to this set of vectors.
+
+Since the quantization is emulated with additive noise, the loss is smooth and thus can be expanded
+to the Taylor series:
+
+∆L = L(v + ε) − L(v) =
+
+=
+
+∂LT
+∂v
+
+ε + εT ∂2L
+∂2v
+
+ε + O
+
+(cid:107)ε(cid:107)3(cid:17)
+(cid:16)
+
+.
+
+(C.15)
+
+(C.16)
+
+13
+
+One can see from Eq C.16 that when the quantization error ε is sufﬁciently small, the overall
+degradation ∆L can be approximated as a sum of N independent degradation processes by neglecting
+the quadratic terms ε2:
+
+∆L ≈
+
+∂LT
+∂v
+
+ε =
+
+n
+(cid:88)
+
+i
+
+∂L
+∂vi
+
+· εi
+
+(C.17)
+
+We note that Lin et al. (2016); Choukroun et al. (2019) used a similar assumption with respect to the
+additivity of quantization noise.
+
+D Experimental Details
+
+In all our experiments, we used a small subset of the training set to run our methods. Speciﬁcally,
+for vision models, we used 1000 unlabeled images from the ImageNet training set (single image for
+each class) as a calibration set. For the Bert model, we used one paragraph from the training set.
+All presented methods AdaQuant, BNT, BT, and IP, performed well on such small calibration set
+producing SOTA results. Next we detail our setting for each of the technique in our pipelines
+
+D.1 AdaQuant
+
+AdaQuant optimization problem deﬁned as following except zero-point of the quantizer which we
+omitted from eq. (D.18):
+
+(cid:16) ˆ∆w, ˆ∆x, ˆVW , ˆVb
+
+(cid:17)
+
+= arg min
+
+∆w,∆x,VW ,Vb
+
+||W X + b − Q∆w (W + VW ) · Q∆x (X) − Q(b + Vb)||2 (D.18)
+
+Technically to ﬁnd a solution for eq. (D.18), we use Adam optimizer with different learning rates
+per type of parameters. We set different learning rates for weight, bias, and quantization parameters
+of input and weights. After experimenting with different models, we found that the same set of LR
+parameters worked for each model. The learning rates are 1e − 5, 1e − 3, 1e − 1, 1e − 3 for weight,
+bias, quantization parameters of the inputs, and weights, respectively.
+
+For vision models, we used 1000 unlabeled images from the ImageNet training set (single image for
+each class), running Adam optimizer for 100 iterations and a batch-size of 50 unless otherwise stated.
+For BERT-base model, we used one paragraph from the training set, running Adam optimizer for 50 -
+100 iterations depending on the type of layer. Learning rates and batch size are the same as of vision
+models.
+
+In ﬁg. 1 we aimed to answer the following question: Assuming you have a small calibration set
+and no resources constraints (time,power) which method is the most accurate and robust Assuming
+you have a small calibration set and no resources constraints (time,power) which method is the
+most accurate and robust Out method were evaluated by running each experiments ﬁve times and
+reporting mean and standrad deviation. Here, in ﬁg. D.2, we add an additional naive early-stop plot
+on top of QAT-KLD experiment. We split the calibration data into two equal sets and train on half the
+examples while evaluation our performance on the other half Both KLD experiments used an SGD
+optimizer over 10 epochs; starting with learning rate of 0.1 and decreasing it by 1e-2 factor after 2
+and 8 epochs. We also conducted KLD experiments with Adam optimizer and learning rate of 1e-3
+where performed but their results were inferior. As can be seen in the plot AdaQuant is superior to
+other methods and remarkably excels on small calibration sets. As can be seen in ﬁg. D.2 the early
+exit results were inferior to the QAT-KLD as they use much smaller training set. However, other
+types of training-validation splits (e.g. 80-20) may boost the results.
+
+D.2
+
+Integer Programming
+
+Our IP method requires two steps, the ﬁrst is measuring the properties of each layer, and the second
+is applying the program based on these measurements with user deﬁned constraint. As reference,
+we measure the loss (can also be accuracy) of the base precision model on the calibration set. Next,
+we measure the sensitivity of each layer by evaluating a model where all layers are qunatize to the
+base-precision but one layer that is quantized to lower precision (e.g., all 8-bit but one layer with
+
+14
+
+Figure D.2: Calibration size ablation study with additional early-stop plot.
+
+4-bit). The ∆Ll in Eq. 3 is deﬁned as the difference between the reference model loss and the
+measured loss. If a layer is robust to quantization, ∆Ll will be small, and if a layer is sensitive to
+quantization, ∆Ll will be large. The performance gain in the case of compression, is simply the
+model parameters size difference when lowering the precision of the examined layer. Hence, if a layer
+has N parameters, the performance gain when changing from 8-bit to 4-bit result in compression
+gain of ∆Pl = N ∗ 8 − N ∗ 4 = 4N . In the second stage, we run the integer program based on the
+sensitivity and compression measured on each layer along with the user deﬁned constraint.
+
+D.3 Batch Normalization and Bias Tuning
+
+The Batch Norm tuning phase is the most lightweight phase of the pipeline. We found empirically
+less than ten iterations of statistics update are sufﬁcient. We also found that as compression growth,
+more iterations of batch norm tuning are required. At the bias tuning phase, we perform 200 iterations
+of ﬁne-tuning with the learning-rate of 0.1.
+
+E Code
+
+For all our vision dataset we used the default torchvision pre-trained model. For BERT-base experi-
+ment we ﬁned-tuned on SQUAD1.1 dataset and provide the script for that as a part of our repository.
+Our code can be found at: https://github.com/papers-submission/CalibTIP.
+
+15
+
+

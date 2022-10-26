@@ -1,0 +1,1408 @@
+µ-cuDNN: Accelerating Deep Learning Frameworks
+with Micro-Batching
+
+Yosuke Oyama∗, Tal Ben-Nun†, Torsten Hoeﬂer†, Satoshi Matsuoka‡ ∗
+∗Department of Mathematical and Computing Science, Tokyo Institute of Technology, Tokyo, Japan
+†Department of Computer Science, ETH Zurich, Zurich, Switzerland
+‡RIKEN Center for Computational Science, Hyogo, Japan
+oyama.y.aa@m.titech.ac.jp, {talbn,htor}@inf.ethz.ch, matsu@acm.org
+
+8
+1
+0
+2
+
+r
+p
+A
+3
+1
+
+]
+
+G
+L
+.
+s
+c
+[
+
+1
+v
+6
+0
+8
+4
+0
+.
+4
+0
+8
+1
+:
+v
+i
+X
+r
+a
+
+Abstract—NVIDIA cuDNN is a low-level
+
+library that
+provides GPU kernels
+frequently used in deep learning.
+Speciﬁcally, cuDNN implements several equivalent convolution
+algorithms, whose performance and memory footprint may vary
+considerably, depending on the layer dimensions. When an
+algorithm is automatically selected by cuDNN, the decision is
+performed on a per-layer basis, and thus it often resorts to
+slower algorithms that ﬁt the workspace size constraints. We
+present µ-cuDNN, a transparent wrapper library for cuDNN,
+which divides
+layers’ mini-batch computation into several
+micro-batches. Based on Dynamic Programming and Integer
+Linear Programming, µ-cuDNN enables faster algorithms by
+the same time,
+decreasing the workspace requirements. At
+µ-cuDNN keeps the computational semantics unchanged, so that
+it decouples statistical efﬁciency from the hardware efﬁciency
+safely. We demonstrate the effectiveness of µ-cuDNN over two
+frameworks, Caffe and TensorFlow, achieving speedups of 1.63x
+for AlexNet and 1.21x for ResNet-18 on P100-SXM2 GPU. These
+results indicate that using micro-batches can seamlessly increase
+the performance of deep learning, while maintaining the same
+memory footprint.
+
+I. INTRODUCTION
+
+Prevalent Deep Neural Networks (DNNs) are becoming
+increasingly deeper and are trained with large batch sizes.
+Speciﬁcally, state-of-the-art DNNs contain hundreds of layers
+[1], [2], and utilize batch sizes in the order of thousands [3],
+[4], [5].
+
+Large batches are also favored by distributed data-parallel
+deep learning frameworks, because they improve utilization of
+accelerators, as well as hiding the communication of parameter
+gradients in the computation efﬁciently. Consequently,
+the
+batch size per accelerator (e.g., GPU) should be large to
+achieve better scaling. Since the memory usage of a DNN
+is nearly proportional to the layer size and the batch size, the
+accelerator memory tends to be used at full capacity in most
+real-world cases.
+
+This “limited memory scenario” is also exhibited in cuDNN
+[6], a deep learning kernel library for NVIDIA GPUs. cuDNN
+provides a variety of computational primitives for deep neural
+networks, and is widely used in deep learning frameworks,
+such as Caffe [7] and others [8], [9], [10]. cuDNN provides
+up to eight different algorithms to perform convolutions, each
+of which requires different
+temporary storage (workspace)
+schemes. To guide users to determine the best algorithm
+for a given maximum workspace size, cuDNN provides
+
+a function cudnnGetConvolution*Algorithm (* is
+one of convolution types, Forward, BackwardData and
+BackwardFilter), that benchmarks all the algorithms and
+chooses the best algorithm, either with respect to computation
+time or memory usage. However,
+if the workspace size
+requested by a fast algorithm is one byte larger than provided,
+cuDNN will resort to a slower algorithm that requires less
+workspace. In fact, the performance impact can be 4.51x in
+the 2nd convolutional layer of AlexNet, as shown in Fig. 1.
+
+In this paper, we propose µ-cuDNN, a transparent wrapper
+for cuDNN that attempts to mitigate the aforementioned
+inefﬁciency. In order to utilize fast convolution algorithms with
+limited size of workspace, µ-cuDNN automatically divides
+layer mini-batch computation into several micro-batches
+and perform multiple convolutions sequentially. µ-cuDNN
+decouples the statistical efﬁciency (speed of accuracy/loss
+improvement with ﬁxed amount of parameter updates) from
+the hardware efﬁciency (speed of computations with ﬁxed
+improving only the latter.
+amount of parameter updates),
+Using micro-batches, µ-cuDNN improves the utilization of
+the accelerators without incurring any reduction in training
+accuracy.
+
+The contributions of this paper are as follows:
+• We present a method to automatically divide mini-batch
+training into several “micro-batches”, so that
+faster
+algorithms are utilized with tight workspace constraints.
+• We propose two different workspace allocation policies,
+which enable optimization of multiple convolutional
+layers with inter-dependencies.
+
+• We evaluate µ-cuDNN over two different deep learning
+frameworks, Caffe and TensorFlow, showing that
+it
+can mitigate the inefﬁciency of cuDNN even with
+state-of-the-art Convolutional Neural Networks (CNNs),
+such as AlexNet and ResNet.
+
+II. THE ANATOMY OF CONVOLUTIONAL NEURAL
+NETWORKS
+
+Convolution operations in Convolutional Neural Networks
+(CNNs) apply multiple ﬁlters to a batch of channels of
+two-dimensional data (Algorithm 1, Fig. 2). In particular, input
+and output tensors are represented as four-dimensional tensors
+with dimensions (N, C, H, W ), where N is the mini-batch
+size, C is the number of channels, and H and W represent
+
+ 
+ 
+ 
+ 
+ 
+ 
+(a) Execution time of all layers.
+
+(b) Execution time vs. execution time of conv2. ◦ and (cid:5) represent the “Best”
+and the “-1 byte” respectively.
+
+Fig. 1: Execution time of cuDNN 7.0.1 forward convolution of single-column AlexNet [11] with different workspace sizes.
+The “Best” case always chooses the fastest algorithm regardless of workspace size, while in the “-1 byte” case the maximum
+workspace size is limited to 1 byte less than the best algorithm.
+
+Algorithm 1 Pseudo-code of two-dimensional convolution.
+
+1: for(n = 0; n < N ; n++)
+for(k = 0; k < K; k++)
+2:
+for(h = 0; h < H; h++)
+3:
+for(w = 0; w < W ; w++)
+for(c = 0; c < C; c++)
+for(v = 0; v < V ; v++)
+for(u = 0; u < U ; u++)
+Y[n, k, h, w] += W[k, c, v, u] × X[n, c, h + v, w + u];
+
+// Mini-batch loop
+// Output channel loop
+// Height loop
+// Width loop
+// Input channel loop
+// Kernel width loop
+// Kernel height loop
+
+4:
+5:
+6:
+7:
+8:
+
+Fig. 2: Two-dimensional convolution. Each element of Y is
+set to be a sum of element-wise products between partial C ×
+V × U area of X and one ﬁlter from W.
+
+image height and width, respectively. Similarly, the ﬁlter tensor
+is represented as four-dimensional (K, C, V, U ) tensor, where
+K is the number of output channels and V, U represent kernel
+height and width.
+
+The
+
+convolution
+
+two-dimensional
+
+of
+three
+seven-nested loops
+loops compute the actual convolution, where one element
+of the input tensor X is multiplied and accumulated to one
+element of the output tensor Y. The remaining loops iterate
+
+(Algorithm 1). The innermost
+
+composed
+
+is
+
+over all elements of Y. The key observation is that in order
+to solve the problem described in Section I,
+there is no
+dependency inside the mini-batch loop between different
+iterations. This is intuitive because in training or inference
+we compute parameter gradients or outputs with respect to
+different data samples, so this is equivalent to computing N
+different CNNs concurrently. This observation motivates us
+to apply loop tiling to the mini-batch loop, so that we can
+reduce the resident workspace size.
+
+The only exception to the inter-sample independency is the
+
+computation of parameter gradients;
+
+∂L
+∂W
+
+=
+
+1
+N
+
+N
+(cid:88)
+
+n=1
+
+∂Ln
+∂Yn
+
+∗ Xn,
+
+where L and Ln is the loss function with respect
+to
+a mini-batch and a sample n respectively, and ∗ is the
+convolution operation [12]. The semantics of this computation
+is, however, not violated by the loop splitting, only if each of
+the iterations is performed sequentially.
+
+there are three operations related to the
+In cuDNN,
+Forward
+forward
+two-dimensional
+convolution;
+computation (Fig. 2), BackwardData for
+computing
+neuron errors in back-propagation, BackwardFilter for
+computing parameter gradients in back-propagation.
+
+for
+
+there
+
+since
+
+Although Forward and BackwardData can directly
+be divided into several micro-batches, BackwardFilter
+are output dependencies on the
+cannot,
+accumulated parameter gradients tensor dW. However, we
+can still divide the loops by running BackwardFilter
+multiple times while accumulating the results, i.e., output scale
+= 1 in cuDNN. Therefore, loop splitting can be achieved
+by repeating cuDNN kernels one or more times for any
+convolution-related operation, regardless of the underlying
+method.
+
+conv1conv2conv3conv4conv5Best−1 byteExecution time [ms]051015l0200400600800100005101520Workspace size [MiB]Execution time [ms]5471020 IMPLICIT_GEMM1 IMPLICIT_PRECOMP_GEMM2 GEMM3 DIRECT4 FFT5 FFT_TILING6 WINOGRAD7 WINOGRAD_NONFUSEDCWHUVCXWHKYΣWNFig. 3: The conceptual timeline of µ-cuDNN. “@256” means
+that each computation is executed with batch-size of 256.
+µ-cuDNN splits one convolution operation into one or more
+disjoint subsets of the mini-batch.
+
+III. µ-CUDNN
+µ-cuDNN is a transparent C++ wrapper library for cuDNN,
+which can easily be integrated into most deep learning
+frameworks [7], [13], [8], [10]. The key concept of µ-cuDNN
+is that it automatically divides a mini-batch to several batches
+(referred to as “micro-batches” in this paper) and optimizes
+their sizes, to utilize faster convolution algorithms (Fig. 3).
+
+A. µ-cuDNN Methodology
+
+µ-cuDNN library employs one of two workspace utilization
+policies to optimize micro-batches for convolution kernels
+(Fig. 4):
+
+layer,
+
+• Workspace Reuse (WR): WR allocates one workspace
+sharing the space between the internal
+per
+micro-batches. In this scheme, each layer is assumed
+to use the workspace exclusively, hence the total size
+of the workspaces is in proportion to the number of
+convolutional layers.
+
+layer. WD enables
+
+• Workspace Division (WD): WD allocates one workspace
+per network, and assigns different segments to each
+convolutional
+small groups of
+convolution operations, as in the Inception module [14],
+to run concurrently with larger workspaces. In WD, the
+actual workspace is managed by µ-cuDNN rather than the
+deep learning framework. This is because conventional
+frameworks allocate each workspace separately, lacking
+the entire network’s workspace
+a global view of
+requirements.
+
+rely
+
+a division of
+
+the mini-batch,
+
+on
+the
+kernel(s),
+
+WR and WD both
+
+or more
+convolution
+and the maximum workspace
+
+parameters
+of
+the mini-batch
+one
+size. The output
+size,
+of µ-cuDNN is
+and
+“micro-conﬁgurations”; a pair of a convolution algorithm
+and micro-batch size for each convolution micro-batch.
+In this paper, we deﬁne “conﬁguration” of a segmented
+convolution kernel as “a list of micro-conﬁgurations”.
+if a kernel with a mini-batch size of
+For example,
+256 is
+and
+the conﬁguration is
+each of
+represented as {(X, 64), (X, 64), (X, 64), (X, 64)}. Also
+we deﬁne concatenation of
+such as
+{a, b} + {c, d} = {a, b, c, d} and {a} + ∅ = {a}.
+
+equally divided into four micro-batches
+them uses algorithm X,
+
+two lists as +,
+
+Fig. 4: Overview of WR and WD. µ-cuDNN optimizes
+micro-batch sizes and internally calls cuDNN functions, via
+the cuDNN interfaces.
+
+B. WR Algorithm
+
+The goal of the WR policy is to optimize T (B), the total
+execution time with mini-batch size of B using Dynamic
+Programming (DP), given by:
+
+T (b) = min
+
+(cid:26) Tµ(b),
+
+minb(cid:48)=1,2,...,B−1 T (b(cid:48)) + T (b − b(cid:48))
+
+(cid:27)
+
+,
+
+where Tµ(b) is the fastest execution time of one convolution
+kernel with a micro-batch size of b, within the workspace
+constraint. If the ﬁrst row of the deﬁnition of T (B) is smaller
+than the second row, µ-cuDNN does not have to divide the
+batch. Otherwise, it is beneﬁcial to divide the batch into two
+or more parts, applying the process recursively (Fig. 5).
+
+The key point of WR is that the optimal micro-conﬁguration
+size is deterministic and independent from other kernels. This
+is because in this case, we assume that multiple kernels do
+not run simultaneously.
+
+The algorithm of WR is three-fold, where the mini-batch
+
+size is B, and user-given maximum workspace size is M :
+
+1) For b = 1, 2, · · · , B, WR benchmarks all available
+convolution algorithms of micro-batch size of b with
+maximum workspace size of M , using cuDNN. We
+deﬁne the fastest micro-conﬁguration as cµ(b) = (a, b)
+(where a is the fastest algorithm) and its execution time
+as Tµ(b).
+
+2) For b = 1, 2, · · · , B, WR computes T (b), the fastest
+execution time for micro-batch size of b, and c(b), the
+corresponding conﬁguration, as follows (where T (0) =
+0, c(0) = ∅). T (b) and c(b) are memorized and reused
+for further iterations.
+
+{Tµ(bµ) + T (b − bµ)}
+
+ˆbµ ← argmin
+bµ=1,2,...,b
+T (b) ← Tµ( ˆbµ) + T (b − ˆbµ)
+c(b) ← {cµ( ˆbµ)} + c(b − ˆbµ)
+
+3) Outputs the optimal conﬁguration c(B).
+
+conv1@256relu1@256TimecuDNN:μ-cuDNN:pool1@256conv2@256…conv1@128relu1@256pool1@256conv1@128conv2@64using FFT-based conv.using GEMM-based conv.optimize_with_DP(…) {}cudnnGetConvolution*Algorithm(…);cudaMalloc(&ws, …);// Training loopfor(…) { cudnnConvolution*(…, ws, …);}Optimization Result CacheUcudnnConvolution*(…) {cudnnConvolution*(…, ws, …);cudnnConvolution*(…, ws, …);}DL Frameworkμ-cuDNN•layer params.•max. WS size•WS size•layer params.•WS pointer…………Workspace (WS)optimize_with_ILP(…) {}cudnnGetConvolution*Algorithm(…);cudnnGetConvolution*Algorithm(…);// Training loopfor(…) { cudnnConvolution*(…, NULL, …);cudnnConvolution*(…, NULL, …);}Optimization Result CacheUcudnnConvolution*(…) {cudnnConvolution*(…, ws+o1, …);}DL Frameworkμ-cuDNN•layer params.•layer params.…UcudnnConvolution*(…) {cudnnConvolution*(…, ws+o2, …);}•zeroas WS sizeShared Workspace (WS)Workspace ReuseWorkspace DivisionFig. 5: DP-based optimization of WR. Here we assume that
+convolution algorithm 4 with micro-batch size of 60 (cµ(60) =
+(4, 60)) achieves better computation efﬁciency, hence it is
+repeatedly used.
+
+C. WD Algorithm
+
+In the WD scheme, conﬁgurations for multiple convolution
+kernels are optimized, while at
+the same time the total
+workspace size should be less than the total workspace limit
+that users specify. Therefore, WD is a more complex problem
+than WR, since the conﬁguration of each convolution kernel is
+no longer independent from others, due to the total workspace
+size constraint.
+
+To solve this problem, we formulate a 0-1 Integer Linear
+Programming (ILP)-based optimization algorithm (Fig. 6).
+Given the set of kernels K and sets of available conﬁgurations
+Ck of kernel k, WD is solved by minimizing Equation 1:
+(cid:88)
+
+(cid:88)
+
+min.
+
+T =
+
+Tk(c)xk,c
+
+(1)
+
+subject to.
+
+(cid:88)
+
+k∈K
+(cid:88)
+
+c∈Ck
+
+Mk(c)xk,c ≤ M
+
+k∈K
+(cid:88)
+
+c∈Ck
+
+xk,c = 1 (∀k ∈ K)
+
+c∈Ck
+xk,c ∈ {0, 1} (∀k ∈ K, ∀c ∈ Ck),
+
+(2)
+
+(3)
+
+(4)
+
+where Mk(c) and Tk(c) are the workspace size and execution
+time of kernel k with conﬁguration c, respectively. Equation
+2 limits the total workspace size to the user-speciﬁed size
+M . µ-cuDNN uses conﬁguration c on kernel k if and only
+if xk,c = 1, and exactly one of them is selected for each
+kernel k, according to the constraint in Equation 3.
+
+1) Desirable Conﬁguration Selection: The challenging
+problem of the above ILP-based algorithm is that if all possible
+conﬁgurations are evaluated (i.e., all combinations of the
+number of micro-batch and algorithms), the search-space is
+in the order of |K||A|B (where A is set of algorithms and B
+is the mini-batch size) conﬁgurations in total, which makes
+the problem impractically large.
+
+Here we compute a Pareto front to remove undesirable
+conﬁgurations
+from all possible conﬁgurations, without
+returning any sub-optimal solutions. The resulting Pareto front
+
+Fig. 6:
+ILP-based optimization of WD. The problem is
+stacking “time × memory” rectangles of conﬁgurations
+diagonally, and obtaining the minimum total width T , provided
+that the total height is lower than M . Each conﬁguration
+u, v, . . . , c is composed of one or more micro-conﬁgurations
+such as cµ.
+
+Ck is then input to the ILP (Equation 1-4) to solve the entire
+problem.
+
+First, we modify the DP algorithm from WR (Section
+III-B) to output a set of conﬁgurations, rather than the fastest
+conﬁguration, as follows:
+(cid:32)
+
+(cid:33)
+
+(cid:91)
+
+(cid:91)
+
+(cid:91)
+
+({cµ} + c)
+
+,
+
+C(b) = D
+
+bµ=1,2,...,b
+
+cµ∈Cµ(bµ)
+
+c∈C(b−bµ)
+
+where Cµ(b) is a set of available micro-conﬁgurations of
+micro-batch size of b, and D is a pruning function described
+below. Note that this outputs c(B) of the WR algorithm as
+one of its elements; c(b) ∈ C(b) and cµ(b) ∈ Cµ(b) for any
+b.
+
+Second, we deﬁne the “desirable conﬁguration set” D(C) ⊂
+C as a Pareto front in the two-dimensional (execution time ×
+workspace size) space (Fig. 7):
+
+D(C) = {c ∈ C|∀c(cid:48) ∈ C [T (c) < T (c(cid:48)) ∨ M (c) < M (c(cid:48))]},
+
+where T (c) and M (c) is execution time and required
+workspace size of a conﬁguration set c. This deﬁnition implies
+that any c ∈ D(C) is the fastest conﬁguration among any of
+the elements of D(C) using a workspace size of M (c) or
+less. Conversely, if an element c ∈ C is not in D(C), there is
+an element that is faster than c and requires less workspace,
+hence there is no reason to choose c, namely “undesirable”.
+
+The pruning drastically reduces the number of variables of
+Equation 1, and enables solving the ILP for state-of-the-art
+deep CNNs in practical time. For instance, the maximum
+number of desirable conﬁgurations of AlexNet’s layers we
+examined in Section IV-D was 68, which is much smaller
+than the exponential order. Fig. 8 illustrates a Pareto front of
+one convolutional layer of AlexNet.
+
+The validity of the pruning algorithm that
+
+the optimal
+include any undesirable
+
+solution of
+conﬁgurations is proved as follows:
+
+the ILP does not
+
+c(256) = {(4, 60), (4, 60), (4, 60), (4, 60), (0, 16)}T(256)conv1cμ= (4, 60)conv1cμ= (4, 60)conv1cμ= (4, 60)conv1cμ= (4, 60)conv1cμ= (0, 16)Tμ(60)cμ(60) = (4, 60)T(196)c(206) = {(4, 60), (4, 60), (4, 60), (0, 16)}TimeTμ(60)cμ(60) = (4, 60)T(136)c(156) = {(4, 60), (4, 60), (0, 16)}conv1u∈C1conv2v∈C2conv kc∈CkTimeTotal workspace sizeMM2(v)T2(v)Tx1,u= 1x2,v= 1xk,c= 1cμcμcμcμand Equation 2 as
+(cid:88)
+
+(cid:88)
+
+Mk(c)g(xk,c) =
+
+k∈K
+
+c∈Ck
+
+≤
+
+≤
+
+(cid:88)
+
+(cid:88)
+
+Mk(c)g(xk,c)
+
+c∈Ck
+
+k∈K\{a}
++Ma(v)g(xa,v)
+
+(cid:88)
+
+(cid:88)
+
+Mk(c)f (xk,c)
+
+c∈Ck
+
+k∈K\{a}
++Ma(u)f (xa,u)
+(cid:88)
+
+(cid:88)
+
+Mk(c)f (xk,c) ≤ M.
+
+Fig. 7: The concept of desirable set. Here c cannot be in D(C)
+because a c(cid:48) exists for which the condition T (c) < T (c(cid:48)) ∨
+M (c) < M (c(cid:48)) is not satisﬁed.
+
+Fig. 8: Desirable conﬁgurations (i.e. a Pareto front) of
+AlexNet’s “conv2” layer (Forward) on P100-SXM2 with a
+maximum workspace size of 120 MiB, and a mini-batch
+size of 256. Colored bars corresponding to data points
+represent
+the division of the mini-batch and the chosen
+micro-batch algorithms. For example, the top-left point divides
+the mini-batch into two micro-batches of 128 and utilizes the
+FFT_TILING algorithm.
+
+Proof. Suppose that an optimal solution of the ILP f : X →
+{0, 1}, where X is the set of variable symbols of the ILP,
+contains an undesirable conﬁguration u of a kernel a (i.e.
+f (xa,u) = 1). According to the deﬁnition of desirable sets,
+there is a conﬁguration v of a such that Ta(v) ≤ Ta(u)
+and Ma(v) ≤ Ma(u). According to Equation 3, f (xa,c) =
+1 − f (xa,u) = 0 for all c ∈ Ca.
+
+Let g : X → {0, 1} be deﬁned as
+
+g(xk,c) =
+
+
+
+
+
+
+1
+0
+f (xk,c)
+
+(k = a ∧ c = v)
+(k = a ∧ c (cid:54)= v)
+(otherwise)
+
+.
+
+g satisﬁes Equation 3 for k = a as
+
+(cid:88)
+
+c∈Ca
+
+g(xa,c) =
+
+(cid:88)
+
+c∈Ca\{v}
+
+g(xa,c) + g(xa,v) = 1,
+
+k∈K
+
+c∈Ck
+
+Similarly, by replacing Mk as Tk in the inequality above, the
+objective value of g is proved to be lower than f , hence g
+is a better solution of the ILP. Therefore it contradicts the
+supposition that f is the optimal solution.
+
+D. µ-cuDNN Implementation
+
+To enable µ-cuDNN, the only modiﬁcation that needs to be
+performed to the code is to replace the cuDNN handle type
+cudnnHandle_t with UcudnnHandle_t. The µ-cuDNN
+handle object
+is an opaque type that wraps the original
+type, such that users can call any cuDNN function. When
+a convolution operation or benchmarking function is called
+the µ-cuDNN library
+with the µ-cuDNN handle object,
+internally computes the optimal conﬁgurations, and returns
+a virtual algorithm ID and zero required workspace size.
+This mechanism enables users to call µ-cuDNN with minimal
+modiﬁcation to the original code. For example, the number of
+lines to be modiﬁed to introduce µ-cuDNN to Caffe (v1.0) is
+approximately three.
+
+The implementation of µ-cuDNN is based on overloading
+a subset of cuDNN functions, where the memory of the
+µ-cuDNN handle type is structured to behave to act as the
+cuDNN internal handle for the other calls. We deﬁne a cast
+operator from the µ-cuDNN handle to cuDNN handle so
+that the framework automatically adopts this method. Using
+this technique, µ-cuDNN delegates most of the functions to
+cuDNN, but overrides functions related to the convolutional
+layers.
+
+The optimization algorithm in µ-cuDNN is based on
+the methodology described in Section III-A. In practice,
+µ-cuDNN provides a “batch size policy”, which determines
+what micro-batch sizes are benchmarked at the step 1 of the
+WR algorithm, as follows:
+
+• all uses all batch sizes b ∈ {1, 2, 3, · · · , B}. Although
+this always ﬁnds the optimal solution, it takes O(B) time
+for the benchmark.
+
+• powerOfTwo uses only power-of-two batch sizes b ∈
+{20, 21, 22, · · · , B}. This saves a considerable amount of
+time since it only costs O(log B) time for the benchmark.
+• undivided uses only the original mini-batch size
+b ∈ {B}. In WR, this option always selects the same
+conﬁguration as cuDNN, hence this option is only useful
+to evaluate the overhead of µ-cuDNN.
+
+These policies can be speciﬁed via an environment variable or
+through a special library function in µ-cuDNN. Furthermore,
+
+M(c)T(c)c’c¬[T(c)<T(c’)∨M(c)<M(c’)]D(𝐶)llllllllllllllll0246810020406080100120Execution time [ms]Workspace size [MiB]IMPLICIT_GEMMIMPLICIT_PRECOMP_GEMMGEMMFFTFFT_TILINGWINOGRAD_NONFUSEDµ-cuDNN supports parallel micro-conﬁguration evaluation
+via an environment variable, in which the aforementioned
+micro-batches are distributed to different GPUs on the
+same computing node and tested concurrently. This function
+assumes that the node contains multiple homogeneous GPUs.
+µ-cuDNN caches the optimized conﬁgurations and the
+benchmark results into memory and optional ﬁle-based
+to skip unnecessary recomputations.
+database respectively,
+This is especially beneﬁcial
+replicate
+for networks that
+convolutional layers of the same size, such as ResNet [2]. In
+addition, the ﬁle-based caching enable ofﬂine benchmarking,
+as well as sharing the results among a homogeneous GPU
+cluster via network ﬁle system.
+
+E. Implementation of WD Optimization
+
+To perform WD optimization, µ-cuDNN must know the
+number of convolutional
+layers and corresponding layer
+parameters in advance, i.e., before running any kernel. In the
+current cuDNN API, however, the parameters are passed one
+layer at a time, and thus there is no way to obtain all the
+parameters collectively from deep learning frameworks.
+
+To overcome this issue, we assume that the deep learning
+framework calls cudnnGetConvolution*Algorithm
+to the computation of
+one time for each layer prior
+inference). This
+the
+is
+entire network (e.g.,
+the cuDNN interface,
+the most
+is usually allocated
+as memory (including workspace)
+speciﬁc
+the
+computations. Due
+before
+implementation of Caffe, we add a µ-cuDNN library
+call after network initialization, which ignores subsequent
+cudnnGetConvolution*Algorithm calls.
+
+straightforward use of
+
+initiating
+
+training,
+
+to
+
+When cudnnGetConvolution*Algorithm is called,
+µ-cuDNN pushes the kernel parameters to an internal list, and
+returns a dummy result. Note that the returned results satisfy
+the semantics given by the cuDNN interface, so the framework
+will not raise errors and will not allocate its own workspaces.
+When cudnnConvolution* is called for the ﬁrst time,
+µ-cuDNN executes the optimization algorithm (namely, WD).
+We use the GNU Linear Programming Kit (GLPK) [15] as the
+ILP solver.
+
+Table I: Evaluation Environment Speciﬁcation.
+
+TSUBAME-KFC/DL
+
+TSUBAME 3
+
+DGX-1
+
+CPU
+(Intel
+Xeon)
+
+GPU
+(NVIDIA
+Tesla)
+
+OS
+
+CUDA
+cuDNN
+GLPK
+
+Caffe
+
+TensorFlow
+
+E5-2620 × 2
+
+E5-2680 v4 × 2
+
+E5-2698 v4 × 2
+
+K80 × 4
+- 8.73 SP TFlop/s
+- 24 GiB GDDR5
+(480 GiB/s BW)
+
+CentOS 7.3.1611
+
+8.0.61
+6.0
+4.63
+
+1.0
+
+N/A
+
+P100-SXM2 × 4
+- 10.6 SP TFlop/s
+- 16 GiB HBM2
+(732 GiB/s BW)
+SUSE Linux
+Enterprise Server
+12 SP2
+8.0.44
+6.0
+4.63
+
+1.0
+
+1.4.1
+
+V100-SXM2 × 8
+- 15.7 SP TFlop/s
+- 16 GiB HBM2
+(900 GiB/s BW)
+
+Ubuntu 16.04.3
+
+9.0
+7.0.5
+N/A
+NVCaffe
+v0.16.5 [16]
+N/A
+
+IV. PERFORMANCE EVALUATION
+We evaluate the performance of µ-cuDNN for three different
+GPU architectures, NVIDIA Tesla K80 [17], P100-SXM2
+[18] and V100-SXM2 [19] on the TSUBAME-KFC/DL,
+TSUBAME 3, and DGX-1 supercomputers, respectively. The
+speciﬁcations of these supercomputers are listed in Table I.
+
+Throughout the evaluation, we use single-precision ﬂoating
+format and store tensors in the N CHW storage
+point
+order. We use three different deep learning frameworks for
+evaluations: Caffe [7], its NVIDIA branch (NVCaffe) [16],
+and TensorFlow [8]. Both support recent versions of cuDNN
+(6 or 7). We use a built-in benchmarking command (Caffe’s
+“time” command) or an ofﬁcial benchmarking script (from
+TensorFlow models repository [20]) to measure the execution
+time of forward and backward passes, and show the sum
+of forward and backward passes together. In the following
+sections, unless explicitly mentioned, each forward-backward
+passes are measured 50 times on Caffe and 100 times on
+TensorFlow.
+
+For neural networks, we use AlexNet[1], ResNet[2], and
+DenseNet[21]. For evaluations on Caffe, we use the AlexNet
+model deﬁned in Caffe, ResNet-18, and ResNet-50 from
+NVCaffe. We modify data prefetching size from 4 to 16 for
+AlexNet and ResNet-18 for TSUBAME 3. For evaluations on
+TensorFlow, we use the deﬁnitions in an ofﬁcial benchmarking
+repository [22].
+
+As for workspace limit, unless explicitly mentioned, we
+use 8 MiB and 64 MiB for each layer, which are the default
+workspace size limits of Caffe and Caffe2 [13] respectively. In
+addition, we use 512 MiB of workspace per layer to investigate
+the case where sufﬁciently large workspace is provided. To
+shorten the benchmarking time, we use several GPUs on the
+same node with the parallel evaluation function of µ-cuDNN,
+mentioned in Section III-D.
+
+A. Convolution Kernel Optimization Using WR
+
+Fig. 9 shows the execution time of forward convolution
+(cudnnConvolutionForward) of the “conv2” layer in
+AlexNet on P100-SXM2. With workspace size of 64 MiB,
+
+Fig. 9: Benchmark results of forward convolution of AlexNet’s
+“conv2” layer on P100-SXM2. We use 64 MiB workspace
+size and a mini-batch size of 256. Numbers on each rectangle
+represent micro-batch sizes.
+
+undividedpowerOfTwoallExecution time [ms]01234567IMPLICIT_PRECOMP_GEMMFFT_TILINGWINOGRAD_NONFUSED2563232323232323232323248484848(a) K80
+
+(b) P100-SXM2
+
+(c) V100-SXM2
+
+Fig. 10: Benchmark results of AlexNet on three different GPUs with different workspace sizes (8, 64, 512 MiB). The labels
+“u”, “p” and “a” represent undivided, powerOfTwo, and all, respectively. We use a mini-batch size of 256 on K80 and
+P100-SXM2, and 1024 on V100-SXM2.
+
+the GEMM (GEneral Matrix-Matrix multiply)-based algorithm
+is the one chosen by cuDNN, requiring only 4.3 KiB for
+workspace if the mini-batch is not divided. On the other hand,
+FFT-based convolution [12]
+is more efﬁcient, although it
+requires excessive amount of workspace (213 MiB) to store
+the images and ﬁlters in the frequency domain. µ-cuDNN with
+powerOfTwo option successfully enables the use of FFT
+within the workspace size constraints, using 48.9 MiB over
+micro-batches of size 32.
+
+The all option also enables µ-cuDNN to use Winograd
+convolution [23], an algorithm that
+is especially efﬁcient
+for small convolution kernels, achieving 2.33x speedup over
+undivided in total.
+
+workspace is too small to utilize. Indeed, on P100-SXM2, only
+one kernel of all option seems to increase the utilization of
+the workspace over undivided.
+
+On the other hand, when the workspace size limit is too
+large (512 MiB) on K80 and P100-SXM2 GPUs, performance
+difference between cuDNN and µ-cuDNN is negligible. This
+is because there is no beneﬁt from dividing the mini-batch,
+as all algorithms ﬁt into the workspace constraints. However,
+this workspace limit consumes a considerable amount of
+workspace memory: While the undivided option consumes
+2.87 GiB in total, all with 64 MiB limit only consumes
+0.70 GiB, although with 4% overhead caused by the choice
+of micro-batch algorithms.
+
+B. CNN Optimization Using WR
+
+We evaluate WR-based optimization on two different deep
+
+learning frameworks: Caffe and TensorFlow.
+
+1) Caffe: Fig. 10 shows timing breakdowns of Caffe on
+AlexNet with three different GPUs. Additionally, we only
+highlight convolutional layers since the others (e.g., pooling)
+are out of the scope of this paper.
+
+the
+One important observation from Fig. 10 is that
+performance improvement of µ-cuDNN over cuDNN (which
+is equivalent to undivided) is signiﬁcant when the moderate
+amount of workspace is set by users. For instance, if the
+workspace size per kernel is 64 MiB, µ-cuDNN with the
+all option achieves 1.81x speedup with respect to the entire
+iteration, and 2.10x with respect to convolutions alone, than
+undivided on K80. This is because µ-cuDNN successfully
+enables cuDNN to use faster algorithms, as in the example
+from Section IV-A. In addition, a similar speedup is achieved
+on P100-SXM2 (1.40x for the entire iteration, and 1.63x for
+convolutions alone), and on V100-SXM2 (1.47x for the entire
+iteration, and 1.63x for convolutions alone).
+
+In the case where workspace size is
+
+limited to 8
+MiB, µ-cuDNN cannot attain any performance improvement,
+because even if the mini-batch is ﬁnely divided, the speciﬁed
+
+the
+
+time
+
+From the viewpoint of
+
+to optimization,
+including kernel benchmarking and solving DP, powerOfTwo
+considerably outperforms all. In particular, with 64 MiB
+workspace on P100-SXM2, all takes 34.16 s, whereas
+powerOfTwo takes 3.82 s. This result and Fig. 10 imply that
+powerOfTwo is a reasonable choice to test the computation
+efﬁciency of new CNNs quickly. Generally, the overhead of
+µ-cuDNN is negligible with respect
+to the entire training
+time, in which the forward and backward passes are repeated
+hundreds of thousands of times.
+
+2) TensorFlow: Fig. 11 presents timing breakdowns of
+
+AlexNet and ResNet-50, DenseNet-40 on P100-SXM2.
+
+We set
+
+the (input width, output width) as (224, 1000)
+for AlexNet and ResNet-50, or (32, 10) for DenseNet-40,
+which are used for training ILSVRC2012 classiﬁcation dataset
+[24] or the CIFAR dataset [25], respectively. We also set
+k of DenseNet-40,
+the number of feature maps of each
+convolutional
+to 40 to obtain better computational
+layer,
+efﬁciency.
+
+Since TensorFlow 1.4.1 does not provide any workspace
+limits to µ-cuDNN via cuDNN’s benchmarking functions
+before actual convolutions, we manually provide workspace
+limits of 8, 64, and 512 MiB to µ-cuDNN. µ-cuDNN with
+a workspace limit of 64 MiB achieves 1.24x speedup for
+
+u (8 MiB)p (8 MiB)a (8 MiB)u (64 MiB)p (64 MiB)a (64 MiB)u (512 MiB)p (512 MiB)a (512 MiB)Execution time [ms]02004006008001000u (8 MiB)p (8 MiB)a (8 MiB)u (64 MiB)p (64 MiB)a (64 MiB)u (512 MiB)p (512 MiB)a (512 MiB)Execution time [ms]050100150200u (8 MiB)p (8 MiB)a (8 MiB)u (64 MiB)p (64 MiB)a (64 MiB)u (512 MiB)p (512 MiB)a (512 MiB)Execution time [ms]0100200300400500conv1conv2conv3conv4conv5etc.(a) AlexNet
+
+(b) ResNet-50
+
+(c) DenseNet-40 (k = 40)
+
+Fig. 11: Benchmark results of different CNNs on P100-SXM2 with different workspace sizes (8, 64, 512 MiB), using TensorFlow
+framework. We use a mini-batch size of 256 for AlexNet and DenseNet, and 64 for ResNet-50.
+
+AlexNet, and 1.06x for ResNet-50. These results prove that
+µ-cuDNN has good performance portability between different
+deep learning frameworks that depend on cuDNN.
+
+C. Memory Consumption Using WR
+
+Fig. 12 shows the per-layer memory usage of AlexNet and
+ResNet-18 on P100-SXM2. In Fig. 12, we set a per-layer
+workspace limit of 512 MiB for cuDNN, and 64 MiB for
+µ-cuDNN, where the slowdown due to the decrease of memory
+limit is negligible (1.17x). These ﬁgures clearly show that
+µ-cuDNN can cut down per-layer memory consumption by up
+to 3.43x and 2.73x on AlexNet and ResNet-18 respectively.
+
+D. CNN Optimization Using WD
+
+Fig. 13 shows the benchmark results of using the WD
+algorithm. The adjoined bars have the same workspace limit in
+total: For example, since AlexNet has ﬁve convolutional layers
+and each layer has three kernels (Forward, BackwardData,
+BackwardFilter), we place the result with 120 MiB WD
+workspace next to that of 8 MiB WR workspaces.
+
+In Fig. 13, we can see that the training time decreases as
+the workspace constraints increase in both WR and WD. At
+the same time, WD successfully manages the global memory
+requirements better, attaining higher performance with the
+same overall memory footprint (see Fig. 14 for breakdown).
+Speciﬁcally, when 120 MiB workspace in total is provided for
+AlexNet, the entire execution time with WD optimization and
+all option is 1.24x faster than the WR with undivided
+option for the entire iteration (or 1.38x for convolution). WD
+also outperforms the baseline with 960 MiB workspace in
+total, which can use 8 times more memory for workspace,
+by 1.24x in total execution time.
+
+Furthermore, even for ResNet-50, which has 10 times
+more convolutional layers than AlexNet, WD achieves 1.05x
+speedup for the entire iteration (or 1.14x for convolution)
+with 2,544 MiB of total workspace, outperforming the original
+version (which consumes 5,088 MiB) in terms of memory
+footprint as well. In addition, the ILP for ResNet-50 is still
+
+(a) AlexNet (cuDNN)
+
+(b) AlexNet (µ-cuDNN)
+
+(c) ResNet-18 (cuDNN)
+
+(d) ResNet-18 (µ-cuDNN)
+
+Fig. 12: Per-layer breakdowns of memory consumption of
+AlexNet and ResNet-18 on P100-SXM2. For simplicity, we
+only show the memory usage of unique convolutional layers
+(CONV n) and fully-connected layers (fc or fcn) in one
+forward propagation. We use a mini-batch of 256 for AlexNet
+and 128 for ResNet-18 respectively. We set a per-layer
+workspace limit of 512 MiB for cuDNN, and 64 MiB for
+µ-cuDNN. Each bar segment of “WS (µ-cuDNN)” represents
+the maximum workspace size of the layer.
+
+u (8MiB)p (8MiB)a (8MiB)u (64MiB)p (64MiB)a (64MiB)u (512MiB)p (512MiB)a (512MiB)Execution time [ms]050100150200250u (8MiB)p (8MiB)a (8MiB)u (64MiB)p (64MiB)a (64MiB)u (512MiB)p (512MiB)a (512MiB)Execution time [ms]0100200300u (8MiB)p (8MiB)a (8MiB)u (64MiB)p (64MiB)a (64MiB)u (512MiB)p (512MiB)a (512MiB)Execution time [ms]0100200300400500600700undividedpowerOfTwoallCONV_1CONV_2CONV_3CONV_4CONV_5fc6fc7fc8Memory [MiB]0100200300400500600DataWorkspaceWeightsCONV_1CONV_2CONV_3CONV_4CONV_5fc6fc7fc8Memory [MiB]0100200300400500600DataWorkspaceWeightsCONV_1CONV_2CONV_3CONV_4CONV_5fc6fc7fc8Memory [MiB]0100200300400500600DataWorkspaceWeightsCONV_1CONV_2CONV_3CONV_4CONV_5fc6fc7fc8Memory [MiB]0100200300400500600DataWorkspaceWeightsCONV_1CONV_2CONV_3CONV_4CONV_5CONV_6CONV_7CONV_8CONV_9CONV_10CONV_11fcMemory [MiB]0100200300400500DataWorkspaceWeightsCONV_1CONV_2CONV_3CONV_4CONV_5CONV_6CONV_7CONV_8CONV_9CONV_10CONV_11fcMemory [MiB]0100200300400500DataWorkspaceWeightsCONV_1CONV_2CONV_3CONV_4CONV_5CONV_6CONV_7CONV_8CONV_9CONV_10CONV_11fcMemory [MiB]0100200300400500DataWorkspaceWeightsCONV_1CONV_2CONV_3CONV_4CONV_5CONV_6CONV_7CONV_8CONV_9CONV_10CONV_11fcMemory [MiB]0100200300400500DataWorkspaceWeights(a) AlexNet
+
+(b) ResNet-50
+
+Fig. 13: Benchmark results of AlexNet and ResNet-50 on
+P100-SXM2 with different workspace sizes and policies (WR
+and WD). We use a mini-batch size of 256 for AlexNet and
+32 for ResNet-50. Note that the adjoined bars have the same
+workspace limit in total.
+
+small enough to solve in practical time. When the workspace
+limit is set to 5,088 MiB, the number of 0-1 variables is 562,
+and the GLPK solver takes 5.46 ms to solve it.
+
+The main reason that WD outperforms WR is that
+if µ-cuDNN fails to ﬁnd better algorithms and
+in WR,
+micro-batch sizes to fully utilize the assigned workspace,
+µ-cuDNN must abandon that workspace slot and cannot
+allocate it
+in WD,
+to other kernels. On the other hand,
+characteristics of different desirable workspace sizes of
+different kernels (Fig. 8) are implicitly considered in the
+ILP-based optimization framework. Therefore, µ-cuDNN can
+assign larger proportional workspaces to time-consuming
+layers, if it is expected that the kernels will be considerably
+faster with a larger workspace.
+
+In Fig. 14, µ-cuDNN with the WD policy spares
+most of the workspace for “conv2” and “conv3” (93.7%),
+which are the most time-consuming layers in the baseline
+
+Fig. 14: Assigned workspace division of AlexNet on
+P100-SXM2. “F”, “BF”, “BD” represent kernel
+types
+(Forward, BackwardFilter, BackwardData respectively). We
+use a mini-batch size of 256 for AlexNet. We set a workspace
+limit of 8 MiB for WR, and a total workspace limit of 120
+MiB for WD.
+
+(WR, undivided). In contrast, µ-cuDNN doesn’t allocate
+workspace of over 3 MiB for “conv4” and “conv5”, although
+µ-cuDNN lists some faster and desirable conﬁgurations
+than the baseline. For instance, the fastest conﬁguration of
+conv5 (forward), which uses FFT-based convolution with two
+is 1.29x faster than baseline, although this
+micro-batches,
+conﬁguration uses 109 MiB of workspace. This observation
+implies that the WD does not unnecessarily allocate workspace
+for a speciﬁc layer but chooses the best combination, as
+deﬁned by the ILP.
+
+V. RELATED WORK
+
+Li et. al [26] propose a heuristic to automatically tune
+each tensor memory layout to utilize either GEMM-based
+or FFT-based convolution efﬁciently. The proposed heuristic
+is, however, based on the authors’ performance observation
+using conventional convolutional
+layers and speciﬁc GPU
+architecture, and thus there is no guarantee that the algorithm
+always provides the best memory alignment for any deep
+neural network and GPU architecture. On the other hand, since
+µ-cuDNN uses the techniques of dynamic programming and
+integer linear programming, it is mathematically guaranteed
+that µ-cuDNN provides the best performance that the library
+can produce, provided that each convolution is independent
+from the others.
+
+Rhu et al. [27] propose a memory management technique
+that ofﬂoads neuron activations, parameters, and errors
+from the GPU memory to the CPU memory during
+forward-/backward-propagation, so that larger models can be
+trained with the same memory constraint. However, as Fig.
+12 shows, even in such memory-efﬁcient implementation or
+similar memory management techniques [28] µ-cuDNN is
+expected to save the peak memory usage of each layer.
+
+undivided (WR, 8 MiB)all (WR, 8 MiB)undivided (WD, 120 MiB)all (WD, 120 MiB)undivided (WR, 64 MiB)all (WR, 64 MiB)undivided (WD, 960 MiB)all (WD, 960 MiB)undivided (WR, 512 MiB)all (WR, 512 MiB)undivided (WD, 7680 MiB)all (WD, 7680 MiB)Execution time [ms]050100150200conv1conv2conv3conv4conv5etc.(WD)undivided (WR, 8 MiB)all (WR, 8 MiB)undivided (WD, 1272 MiB)all (WD, 1272 MiB)undivided (WR, 16 MiB)all (WR, 16 MiB)undivided (WD, 2544 MiB)all (WD, 2544 MiB)undivided (WR, 32 MiB)all (WR, 32 MiB)undivided (WD, 5088 MiB)all (WD, 5088 MiB)Execution time [ms]050100150200250convetc.(WD)undivided (WR)powerOfTwo (WR)all (WR)undivided (WD)powerOfTwo (WD)all (WD)Total workspace size [MiB]020406080100120140FBDFBDFBDFBDFBFBDFBFBDFBFBDFBFBDTotal workspace limit (120 MiB)conv1conv2conv3conv4conv5Zlateski et al. [29] propose ZNNi, an FFT-based convolution
+algorithm, and mention micro-batching technique to reduce
+the temporal memory usage by FFT. µ-cuDNN, however,
+generalizes the schema so that micro-batching can be applied
+to any convolution algorithm, obtaining the best computational
+performance for the given layer conﬁgurations, as well as
+maintains high portability between different existing deep
+learning frameworks.
+
+VI. CONCLUSION
+
+cuDNN, which divides
+
+In this paper, we proposed µ-cuDNN, a wrapper library
+for
+the mini-batch to utilize
+high-performance convolution algorithms with limited amount
+of memory for workspace. We have shown that µ-cuDNN
+works well even with recent CNNs, which are composed of
+many convolutional layers, and can easily be integrated into
+existing deep learning frameworks.
+
+The performance of µ-cuDNN demonstrated in our work
+suggests that other layer types can be optimized as well, if they
+can be decomposed and computed by different algorithms.
+This is because µ-cuDNN does not use any special properties
+of the convolution operator, apart from gradient accumulation.
+In addition, the result of WD optimization (Fig. 14) provides
+us with the insight that allocating the same workspace memory
+for each convolutional
+is not necessarily effective,
+and dynamic, adaptive assignment performs better. This
+observation should be beneﬁcial for advanced deep learning
+frameworks that dynamically manage GPU memory to store
+tensors such as neuron data, weights and their gradients, for
+further memory optimization.
+
+layer
+
+ACKNOWLEDGMENT
+
+This research was supported by the ETH Postdoctoral
+Fellowship (for T. B. N.), Student Summer Research
+Fellowship (for Y. O.), and JST CREST Grant Number
+JPMJCR1303, JPMJCR1687, Japan. Part of this work is
+conducted as research activities of AIST - TokyoTech Real
+World Big-Data Computation Open Innovation Laboratory
+(RWBC-OIL).
+
+REFERENCES
+
+I. Sutskever,
+
+[1] A. Krizhevsky,
+
+and H. Geoffrey E.,
+
+“ImageNet
+Classiﬁcation with Deep Convolutional Neural Networks,” Advances in
+Neural Information Processing Systems 25 (NIPS 2012), Dec 2012.
+[2] K. He, X. Zhang, S. Ren, and J. Sun, “Deep Residual Learning for Image
+Recognition,” in Proceedings of the IEEE Computer Society Conference
+on Computer Vision and Pattern Recognition (CVPR 2016), Jun 2016,
+pp. 770–778.
+
+[3] P. Goyal, P. Doll´ar, R. B. Girshick, P. Noordhuis, L. Wesolowski,
+A. Kyrola, A. Tulloch, Y. Jia, K. He, and P. Dollar, “Accurate, Large
+Minibatch SGD: Training ImageNet in 1 Hour,” CoRR, vol. abs/1706.0,
+Jun 2017, http://arxiv.org/abs/1706.02677.
+
+[4] T. Akiba, S. Suzuki, and K. Fukuda, “Extremely Large Minibatch
+SGD: Training ResNet-50 on ImageNet in 15 Minutes,” CoRR, vol.
+abs/1711.04325, Nov 2017, https://arxiv.org/abs/1711.04325.
+
+[5] S. L. Smith, P.-J. Kindermans, and Q. V. Le, “Don’t Decay the Learning
+Rate, Increase the Batch Size,” CoRR, vol. abs/1711.00489, Nov 2017,
+https://arxiv.org/abs/1711.00489.
+[6] NVIDIA. NVIDIA cuDNN.
+
+https://developer.nvidia.com/cudnn.
+
+Accessed on 2017-11-23.
+
+[7] Y. Jia, E. Shelhamer, J. Donahue, S. Karayev, J. Long, R. Girshick,
+S. Guadarrama, and T. Darrell, “Caffe: Convolutional Architecture for
+Fast Feature Embedding,” arXiv preprint arXiv:1408.5093, 2014.
+[8] M. Abadi, A. Agarwal, P. Barham, E. Brevdo, Z. Chen, C. Citro, G. S.
+Corrado, A. Davis, J. Dean, M. Devin, S. Ghemawat, I. Goodfellow,
+A. Harp, G.
+Isard, Y. Jia, R. Jozefowicz, L. Kaiser,
+M. Kudlur, J. Levenberg, D. Man´e, R. Monga, S. Moore, D. Murray,
+C. Olah, M. Schuster, J. Shlens, B. Steiner, I. Sutskever, K. Talwar,
+P. Tucker, V. Vanhoucke, V. Vasudevan, F. Vi´egas, O. Vinyals, P. Warden,
+M. Wattenberg, M. Wicke, Y. Yu, and X. Zheng, “TensorFlow:
+Large-scale machine learning on heterogeneous systems,” https://www.
+tensorﬂow.org/, Nov 2015.
+
+Irving, M.
+
+[9] Theano Development Team, “Theano: A Python framework for
+fast computation of mathematical expressions,” arXiv e-prints, vol.
+abs/1605.02688, May 2016, http://arxiv.org/abs/1605.02688.
+
+[10] S. Tokui, K. Oono, S. Hido, and J. Clayton, “Chainer: a Next-Generation
+Open Source Framework for Deep Learning,” in Proceedings of
+Workshop on Machine Learning Systems
+in The
+Twenty-ninth Annual Conference on Neural Information Processing
+Systems (NIPS 2015), Dec 2015.
+
+(LearningSys)
+
+[11] A. Krizhevsky, “One weird trick for parallelizing convolutional neural
+networks,” arXiv preprint, vol. abs/1404.5, Apr 2014, http://arxiv.org/
+abs/1404.5997.
+
+[12] M. Mathieu, M. Henaff, and Y. Lecun, “Fast training of convolutional
+networks through FFTs,” in International Conference on Learning
+Representations (ICLR 2014), Apr 2014.
+
+[13] Facebook. Caffe2. https://caffe2.ai/. Accessed on 2017-11-23.
+[14] C. Szegedy, W. Liu, Y. Jia, P. Sermanet, S. Reed, D. Anguelov, D. Erhan,
+V. Vanhoucke, and A. Rabinovich, “Going deeper with convolutions,”
+in Proceedings of the IEEE Computer Society Conference on Computer
+Vision and Pattern Recognition (CVPR 2015), vol. 07-12-June, Jun 2015.
+[15] A. Makhorin. GLPK (GNU Linear Programming Kit). https://www.gnu.
+
+org/software/glpk/. Accessed on 2017-11-23.
+
+[16] NVIDIA. NVIDIA Caffe. https://github.com/NVIDIA/caffe. Accessed
+
+on 2017-11-23.
+
+[17] ——. Tesla K80 HPC and Machine Learning Accelerator. http://www.
+
+nvidia.com/object/tesla-k80.html. NVIDIA. Accessed on 2017-11-23.
+
+[18] ——. Tesla P100 Most Advanced Data Center Accelerator. http://www.
+
+nvidia.com/object/tesla-p100.html. Accessed on 2017-11-23.
+
+[19] ——. NVIDIA Tesla V100. https://www.nvidia.com/en-us/data-center/
+
+tesla-v100/. Accessed on 2018-3-1.
+
+[20] The TensorFlow Authors.
+
+tensorﬂow/models.
+
+https://github.com/
+
+tensorﬂow/models. Accessed on 2018-3-1.
+
+[21] G. Huang, Z. Liu, L. van der Maaten, and K. Q. Weinberger,
+“Densely connected convolutional networks,” in Proceedings of
+the
+IEEE Computer Society Conference on Computer Vision and Pattern
+Recognition (CVPR 2017), Jul 2017.
+
+[22] The TensorFlow Authors.
+
+tensorﬂow/benchmarks. https://github.com/
+
+tensorﬂow/benchmarks. Accessed on 2018-3-1.
+
+[23] A. Lavin and S. Gray, “Fast Algorithms for Convolutional Neural
+Networks,” in Proceedings of the IEEE Computer Society Conference
+on Computer Vision and Pattern Recognition (CVPR 2016), Jun 2016,
+pp. 4013–4021.
+
+[24] O. Russakovsky, J. Deng, H. Su, J. Krause, S. Satheesh, S. Ma,
+Z. Huang, A. Karpathy, A. Khosla, M. Bernstein, A. C. Berg, and
+L. Fei-Fei, “ImageNet Large Scale Visual Recognition Challenge,”
+International Journal of Computer Vision, no. 3, pp. 211–252, 2015.
+
+[25] A. Krizhevsky, “Learning Multiple Layers of Features from Tiny
+Images,” https://www.cs.toronto.edu/∼kriz/learning-features-2009-TR.
+pdf, Tech. Rep., Apr 2009.
+
+[26] C. Li, Y. Yang, M. Feng, S. Chakradhar, and H. Zhou, “Optimizing
+Memory Efﬁciency for Deep Convolutional Neural Networks on GPUs,”
+in Proceedings of the International Conference for High Performance
+Computing, Networking, Storage and Analysis (SC ’16).
+Piscataway,
+NJ, USA: IEEE Press, Nov 2016, pp. 54:1–54:12.
+
+[27] M. Rhu, N. Gimelshein, J. Clemons, A. Zulﬁqar, and S. W. Keckler,
+“vDNN: Virtualized deep neural networks for scalable, memory-efﬁcient
+neural network design,” in 2016 49th Annual IEEE/ACM International
+Symposium on Microarchitecture (MICRO 2016), Oct 2016.
+
+[28] K. Shirahata, Y. Tomita, and A. Ike, “Memory reduction method for deep
+neural network training,” in 2016 IEEE 26th International Workshop on
+Machine Learning for Signal Processing (MLSP 2016), Sep 2016.
+[29] A. Zlateski, K. Lee, and H. S. Seung, “ZNNi: Maximizing the Inference
+Throughput of 3D Convolutional Networks on CPUs and GPUs,” in
+
+Proceedings of
+the International Conference for High Performance
+Computing, Networking, Storage and Analysis (SC ’16), Nov 2016, pp.
+854–865.
+
+

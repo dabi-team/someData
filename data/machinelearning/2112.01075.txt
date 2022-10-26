@@ -1,0 +1,2171 @@
+1
+2
+0
+2
+c
+e
+D
+2
+
+]
+
+C
+D
+.
+s
+c
+[
+
+1
+v
+5
+7
+0
+1
+0
+.
+2
+1
+1
+2
+:
+v
+i
+X
+r
+a
+
+Memory-efficient array redistribution through portable
+collective communication
+NORMAN A. RINK, DeepMind, United Kingdom
+ADAM PASZKE, Google Research, Poland
+DIMITRIOS VYTINIOTIS, DeepMind, United Kingdom
+GEORG STEFAN SCHMID∗, EPFL, Switzerland
+
+Modern large-scale deep learning workloads highlight the need for parallel execution across many devices
+in order to fit model data into hardware accelerator memories. In these settings, array redistribution may
+be required during a computation, but can also become a bottleneck if not done efficiently. In this paper we
+address the problem of redistributing multi-dimensional array data in SPMD computations, the most prevalent
+form of parallelism in deep learning. We present a type-directed approach to synthesizing array redistributions
+as sequences of MPI-style collective operations. We prove formally that our synthesized redistributions are
+memory-efficient and perform no excessive data transfers. Array redistribution for SPMD computations using
+collective operations has also been implemented in the context of the XLA SPMD partitioner, a production-
+grade tool for partitioning programs across accelerator systems. We evaluate our approach against the XLA
+implementation and find that our approach delivers a geometric mean speedup of 1.22×, with maximum
+speedups as a high as 5.7×, while offering provable memory guarantees, making our system particularly
+appealing for large-scale models.
+
+1 INTRODUCTION
+The growth in model complexity and size has driven high-performance computing, and especially
+deep learning (DL), towards distributed computing, which offers two key benefits. First, it increases
+the available compute power and can thus speed up workloads. Second, it makes it possible to
+scale the computation beyond the memory capacity of a single device. These benefits come at the
+cost of a change in programming model, which must reflect the distributed memory structure. A
+common programming model for training DL models, e.g. [32], is the single-program-multiple-data
+(SPMD) model, where all devices run the same executable and can also perform MPI-style collective
+operations to synchronize and exchange data. While very simple, the SPMD model is expressive
+enough to implement techniques such as data parallelism, parameter sharding, and even pipeline
+parallelism [34].
+
+The SPMD model is available in many DL frameworks, but it is exposed in different ways.
+The simplest one surfaces the SPMD computation to the user and forces them to insert cross-
+device collectives manually (e.g. xmap() in JAX, Mesh Tensorflow [24]). A slightly more automated
+approach is to transform a single-device program with user-specified partitioning annotations
+into an explicit SPMD computation [34]. Finally, fully-automated approaches can rewrite almost
+arbitrary single-device programs as SPMD programs with minimal supervision [13]. Many of these
+systems rely on similar concepts: the dimensions of arrays can be partitioned over the axes of
+a device mesh, while operators or even whole sub-computations are executed on every device
+independently, with brief synchronization points in between to ensure the correct assignment of
+data chunks to devices.
+
+While these synchronization points may seem minor, they correspond to distributed communi-
+cation, commonly done through widely available MPI-style communication operations (cf. NVIDIA
+
+∗Work done while at DeepMind, United Kingdom.
+
+Authors’ addresses: Norman A. Rink, nrink@google.com, DeepMind, United Kingdom; Adam Paszke, apaszke@google.com,
+Google Research, Poland; Dimitrios Vytiniotis, dvytin@google.com, DeepMind, United Kingdom; Georg Stefan Schmid,
+georg.schmid@epfl.ch, EPFL, Switzerland.
+
+ 
+ 
+ 
+ 
+ 
+ 
+2
+
+Norman A. Rink, Adam Paszke, Dimitrios Vytiniotis, and Georg Stefan Schmid
+
+NCCL, XLA, commercial MPI implementations). We focus specifically on the communication
+required to redistribute multi-dimensional arrays across the devices in a distributed system ex-
+ecuting SPMD programs. Redistribution can easily become a bottleneck due to the bandwidth
+of cross-device links usually being magnitudes smaller than that of the on-device memory bus.
+Therefore, a lot of effort is typically spent on carefully hand-crafting partitioning strategies to
+minimize expensive data transfers. Automatic partitioning tools can take on this effort, but then
+the tools become responsible for inserting redistributions. Hence there is a clear need for efficient
+array redistribution.
+
+We propose a novel approach to synthesizing array redistributions as sequences of MPI-style
+collective operations. While partitioning of multi-dimensional arrays has a long history, by intro-
+ducing types and formal semantics for distributed arrays that extend to MPI-style collectives we
+are able to make the following contributions:
+
+• We show that redistributions implemented as sequences of collectives enjoy normal forms
+that guarantee that per-device memory never exceeds the maximum of the per-device input
+and output tile sizes. (Section 4)
+
+• We prove that any redistribution problem can be solved by a sequence of collectives that is
+both in normal form and optimal with respect to data transfer, up to a final permutation of
+data across devices. (Section 6)
+
+• We devise a search procedure that synthesizes a nearly-optimal sequence of collectives for
+any given redistribution problem. (Section 7) The search space is made manageable by passing
+to a weak interpretation of types, which we originally introduce to facilitate formal work.
+(Section 5)
+
+• We experimentally evaluate our search-based synthesis and compare with redistributions
+generated by the XLA SPMD partitioner. Our approach delivers a geometric mean speedup
+of 1.22×, while also guaranteeing memory efficiency. (Section 8)
+
+Since we synthesize sequences of portable MPI-style collectives, our work can be directly trans-
+
+ferred to any framework or system that has access to such collectives.
+
+2 BACKGROUND AND MOTIVATION
+Our work applies to any array language that supports distributed arrays. To be specific in our
+presentation we will introduce distributed array types and motivate redistribution in the context
+of PartIR:SPMD, an intermediate representation used in generating code from the higher-level
+array language PartIR (“Partitioning Intermediate Representation”). PartIR is designed to support
+automated exploration of partitioning strategies; it has array types and operations, as well as
+tiling loop constructs, but neither distributed arrays nor redistribution instructions. At the level
+of PartIR, partitioning of arrays is an implicit consequence of how arrays are used by specific
+instructions. Lowering to PartIR:SPMD happens after all exploration decisions that affect the
+partitioning of arrays have been taken and, in lowering to PartIR:SPMD, all redistributions become
+explicit instructions. A detailed presentation of PartIR and PartIR:SPMD is beyond the scope of
+this paper and is not required to discuss and solve the problem of efficiently redistributing arrays.
+Note though that the exploration of partitioning strategies in PartIR can generate many array
+redistributions in PartIR:SPMD, which have to run efficiently, further motivating our work. We
+introduce PartIR:SPMD by example, starting with Listing 1.
+
+1 mesh {" devices ": 32}
+2
+
+3 fn main (x : [8{ " devices " }256 , 1024] , p : [1024 , 10]) -> [8{ " devices " }256 , 10] {
+4
+
+y = spmd_op x p ( xtile : [8 , 1024] , ptile : [1024 , 10]) {
+
+Memory-efficient array redistribution through portable collective communication
+
+3
+
+w = matmul xtile ptile : [8 , 10]
+return w
+
+} as [8{ " devices " }256 , 10]
+
+return y
+
+5
+
+6
+
+7
+
+8
+
+9 }
+
+Listing 1. Distributed types in SPMD computations.
+
+2.1 Distributed array types
+The first line of Listing 1 declares the mesh, a set of named axes which describes the available
+hardware resources. Here, we use a mesh with a single axis of size 32. Although the mesh describes
+the available devices, it does not denote concrete hardware devices but only a logical space of device
+coordinates. To execute a PartIR:SPMD program, the runtime system must choose a mapping from
+logical device coordinates in a mesh to real hardware devices.
+
+In line 3, we declare a function main() that executes over the mesh. The function’s signature is
+specified with distributed array types. The syntax of distributed types is similar to that of regular
+array types, but the entries for dimensions are no longer restricted to integer literals. Instead we
+additionally allow partitioning specifications of the form:
+
+tileSize{𝑎𝑥𝑖𝑠1, . . . , 𝑎𝑥𝑖𝑠𝑛 }globalSize
+where tileSize and globalSize are integer literals, while 𝑎𝑥𝑖𝑠1, . . . , 𝑎𝑥𝑖𝑠𝑛 are a subset of axes in the
+mesh. The meaning of this annotation is that the data represents a global array with size globalSize
+in that dimension, but it has been partitioned over the specified mesh axes. After partitioning, every
+device only stores a tile of the global array with size tileSize in that dimension.1
+
+When working over a mesh with multiple axes, e.g. {"x": 2, "y": 2}, the order of axes in a
+single partitioning specification matters. It does not affect the way the data is partitioned — we
+always split the global array into as many tiles as the product of axis sizes dictates — but it does
+affect how those tiles are assigned to devices. E.g., an array [8{"x", "y"}32] is first partitioned
+into 2 tiles over "y", and then each of these tiles is further partitioned into 2 tiles along "x". This
+yields 4 final tiles of shape [8] each. Reversing the order of axes will result in the same tile shape,
+but in a different device assignment. We use the convention of interpreting the mesh axes as being
+listed in minor-to-major order (fastest-changing first).
+
+Finally, we remark that if an array type has no partitioned dimensions, then it is replicated on all
+
+devices, i.e. each device holds an identical copy of the data in its entirety.
+
+2.2 SPMD computations
+The spmd_op operator from line 4 of Listing 1 is the key computational construct of PartIR:SPMD. It
+accepts a number of distributed arrays as arguments and returns distributed arrays. In addition, it is
+parameterized by a lambda expression that takes the local tiles of the spmd_op arguments, performs
+some (non-distributed) computation on these tiles independently of other devices, and returns the
+resulting local tiles of the output distributed arrays.
+
+In Listing 1 the spmd_op takes two arguments: x of type [8{"devices"}256, 1024] which translates
+into an argument xtile of type [8, 1024], and p of type [1024, 10] which matches the type of
+ptile because that value is replicated. The spmd_op returns local tiles of shape [8, 10] that are
+interpreted as pieces of a global array of shape 256 × 10 that has been partitioned along its first
+dimension, as indicated by type [8{"devices"}256, 10] following the as keyword.
+
+1Our notation can simplify reasoning but is generally a bit verbose: globalSize must be equal to tileSize times the
+product of axis sizes.
+
+4
+
+Norman A. Rink, Adam Paszke, Dimitrios Vytiniotis, and Georg Stefan Schmid
+
+Fig. 1. Distributed types over a two-dimensional mesh {"xdev": 4, "ydev": 8}. Numbers and colors
+identify distinct tiles of data. Left: [64{"xdev"}256, 1024]. Right: [1024, 128{"ydev"}1024]. Cf. argument
+types of function main() in Listing 2.
+
+2.3 Example: distributed matrix multiplication
+It is often convenient to introduce multiple axes of parallelism in a program, viewing the available
+hardware resources as a multi-dimensional mesh. A popular example is Megatron-style partitioning
+of transformers [25], combining data parallelism and parameter sharding. Here we consider the
+simpler example of matrix multiplication in Listing 2.
+
+1 mesh {" xdev ": 4, " ydev ": 8}
+2
+
+3 fn main (x : [64{ " xdev " }256 , 1024] ,
+4
+
+p : [1024 , 128{ " ydev " }1024]) -> [64{ " xdev " }256 , 128{ " ydev " }1024] {
+
+y = spmd_op x p ( xtile : [64 , 1024] , ptile : [1024 , 128]) {
+
+w = matmul xtile ptile : [64 , 128]
+return w
+
+} as [64{ " xdev " }256 , 128{ " ydev " }1024]
+
+return y
+
+5
+
+6
+
+7
+
+8
+
+9
+
+10 }
+
+Listing 2. Distributed types over a multi-dimensional mesh.
+
+Both arguments to main() are partitioned. However, each is split along only one of the two
+available mesh axes, leading to a situation often called partial replication. Figure 1 shows how the
+tiles of the arguments are laid out across the mesh.
+
+Now, recall that the first dimension of xtile (of size 64) comes from partitioning a dimension of
+x, and similarly for the second dimension of ptile (of size 128). Hence, the matrix multiplication
+on line 6 contracts away the unpartitioned dimension of size 1024, and produces an output that has
+its first dimension derived from the partitioning of xtile, and the second dimension derived from
+the partitioning of ptile. This means that the outputs of the spmd_op actually vary along both mesh
+axes, which is why we ascribe type [64{"xdev"}256, 128{"ydev"}1024] to the result.2
+
+2.4 Redistribution
+When multiple spmd_op appear in a PartIR:SPMD program, it is not uncommon that produced and
+consumed arrays are incompatibly partitioned. This is the case in the program in Listing 3, which
+specifies a chain matrix multiplication where x is first multiplied by w1 and then by w2.
+
+1 mesh {" devs ": 32}
+2
+
+3 fn main (x : [32 , 1024] ,
+4
+
+5
+
+w1 : [1024 , 64{ " devs " }2048] ,
+w2 : [2048 , 256]) -> [1{ " devs " }32 , 256] {
+
+2The semantics of PartIR:SPMD allows other types to be ascribed to the output of the spmd_op, but then Listing 2 would
+not denote matrix multiplication.
+
+32103210321032103210321032103210xdevydev01234567012345670123456701234567ydevxdevMemory-efficient array redistribution through portable collective communication
+
+5
+
+Fig. 2. The redistribution from Listing 3. Colors identify tiles of data, inscribed numbers identify devices.
+
+y = spmd_op x w1 ( xtile : [32 , 1024] , wtile : [1024 , 64]) {
+
+return ( matmul xtile wtile )
+
+} as [32 , 64{ " devs " }2048]
+
+z = redistribute y as [1{ " devs " }32 , 2048]
+w = spmd_op z w2 ( ztile : [1 , 2048] , wtile : [2048 , 256]) {
+
+return ( matmul ztile wtile )
+
+} as [1{ " devs " }32 , 256]
+
+return w
+
+6
+
+7
+
+8
+
+9
+
+10
+
+11
+
+12
+
+13
+
+14 }
+
+Listing 3. Partitioned chain matrix multiplication.
+
+The first spmd_op implements the first of the matrix multiplications. The 1024-sized dimension is
+not partitioned in either x or w1, so this can be carried out on every device independently, without
+any communication. The result is again a matrix, but with its second dimension partitioned in the
+same way as that of w1. Now we would like to perform the second multiplication, but there is an
+issue: the 2048-sized dimension we want to contract over is partitioned in the intermediate value y,
+meaning that no device can compute the output independently. To resolve this issue, we insert a
+redistribute operation, which intuitively acts as a type cast between two distributed array types:
+[32, 64{"devs"}2048] ⇝ [1{"devs"}32, 2048]
+Operationally, it has to perform data exchange to obtain tiles of the global array that fit the new
+partitioning. Figure 2 depicts this redistribute operation: the input matrix is split column-wise
+into tiles of shape [32, 64], while the output matrix is partitioned row-wise into tiles of shape
+[1, 2048]. After this redistribution, the 2048-sized dimension has become local and the second
+matrix multiplication can be done locally, as shown in the second spmd_op in Listing 3.
+
+2.5 Redistribution semantics
+The following must hold for redistribute operations:
+
+A redistribution from 𝜏1 to 𝜏2 is valid iff the global array types for 𝜏1 and 𝜏2 are the same.
+For instance, it is not meaningful to redistribute [512, 32{"devs"}1024] to [1024, 32{"devs"
+}1024] since the target type semantically represents a larger global array, and we have no way
+of producing that extra data. The reverse redistribution is also invalid since we would not know
+which part of the data to retain and which to throw out.
+
+More interestingly, our validity criterion also excludes a redistribution from [32{"xdevs"}128,
+32{"ydevs"}256] to [32{"xdevs", "ydevs"}1024, 32] on the mesh {"xdevs": 4, "ydevs": 8}. The
+
+(cid:62)(cid:19)(cid:15)(cid:19)(cid:64)(cid:62)(cid:19)(cid:15)(cid:20)(cid:64)(cid:62)(cid:19)(cid:15)(cid:21)(cid:64)(cid:62)(cid:19)(cid:15)(cid:22)(cid:64)(cid:62)(cid:19)(cid:15)(cid:23)(cid:64)(cid:62)(cid:19)(cid:15)(cid:24)(cid:64)(cid:62)(cid:19)(cid:15)(cid:25)(cid:64)(cid:62)(cid:19)(cid:15)(cid:26)(cid:64)(cid:62)(cid:22)(cid:15)(cid:19)(cid:64)(cid:62)(cid:22)(cid:15)(cid:20)(cid:64)(cid:62)(cid:22)(cid:15)(cid:21)(cid:64)(cid:62)(cid:22)(cid:15)(cid:22)(cid:64)(cid:62)(cid:22)(cid:15)(cid:23)(cid:64)(cid:62)(cid:22)(cid:15)(cid:24)(cid:64)(cid:62)(cid:22)(cid:15)(cid:25)(cid:64)(cid:62)(cid:22)(cid:15)(cid:26)(cid:64)(cid:17)(cid:17)(cid:17)(cid:62)(cid:19)(cid:15)(cid:19)(cid:64)(cid:62)(cid:20)(cid:15)(cid:19)(cid:64)(cid:62)(cid:21)(cid:15)(cid:19)(cid:64)(cid:62)(cid:22)(cid:15)(cid:19)(cid:64)(cid:62)(cid:19)(cid:15)(cid:20)(cid:64)(cid:62)(cid:20)(cid:15)(cid:20)(cid:64)(cid:62)(cid:21)(cid:15)(cid:20)(cid:64)(cid:62)(cid:22)(cid:15)(cid:20)(cid:64)(cid:62)(cid:19)(cid:15)(cid:25)(cid:64)(cid:62)(cid:20)(cid:15)(cid:25)(cid:64)(cid:62)(cid:21)(cid:15)(cid:25)(cid:64)(cid:62)(cid:22)(cid:15)(cid:25)(cid:64)(cid:62)(cid:19)(cid:15)(cid:26)(cid:64)(cid:62)(cid:20)(cid:15)(cid:26)(cid:64)(cid:62)(cid:21)(cid:15)(cid:26)(cid:64)(cid:62)(cid:22)(cid:15)(cid:26)(cid:64)(cid:265)(cid:265)(cid:265)(cid:303)(cid:253)(cid:251)(cid:247)(cid:248)(cid:250)(cid:249)(cid:250)(cid:247)(cid:250)(cid:248)(cid:247)(cid:248)(cid:250)(cid:247)(cid:250)(cid:248)(cid:20)(cid:21)(cid:27)(cid:25)(cid:23)(cid:284)(cid:250)(cid:249)(cid:266)(cid:303)(cid:253)(cid:251)(cid:282)(cid:301)(cid:139)(cid:143)(cid:225)(cid:204)(cid:301)(cid:283)(cid:249)(cid:247)(cid:251)(cid:255)(cid:285)(cid:303)(cid:284)(cid:248)(cid:282)(cid:301)(cid:139)(cid:143)(cid:225)(cid:204)(cid:301)(cid:283)(cid:250)(cid:249)(cid:266)(cid:303)(cid:249)(cid:247)(cid:251)(cid:255)(cid:285)(cid:284)(cid:253)(cid:251)(cid:282)(cid:301)(cid:232)(cid:139)(cid:143)(cid:225)(cid:301)(cid:266)(cid:303)(cid:301)(cid:231)(cid:139)(cid:143)(cid:225)(cid:301)(cid:283)(cid:249)(cid:247)(cid:251)(cid:255)(cid:266)(cid:248)(cid:249)(cid:255)(cid:285)(cid:284)(cid:253)(cid:251)(cid:282)(cid:301)(cid:231)(cid:139)(cid:143)(cid:225)(cid:301)(cid:266)(cid:303)(cid:301)(cid:232)(cid:139)(cid:143)(cid:225)(cid:301)(cid:283)(cid:249)(cid:247)(cid:251)(cid:255)(cid:266)(cid:248)(cid:249)(cid:255)(cid:285)(cid:265)(cid:265)(cid:265)(cid:303)(cid:248)(cid:249)(cid:247)(cid:251)(cid:255)(cid:17)(cid:17)(cid:17)6
+
+Norman A. Rink, Adam Paszke, Dimitrios Vytiniotis, and Georg Stefan Schmid
+
+[64{"ydev", "xdev"}2048, 128] ⇝ [64{"xdev", "ydev"}2048, 128]
+[32{"xdev"}128, 16{"ydev"}64] ⇝ [32{"ydev"}128, 16{"xdev"}64]
+[32{"xdev"}128] ⇝ [32{"ydev"}128]
+
+swap within dimension
+swap across dimensions
+swap for replicated axis
+
+Fig. 3. Redistributions via permutation over the mesh {"xdev": 4, "ydev": 4}.
+
+per-device tile shape is equal for both types, and there are equal numbers of tiles, but the semantics
+of the two types have to be different as each represents a global array of a different shape.
+
+2.6 Collective operations
+We do not want to focus on the problem of fine-grained data transfers, but instead defer data
+exchange to well-established, portable and highly optimized routines for collective communication.
+We have isolated a set of common collectives that are sufficient to implement array redistribution:3
+• allgather(𝑖) removes the minor-most (left-most) axis from the partitioning specification of
+
+dimension 𝑖, as illustrated on the right of Figure 4. (T-AllGather)
+
+• dynslice(𝑖, 𝑥) introduces a new minor-most axis into the partitioning specification of dimen-
+sion 𝑖. The local size of dimension 𝑖 has to be divisible by the size of the introduced axis, and
+that axis cannot already partition any array dimension. (T-DynSlice)
+
+• alltoall(𝑖, 𝑗) transfers the minor-most axis from the partitioning specification of dimension
+𝑖 to dimension 𝑗. The local size of dimension 𝑗 must be divisible by the size of the moved
+mesh axis. (T-AllToAll)
+
+• allpermute can transform any 𝜏1 to 𝜏2 if their local and global shapes match. (T-Permute)
+While the kinds of redistribution problems that can be handled by the first three collectives are
+relatively easy to understand, let us give a few concrete examples showing the utility of allpermute.
+
+Example 2.1 (Redistributions via permutation). Any bijective reassignment of local tiles to devices
+can be performed by a single allpermute collective. Consider the mesh {"xdev": 4, "ydev": 4}.
+Three prominent cases handled by permutation are listed in Figure 3. In all these cases the local
+per-device type does not change between the source and target type, and this is precisely what
+justifies that they are implementable directly with a permutation.
+
+Figure 4 (left) illustrates tile reassignment for the last permutation in Figure 3 (i.e. swap for a
+
+replicated axis).
+
+Finally, note that while each of the three redistributions in Figure 3 can be handled by allpermute,
+it can additionally perform multiple of them at the same time. For example, it is possible to swap
+some axes within one dimension, move axes between other dimensions, and swap out certain
+axes for ones that replicate the data, all at the same time. Conversely, any permutation of tiles
+facilitated by allpermute is a composition of the three redistributions in Figure 3 (i.e. swapping
+within a dimension, swapping across dimensions and swapping for a replicated axis).
+
+3 CHALLENGE: SYNTHESIZING REDISTRIBUTIONS
+So far we have seen simple examples of redistribution problems that can be solved using a single
+collective operation. In general, however, we need to synthesize whole sequences of collectives
+to implement a specific redistribution, with the space of potential candidate sequences growing
+quickly with the number of mesh axes and complexity of the partitioning specifications in the
+
+3The names T-AllGather, T-DynSlice, T-AllToAll and T-Permute that appear in parentheses refer to Figure 8, which is
+discussed in detail starting in Section 4.
+
+Memory-efficient array redistribution through portable collective communication
+
+7
+
+Fig. 4. Redistributions over {"xdev": 4, "ydev": 4}. Left: Permutation by exchanging for a replicated axis,
+from type [32{"xdev"}128] to [32{"ydev"}128]. Right: allgather from type [32{"xdev","ydev"}512, 512] to
+[128{"ydev"}512, 512].
+
+[32{𝑥, 𝑦 }512, 128]
+[32{𝑦, 𝑥 }512, 128]
+[128{𝑥 }512, 32{𝑦 }128]
+[32{𝑥 }128, 512, 32{𝑦 }128]
+[128, 128{𝑥 }512, 32{𝑦 }128]
+[128, 32{𝑦, 𝑥 }512, 128]
+
+allpermute
+alltoall(0, 1)
+
+alltoall(0, 1)
+alltoall(2, 1)
+
+[32{𝑥 }128, 512, 32{𝑦 }128]
+[128, 512, 32{𝑦 }128]
+[128, 128{𝑦 }512, 128]
+
+allgather(0)
+alltoall(2, 1)
+
+[32{𝑥, 𝑦 }512, 128]
+[128{𝑦 }512, 32{𝑥 }128]
+[128{𝑥 }512, 32{𝑦 }128]
+[32{𝑥 }128, 512, 32{𝑦 }128]
+[32{𝑥 }128, 128{𝑦 }512, 128]
+[128, 32{𝑥, 𝑦 }512, 128]
+[128, 32{𝑦, 𝑥 }512, 128]
+[32{𝑥 }128, 512, 32{𝑦 }128]
+[32{𝑥 }128, 128{𝑦 }512, 128]
+[128, 128{𝑦 }512, 128]
+
+alltoall(0, 1)
+
+allpermute
+
+alltoall(2, 1)
+alltoall(0, 1)
+allpermute
+
+alltoall(2, 1)
+allgather(0)
+
+Fig. 5. Examples of redistributions implemented by sequences of collective operations on the mesh {𝑥 : 4, 𝑦 : 4}.
+Every row shows two different implementations of the same redistribution (and more may be possible).
+
+source and target distributed types. Some examples of redistribution problems that require multiple
+steps and allow multiple programs can be found in Figure 5.
+
+The challenge we focus on for the rest of this paper is how to synthesize efficient redistribution
+programs (sequences of collectives), taking into account both the peak per-device memory usage
+(to avoid out-of-memory errors) as well as the overall amount of data transferred. The following
+challenging example motivates much of the subsequent work.
+
+Example 3.1 (Factor decomposition). Consider the problem of redistributing the distributed array
+of type [3{"x"}12, 2{"y"}12] to type [2{"y"}12, 3{"x"}12], over the mesh {"x": 4, "y": 6} of
+24 devices. Our collective operations do not leave much space for an efficient execution of this
+redistribution other than allgather, to first create the fully replicated type [12, 12], followed by
+dynslice to partition along the axes again. This is inefficient both in terms of peak memory usage,
+since all data has to be temporarily replicated in all device memories, and communication, because
+the dynslice operations discard a large portion of the data received.
+
+The root of the issue is that "x" and "y" cannot partition a single dimension at the same time,
+and mesh axes are atomic so that we cannot just move an axis partially to avoid over-partitioning a
+dimension. But, consider temporarily viewing our 2D mesh as a 4D mesh given by {"x1": 2, "x2":
+2, "y1": 3, "y2": 2}. In that case our redistribution can be restated as:
+
+[3{"x1","x2"}12, 2{"y1","y2"}12] ⇝ [2{"y1","y2"}12, 3{"x1","x2"}12]
+And this equivalent redistribution problem can be solved without ever gathering all of the data on
+a single device:
+
+32103210321032100000111122223333xdevydevhgfelkjiponmxdevydevabcdabcdabcdabcdefghefghefghefghijklijklijklijklmnopmnopmnopmnopdcba8
+
+Norman A. Rink, Adam Paszke, Dimitrios Vytiniotis, and Georg Stefan Schmid
+
+, 2{"y1","y2"}12 ] ⇝alltoall(1,0)
+
+[3{"x1","x2"}12
+[1{"y1","x1","x2"}12, 6{"y2"}12
+[1{"x1","y1","x2"}12, 6{"y2"}12
+[2{"y1","x2"}12
+[2{"y1","y2"}12
+
+, 3{"x1","y2"}12 ] ⇝allpermute
+, 3{"x1","x2"}12 ]
+
+] ⇝allpermute
+] ⇝alltoall(1,0)
+
+Example 3.1 lets us hope that we can generate sequences of collectives whose per-device memory
+
+usage never exceeds input or output tile sizes, provided we observe the following:
+
+Principle 1 Memory-efficient redistribution (with collective operations) requires working
+with multi-dimensional meshes that have all axes of prime sizes.
+
+From now on we assume that meshes have been decomposed into axes of prime sizes. This happens
+without loss of generality because every redistribution problem can be converted into an equivalent
+one that satisfies this assumption.
+
+Example 3.1 reveals another challenge: the allpermute operation between the alltoall operations
+had been inserted there purely for the sake of type bookkeeping because alltoall cannot transfer
+the axis "x1" unless it appears at the front of the partitioning specification for a dimension. Similar
+problems arise countless times in more involved examples, and we would hope to elide intermediate
+permutations for the sake of efficiency. Intuitively this should be possible: allpermute only changes
+the assignment of tiles to devices, and this is necessary only because alltoall is parameterized by
+a mesh axis. If we could specify explicit device coordinates instead, then it would be possible to
+perform the second alltoall without the intermediate allpermute operation.
+
+Later (Section 6) we will give a more general formulation of the collective operations that allows
+us to use collectives more flexibly, i.e. addressing individual devices rather than axes in a mesh. For
+now, we only state a principle that lets us elide intermediate permutations:
+
+Principle 2 To optimize the cost of redistribution, we should use collective operations
+that work up to permutation of the tiles on the mesh devices.
+
+Our two principles will guide the reasoning about array redistribution in the next sections.
+
+4 FORMAL SEMANTICS FOR REDISTRIBUTION
+Starting in this section, we develop formal results about array redistribution based on collective
+operations. While our results are cast into lemmas and theorems, we only outline proofs in prose,
+and only for interesting results. More detailed proofs of all our lemmas and theorems are given in
+Appendix A.
+
+Figure 6 formally defines the syntax of distributed array types and (device) meshes. As in a
+PartIR:SPMD program, we usually assume a fixed global mesh 𝐻 , consisting of prime-factor axes,
+as discussed in Section 3. Figure 6 also gives precise definitions of auxiliary meta-functions that we
+have informally alluded to before, e.g. 𝑔𝑙𝑜𝑏𝑎𝑙𝑡𝑦𝑝𝑒. As stated in Section 2.5, we consider redistribution
+between types 𝜏1, 𝜏2 to be valid only if 𝑔𝑙𝑜𝑏𝑎𝑙𝑡𝑦𝑝𝑒 (𝜏1) = 𝑔𝑙𝑜𝑏𝑎𝑙𝑡𝑦𝑝𝑒 (𝜏2).
+
+4.1 Semantics for distributed array types
+A distributed type 𝜏 specifies how global data is distributed across 𝐻 . The meaning of 𝜏 is a map
+that assigns exactly one tile of the global array data to each index tuple 𝑖 ∈ 𝐻 . The 𝑙𝑜𝑐𝑎𝑙𝑡𝑦𝑝𝑒 (𝜏)
+gives the dimensions of each local tile, which must be the same for all tiles. Each tile is identified
+by its base offset, which is the (lexicographically) lowest index tuple for the data in the tile when
+viewed as data in the global array. We use the term base offset map to refer to a map that assigns
+a base offset to each point 𝑖 ∈ 𝐻 . In Figure 7a, T ⟦𝜏⟧𝐻 gives a precise definition of the base offset
+map for a type 𝜏.
+
+Memory-efficient array redistribution through portable collective communication
+
+9
+
+integer literals
+string literals
+
+::= {𝛼1, . . . , 𝛼𝑛 }
+::= 𝑥 : 𝑘
+
+𝑐, 𝑠, 𝑛
+∈
+𝑥, 𝑦, 𝑧
+∈
+Meshes and axes
+𝐻
+𝛼
+Distributed dimensions and types
+𝑒, 𝑑, 𝑔
+𝜏, 𝜎
+Notation for (possibly empty) sequences
+𝑒
+
+::= 𝑘 {𝑥 }𝑛
+::= [𝑑1, . . . , 𝑑𝑛]
+
+::= ·
+
+| 𝑒, 𝑒
+
+𝑎𝑥𝑒𝑠 (𝑐{𝑥 }𝑛)
+𝑎𝑥𝑒𝑠 ([𝑐0{𝑥 0}𝑠0, . . . , 𝑐𝑛 {𝑥𝑛 }𝑠𝑛])
+𝑟𝑎𝑛𝑘 ([𝑐0{𝑥 0}𝑠0, . . . , 𝑐𝑛 {𝑥𝑛 }𝑠𝑛])
+𝑔𝑙𝑜𝑏𝑎𝑙𝑡𝑦𝑝𝑒 ([𝑐0{𝑥 0}𝑠0, . . . , 𝑐𝑛 {𝑥𝑛 }𝑠𝑛]) = [𝑠0, . . . , 𝑠𝑛]
+𝑔𝑙𝑜𝑏𝑎𝑙𝑠𝑖𝑧𝑒 ([𝑐0{𝑥 0}𝑠0, . . . , 𝑐𝑛 {𝑥𝑛 }𝑠𝑛])
+𝑙𝑜𝑐𝑎𝑙𝑡𝑦𝑝𝑒 ([𝑐0{𝑥 0}𝑠0, . . . , 𝑐𝑛 {𝑥𝑛 }𝑠𝑛])
+𝑙𝑜𝑐𝑎𝑙𝑠𝑖𝑧𝑒 ([𝑐0{𝑥 0}𝑠0, . . . , 𝑐𝑛 {𝑥𝑛 }𝑠𝑛])
+
+= (cid:206)𝑛
+𝑖=0 𝑠𝑖
+= [𝑐0, . . . , 𝑐𝑛]
+= (cid:206)𝑛
+𝑖=0 𝑐𝑖
+
+= 𝑥
+= ∪𝑛
+𝑖=0𝑥𝑖
+= 𝑛 + 1
+
+Fig. 6. Meshes, distributed types, and meta-functions.
+
+D⟦𝑑⟧𝐻 : 𝐻 → N
+D⟦𝑐 { }𝑐⟧𝐻 (𝑖)
+D⟦𝑐 {𝑥, 𝑥 }𝑛⟧𝐻 (𝑖)
+
+T⟦𝜏⟧𝐻 : 𝐻 → N𝑟𝑎𝑛𝑘 (𝜏 )
+T⟦[𝑑1, . . . , 𝑑𝑛 ]⟧𝐻 (𝑖)
+
+=
+=
+
+=
+
+0
+𝑐 · 𝑖𝑥 + D⟦(𝑐 · 𝑘) {𝑥 }𝑛⟧𝐻 (𝑖)
+
+( D⟦𝑑1⟧𝐻 (𝑖), . . . , D⟦𝑑𝑛⟧𝐻 (𝑖))
+
+𝑥𝑖 : 𝑘𝑖 ∈ 𝐻 𝑐 · (cid:206)𝑖 𝑘𝑖 = 𝑛
+𝑥𝑖 ≠ 𝑥 𝑗 for every 𝑖, 𝑗
+𝐻 ⊢ 𝑐 {𝑥 }𝑛
+
+wf-dim
+
+𝐻 ⊢ 𝑐𝑖 {𝑥𝑖 }𝑠𝑖
+𝑥𝑖 #𝑥 𝑗 for every 𝑖, 𝑗
+𝐻 ⊢ [𝑐0 {𝑥 0 }𝑠0, . . . , 𝑐𝑛 {𝑥𝑛 }𝑠𝑛 ]
+
+wf-type
+
+(a) Base offset maps
+
+(b) Well-formedness rules
+
+Fig. 7. Semantics for distributed dimensions and types.
+
+𝑥 : 𝑛 ∈ 𝐻
+𝐻 ⊢ allgather(𝑖) : [. . . , 𝑐𝑖 {𝑥, 𝑥𝑖 }𝑠𝑖, . . .] → [. . . , (𝑐𝑖 · 𝑛) {𝑥𝑖 }𝑠𝑖, . . .]
+
+t-allgather
+
+𝑥 : 𝑛 ∈ 𝐻 𝑥 ∉ 𝑎𝑥𝑒𝑠 ( [. . . , (𝑐𝑖 · 𝑛) {𝑥𝑖 }𝑠𝑖, . . .])
+𝐻 ⊢ dynslice(𝑖, 𝑥) : [. . . , (𝑐𝑖 · 𝑛) {𝑥𝑖 }𝑠𝑖, . . .] → [. . . , 𝑐𝑖 {𝑥, 𝑥𝑖 }𝑠𝑖, . . .]
+
+t-dynslice
+
+𝑒𝑖 = 𝑐𝑖 {𝑥, 𝑥𝑖 }𝑠𝑖
+
+𝑒 𝑗 = 𝑐 𝑗 {𝑥 𝑗 }𝑠 𝑗
+
+𝑒′
+𝑖 = (𝑐𝑖 · 𝑛) {𝑥𝑖 }𝑠𝑖
+
+𝑥 : 𝑛 ∈ 𝐻 𝑐 𝑗 𝑚𝑜𝑑 𝑛 = 0
+𝑒′
+𝑗 = (𝑐 𝑗 𝑑𝑖𝑣 𝑛) {𝑥, 𝑥 𝑗 }𝑠 𝑗
+𝑖, 𝑗 ↦→ 𝑒′
+𝑗 ]
+
+𝑒′ = 𝑒 [𝑖 ↦→ 𝑒′
+
+𝐻 ⊢ alltoall(𝑖, 𝑗) : [𝑒 ] → [𝑒′]
+
+t-alltoall
+
+localtype(𝜏1) = localtype(𝜏2)
+𝐻 ⊢ allpermute : 𝜏1 → 𝜏2
+
+t-permute
+
+Fig. 8. Typing collective operations.
+
+The rules in Figure 7b formalize that axes must appear in a well-formed distributed type in an
+affine way. If this is the case for type 𝜏, then the image of T ⟦𝜏⟧𝐻 contains base offsets for all tiles
+that make up the global array data, as the following lemmas establish.
+
+Lemma 4.1. If 𝐻 ⊢ 𝑐{𝑥 }𝑛, then the image of D⟦𝑐{𝑥 }𝑛⟧𝐻 consists of all multiples of 𝑐 below 𝑛.
+
+Lemma 4.2. If 𝐻 ⊢ 𝜏, then the image of T ⟦𝜏⟧𝐻 consists of all base offsets that are (lexicographically)
+
+below 𝑔𝑙𝑜𝑏𝑎𝑙𝑡𝑦𝑝𝑒 (𝜏).
+
+10
+
+Norman A. Rink, Adam Paszke, Dimitrios Vytiniotis, and Georg Stefan Schmid
+
+𝑥 : 𝜏 ∈ Γ
+𝑠𝑖 = localtype(𝜏𝑖 )
+𝑥𝑠 : 𝑠 ⊢xla 𝑒 : [𝑐1, . . . , 𝑐𝑛 ]
+localtype(𝜏) = [𝑐1, . . . , 𝑐𝑛 ]
+𝐻 ; Γ ⊢ spmd_op 𝑥 (𝜆𝑥𝑠 → 𝑒) as 𝜏 : 𝜏
+
+t-spmd
+
+⟦𝑥 𝑗 ⟧Δ
+
+𝐻 = (𝑣𝑗 , 𝛽 𝑗 )
+
+𝛽 = T⟦𝜏⟧𝐻
+
+for all 𝑖 ∈ 𝐻, ⟦𝑒⟧xla
+
+𝑥 𝑗 ↦→𝑣𝑗 [𝛽 𝑗 (𝑖 ) ]
+
+= 𝑣 [𝛽 (𝑖) ]
+
+⟦spmd_op 𝑥 (𝜆𝑥𝑠 → 𝑒) as 𝜏⟧Δ
+
+𝐻 = (𝑣, 𝛽)
+
+d-spmd
+
+Fig. 9. Typing (left) and semantics (right) for SPMD regions. Left: a typing relation for the underlying array
+language (XLA) is assumed. Right: the environment Δ maps variables to their denotations, i.e. to pairs of
+global values and base offset maps; 𝑣 [𝛽 (𝑖)] denotes the tile of 𝑣 that starts at the base offset given by 𝛽 (𝑖)
+and has the appropriate size.
+
+We only consider well-formed distributed types 𝜏. By the previous lemma, the tiles with base
+offsets in the image of T ⟦𝜏⟧𝐻 form a partitioning4 of the global data with shape 𝑔𝑙𝑜𝑏𝑎𝑙𝑡𝑦𝑝𝑒 (𝜏), as
+we would expect of a meaningful definition of distributed array type.
+
+4.2 Semantics of collective operations
+Having given semantics to distributed array types, it is now straightforward to assign meanings
+also to collective operations. In fact, the typing rules for collective operations in Figure 8 fully
+determine the semantics that must be assigned to these operations. To understand why, note that
+the type signatures from Figure 8 give much stronger guarantees than common function types in
+programming languages: this is because our collective operations do not manipulate data, they
+merely modify how tiles of data are placed on devices, and that is precisely what is prescribed by
+our distributed types. Consequently, the meaning of a collective operation is how it transforms
+base offset maps, which we can directly “read off” its typing rule.
+
+Definition 4.3. Let 𝑝 be an allgather, alltoall, dynslice or allpermute operation. Define the
+
+semantics of 𝑝 as a relation
+
+𝑝
+−→ on base offset maps:
+𝑝
+−→ T ⟦𝜏2⟧𝐻 iff 𝐻 ⊢ 𝑝 : 𝜏1 → 𝜏2 .
+
+T ⟦𝜏1⟧𝐻
+
+(1)
+
+We refer to the base offset map T ⟦𝜏⟧𝐻 as a semantic type.
+
+The term semantic type may seem unusual for a definition that does not include the actual values
+in hand, i.e. the data in the global array. In principle, the denotation of a type should also include
+values: ⟦𝜏⟧𝐻 = {(𝑣, T ⟦𝜏⟧𝐻 ) for 𝑣 : R𝑟𝑎𝑛𝑘 (𝜏) }. However, since the data in the global array never
+changes during redistribution, we can safely ignore the actual values. For the sake of completeness,
+Figure 9 gives the typing and denotation of spmd_op,
+
+4.3 Sequences of collectives in normal form
+To implement redistribution between pairs of distributed types, we must generally form sequences
+of collective operations. The abstract formulation of this problem is this:5
+
+Easy redistribution: For 𝜏1, 𝜏2 with 𝑔𝑙𝑜𝑏𝑎𝑙𝑡𝑦𝑝𝑒 (𝜏1) = 𝑔𝑙𝑜𝑏𝑎𝑙𝑡𝑦𝑝𝑒 (𝜏2), find a sequence of
+𝑝𝑛
+collective operations 𝑝𝑖 such that 𝜏1
+−−→ 𝜏2.
+
+𝑝1
+−→ · · ·
+
+This redistribution problem is an easy one because it has the following simple solution: fully
+undistribute the initially distributed array of type 𝜏1, so that every device has a full copy of the
+
+4Mathematically speaking, the image of T⟦𝜏⟧𝐻 defines a partitioning of the global data only if T⟦𝜏⟧𝐻 is 1-1; otherwise,
+merely a cover is defined.
+5To ease notation, we will henceforth write a distributed type 𝜏 to mean T⟦𝜏⟧𝐻 in places where a semantic type (i.e. the
+base offset map that arises from 𝜏) is expected. This notational shortcut should not cause any confusion since we are only
+interested in base offset maps that are semantic types.
+
+Memory-efficient array redistribution through portable collective communication
+
+11
+
+global data. Then, let every device slice out the local tile of data it needs to retain according to the
+desired final type 𝜏2. Formally we might write this solution as
+
+allgather(0)
+−−−−−−−−−−→ · · ·
+
+allgather(𝑛)
+−−−−−−−−−−→ [𝑠0{}𝑠0, . . . , 𝑠𝑛 {}𝑠𝑛]
+
+dynslice(0,...)
+−−−−−−−−−−−→ · · ·
+
+dynslice(𝑛,...)
+−−−−−−−−−−−→ 𝜏2 .
+
+𝜏1
+
+(2)
+
+This sequence suffers from the problem that it includes types, esp. [𝑠0{}𝑠0, . . . , 𝑠𝑛 {}𝑠𝑛], that consume
+more memory per device than 𝜏1 and 𝜏2. The per-device memory footprint of a distributed array is
+identical to the 𝑙𝑜𝑐𝑎𝑙𝑠𝑖𝑧𝑒 of its type. Because of the allgather and dynslice in (2), we have
+
+𝑙𝑜𝑐𝑎𝑙𝑠𝑖𝑧𝑒 ( [𝑠0{}𝑠0, . . . , 𝑠𝑛 {}𝑠𝑛]) ≥ max(𝑙𝑜𝑐𝑎𝑙𝑠𝑖𝑧𝑒 (𝜏1), 𝑙𝑜𝑐𝑎𝑙𝑠𝑖𝑧𝑒 (𝜏2) .
+
+(3)
+
+We would in fact expect the opposite of a good solution to the redistribution problem, namely
+that all types that appear in the sequence 𝜏1 −→∗ 𝜏2 should have a 𝑙𝑜𝑐𝑎𝑙𝑠𝑖𝑧𝑒 no greater than the
+right-hand side of (3). To formalize this expectation, we define the ℎ𝑒𝑖𝑔ℎ𝑡 of a sequence.
+
+Definition 4.4. Let 𝜏1 −→∗ 𝜏2 be a sequence of collective operations, i.e. 𝜏1 = 𝜎0 −→ 𝜎1 −→ · · · −→
+𝜎𝑛−1 −→ 𝜎𝑛 = 𝜏2, with intermediate types 𝜎1, . . . , 𝜎𝑛−1. The height 𝔥 of this sequence is defined as
+𝔥(𝜏1 −→∗ 𝜏2) = max𝑖=0,...,𝑛 𝑙𝑜𝑐𝑎𝑙𝑠𝑖𝑧𝑒 (𝜎𝑖 ).
+
+We now formulate the memory-constrained redistribution problem, solutions to which never
+
+consume more per-device memory than the maximum of 𝜏1 and 𝜏2.
+
+Memory-constrained redistribution: For 𝜏1, 𝜏2 with 𝑔𝑙𝑜𝑏𝑎𝑙𝑡𝑦𝑝𝑒 (𝜏1) = 𝑔𝑙𝑜𝑏𝑎𝑙𝑡𝑦𝑝𝑒 (𝜏2), find
+a sequence 𝜏1 −→∗ 𝜏2 such that
+
+𝔥(𝜏1 −→∗ 𝜏2) ≤ max(𝑙𝑜𝑐𝑎𝑙𝑠𝑖𝑧𝑒 (𝜏1), 𝑙𝑜𝑐𝑎𝑙𝑠𝑖𝑧𝑒 (𝜏2)) .
+We will solve this memory-constrained problem by successively transforming an arbitrary
+sequence 𝜏1 −→∗ 𝜏2 into one that satisfies (4). In fact, it suffices to restrict attention to sequences in
+normal form, as defined next.
+
+(4)
+
+Definition 4.5. A sequence 𝜎0 →∗ 𝜎𝑛 is in normal form if the string formed by its labels 𝑝𝑖 is
+
+matched by the regular expression dynslice∗{alltoall | allpermute}∗allgather∗.
+
+Normal forms are relevant to the memory-constrained redistribution problem because (a) the
+initial sub-sequence of dynslice reduces 𝑙𝑜𝑐𝑎𝑙𝑠𝑖𝑧𝑒, (b) the intermediate sub-sequence of alltoall
+and allpermute does not change 𝑙𝑜𝑐𝑎𝑙𝑠𝑖𝑧𝑒, and (c) the final sub-sequence of allgather increases
+𝑙𝑜𝑐𝑎𝑙𝑠𝑖𝑧𝑒. It is instructive to draw normal forms in two dimensions, where the vertical direction
+indicates the 𝑙𝑜𝑐𝑎𝑙𝑠𝑖𝑧𝑒 of each distributed type 𝜎0, . . . , 𝜎𝑛 in the sequence:
+
+𝜎0
+
+𝜎𝑛
+
+dynslice∗
+
+𝜎𝑖
+
+𝜎 𝑗
+
+allgather∗
+
+{alltoall | allpermute}∗
+
+From this it is immediately clear that a sequence in normal form satisfies
+
+𝔥(𝜎0 −→∗ 𝜎𝑛) ≤ max(𝑙𝑜𝑐𝑎𝑙𝑠𝑖𝑧𝑒 (𝜎0), 𝑙𝑜𝑐𝑎𝑙𝑠𝑖𝑧𝑒 (𝜎𝑛)) ,
+
+i.e. normal forms solve the memory-constrained redistribution problem between types 𝜎0, 𝜎𝑛.
+
+Moreover, any given sequence 𝜏1 −→∗ 𝜏2 can be brought into normal form by successively
+
+removing peaks. The following lemma formalizes the removal of a single peak.
+
+Lemma 4.6 (Peak Lemma). Given the following sequence:
+
+12
+
+Norman A. Rink, Adam Paszke, Dimitrios Vytiniotis, and Georg Stefan Schmid
+
+allgather(𝑖)
+
+𝜎1
+
+dynslice( 𝑗, 𝑥)
+
+𝜎0
+
+𝜎2
+
+There exists a sequence 𝜎0 −→3 𝜎2 (where −→𝑘 is the 𝑘-step closure of the relation from (1)) such that
+
+𝔥(𝜎0 −→3 𝜎2) ≤ max(𝑙𝑜𝑐𝑎𝑙𝑠𝑖𝑧𝑒 (𝜎0), 𝑙𝑜𝑐𝑎𝑙𝑠𝑖𝑧𝑒 (𝜎2)) .
+
+The proof of Lemma 4.6 is a straightforward case analysis on 𝑖, 𝑗, 𝑥 and the axis that allgather
+operates on. The prove crucially relies on the fact that all axis sizes are prime. Note that the resulting
+sequence is only guaranteed to be in −→3, i.e. it may be one step longer than the original peak. This
+is a result of the potential need to introduce an allpermute operation for correct bookkeeping of
+axes in distributed types.
+
+The next lemma is very similar to Lemma 4.6. It formalizes the moving of rising and falling
+edges, which are the initial and final segments, respectively, of broader peaks, or plateaus. The
+proof of Lemma 4.7 also relies on axis sizes being prime, it may also need to introduce an additional
+allpermute into the constructed sequence, and overall it is analogous to the proof of Lemma 4.6.
+
+Lemma 4.7 (Rising and Falling Edges Lemma). Given one of the sequences on the left, with
+𝑝 ∈ {alltoall, allpermute}, we can construct the corresponding sequence on the right, where
+𝑞1, . . . , 𝑞𝑟 ∈ {alltoall, allpermute}, 𝑟 ≤ 2, and at most one of the 𝑞𝑖 an alltoall operation:
+
+𝑝
+
+𝜎1
+
+𝜎2
+
+allgather(𝑖)
+
+𝜎0
+
+𝑝
+
+𝜎0
+
+𝜎1
+
+dynslice
+
+𝜎2
+
+𝑞1
+
+. . .
+
+𝑞𝑟
+
+𝜎′
+1
+
+allgather( 𝑗)
+
+𝜎2
+
+𝜎0
+
+𝜎0
+
+dynslice
+
+𝜎′
+1
+
+𝑞1
+
+. . .
+
+𝑞𝑟
+
+𝜎2
+
+Lemmas 4.6 and 4.7 can be summarized intuitively as follows: Lemma 4.6 turns a peak into a
+flat line or a valley; and Lemma 4.7 either moves a rising edge further to the right or moves a
+falling edge further to the left. Repeated application of Lemmas 4.6 and 4.7 to an arbitrary sequence
+reaches a fixed point precisely when the sequence is in normal form. Hence the next theorem.
+
+Theorem 4.8 (Normal Form Theorem). For any sequence 𝜎0 −→∗ 𝜎𝑛, there exists a sequence
+
+𝜎0 −→∗ 𝜎𝑛 in normal form.
+
+Normal forms solve the memory-constrained redistribution problem, and the proof of Theorem 4.8
+is fully constructive. However, this construction may not yield good redistributions because it does
+not control the number of inserted allpermute operations, as the next example illustrates.
+
+Example 4.9. Consider the redistribution problem 𝜏1 = [1{𝑎}8, 8{}8], 𝜏2 = [8{}8, 1{𝑎}8] in
+the context of the mesh {𝑎 : 8}. Clearly alltoall(0, 1) is a solution of the memory-constrained
+problem. To solve this problem using Theorem 4.8, we first need to decompose axis 𝑎 into prime
+factors, giving the equivalent mesh {𝑎0 : 2, 𝑎1 : 2, 𝑎2 : 2} and, correspondingly, the new types
+𝜏1 = [1{𝑎0, 𝑎1, 𝑎2}8, 8{}8], 𝜏2 = [8{}8, 1{𝑎0, 𝑎1, 𝑎2}8]. One can then apply Theorem 4.8 to, say, a
+
+Memory-efficient array redistribution through portable collective communication
+
+13
+
+naive sequence 𝜏1 −→∗ 𝜏2 analogous to the one in (2). As a result, one might obtain the sequence
+
+alltoall(0,1)
+−−−−−−−−−−→ [2{𝑎1, 𝑎2}8, 4{𝑎0}8]
+
+allpermute
+−−−−−−−−−→ [2{𝑎2, 𝑎1}8, 4{𝑎0}8]
+
+[1{𝑎0, 𝑎1, 𝑎2}8, 8{}8]
+alltoall(0,1)
+−−−−−−−−−−→ [4{𝑎1}8, 2{𝑎2, 𝑎0}8]
+alltoall(0,1)
+−−−−−−−−−−→ [8{}8, 1{𝑎1, 𝑎0, 𝑎2}8]
+
+allpermute
+−−−−−−−−−→ [4{𝑎1}8, 2{𝑎0, 𝑎2}8]
+
+allpermute
+−−−−−−−−−→ [8{}8, 1{𝑎0, 𝑎1, 𝑎2}8] ,
+
+(5)
+
+which is a lot less efficient than the solution we first guessed, i.e. alltoall(0, 1). To recover this
+simpler normal form from the one in (5), we somehow have to remove the allpermute operations
+and merge the alltoall operations into a single one. The next section shows how to deal with the
+intermediate permutations, and Section 7 shows how to merge collective operations that manipulate
+more than one axis in the same dimension.
+
+5 THE WEAK INTERPRETATION OF COLLECTIVES
+Whenever 𝜏1
+bijective map 𝜋 : 𝐻 → 𝐻 .
+
+allpermute
+−−−−−−−−−→ 𝜏2 holds, the maps T ⟦𝜏1⟧𝐻 , T ⟦𝜏2⟧𝐻 are related by a permutation, i.e. a
+
+Lemma 5.1. If 𝐻 ⊢ 𝜏1, 𝜏2, 𝑔𝑙𝑜𝑏𝑎𝑙𝑡𝑦𝑝𝑒 (𝜏1) = 𝑔𝑙𝑜𝑏𝑎𝑙𝑡𝑦𝑝𝑒 (𝜏2) and 𝑙𝑜𝑐𝑎𝑙𝑡𝑦𝑝𝑒 (𝜏1) = 𝑙𝑜𝑐𝑎𝑙𝑡𝑦𝑝𝑒 (𝜏2),
+
+then there exists a permutation 𝜋 : 𝐻 → 𝐻 such that T ⟦𝜏2⟧𝐻 = T ⟦𝜏1⟧𝐻 ◦ 𝜋.
+
+We now decree two base offset maps equivalent if they are related by a permutation.
+
+Definition 5.2 (Equivalence of Base Offset Maps, Weak Semantic Types). Two base offset maps
+𝛽1, 𝛽2 : 𝐻 → N𝑟 are equivalent, in symbols 𝛽1 ∼ 𝛽2, if there exists a permutation 𝜋 : 𝐻 → 𝐻 such
+that 𝛽2 = 𝛽1 ◦ 𝜋. The relation ∼ is an equivalence relation and we denote the equivalence class of
+𝛽1 as [𝛽1]∼. We define E⟦𝜏⟧𝐻 := [T ⟦𝜏⟧𝐻 ]∼, and we refer to E⟦𝜏⟧𝐻 as the weak (semantic) type of
+an array of (syntactic) type 𝜏.
+
+The relation ∼ makes it easy to remove allpermute operations from sequences of collective
+𝑝
+−→ (defined in (1)) by interpreting types not with T ⟦·⟧𝐻 but
+
+operations: we modify the relation
+with E⟦·⟧𝐻 instead.
+
+Definition 5.3 (Weak Collective Operations). The relation ▶ is defined on equivalence classes of
+
+base offset maps as follows: For 𝑝 ∈ {allgather, alltoall, dynslice},
+
+(6)
+We refer to E⟦𝜏1⟧𝐻 ▶𝑝 E⟦𝜏2⟧𝐻 as a weak collective operation between the distributed types 𝜏1
+and 𝜏2.6
+
+E⟦𝜏1⟧𝐻 ▶𝑝 E⟦𝜏2⟧𝐻 iff T ⟦𝜏1⟧𝐻
+
+𝑝
+−→ T ⟦𝜏2⟧𝐻 .
+
+In the previous definition, 𝑝 ∈ {allpermute} has been omitted. This is because (6) would define
+𝜉 ▶allpermute 𝜒 only for equivalence classes 𝜉 = 𝜒. Since we are typically interested in the reflexive,
+transitive closure ▶∗, we need not take care to make ▶ reflexive already. Note, however, that since
+there are no ▶allpermute transitions, no allpermute operations occur in sequences in ▶∗.
+
+Consider the redistribution problem for weak collectives:
+
+Weak memory-constrained redistribution: For 𝜏1, 𝜏2 with 𝑔𝑙𝑜𝑏𝑎𝑙𝑡𝑦𝑝𝑒 (𝜏1) = 𝑔𝑙𝑜𝑏𝑎𝑙𝑡𝑦𝑝𝑒 (𝜏2),
+find a sequence 𝜏1 ▶∗ 𝜏2 such that
+
+𝔥(𝜏1 ▶∗ 𝜏2) ≤ max(𝑙𝑜𝑐𝑎𝑙𝑠𝑖𝑧𝑒 (𝜏1), 𝑙𝑜𝑐𝑎𝑙𝑠𝑖𝑧𝑒 (𝜏2))
+(where the height of a sequence 𝜏1 ▶∗ 𝜏2 is defined analogously to the height of 𝜏1 −→∗ 𝜏2).
+
+6As before, we typically write 𝜏1 ▶ 𝜏2 instead of E⟦𝜏1⟧𝐻 ▶ E⟦𝜏2⟧𝐻 .
+
+14
+
+Norman A. Rink, Adam Paszke, Dimitrios Vytiniotis, and Georg Stefan Schmid
+
+Lemmas 4.6, 4.7 and Theorem 4.8 also hold for ▶∗. In fact, their proofs for ▶∗ are noticeably
+simpler because fewer cases need be analyzed in the absence of allpermute operations. As before,
+Theorem 4.8 for ▶∗ lets us construct solutions of the weak memory-constrained redistribution
+problem. However, from the equivalence class E⟦𝜏2⟧𝐻 at the end of a normal form sequence 𝜏1 ▶∗ 𝜏2,
+we cannot immediately recover the desired base offset map T ⟦𝜏2⟧𝐻 . We only know that T ⟦𝜏2⟧𝐻
+is an element of the equivalence class E⟦𝜏2⟧𝐻 . Nonetheless, for any representative 𝛽 ∈ E⟦𝜏2⟧𝐻 ,
+we can obtain the desired T ⟦𝜏2⟧𝐻 by composing with a suitable permutation 𝜋 : 𝐻 → 𝐻 . We will
+use this observation in the next section to find solutions to the (non-weak) redistribution problem
+that include at most one allpermute operation.
+
+6 LOW-LEVEL MPI-STYLE COLLECTIVES
+𝑝
+Our collective operations 𝜏1
+−→ 𝜏2 are quite abstract. Specifically, they only operate in the context
+of a fixed (logical) mesh of devices 𝐻 . Real-world MPI-style primitives typically allow more fine-
+grained control over how individual devices (“ranks” in MPI parlance) participate in communication.
+We now make more control available in our formalism by introducing a set 𝐷 of physical devices
+and a map that mediates between the logical mesh 𝐻 and this physical 𝐷.
+
+Definition 6.1. A device map 𝜙 is a bijection 𝜙 : 𝐻 → 𝐷. A device assignment is a pair ⟨𝜙, 𝛽⟩𝐻 ,
+where 𝜙 : 𝐻 → 𝐷 is a device map and 𝛽 is a base offset map. The device assignment ⟨𝜙, 𝛽⟩𝐻 assigns
+a tile of an array to each device 𝑑 ∈ 𝐷 by mapping 𝑑 to the base offset 𝛽 ◦ 𝜙 −1(𝑑).
+
+1 = 𝛽2 ◦ 𝜙 −1
+2 .
+
+Definition 6.2. Device assignments ⟨𝜙1, 𝛽1⟩𝐻1 , ⟨𝜙2, 𝛽2⟩𝐻2 are equivalent if 𝛽1 ◦ 𝜙 −1
+Figure 10 specifies low-level MPI-style collectives that operate on device assignments. The key
+difference between ⇒ and −→ is that device maps 𝜙, 𝜙 ′ now appear in the rules in Figure 10.
+These device maps give additional flexibility to the rules allgather and alltoall, which can now
+operate on an axis 𝑥 that need not be in the left-most position within its distributed dimension. The
+precondition 𝛽 ′ ◦ 𝜙 ′−1 = 𝛽 ◦ 𝜙 −1 should be read as a definition of a new device map 𝜙 ′ : 𝐻 → 𝐷.
+With respect to this device map, the distributed array whose original type was given by 𝛽 now
+has the type 𝛽 ′. Note how 𝛽 ′ has the right form for our old collective operations allgather and
+alltoall (in −→) to operate on. The corresponding operations in Figure 10 then produce the new
+type 𝛽 ′′, but now with respect to 𝜙 ′.
+
+The device map 𝜙 ′ in the rules allgather and alltoall is precisely what enables us to apply
+these rules also to types where we would have to perform a permutation first if we wanted to apply
+the corresponding T-AllGather and T-AllToAll rules from Figure 8. By changing the original
+device map 𝜙 to 𝜙 ′ in Figure 10, the permutation operation can be skipped. Note that no data needs
+to move in going from ⟨𝜙, 𝛽⟩𝐻 to ⟨𝜙 ′, 𝛽 ′⟩𝐻 because of the requirement 𝛽 ′ ◦ 𝜙 ′−1 = 𝛽 ◦ 𝜙 −1 in the
+preconditions of allgather and alltoall.
+
+6.1 Lowering of weak collective operations
+
+𝑝
+−→ 𝜏2 can be implemented by the collectives in Figure 10
+Our original collective operations 𝜏1
+simply by setting 𝛽 ′ = 𝛽, which will entail 𝜙 ′ = 𝜙. It is more interesting to look at how weak
+collectives in ▶ are lowered to the operations from Figure 10. Since ▶ relates equivalence classes of
+base offset maps, lowering requires us to specify an explicit initial 𝛽. Moreover, since a device map
+𝜙 is also required for the rules in Figure 10, we will in fact lower ▶ in the presence of a given initial
+device assignment ⟨𝜙, 𝛽⟩𝐻 .
+
+The following lemma is established by mapping every transition ▶𝑝 to the corresponding ⇒𝑝
+
+from Figure 10.
+
+Memory-efficient array redistribution through portable collective communication
+
+15
+
+𝑥 : 𝑛 ∈ 𝐻 𝛽 = T⟦[. . . , 𝑐𝑖 {𝑦𝑖, 𝑥, 𝑥𝑖 }𝑠𝑖, . . .]⟧𝐻 𝛽′ = T⟦[. . . , 𝑐𝑖 {𝑥, 𝑦𝑖, 𝑥𝑖 }𝑠𝑖, . . .]⟧𝐻
+
+𝛽′ ◦ 𝜙′−1 = 𝛽 ◦ 𝜙 −1
+
+𝛽′′ = T⟦[. . . , (𝑐𝑖 · 𝑛) {𝑦𝑖, 𝑥𝑖 }𝑠𝑖, . . .]⟧𝐻
+
+⟨𝜙, 𝛽 ⟩𝐻 ⇒allgather(𝑥 ) ⟨𝜙′, 𝛽′′⟩𝐻
+
+allgather
+
+𝑒𝑖 = 𝑐𝑖 {𝑦𝑖, 𝑥, 𝑥𝑖 }𝑠𝑖
+
+𝑒′ = 𝑒 [𝑖 ↦→ 𝑒′
+𝑒′
+𝑖 = 𝑐𝑖 {𝑥, 𝑦𝑖, 𝑥𝑖 }𝑠𝑖
+𝑖 ]
+𝑒′′
+𝑗 = (𝑐 𝑗 𝑑𝑖𝑣 𝑛) {𝑥, 𝑥 𝑗 }𝑠 𝑗
+
+𝑒′′
+𝑖 = (𝑐𝑖 · 𝑛) {𝑦𝑖, 𝑥𝑖 }𝑠𝑖
+
+𝑒 𝑗 = 𝑐 𝑗 {𝑥 𝑗 }𝑠 𝑗
+
+𝑒′′ = 𝑒 [𝑖 ↦→ 𝑒′′
+
+𝑥 : 𝑛 ∈ 𝐻 𝑐 𝑗 𝑚𝑜𝑑 𝑛 = 0
+𝑖 , 𝑗 ↦→ 𝑒′′
+𝑗 ]
+
+𝛽 = T⟦𝑒⟧𝐻 𝛽′ = T⟦𝑒′⟧𝐻 𝛽′ ◦ 𝜙′−1 = 𝛽 ◦ 𝜙 −1
+
+𝛽′′ = T⟦𝑒′′⟧𝐻
+
+⟨𝜙, 𝛽 ⟩𝐻 ⇒alltoall(𝑥,𝑗 ) ⟨𝜙′, 𝛽′′⟩𝐻
+
+alltoall
+
+𝑥 : 𝑛 ∈ 𝐻 𝑥 ∉ 𝑎𝑥𝑒𝑠 ( [. . . , (𝑐𝑖 · 𝑛) {𝑥𝑖 }𝑠𝑖, . . .])
+𝛽 = T⟦[. . . , (𝑐𝑖 · 𝑛) {𝑥𝑖 }𝑠𝑖, . . .]⟧𝐻
+𝛽′ = T⟦[. . . , 𝑐𝑖 {𝑥, 𝑥𝑖 }𝑠𝑖, . . .]⟧𝐻
+⟨𝜙, 𝛽 ⟩𝐻 ⇒dynslice(𝑖,𝑥 ) ⟨𝜙, 𝛽′⟩𝐻
+
+dynslice
+
+𝛽′ ◦ 𝜙′−1 = 𝛽 ◦ 𝜙 −1 ◦ 𝜋
+𝜋 : 𝐷 → 𝐷 a bijection
+
+⟨𝜙, 𝛽 ⟩𝐻 ⇒allpermute ⟨𝜙′, 𝛽′⟩𝐻 ′
+
+permute
+
+Fig. 10. Semantics of low-level collective operations as a relation on device assignments.
+
+Lemma 6.3 (Lowering Lemma). Let 𝜏1 ▶𝑝 𝜏2, 𝑝 ∈ {allgather, alltoall, dynslice}. Further let
+
+𝛽 ∈ E⟦𝜏1⟧𝐻 , and let 𝜙 : 𝐻 → 𝐷 be a device map. Then,
+
+⟨𝜙, 𝛽⟩𝐻 ⇒𝑝 ⟨𝜙 ′, 𝛽 ′⟩𝐻
+
+with 𝛽 ′ ∈ E⟦𝜏2⟧𝐻 .
+
+Repeatedly applying Lemma 6.3 lets us lower a sequence in ▶∗ to ⇒∗. The fact that the resulting
+sequence in ⇒∗ contains no allpermute operations is then a direct consequence of there not being
+any allpermute operations in ▶.
+
+Theorem 6.4 (Lowering Theorem). Given 𝜏1 ▶∗ 𝜏2, 𝛽 ∈ E⟦𝜏1⟧𝐻 and a device map 𝜙 : 𝐻 → 𝐷.
+There exists a sequence ⟨𝜙, 𝛽⟩𝐻 ⇒∗ ⟨𝜙 ′, 𝛽 ′⟩𝐻 with 𝛽 ′ ∈ E⟦𝜏2⟧𝐻 , and the sequence includes no
+allpermute transitions.
+
+With Theorem 6.4 we can now turn any sequence 𝜏1 −→∗ 𝜏2 into a sequence ⟨𝜙, T ⟦𝜏1⟧𝐻 ⟩𝐻 ⇒∗
+⟨𝜙, T ⟦𝜏2⟧𝐻 ⟩𝐻 that includes at most one permutation (at the end). To do this, first pass from
+𝜏1 −→∗ 𝜏2 to 𝜏1 ▶∗ 𝜏2, and then apply Theorem 6.4 with 𝛽 = T ⟦𝜏1⟧𝐻 . This yields a sequence
+⟨𝜙, 𝛽⟩𝐻 ⇒∗ ⟨𝜙 ′, 𝛽 ′⟩𝐻 with 𝛽 ′ ∈ E⟦𝜏2⟧𝐻 . There then exists a permutation 𝜌 : 𝐻 → 𝐻 such that
+𝛽 ′ = T ⟦𝜏2⟧𝐻 ◦ 𝜌. Now, define a permutation 𝜋 = 𝜙 ′ ◦ 𝜌 −1 ◦ 𝜙 −1 : 𝐷 → 𝐷. Since
+
+we can apply rule allpermute from Figure 10 to get
+
+T ⟦𝜏2⟧𝐻 ◦ 𝜙 −1 = 𝛽 ′ ◦ 𝜙 ′−1 ◦ 𝜋 ,
+
+⟨𝜙, 𝛽⟩𝐻 ⇒∗ ⟨𝜙 ′, 𝛽 ′⟩𝐻 ⇒allpermute ⟨𝜙, T ⟦𝜏2⟧𝐻 ⟩𝐻 ,
+
+(7)
+
+(8)
+
+where the sub-sequence ⟨𝜙, 𝛽⟩𝐻 ⇒∗ ⟨𝜙 ′, 𝛽 ′⟩𝐻 includes no allpermute transitions (by Theorem 6.4).
+The observation that at most one permutation is required at the end of a sequence allows us to
+give a low upper bound for the cost of normal form sequences. To discuss cost, however, we first
+need to introduce a cost model.
+
+6.2 Cost model based on data transfers
+We model the cost of collective operations in terms of the amount of data that is transferred. This
+amount is proportional to the number of devices that communicate, which we have therefore
+
+16
+
+Norman A. Rink, Adam Paszke, Dimitrios Vytiniotis, and Georg Stefan Schmid
+
+𝑝𝑖
+−−→ 𝜎𝑖+1)
+
+𝑐𝑜𝑠𝑡
+
+(cid:16)
+𝜎0
+
+𝑐𝑜𝑠𝑡 (𝜏1
+𝑐𝑜𝑠𝑡 (𝜏1
+𝑐𝑜𝑠𝑡 (𝜏1
+𝑐𝑜𝑠𝑡 (𝜏1
+
+(cid:17)
+
+𝑝𝑛−1
+−−−−→ 𝜎𝑛
+
+𝑝0
+−−→ · · ·
+allpermute
+−−−−−−−−−−→ 𝜏2)
+dynslice
+−−−−−−−−→ 𝜏2)
+allgather
+−−−−−−−−−→ 𝜏2)
+alltoall
+−−−−−−−−→ 𝜏2)
+
+= (cid:205)𝑛−1
+
+𝑖=0 𝑐𝑜𝑠𝑡 (𝜎𝑖
+= 𝑙𝑜𝑐𝑎𝑙𝑠𝑖𝑧𝑒 (𝜏1)
+= 0
+= 𝑙𝑜𝑐𝑎𝑙𝑠𝑖𝑧𝑒 (𝜏2)
+= 𝑙𝑜𝑐𝑎𝑙𝑠𝑖𝑧𝑒 (𝜏1)
+
+Fig. 11. Costs derived from the total number of bytes communicated, normalized to the number of devices.
+Derivations appear in Appendix B.
+
+factored out of the 𝑐𝑜𝑠𝑡 defined in Figure 11. Although the definitions in Figure 11 are written out
+for 𝜏1 −→∗ 𝜏2, they equally apply also to 𝜏1 ▶∗ 𝜏2 and ⟨𝜙, 𝛽⟩𝐻 ⇒∗ ⟨𝜙 ′, 𝛽 ′⟩𝐻 .
+
+Given the cost model, we can state the most specific version of our redistribution problem:
+
+Memory-constrained optimal-cost redistribution: For 𝜏1, 𝜏2 with 𝑔𝑙𝑜𝑏𝑎𝑙𝑡𝑦𝑝𝑒 (𝜏1) = 𝑔𝑙𝑜𝑏𝑎𝑙𝑡𝑦𝑝𝑒 (𝜏2),
+find 𝑠 : ⟨𝜙, T ⟦𝜏1⟧𝐻 ⟩𝐻 ⇒∗ ⟨𝜙, T ⟦𝜏2⟧𝐻 ⟩𝐻 with
+
+𝔥(𝑠) ≤ max(𝑙𝑜𝑐𝑎𝑙𝑠𝑖𝑧𝑒 (𝜏1), 𝑙𝑜𝑐𝑎𝑙𝑠𝑖𝑧𝑒 (𝜏2))
+
+and such that 𝑐𝑜𝑠𝑡 (𝑠) is minimal.
+
+The number of sequences that must be considered as candidate solutions to this problem is finite:
+there are only finitely many distributed types 𝜏 with 𝐻 ⊢ 𝜏 and given 𝑔𝑙𝑜𝑏𝑎𝑙𝑡𝑦𝑝𝑒 (𝜏). Sequences
+which include loops need not be considered since they cannot have minimum cost. Note that no
+loop can be formed only with the zero-cost dynslice operations. Finiteness implies that there exists
+a solution that is optimal with respect to 𝑐𝑜𝑠𝑡. We will now show that the theory established in the
+previous sections finds nearly optimal solutions.
+
+We first note that Lemmas 4.6 and 4.7 interact well with our cost model. Specifically, the trans-
+formation of a peak (or plateau) never yields a sequence of greater cost than the original peak (or
+plateau). Hence, we arrive at the following statement about normal forms.
+
+Lemma 6.5. For any sequence 𝑠 : 𝜏1 ▶∗ 𝜏2 between 𝜏1 and 𝜏2, there exists a sequence 𝑠nf : 𝜏1 ▶∗ 𝜏2 in
+
+normal form such that 𝑐𝑜𝑠𝑡 (𝑠nf) ≤ 𝑐𝑜𝑠𝑡 (𝑠).
+
+Lemma 6.5 does not say that normal forms are optimal with respect to our cost model, but it
+implies that there exists a normal form sequence (in ▶∗) of optimal cost. To use Lemma 6.5 in the
+context of a sequence ⟨𝜙, T ⟦𝜏1⟧𝐻 ⟩𝐻 ⇒∗ ⟨𝜙 ′, T ⟦𝜏2⟧𝐻 ⟩𝐻 , we first need to lift such a sequence to
+▶∗:7
+
+Lemma 6.6 (Lifting Lemma). Given a sequence
+
+𝑠 : ⟨𝜙, T ⟦𝜏1⟧𝐻 ⟩𝐻 ⇒𝑝1 · · · ⇒𝑝𝑚 ⟨𝜙 ′, T ⟦𝜏2⟧𝐻 ⟩𝐻 .
+We can construct a sequence 𝑠𝑤 : 𝜏1 ▶ 𝑞1 · · · ▶𝑞𝑛 𝜏2 where the 𝑞𝑖 are precisely those 𝑝 𝑗 that are not
+allpermute operations.
+
+Lemma 6.6 is proven by mapping every transition ⇒𝑝 𝑗 where 𝑝 𝑗 is not an allpermute operation
+to the corresponding transition ▶𝑝 . This works because of the preconditions 𝛽 ′ ◦ 𝜙 ′−1 = 𝛽 ◦ 𝜙 −1
+in Figure 10, which imply 𝛽 ′ ∼ 𝛽.
+
+We can now establish the main result of our formal work.
+
+7The terminology of lifting to ▶∗ may seem counter-intuitive given that the relation ▶ is a quotient: one might expect lifting
+to proceed from the quotient. We use the the term lifting here to mean the inverse process of the lowering from Theorem 6.4,
+where lowering carries its usual meaning in the context of code generation as ⇒ describes lower-level operations than ▶.
+
+Memory-efficient array redistribution through portable collective communication
+
+17
+
+Theorem 6.7 (Near Optimality). Let
+
+𝑠 : ⟨𝜙, T ⟦𝜏1⟧𝐻 ⟩𝐻 ⇒∗ ⟨𝜙, T ⟦𝜏2⟧𝐻 ⟩𝐻
+be a sequence in ⇒∗ of minimal 𝑐𝑜𝑠𝑡 (𝑠). There exists a sequence 𝑠 ′ : ⟨𝜙, T ⟦𝜏1⟧𝐻 ⟩𝐻 ⇒∗ ⟨𝜙, T ⟦𝜏2⟧𝐻 ⟩𝐻
+such that 𝑐𝑜𝑠𝑡 (𝑠 ′) ≤ 𝑐𝑜𝑠𝑡 (𝑠) + 𝑙𝑜𝑐𝑎𝑙𝑠𝑖𝑧𝑒 (𝜏2) and 𝑠 ′ is in normal form except for possibly a single
+allpermute as its last step.
+
+To prove Theorem 6.7, first lift 𝑠 to a sequence in ▶∗. Then, obtain a normal form sequence
+using Lemma 6.5. Finally, apply Theorem 6.4 and the reasoning that led to (8) to arrive at the desired
+sequence 𝑠 ′.
+
+We illustrate this result by taking another look at Example 4.9, which highlighted the problem
+
+that sequences of collective operations may include extraneous permutations.
+
+Example 6.8. Consider the redistribution problem from Example 4.9 over {𝑎0 : 2, 𝑎1 : 2, 𝑎2 : 2}.
+
+Theorem 6.7 may yield the solution
+
+⟨𝜙, [1{𝑎0, 𝑎1, 𝑎2}8, 8{}8]⟩𝐻 ⇒alltoall ⟨𝜙1, [2{𝑎1, 𝑎2}8, 4{𝑎0}8]⟩𝐻
+
+⇒alltoall ⟨𝜙2, [4{𝑎2}8, 2{𝑎1, 𝑎0}8]⟩𝐻 ⇒alltoall ⟨𝜙3, [8{}8, 1{𝑎2, 𝑎1, 𝑎0}8]⟩𝐻
+⇒allpermute ⟨𝜙, [8{}8, 1{𝑎0, 𝑎1, 𝑎2}8]⟩𝐻 .
+
+(9)
+
+Of the three allpermute operations in (5) only one remains in (9), and it appears at the end. Note
+that Theorem 6.4 does not control which base offset map in E⟦𝜏2⟧𝐻 is obtained after lowering
+𝜏1 ▶∗ 𝜏2 to ⇒∗. This means that moving permutations to the end may alternatively lead to
+
+⟨𝜙, [1{𝑎0, 𝑎1, 𝑎2}8, 8{}8]⟩𝐻 ⇒alltoall ⟨𝜙1, [2{𝑎0, 𝑎1}8, 4{𝑎2}8]⟩𝐻
+
+⇒alltoall ⟨𝜙2, [4{𝑎0}8, 2{𝑎1, 𝑎2}8]⟩𝐻 ⇒alltoall ⟨𝜙3, [8{}8, 1{𝑎0, 𝑎1, 𝑎2}8]⟩𝐻
+⇒allpermute ⟨𝜙, [8{}8, 1{𝑎0, 𝑎1, 𝑎2}8]⟩𝐻 .
+
+(10)
+
+If it then happens to be the case that 𝜙3 = 𝜙, the final allpermute operation is in fact not needed.
+
+It is worth stressing that, apart from Lemma 6.5, the results in the present section do not depend
+on the details of our cost model. Analogous results can be derived for any other choice of cost
+model so long as one takes care to separately track the cost of allpermute operations.
+
+7 FINDING NEARLY-OPTIMAL REDISTRIBUTIONS
+We know now that (i) sequences in normal form solve the memory-constrained redistribution
+problem; (ii) we can eliminate all intermediate allpermute collective operations in favour of at
+most a single allpermute operation at the end of a sequence; and (iii) there exist sequences that are
+within a bound of the minimal cost and are in normal form except for a potential final allpermute
+(which does not increase per-device memory consumption). Looking back at Examples 4.9 and 6.8,
+our central result Theorem 6.7 may construct needlessly long sequences for a redistribution as
+simple as [1{𝑎}8, 8{}8] ⇝ [8{}8, 1{𝑎}8]. This is a consequence of our requirement that axes be
+decomposed into axes of prime sizes. We now show how to find near-optimal sequences and how
+to merge (sub-)sequences of the same kind of operation into a single one. The decomposition of
+axes into prime factors in fact allows us to resolve both issues simultaneously.
+
+7.1 Merging collective operations
+The rules in Figure 10 only allow for transfers of a single axis 𝑥 at a time, with the exception of
+the allpermute rule. To enable merging of collective operations, e.g. the alltoalls in (9) or (10), we
+need more general allgather, alltoall and dynslice rules that can act on multiple axes at once.
+
+18
+
+Norman A. Rink, Adam Paszke, Dimitrios Vytiniotis, and Georg Stefan Schmid
+
+This is straightforward: the generalized multi-axes rules are obtained by replacing the single axis 𝑥
+in allgather, alltoall and dynslice with a sequence of axes 𝑥.8
+
+The multi-axes rules are well within the capabilities of distributed systems that provide MPI-
+style collectives; and the cost model from Figure 11 applies verbatim to the multi-axes collectives.
+What is more remarkable, but largely trivial to show, is that our results from Sections 4–6 carry
+over to collectives that act on multiple axes simultaneously. In particular, weak collectives are
+introduced completely analogously, and lowering from weak to low-level MPI-style collectives
+can be used as before to move allpermute operations to the end of a sequence. Hence, our central
+result, Theorem 6.7, holds also for sequences of multi-axes collectives.
+
+The multi-axes rules clearly enable merging of operations: whenever a collective operation that
+acts on axis 𝑥 appears next to an operation of the same kind that acts on axis 𝑦, a single instance of
+the same operation can be used to operate on both axes 𝑥, 𝑦 simultaneously. While semantically
+equivalent, using different numbers of collectives of the same kind may incur different costs.
+
+Example 7.1. Consider sequence (10). Its cost is 3 · 8 for the three allgather operations (plus
+another 8 if the final allpermute is required). In the presence of multi-axes collectives, sequence (10)
+is not the nearly-optimal solution that is guaranteed to exist by Theorem 6.7: the cost of
+
+⟨𝜙, [1{𝑎0, 𝑎1, 𝑎2}8, 8{}8]⟩𝐻 ⇒alltoall ⟨𝜙3, [8{}8, 1{𝑎0, 𝑎1, 𝑎2}8]⟩𝐻
+
+⇒allpermute ⟨𝜙, [8{}8, 1{𝑎0, 𝑎1, 𝑎2}8]⟩𝐻
+
+is only 8 for the single allgather operation (plus another 8 if the final allpermute is required).
+
+7.2 Redistribution as a shortest path problem
+We obtain near-optimal solutions of the memory-constrained redistribution problem by phrasing
+this problem as a shortest path search in a graph with weighted edges. From Section 6 we know that
+near-optimal sequences can be obtained by passing to weak semantic types and weak collectives.
+Based on this knowledge, we perform a shortest path search in the graph whose nodes are weak
+types E⟦𝜏⟧𝐻 , with fixed 𝑔𝑙𝑜𝑏𝑎𝑙𝑡𝑦𝑝𝑒 (𝜏). The edges in the graph are the weak collectives that define
+the relation ▶, and their weights are assigned according to our cost model from Figure 11.
+
+Having graph nodes represent weak types facilitates a simple encoding of nodes: it suffices to
+store only 𝑙𝑜𝑐𝑎𝑙𝑡𝑦𝑝𝑒 (𝜏) since, with fixed 𝑔𝑙𝑜𝑏𝑎𝑙𝑡𝑦𝑝𝑒 (𝜏), only 𝑙𝑜𝑐𝑎𝑙𝑡𝑦𝑝𝑒 (𝜏) is needed to identify the
+equivalence class E⟦𝜏⟧𝐻 . This has the convenient side effect of avoiding a combinatorial explosion
+that would result from tracking all possible permutations of axes in distributed dimensions. We
+further limit the nodes in our graph to only those types 𝜏 for which 𝑙𝑜𝑐𝑎𝑙𝑠𝑖𝑧𝑒 (𝜏) is bounded
+according to (4) because we are interested in solving memory-constrained redistribution problems.
+Graph edges correspond to transitions in the weak relation ▶ for multi-axes collectives, i.e. mul-
+tiple axes can be transferred along an edge. We run the shortest-path search with axes that have
+been fully decomposed into prime factors: if each axis corresponds to a prime factor, the multi-axes
+collectives will give rise to graph edges for all possible transfers of (non-prime) factors between
+distributed dimensions. In other words, our search space is not artificially constrained.
+
+Since our search procedure has access to graph edges that can transfer multiple axes at once, we
+know that a shortest path will necessarily contain only maximally merged allgather and alltoall
+
+8There is an alternative route to the multi-axes rules via another mild generalization of the low-level collectives from
+Figure 10: simply allow 𝐻 to vary across ⇒. Varying 𝐻 as in ⟨𝜙, 𝛽 ⟩𝐻 ⇒ ⟨𝜙′, 𝛽′⟩𝐻 ′ is no challenge for real systems since
+𝐻 , 𝐻 ′ have no physical meaning: only the combined maps 𝛽 ◦ 𝜙 −1, 𝛽′ ◦ 𝜙′−1 : 𝐷 → N𝑟 are physically significant. If 𝐻 is
+allowed to vary, then the multi-axes rules can be implemented on top of the ones from Figure 10 by passing to a new mesh
+𝐻 ′ with a single axis 𝑥 that has been formed by merging the 𝑥 from 𝐻 .
+
+Memory-efficient array redistribution through portable collective communication
+
+19
+
+[1{𝑦, 𝑥 }8, 8, 8, 4]
+[2{𝑥 }8, 4{𝑦 }8, 8, 4]
+[8, 4{𝑦 }8, 2{𝑥 }8, 4]
+
+alltoall(0, 1), cost 256
+alltoall(0, 2), cost 256
+
+[1{𝑦, 𝑥 }8, 8, 8, 4]
+[1{𝑦, 𝑥 }8, 8, 8, 1{𝑧 }4]
+[2{𝑥 }8, 4{𝑦 }8, 8, 1{𝑧 }4]
+[8, 4{𝑦 }8, 2{𝑥 }8, 1{𝑧 }4]
+[8, 4{𝑦 }8, 2{𝑥 }8, 4]
+
+dynslice(3, 𝑧), cost 0
+alltoall(0, 1), cost 64
+alltoall(0, 2), cost 64
+allgather(3), cost 256
+
+combined cost 512
+
+combined cost 384
+
+Fig. 12. Redistribution over the mesh {𝑥 : 4, 𝑦 : 2, 𝑧 : 4} without over-partitioning (left) and with over-
+partitioning (right).
+
+operations. This may not be the case for dynslice operations since they have zero cost, which
+means that having non-merged dynslice operations in a sequence is no disadvantage.
+
+Over-partitioning due to dynslice operations having cost zero. The fact that dynslice operations
+are assigned zero cost has another interesting consequence. If replicated axes are available in the
+mesh during the redistribution process, it may be beneficial to additionally partition the data that is
+being redistributed along these axes. This does not affect the semantics of the overall redistribution,
+but can have the effect of lowering the cost of intermediate alltoall operations. An example
+appears in Figure 12, where 𝑧 plays the role of the additionally available replicated axes. We refer
+to this effect as over-partitioning, and we have confirmed that over-partitioning does occur and can
+indeed outperform sequences without over-partitioning, but we leave a more detailed analysis to
+future work.
+
+7.3 Optimizations for (single) permutations
+Theorem 6.7 guarantees optimality up to at most a single permutation. In practice, whether this
+permutation occurs and where it occurs in a sequence of collectives affects performance. We address
+this with two optimizations:
+
+• If an allpermute is required at the end of our near-optimal sequence, we move this allpermute
+forward past any final allgather operations in the shortest path (if there are any). This makes
+the permutation cheaper due to smaller tile sizes.
+
+• When lowering the shortest path in ▶∗ to ⇒∗ (cf. Theorem 6.4), we need to concretize
+intermediate (semantic) types 𝜏 ′ (equivalently: base offset maps 𝛽 ′ ∈ E⟦𝜏 ′⟧𝐻 ). We do this by
+picking types 𝜏 ′ based on the axes that appear in the final type 𝜏2.
+
+To give an intuition for the latter optimization, consider the mesh {"x": 4, "y": 4} and the problem
+of redistributing [16] to [4{"x"}16]. Our search algorithm will (correctly) pick a dynslice but could
+accidentally lower by picking axis "y", resulting in the need to fix up with a permutation. (Note that
+the permutation is not a graph edge and hence it is hard to attribute a cost to it in our shortest-path
+search.) However, if we bias the algorithm to pick axis "x" from the final type, then this permutation
+can be elided.
+
+8 EVALUATION
+Based on the shortest path search, we have implemented a redistribution program synthesizer to
+answer the following research questions:
+
+RQ1. Can the shortest path search synthesize redistributions within an acceptable time budget?
+
+RQ2. How do our synthesized programs perform in comparison to redistributions generated by
+
+state-of-the-art tools?
+
+20
+
+Norman A. Rink, Adam Paszke, Dimitrios Vytiniotis, and Georg Stefan Schmid
+
+RQ3. How effective is our simple cost model at driving the shortest path search towards good
+
+solutions of redistribution problems?
+
+To answer these questions, we have randomly sampled 1000 redistribution problems with global
+array sizes of 64MB–800MB. The sampled problems use 3 mesh axes and up to 6D arrays, which
+are common parameters for arrays in deep learning applications. Each axis is randomly chosen
+either to be replicated or to partition one of the dimensions.
+
+With the sampled problems we were able to answer RQ1 in the affirmative: a non-optimized
+Python-based implementation of the shortest path search synthesizes a redistribution program for
+each of the sampled problems in under a second. This is certainly acceptable in the context of PartIR
+where the bottleneck of code generation is the search for partitioning strategies (cf. Section 2),
+typically taking minutes. We attribute the good performance of our search-based synthesizer to the
+elision of intermediate permutations, avoiding a combinatorial explosion, and the fact that typical
+redistribution problems use only a few axes and dimensions.
+
+To address RQ2, we compared with the SPMD partitioner built into XLA [34], which is a widely
+used compiler for ML workloads that features automatic partitioning utilities and hence is capable
+of generating redistribution programs. According to the XLA source code9, the redistribution
+algorithm is based on a set of carefully hand-crafted heuristics (that attempt, e.g., to synthesize
+alltoall sequences or to detect cases directly implementable via allpermute) with a fallback to
+allgather and dynslice (analogous to (2)).
+
+For the sampled redistribution problems, we have benchmarked programs generated both with
+our shortest path search and with XLA on a system of 8 Google TPU devices [14]. Figure 14
+displays the results, which suggest that for small redistribution problems our method yields largely
+equivalent performance to the XLA SPMD partitioner, but we can also demonstrate fairly significant
+improvements. Across all sampled problems our method attains a geometric mean speedup of 1.22×.
+Big speedups of up to 5.7×, cf. Figure 14b, occur when XLA falls back to an expensive allgather
+followed by dynslice. Our method never issues these expensive allgather operations as they are
+also memory inefficient.
+
+For a few small redistribution problems the XLA heuristics outperform our method by up to
+1.6×. The problems for which our method exhibits the biggest slowdowns compared to XLA are
+listed in Figure 13. A detailed analysis reveals that for these small transfers, dominated by latency,
+allgather followed by dynslice is faster (P1–P3) than the redistributions found by our search,
+which generates dynslice, alltoall and allpermute collectives to guarantee memory efficiency.
+Problem P4 is more interesting: XLA solves this by performing an allpermute and single allgather
+on a leading dimension to create an array of 𝑙𝑜𝑐𝑎𝑙𝑡𝑦𝑝𝑒 [4,8,16,16,8,16,8]. Through a sequence
+of local transpose and reshape operations this is transformed into the desired target type. Exploiting
+local reshapes like this, particularly for small transfers, would allow us to fuse allgather operations
+and is an interesting optimization that we could additionally apply. The complication is that
+reasoning about the cost of local reshapes is not straightforward as it may involve data re-layout
+and is backend-dependent.
+
+Figure 14a and the previous discussion around Figure 13 also let us answer RQ3: for larger
+redistributions, where the cost of data transfers dominates latency, our cost model clearly drives
+the shortest path search to efficient solutions. In the future, we may consider enhancing our cost
+model with latency characteristics and exploring the possibility of trading memory efficiency for
+lower run-time.
+
+9https://github.com/tensorflow/tensorflow/blob/8c6d9ae2b497ac99ec0b5a4a9a537d4f66e5e678/tensorflow/compiler/xla/
+service/spmd/spmd_partitioner.cc
+
+Memory-efficient array redistribution through portable collective communication
+
+21
+
+P1
+P2
+P3
+P4
+
+Source type
+[360, 184{c:2}368, 320]
+[80, 40{c:2}80, 72, 64]
+[296, 360, 156{c:2}312]
+[8{c:2}16, 16, 16, 8{a:2}16, \
+16, 8{b:2}16]
+
+Target type
+[90{c:2,a:2}360, 368, 160{b:2}320]
+[40{b:2}80, 80, 36{c:2}72, 64]
+[74{b:2,c:2}296, 180{a:2}360, 312]
+[16, 16, 16, 16, 16, 8{a:2}16]
+
+Global Size
+162MB
+113MB
+127MB
+64MB
+
+Slowdown
+1.6×
+1.6×
+1.5×
+1.5×
+
+Fig. 13. Redistribution problems where our approach leads to the biggest slowdowns when compared with
+the XLA SPMD partitioner.
+
+(a) Run-times: Points correspond to individual redis-
+tribution problems. Along the diagonal both meth-
+ods are equally fast. Points below the diagonal: our
+method outperforms the XLA SPMD partitioner.
+
+(b) Distribution of ratios of run-times. Values larger
+than 1.0 (to the right of the vertical dashed line) cor-
+respond to our search procedure yielding faster pro-
+grams than the XLA SPMD partitioner.
+
+Fig. 14. Comparison of redistribution programs synthesized by our search procedure and by the XLA SPMD
+partitioner.
+
+9 DISCUSSION
+We have established strong theoretical efficiency results for array redistribution when implemented
+with portable MPI-style collective operations. We have also confirmed experimentally that our theo-
+retical results translate into implementations of redistribution that yield good run-time performance,
+while guaranteeing memory-efficiency too.
+
+As we discuss in Section 10, previous research on redistributing arrays typically employs individ-
+ual device-to-device transfers, and our distributed type semantics in terms of base offset maps could
+readily be used to calculate such transfers. Instead, our work builds on collective operations for
+several reasons: (1) collective operations provide a simple set of primitives to use in the context of
+SPMD computations; (2) synthesizing sequences of collectives makes our work portable: instead of
+optimizing schedules of data transfers for different target platforms, we rely on already optimized
+collectives; (3) using collectives is the path taken by the production XLA SPMD implementation;
+(4) as demonstrated in this paper, collectives can be typed using distributed types, which provide
+an intuitive and firm framework for reasoning about correctness. However, collective communi-
+cation comes with the downside of global barriers where all devices have to synchronize, even
+if not all of them need to exchange data (e.g. in a permutation spanning only a few devices). A
+direct quantitative comparison between our approach based on collectives and more conventional
+device-to-device transfers is not meaningful in isolation since it depends strongly on the amount
+
+051015202530354045XLA SPMD [ms]051015202530354045Ours [ms]0.61.01.41.72.12.52.83.23.63.94.34.65.05.45.7XLA SPMD / Ours (ratio)050100150200250300350400Count22
+
+Norman A. Rink, Adam Paszke, Dimitrios Vytiniotis, and Georg Stefan Schmid
+
+of exploitable asynchrony in a system, a topic that we will likely revisit as our PartIR:SPMD and
+PartIR ecosystem matures.
+
+10 RELATED WORK
+
+Partitioning for machine learning (ML). The increasing scale of ML models has led to the creation
+of automated partitioners aimed at exposing model parallelism. Systems developed in the context
+of TensorFlow and XLA [16, 24, 34] emit SPMD programs, and could directly benefit from the
+redistribution techniques described in this paper. Popular ML frameworks such as PyTorch [21]
+and JAX [3] expose MPI collectives to their users, allowing them to explicitly program in the SPMD
+model, though JAX goes one step further and provides higher-level programming abstractions such
+as xmap(). The latest instantiation of XLA-based partitioning, the GSPMD partitioner [34], optimizes
+certain patterns of redistributions automatically, but leaves significant room for improvement, in
+particular for larger redistributions (as shown in Section 8).
+
+DistIR [23] is an automated partitioner for the MPMD model. FlexFlow [13] automatically
+partitions DNNs and executes the resulting graphs using the Legion runtime [2]. Legate NumPy [1]
+also builds on the Legion runtime and targets NumPy programming. When redistribution is required,
+systems like Legate or FlexFlow pass information to the Legion runtime about which tiles are
+needed on each processor for the next task, and Legion works out the minimum amount of data that
+needs to be sent from the source processors and schedules individual memory transfers for each
+tile. The HeAT system [11] also includes array partitioning specifications similar to our distributed
+types. Interestingly, HeAT does use an MPI-syle collectives interface like allgather to implement
+resplit() (redistribution) operations, and our work could be directly applicable.
+
+Data distributions for high-performance computing. Our distributed types essentially represent
+block decompositions of global arrays: each node holds a contiguous, local block, i.e. a tile, of the
+global array. This distribution strategy is particularly well-suited to linear algebra operations that
+expose “embarrassing parallelism”, such as element-wise operators and matrix multiplications.
+Earlier work on High Performance Fortran (HPF) [15] and distributed linear algebra libraries such
+as ScaLAPACK [10] considered the more general block-cyclic distribution and produced a wealth of
+literature on redistribution [8, 9, 20, 22, 28, 33]. Unlike our approach, these redistribution algorithms
+do not use MPI collectives, but typically rely on send/receive primitives to exchange data. We
+assume this is, at least in part, due to the MPI standard only stabilizing around the same time.
+Some works, e.g. [33], anticipate the utility of alltoall for reducing the number of individual
+communication operations, especially as redistributing multi-dimensional arrays has traditionally
+been done one dimension at a time.
+
+Languages and types for distributed data. Languages such as X10 [6], Chapel [4] and Regent [26]
+aim to make programming with distributed memory safe and efficient. To this end, type systems
+and static analyses have been proposed that track the locality of data [5, 7, 12, 17–19, 27] to ensure
+safety, to avoid inefficient access patterns, and to elide runtime checks [29–31]. PartIR:SPMD is
+a much simpler domain-specific language and its spmd_op can, by construction, only access local
+data. Hence a lot of this work is not directly applicable. In essence, we use the distributed types
+mainly as a formal language for the redistribution problem and its optimization.
+
+A PROOFS OF LEMMAS AND THEOREMS
+
+Proof of Lemma 4.1. By induction on 𝑥. If 𝑥 is empty, then 𝑐 = 𝑛 and 0 is the only multiple of 𝑛
+below 𝑛. The induction step makes use of the fact that, by 𝐻 ⊢ 𝑐{𝑥 }𝑛, no axis appears in 𝑥 more
+□
+than once.
+
+Memory-efficient array redistribution through portable collective communication
+
+23
+
+Proof of Lemma 4.2. Let 𝜏 = [𝑑1, . . . , 𝑑𝑛] and apply Lemma 4.1 to each of the 𝑑𝑖 . The tuples in
+the image of T ⟦𝜏⟧𝐻 then contain all combinations of values from the images of the D⟦𝑑𝑖 ⟧𝐻 since,
+□
+by 𝐻 ⊢ 𝜏, no axis appears in more than one of the 𝑑𝑖 .
+
+Proof of Lemma 4.6. By T-AllGather, the allgather(𝑖) operates on an axis 𝑦 : 𝑚 ∈ 𝐻 at
+
+dimension 𝑖. By T-DynSlice, we have 𝑥 : 𝑛 ∈ 𝐻 . Now the proof proceeds by case analysis.
+
+(1) 𝑖 = 𝑗, 𝑥 = 𝑦: In this case, 𝜎0 = 𝜎2 and the desired sequence is the empty one.
+(2) 𝑖 = 𝑗, 𝑥 ≠ 𝑦: If 𝑚 = 𝑛, then 𝑙𝑜𝑐𝑎𝑙𝑠𝑖𝑧𝑒 (𝜎0) = 𝑙𝑜𝑐𝑎𝑙𝑠𝑖𝑧𝑒 (𝜎2) and hence 𝜎0
+
+allpermute
+−−−−−−−−−→ 𝜎2. If
+
+𝑚 ≠ 𝑛:
+
+𝜎0 = [. . . , 𝑐𝑖 {𝑦, 𝑥𝑖 }𝑠𝑖, . . . , . . .]
+
+dynslice( 𝑗,𝑥)
+−−−−−−−−−−−→ [. . . , 𝑐𝑖 /𝑛{𝑥, 𝑦, 𝑥𝑖 }𝑠𝑖, . . .]
+
+allpermute
+−−−−−−−−−→ [. . . , 𝑐𝑖 /𝑛{𝑦, 𝑥, 𝑥𝑖 }𝑠𝑖, . . .]
+
+allgather(𝑖)
+−−−−−−−−−−→ [. . . , (𝑐𝑖 /𝑛 · 𝑚){𝑥, 𝑥𝑖 }𝑠𝑖, . . .] = 𝜎2 .
+
+Here we used the fact that 𝑚, 𝑛 are assumed prime. From rule T-DynSlice in the original
+· 𝑛, which
+sequence we know that there exists 𝑐 ′
+allows us to apply T-DynSlice to 𝜎0.
+
+𝑖 · 𝑛. Therefore, 𝑐𝑖 = 𝑐 ′′
+𝑖
+
+𝑖 such that 𝑐𝑖 · 𝑚 = 𝑐 ′
+
+(3) 𝑖 ≠ 𝑗, 𝑥 = 𝑦: In this case, 𝜎0
+(4) 𝑖 ≠ 𝑗, 𝑥 ≠ 𝑦: In this case, the operations allgather(𝑖) and dynslice( 𝑗, 𝑥) commute.
+
+alltoall(𝑖,𝑗)
+−−−−−−−−−−→ 𝜎2 is the desired sequence.
+
+Note that in cases (2) and (4) the peak of the original sequence has been transformed into a valley.
+In cases (1) and (3), it has been replaced with a flat line, where the trivial sequence from case (1) is
+□
+considered flat.
+
+Proof of Lemma 4.7. Consider the case of a rising edge, i.e. the situation in the top left corner of
+the (graphical) statement of the lemma. The proof proceeds by analyzing all possible cases for 𝑝 and
+𝑖. Here, we restrict ourselves to the cases for 𝑝 = alltoall(𝑘, 𝑙). Note first that by T-AllGather,
+the allgather(𝑖) operates on an axis 𝑥 : 𝑚 ∈ 𝐻 ; and by T-AllToAll, 𝑝 operates on axis 𝑦 : 𝑛 ∈ 𝐻 .
+(1) 𝑖 = 𝑘 ≠ 𝑙: In this case, 𝜎0 = [. . . , 𝑐𝑖 {𝑥, 𝑦, 𝑥 }𝑠𝑖, . . .] and hence there exists a permutation such
+allgather(𝑖)
+−−−−−−−−−−→ 𝜎2.
+
+alltoall(𝑖,𝑙)
+−−−−−−−−−−→ 𝜎 ′
+1
+
+that 𝜎0
+
+allpermute
+−−−−−−−−−→ 𝜎 ′
+0
+(2) 𝑖 = 𝑙 ≠ 𝑘: In this case,
+
+𝜎0 = [. . . , 𝑐𝑖 {𝑥, 𝑥𝑖 }𝑠𝑖, . . . , 𝑐𝑘 {𝑦, 𝑥𝑘 }𝑠𝑘, . . .] ,
+𝜎2 = [. . . , (𝑐𝑖 /𝑛 · 𝑚){𝑦, 𝑥𝑖 }𝑠𝑖, . . . , (𝑐𝑘 · 𝑛){𝑥𝑘 }𝑠𝑘, . . .] .
+
+If 𝑚 = 𝑛, then 𝜎0
+are prime, the following sequence exists:
+
+allpermute
+−−−−−−−−−→ 𝜎 ′
+1
+
+allgather(𝑘)
+−−−−−−−−−−→ 𝜎2. If 𝑚 ≠ 𝑛, using again the fact that 𝑚 and 𝑛
+
+𝜎0 = [. . . , 𝑐𝑖 {𝑥, 𝑥𝑖 }𝑠𝑖, . . . , 𝑐𝑘 {𝑦, 𝑥𝑘 }𝑠𝑘, . . .]
+
+alltoall(𝑘,𝑖)
+−−−−−−−−−−→ [. . . , 𝑐𝑖 /𝑛{𝑦, 𝑥, 𝑥𝑖 }𝑠𝑖, . . . , (𝑐𝑘 · 𝑛){𝑥𝑘 }𝑠𝑘, . . .]
+
+allpermute
+−−−−−−−−−→ [. . . , 𝑐𝑖 /𝑛{𝑥, 𝑦, 𝑥𝑖 }𝑠𝑖, . . . , (𝑐𝑘 · 𝑛){𝑥𝑘 }𝑠𝑘, . . .]
+allgather(𝑖)
+−−−−−−−−−−→ [. . . , (𝑐𝑖 /𝑛 · 𝑚){𝑦, 𝑥𝑖 }𝑠𝑖, . . . , (𝑐𝑘 · 𝑛){𝑥𝑘 }𝑠𝑘, . . .] = 𝜎2 .
+
+(3) 𝑖 ≠ 𝑘, 𝑖 ≠ 𝑙: In this case, the operations allgather(𝑖) and alltoall(𝑘, 𝑙) commute.
+The remaining cases, i.e. where 𝑝 ∈ {allpermute}, are treated analogously. Note that to make
+the case analysis manageable, one should split allpermute into three more low-level permutations:
+(i) swapping two axes within a dimension, (ii) swapping two axes across different dimensions, (iii)
+
+24
+
+Norman A. Rink, Adam Paszke, Dimitrios Vytiniotis, and Georg Stefan Schmid
+
+swapping an axis for a replicated one. This presents no loss of generality since any permutation
+can be decomposed into a sequence of these special permuations (i)–(iii).
+
+Finally, the case of a falling edge, i.e. the situation in the bottom left corner of the (graphical)
+□
+
+lemma statement, is handled in an entirely dual fashion.
+
+Proof of Theorem 4.8. Repeated application of Lemmas 4.6, 4.7. This process reaches a fixed
+point when there are no more peaks or rising or falling edges. Hence, the resulting sequence is in
+□
+normal form.
+
+Proof of Lemma 5.1. The preconditions in the lemma statement guarantee that the images of
+T ⟦𝜏1⟧𝐻 , T ⟦𝜏2⟧𝐻 contain the same base offsets, for identical numbers of tiles of identical sizes. □
+
+Proof of Lemma 6.3. Consider 𝑝 ∈ {allgather}. We obtain 𝛽 ∼ T ⟦[. . . , 𝑐𝑖 {𝑥, 𝑥𝑖 }𝑠𝑖, . . .]⟧𝐻 by
+applying rule inversion to 𝜏1 ▶𝑝 𝜏2. Hence, 𝛽 = T ⟦[. . . , 𝑐𝑖 {𝑦, 𝑧, 𝑥 }𝑠𝑖, . . .]⟧𝐻 with suitable 𝑥, 𝑦, 𝑧,
+where axis 𝑧 has the same size as 𝑥. (This uses the fact that axis sizes are prime.) From rule allgather
+in Figure 10 we then get ⟨𝜙, 𝛽⟩𝐻,𝐷 ⇒𝑝 ⟨𝜙 ′, 𝛽 ′′⟩𝐻,𝐷 with 𝛽 ′′ = T ⟦[. . . , (𝑐𝑖 ·𝑛){𝑦, 𝑥 }𝑠𝑖, . . .]⟧𝐻 . Because
+of 𝜏1 ▶𝑝 𝜏2 we also have E⟦𝜏2⟧𝐻 = E⟦[. . . , (𝑐𝑖 · 𝑛){𝑥𝑖 }𝑠𝑖, . . .]⟧𝐻 = E⟦[. . . , (𝑐𝑖 · 𝑛){𝑦, 𝑥 }𝑠𝑖, . . .]⟧𝐻 .
+Hence, 𝛽 ′′ ∈ E⟦𝜏2⟧𝐻 .
+
+Consider now 𝑝 ∈ {dynslice}. As before, we get 𝛽 ∼ T ⟦[. . . , (𝑐𝑖 ·𝑛){𝑥𝑖 }𝑠𝑖, . . .]⟧𝐻 and E⟦𝜏2⟧𝐻 =
+E⟦[. . . , 𝑐𝑖 {𝑥, 𝑥𝑖 }𝑠𝑖, . . .]⟧𝐻 by inverting 𝜏1 ▶𝑝 𝜏2. Therefore 𝛽 = T ⟦[. . . , (𝑐𝑖 · 𝑛){𝑥 }𝑠𝑖, . . .]⟧𝐻 with
+suitable 𝑥. Hence, from dynslice in Figure 10 we conclude ⟨𝜙, 𝛽⟩𝐻,𝐷 ⇒𝑝 ⟨𝜙 ′, 𝛽 ′⟩𝐻,𝐷 with 𝛽 ′ =
+T ⟦[. . . , 𝑐𝑖 {𝑥, 𝑥 }𝑠𝑖, . . .]⟧𝐻 ∈ E⟦𝜏2⟧𝐻 .
+
+The case 𝑝 ∈ {alltoall} is treated as an amalgamation of the previously considered cases. □
+
+Proof of Theorem 6.4. By induction on the length of the sequence 𝜏1 ▶∗ 𝜏2 and application of
+□
+
+Lemma 6.3.
+
+Proof of Lemma 6.5. Lemmas 4.6 and 4.7 carry over to ▶. In these weak version of the lemmas,
+none of the transformations applied to a sequence in ▶∗ increase 𝑐𝑜𝑠𝑡. In particular, Lemma 4.7 does
+not introduce more alltoall operations than are already in the sequence. Therefore, repeatedly
+□
+applying the weak versions of Lemmas 4.6 and 4.7 to 𝑠 yields the desired 𝑠nf in normal form.
+
+Proof of Lemma 6.6. The proof is straightforward by turning rules from Figure 10 with labels
+𝑝 𝑗 ∉ {allpermute} into the corresponding transitions for ▶. Note that this works for 𝑝 𝑗 ∈
+{allgather, alltoall} because the precondition 𝛽 ′ ◦ 𝜙 ′−1 = 𝛽 ◦ 𝜙 −1 can be written as 𝛽 ′ =
+𝛽 ◦ 𝜙 −1 ◦ 𝜙 ′, which means that 𝛽 ′ ∼ 𝛽. Similarly, the 𝑝 𝑗 ∈ {allpermute} disappear when passing
+□
+to ▶ because the preconditions of allpermute in Figure 10 imply 𝛽 ′ ∼ 𝛽.
+
+Proof of Theorem 6.7. First use Lemma 6.6 to pass to a sequence 𝑠𝑤 : 𝜏1 ▶∗ 𝜏2 with 𝑐𝑜𝑠𝑡 (𝑠𝑤) ≤
+𝑐𝑜𝑠𝑡 (𝑠) (because there are no allpermute transitions in 𝑠𝑤). Then, by Lemma 6.5, there exists
+a normal form sequence 𝑠nf : 𝜏1 ▶∗ 𝜏2 with 𝑐𝑜𝑠𝑡 (𝑠nf) ≤ 𝑐𝑜𝑠𝑡 (𝑠𝑤). By Theorem 6.4 we obtain a
+sequence 𝑠 ′′ : ⟨𝜙, T ⟦𝜏1⟧𝐻 ⟩𝐻 ⇒∗ ⟨𝜙 ′, 𝛽 ′⟩𝐻 with 𝛽 ′ ∈ E⟦𝜏2⟧𝐻 and 𝑐𝑜𝑠𝑡 (𝑠 ′′) = 𝑐𝑜𝑠𝑡 (𝑠nf). Then apply
+the reasoning that led to (8) to obtain 𝑠 ′ : ⟨𝜙, T ⟦𝜏1⟧𝐻 ⟩𝐻 ⇒∗ ⟨𝜙, T ⟦𝜏2⟧𝐻 ⟩𝐻 , which may include a
+single, final allpermute. Hence 𝑐𝑜𝑠𝑡 (𝑠 ′) ≤ 𝑐𝑜𝑠𝑡 (𝑠 ′′) + 𝑙𝑜𝑐𝑎𝑙𝑠𝑖𝑧𝑒 (𝜏2). Putting all previous estimates
+for 𝑐𝑜𝑠𝑡 together, we find
+
+𝑐𝑜𝑠𝑡 (𝑠 ′) ≤ 𝑐𝑜𝑠𝑡 (𝑠 ′′) + 𝑙𝑜𝑐𝑎𝑙𝑠𝑖𝑧𝑒 (𝜏2)
+= 𝑐𝑜𝑠𝑡 (𝑠nf) + 𝑙𝑜𝑐𝑎𝑙𝑠𝑖𝑧𝑒 (𝜏2)
+≤ 𝑐𝑜𝑠𝑡 (𝑠𝑤) + 𝑙𝑜𝑐𝑎𝑙𝑠𝑖𝑧𝑒 (𝜏2)
+≤ 𝑐𝑜𝑠𝑡 (𝑠) + 𝑙𝑜𝑐𝑎𝑙𝑠𝑖𝑧𝑒 (𝜏2) ,
+
+as required.
+
+□
+
+Memory-efficient array redistribution through portable collective communication
+
+25
+
+B DERIVATION OF DATA TRANSFER COST
+To derive 𝑐𝑜𝑠𝑡 from Figure 11, we count the number of array elements that are transferred between
+devices by each of the collective operations. We let 𝛿 be the number of devices in the fixed device
+mesh 𝐻 . Note that 𝛿 is equal to the product of the sizes of the axes in 𝐻 .
+
+(1) 𝜏1
+
+allpermute
+−−−−−−−−−→ 𝜏2
+
+Each device in the mesh 𝐻 holds a local tile of 𝑙𝑜𝑐𝑎𝑙𝑠𝑖𝑧𝑒 (𝜏1) array elements. In a general
+permutation, each tile must move across the device network to a new device in order to
+produce the final distributed type 𝜏2. Hence, the total number of array elements transferred
+is 𝛿 · 𝑙𝑜𝑐𝑎𝑙𝑠𝑖𝑧𝑒 (𝜏1). To obtain 𝑐𝑜𝑠𝑡, we normalize this number by 𝛿, which gives
+
+(cid:18)
+𝜏1
+
+𝑐𝑜𝑠𝑡
+
+allpermute
+−−−−−−−−−→ 𝜏2
+
+(cid:19)
+
+= 𝑙𝑜𝑐𝑎𝑙𝑠𝑖𝑧𝑒 (𝜏1) .
+
+Note that since 𝜏1 and 𝜏2 are related by an allpermute operation, we have 𝑙𝑜𝑐𝑎𝑙𝑠𝑖𝑧𝑒 (𝜏1) =
+𝑙𝑜𝑐𝑎𝑙𝑠𝑖𝑧𝑒 (𝜏2).
+
+(2) 𝜏1
+
+dynslice
+−−−−−−−→ 𝜏2
+
+Since dynslice is a purely local operation, no data is transferred. Therefore,
+
+(cid:18)
+𝜏1
+
+𝑐𝑜𝑠𝑡
+
+dynslice(_,_)
+−−−−−−−−−−→ 𝜏2
+
+(cid:19)
+
+= 0 .
+
+(3) 𝜏1
+
+allgather
+−−−−−−−−→ 𝜏2
+
+Let 𝑛 be the size of the axis that the allgather operates on. When considering a multi-axes
+allgather that operates on axes 𝑥, then 𝑛 is the product of the sizes of the axes in 𝑥. (Note
+that this product is no longer prime if there is more than one axis in 𝑥.)
+An allgather operation gathers tiles among groups of devices along axis 𝑥 (along multiple
+axes 𝑥, respectively). Each group contains 𝑛 devices. Hence there are 𝛿/𝑛 groups in total. Each
+device holds 𝑙𝑜𝑐𝑎𝑙𝑠𝑖𝑧𝑒 (𝜏1) array elements and within each group, tiles must be exchanged
+between each pair of devices. Hence, the communication within a group amounts to 𝑛2 ·
+𝑙𝑜𝑐𝑎𝑙𝑠𝑖𝑧𝑒 (𝜏1). This makes for a total transfer of
+
+𝛿/𝑛 · 𝑛2 · 𝑙𝑜𝑐𝑎𝑙𝑠𝑖𝑧𝑒 (𝜏1) = 𝛿 · 𝑛 · 𝑙𝑜𝑐𝑎𝑙𝑠𝑖𝑧𝑒 (𝜏1)
+
+array elements. Normalizing by 𝛿, and noting that 𝑙𝑜𝑐𝑎𝑙𝑠𝑖𝑧𝑒 (𝜏2) = 𝑛 · 𝑙𝑜𝑐𝑎𝑙𝑠𝑖𝑧𝑒 (𝜏1), we find
+(cid:19)
+
+(cid:18)
+𝜏1
+
+𝑐𝑜𝑠𝑡
+
+allgather(_)
+−−−−−−−−−−→ 𝜏2
+
+= 𝑙𝑜𝑐𝑎𝑙𝑠𝑖𝑧𝑒 (𝜏2) .
+
+(4) 𝜏1
+
+alltoall
+−−−−−−−→ 𝜏2
+
+Let 𝑛 be the size of the axis that the alltoall operates on, i.e. the axis that is transferred
+between dimensions by the alltoall. When considering a multi-axes alltoall that operates
+on axes 𝑥, then 𝑛 is, again, the product of the sizes of the axes in 𝑥.
+Now, alltoall operates as follows:
+• Split the local tile on each device into 𝑛 tiles of size 𝑙𝑜𝑐𝑎𝑙𝑠𝑖𝑧𝑒 (𝜏1)/𝑛.
+• Each of these 𝑛 tiles either remains local or is sent to exactly one other device.
+
+26
+
+Norman A. Rink, Adam Paszke, Dimitrios Vytiniotis, and Georg Stefan Schmid
+
+• After all communication is done, each device locally concatenates all smaller tiles of size
+𝑙𝑜𝑐𝑎𝑙𝑠𝑖𝑧𝑒 (𝜏1)/𝑛 it has received, which produces local tiles of 𝑙𝑜𝑐𝑎𝑙𝑠𝑖𝑧𝑒 (𝜏1) = 𝑙𝑜𝑐𝑎𝑙𝑠𝑖𝑧𝑒 (𝜏2).
+Since each device sends 𝑛 tiles of size 𝑙𝑜𝑐𝑎𝑙𝑠𝑖𝑧𝑒 (𝜏1)/𝑛, the total amount of transferred data is
+
+𝛿 · 𝑛 · 𝑙𝑜𝑐𝑎𝑙𝑠𝑖𝑧𝑒 (𝜏1)/𝑛 = 𝛿 · 𝑙𝑜𝑐𝑎𝑙𝑠𝑖𝑧𝑒 (𝜏1) .
+
+(Note that the number of tiles that remain local is of lower order in 𝑛. To a first approximation,
+we neglect this number.) After normalizing by 𝛿, we find
+
+(cid:18)
+𝜏1
+
+𝑐𝑜𝑠𝑡
+
+alltoall(_,_)
+−−−−−−−−−−→ 𝜏2
+
+(cid:19)
+
+= 𝑙𝑜𝑐𝑎𝑙𝑠𝑖𝑧𝑒 (𝜏1) .
+
+REFERENCES
+[1] Michael Bauer and Michael Garland. 2019. Legate NumPy: Accelerated and Distributed Array Computing. In Proceedings
+of the International Conference for High Performance Computing, Networking, Storage and Analysis (Denver, Colorado)
+(SC ’19). Association for Computing Machinery, New York, NY, USA, Article 23, 23 pages. https://doi.org/10.1145/
+3295500.3356175
+
+[2] Michael Bauer, Sean Treichler, Elliott Slaughter, and Alex Aiken. 2012. Legion: Expressing Locality and Independence
+with Logical Regions. In Proceedings of the International Conference on High Performance Computing, Networking,
+Storage and Analysis (Salt Lake City, Utah) (SC ’12). IEEE Computer Society Press, Washington, DC, USA, Article 66,
+11 pages.
+
+[3] James Bradbury, Roy Frostig, Peter Hawkins, Matthew James Johnson, Chris Leary, Dougal Maclaurin, George Necula,
+Adam Paszke, Jake VanderPlas, Skye Wanderman-Milne, and Qiao Zhang. 2018. JAX: composable transformations of
+Python+NumPy programs. http://github.com/google/jax
+
+[4] B.L. Chamberlain, D. Callahan, and H.P. Zima. 2007. Parallel Programmability and the Chapel Language. The
+International Journal of High Performance Computing Applications 21, 3 (2007), 291–312. https://doi.org/10.1177/
+1094342007078442 arXiv:https://doi.org/10.1177/1094342007078442
+
+[5] Satish Chandra, Vijay Saraswat, Vivek Sarkar, and Rastislav Bodik. 2008. Type Inference for Locality Analysis of
+Distributed Data Structures. In Proceedings of the 13th ACM SIGPLAN Symposium on Principles and Practice of Parallel
+Programming (Salt Lake City, UT, USA) (PPoPP ’08). Association for Computing Machinery, New York, NY, USA, 11–22.
+https://doi.org/10.1145/1345206.1345211
+
+[6] Philippe Charles, Christian Grothoff, Vijay Saraswat, Christopher Donawa, Allan Kielstra, Kemal Ebcioglu, Christoph
+von Praun, and Vivek Sarkar. 2005. X10: An Object-Oriented Approach to Non-Uniform Cluster Computing. In
+Proceedings of the 20th Annual ACM SIGPLAN Conference on Object-Oriented Programming, Systems, Languages, and
+Applications (San Diego, CA, USA) (OOPSLA ’05). Association for Computing Machinery, New York, NY, USA, 519–538.
+https://doi.org/10.1145/1094811.1094852
+
+[7] Gwenaël Delaval, Alain Girault, and Marc Pouzet. 2008. A type system for the automatic distribution of higher-order
+synchronous dataflow programs. In Proceedings of the 2008 ACM SIGPLAN-SIGBED conference on Languages, compilers,
+and tools for embedded systems. 101–110.
+
+[8] F. Desprez, J. Dongarra, A. Petitet, C. Randriamaro, and Y. Robert. 1998. Scheduling block-cyclic array redistribution.
+
+IEEE Transactions on Parallel and Distributed Systems 9, 2 (1998), 192–205. https://doi.org/10.1109/71.663945
+
+[9] Jack J Dongarra, Robert van de Geijn, and David W Walker. 1992. A look at scalable dense linear algebra libraries.
+
+Technical Report. Oak Ridge National Lab., TN (United States).
+
+[10] Jack J Dongarra and David W Walker. 1995. Software libraries for linear algebra computations on high performance
+
+computers. SIAM review 37, 2 (1995), 151–180.
+
+[11] Markus Götz, Charlotte Debus, Daniel Coquelin, Kai Krajsek, Claudia Comito, Philipp Knechtges, Björn Hagemeier,
+Michael Tarnawa, Simon Hanselmann, Martin Siggel, Achim Basermann, and Achim Streit. 2020. HeAT - a Distributed
+and GPU-accelerated Tensor Framework for Data Analytics. In IEEE International Conference on Big Data, Big Data
+2020, Atlanta, GA, USA, December 10-13, 2020, Xintao Wu, Chris Jermaine, Li Xiong, Xiaohua Hu, Olivera Kotevska,
+Siyuan Lu, Weija Xu, Srinivas Aluru, Chengxiang Zhai, Eyhab Al-Masri, Zhiyuan Chen, and Jeff Saltz (Eds.). IEEE,
+276–287. https://doi.org/10.1109/BigData50022.2020.9378050
+
+[12] Christian Grothoff, Jens Palsberg, and Vijay Saraswat. 2006. A type system for distributed arrays. Unpublished draft
+
+(2006).
+
+[13] Zhihao Jia, Matei Zaharia, and Alex Aiken. 2019. Beyond Data and Model Parallelism for Deep Neural Networks. In
+Proceedings of Machine Learning and Systems 2019, MLSys 2019, Stanford, CA, USA, March 31 - April 2, 2019, Ameet
+Talwalkar, Virginia Smith, and Matei Zaharia (Eds.). mlsys.org. https://proceedings.mlsys.org/book/265.pdf
+
+Memory-efficient array redistribution through portable collective communication
+
+27
+
+[14] Norman P. Jouppi, Cliff Young, Nishant Patil, David Patterson, Gaurav Agrawal, Raminder Bajwa, Sarah Bates, Suresh
+Bhatia, Nan Boden, Al Borchers, Rick Boyle, Pierre-luc Cantin, Clifford Chao, Chris Clark, Jeremy Coriell, Mike
+Daley, Matt Dau, Jeffrey Dean, Ben Gelb, Tara Vazir Ghaemmaghami, Rajendra Gottipati, William Gulland, Robert
+Hagmann, C. Richard Ho, Doug Hogberg, John Hu, Robert Hundt, Dan Hurt, Julian Ibarz, Aaron Jaffey, Alek Jaworski,
+Alexander Kaplan, Harshit Khaitan, Daniel Killebrew, Andy Koch, Naveen Kumar, Steve Lacy, James Laudon, James
+Law, Diemthu Le, Chris Leary, Zhuyuan Liu, Kyle Lucke, Alan Lundin, Gordon MacKean, Adriana Maggiore, Maire
+Mahony, Kieran Miller, Rahul Nagarajan, Ravi Narayanaswami, Ray Ni, Kathy Nix, Thomas Norrie, Mark Omernick,
+Narayana Penukonda, Andy Phelps, Jonathan Ross, Matt Ross, Amir Salek, Emad Samadiani, Chris Severn, Gregory
+Sizikov, Matthew Snelham, Jed Souter, Dan Steinberg, Andy Swing, Mercedes Tan, Gregory Thorson, Bo Tian, Horia
+Toma, Erick Tuttle, Vijay Vasudevan, Richard Walter, Walter Wang, Eric Wilcox, and Doe Hyun Yoon. 2017.
+In-
+Datacenter Performance Analysis of a Tensor Processing Unit. SIGARCH Comput. Archit. News 45, 2 (June 2017), 1–12.
+https://doi.org/10.1145/3140659.3080246
+
+[15] Charles H Koelbel, David B Loveman, Robert S Schreiber, Guy Lewis Steele Jr, and Mary Zosel. 1994. The high
+
+performance Fortran handbook. MIT press.
+
+[16] Dmitry Lepikhin, HyoukJoong Lee, Yuanzhong Xu, Dehao Chen, Orhan Firat, Yanping Huang, Maxim Krikun, Noam
+Shazeer, and Zhifeng Chen. 2020. GShard: Scaling Giant Models with Conditional Computation and Automatic
+Sharding. CoRR abs/2006.16668 (2020). arXiv:2006.16668 https://arxiv.org/abs/2006.16668
+
+[17] Ben Liblit and Alexander Aiken. 2000. Type Systems for Distributed Data Structures. In Proceedings of the 27th ACM
+SIGPLAN-SIGACT Symposium on Principles of Programming Languages (Boston, MA, USA) (POPL ’00). Association for
+Computing Machinery, New York, NY, USA, 199–213. https://doi.org/10.1145/325694.325717
+
+[18] Ben Liblit, Alex Aiken, and Katherine Yelick. 2003. Type systems for distributed data sharing. In International Static
+
+Analysis Symposium. Springer, 273–294.
+
+[19] Tom Murphy VII, Karl Crary, and Robert Harper. 2007. Type-Safe Distributed Programming with ML5. In Trustworthy
+Global Computing, Third Symposium, TGC 2007, Sophia-Antipolis, France, November 5-6, 2007, Revised Selected Papers
+(Lecture Notes in Computer Science, Vol. 4912), Gilles Barthe and Cédric Fournet (Eds.). Springer, 108–123. https:
+//doi.org/10.1007/978-3-540-78663-4_9
+
+[20] Neungsoo Park, Viktor K. Prasanna, and Cauligi Raghavendra. 1998. Efficient Algorithms for Block-Cyclic Array
+Redistribution between Processor Sets. In Proceedings of the 1998 ACM/IEEE Conference on Supercomputing (San Jose,
+CA) (SC ’98). IEEE Computer Society, USA, 1–13.
+
+[21] Adam Paszke, Sam Gross, Francisco Massa, Adam Lerer, James Bradbury, Gregory Chanan, Trevor Killeen, Zeming
+Lin, Natalia Gimelshein, Luca Antiga, Alban Desmaison, Andreas Kopf, Edward Yang, Zachary DeVito, Martin Raison,
+Alykhan Tejani, Sasank Chilamkurthy, Benoit Steiner, Lu Fang, Junjie Bai, and Soumith Chintala. 2019. PyTorch: An
+Imperative Style, High-Performance Deep Learning Library. In Advances in Neural Information Processing Systems 32,
+H. Wallach, H. Larochelle, A. Beygelzimer, F. d'Alché-Buc, E. Fox, and R. Garnett (Eds.). Curran Associates, Inc., 8024–
+8035. http://papers.neurips.cc/paper/9015-pytorch-an-imperative-style-high-performance-deep-learning-library.pdf
+[22] S. Ramasulamy and P. Banerjee. 1995. Automatic generation of efficient array redistribution routines for distributed
+memory multicomputers. In Proceedings Frontiers ’95. The Fifth Symposium on the Frontiers of Massively Parallel
+Computation. 342–349. https://doi.org/10.1109/FMPC.1995.380436
+
+[23] Keshav Santhanam, Siddharth Krishna, Ryota Tomioka, Andrew Fitzgibbon, and Tim Harris. 2021. DistIR: An
+Intermediate Representation for Optimizing Distributed Neural Networks. In Proceedings of the 1st Workshop on
+Machine Learning and Systems (Online, United Kingdom) (EuroMLSys ’21). Association for Computing Machinery, New
+York, NY, USA, 15–23. https://doi.org/10.1145/3437984.3458829
+
+[24] Noam Shazeer, Youlong Cheng, Niki Parmar, Dustin Tran, Ashish Vaswani, Penporn Koanantakool, Peter Hawkins,
+HyoukJoong Lee, Mingsheng Hong, Cliff Young, Ryan Sepassi, and Blake Hechtman. 2018. Mesh-TensorFlow: Deep
+Learning for Supercomputers. In Neural Information Processing Systems.
+
+[25] Mohammad Shoeybi, Mostofa Patwary, Raul Puri, Patrick LeGresley, Jared Casper, and Bryan Catanzaro. 2019. Megatron-
+LM: Training Multi-Billion Parameter Language Models Using Model Parallelism. CoRR abs/1909.08053 (2019).
+arXiv:1909.08053 http://arxiv.org/abs/1909.08053
+
+[26] Elliott Slaughter, Wonchan Lee, Sean Treichler, Michael Bauer, and Alex Aiken. 2015. Regent: A High-Productivity
+Programming Language for HPC with Logical Regions. In Proceedings of the International Conference for High Perfor-
+mance Computing, Networking, Storage and Analysis (Austin, Texas) (SC ’15). Association for Computing Machinery,
+New York, NY, USA, Article 81, 12 pages. https://doi.org/10.1145/2807591.2807629
+
+[27] Wouter Swierstra and Thorsten Altenkirch. 2008. Dependent Types for Distributed Arrays. Trends in Functional
+
+Programming 9 (2008).
+
+[28] R. Thakur, A. Choudhary, and J. Ramanujam. 1996. Efficient algorithms for array redistribution. IEEE Transactions on
+
+Parallel and Distributed Systems 7, 6 (1996), 587–594. https://doi.org/10.1109/71.506697
+
+28
+
+Norman A. Rink, Adam Paszke, Dimitrios Vytiniotis, and Georg Stefan Schmid
+
+[29] Arun Thangamani and V Krishna Nandivada. 2018. Optimizing Remote Data Transfers in X10. In Proceedings of the 27th
+International Conference on Parallel Architectures and Compilation Techniques (Limassol, Cyprus) (PACT ’18). Association
+for Computing Machinery, New York, NY, USA, Article 27, 15 pages. https://doi.org/10.1145/3243176.3243209
+[30] Sean Treichler, Michael Bauer, and Alex Aiken. 2013. Language Support for Dynamic, Hierarchical Data Partitioning.
+
+SIGPLAN Not. 48, 10 (Oct. 2013), 495–514. https://doi.org/10.1145/2544173.2509545
+
+[31] Sean Treichler, Michael Bauer, Rahul Sharma, Elliott Slaughter, and Alex Aiken. 2016. Dependent Partitioning. In
+Proceedings of the 2016 ACM SIGPLAN International Conference on Object-Oriented Programming, Systems, Languages,
+and Applications (Amsterdam, Netherlands) (OOPSLA 2016). Association for Computing Machinery, New York, NY,
+USA, 344–358. https://doi.org/10.1145/2983990.2984016
+
+[32] Ashish Vaswani, Noam Shazeer, Niki Parmar, Jakob Uszkoreit, Llion Jones, Aidan N. Gomez, undefinedukasz Kaiser,
+and Illia Polosukhin. 2017. Attention is All You Need. In Proceedings of the 31st International Conference on Neural
+Information Processing Systems (Long Beach, California, USA) (NIPS’17). Curran Associates Inc., Red Hook, NY, USA,
+6000–6010.
+
+[33] D.W. Walker and S.W. Otto. 1996. Redistribution of block-cyclic data distributions using MPI. Concurrency: Practice
+and Experience 8, 9 (1996), 707–728. https://doi.org/10.1002/(SICI)1096-9128(199611)8:9<707::AID-CPE269>3.0.CO;2-V
+[34] Yuanzhong Xu, HyoukJoong Lee, Dehao Chen, Blake A. Hechtman, Yanping Huang, Rahul Joshi, Maxim Krikun,
+Dmitry Lepikhin, Andy Ly, Marcello Maggioni, Ruoming Pang, Noam Shazeer, Shibo Wang, Tao Wang, Yonghui
+Wu, and Zhifeng Chen. 2021. GSPMD: General and Scalable Parallelization for ML Computation Graphs. CoRR
+abs/2105.04663 (2021). arXiv:2105.04663 https://arxiv.org/abs/2105.04663
+
+

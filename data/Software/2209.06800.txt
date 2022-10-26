@@ -1,0 +1,1893 @@
+Empowering GNNs with Fine-grained Communication-Computation
+Pipelining on Multi-GPU Platforms
+
+Yuke Wang, Boyuan Feng, Zheng Wang, †Tong Geng, †Kevin Barker, †Ang Li, and Yufei Ding.
+†: Paciﬁc Northwest National Laboratory,
+University of California, Santa Barbara.
+
+2
+2
+0
+2
+
+p
+e
+S
+4
+1
+
+]
+
+C
+D
+.
+s
+c
+[
+
+1
+v
+0
+0
+8
+6
+0
+.
+9
+0
+2
+2
+:
+v
+i
+X
+r
+a
+
+Abstract
+The increasing size of input graphs for graph neural net-
+works (GNNs) highlights the demand for using multi-GPU
+platforms. However, existing multi-GPU GNN solutions suffer
+from inferior performance due to imbalanced computation
+and inefﬁcient communication. To this end, we propose MGG,
+a novel system design to accelerate GNNs on multi-GPU plat-
+forms via a GPU-centric software pipeline. MGG explores
+the potential of hiding remote memory access latency in GNN
+workloads through ﬁne-grained computation-communication
+pipelining. Speciﬁcally, MGG introduces a pipeline-aware
+workload management strategy and a hybrid data layout de-
+sign to facilitate the communication-computation overlapping.
+MGG implements an optimized pipeline-centric kernel. It in-
+cludes workload interleaving and warp-based mapping for
+efﬁcient GPU kernel operation pipelining and specialized
+memory designs and optimizations for better data access per-
+formance. Besides, MGG incorporates lightweight analytical
+modeling and optimization heuristics to dynamically improve
+the GNN execution performance for different settings at run-
+time. Comprehensive experiments demonstrate that MGG
+outperforms state-of-the-art multi-GPU systems across vari-
+ous GNN settings: on average 3.65× faster than multi-GPU
+systems with a uniﬁed virtual memory design and on average
+7.38× faster than DGCL framework.
+
+1. Introduction
+
+Over the recent years, graph-based deep learning has at-
+tracted lots of attention from the research and industry ﬁeld.
+Among various graph-learning methods, graph neural network
+(GNN) [28, 54, 48] gets highlighted most due to its success in
+many graph-based deep learning tasks (e.g., node feature vec-
+tor (embedding) generation for node classiﬁcation [26, 19, 12]
+and link prediction [7, 29, 46]). GNNs consist of several lay-
+ers, where layer k + 1 computes the embedding for a node v
+based on the embeddings at the previous layer k (k ≥ 0) by
+applying a(k+1)
+v ) and
+h(k+1)
+is the embedding of
+v
+node v at layer k. The Aggregate function will accumulate
+neighbors’(N(v)) embeddings of node v. The Update function
+usually consists of a fully-connected NN layer. In comparison
+with the conventional methods for graph analytics, such as
+random walk [20, 44, 24] and graph Laplacians [33, 32, 10],
+
+u |u ∈ N(v)} ∪ h(k)
+), where h(k)
+v
+
+= Aggregate(k+1)({h(k)
+
+= Update(k+1)(a(k+1)
+
+v
+
+v
+
+GNN features higher accuracy [28, 54, 48, 14, 13] and better
+generality [23, 59, 9] on various applications.
+
+GNN computation on large input graphs with millions/bil-
+lions of nodes and edges is a huge challenge because of the
+high memory and computation demands. Many research ef-
+forts have thus been devoted to improving GNN execution
+performance on powerful multi-GPU platforms (e.g., NVIDIA
+DGX [39]), which feature high aggregated computation power
+and memory capacity and become the major building blocks
+for more than 60% modern HPC systems [45] for large-scale
+scientiﬁc computing and deep learning. The ﬁrst type of ef-
+fort [8, 11, 57, 15] eliminates the need for communication by
+leveraging neighbor sampling and mini-batch processing in a
+data-parallel fashion. However, existing research [25, 8] shows
+that such an algorithmic modiﬁcation would compromise the
+accuracy of GNN models compared to the original GNNs.
+It would also destabilize the algorithmic performance (e.g.,
+slower training convergence rate) under different graph in-
+puts and sampling conﬁgurations. Another type of effort (e.g.,
+DGCL [4] and NeuGraph [34]) keeps the algorithm intact and
+leverages the dedicated communication libraries optimized
+for GNN computation on multi-GPU platforms. However,
+this type of effort would incur excessive ﬁne-grained irregular
+remote access for fetching neighbor embeddings.
+
+In this paper, we highlight a more promising, new type of
+solution for accelerating GNNs on multi-GPU systems. We
+propose to exploit the ﬁne-grained pipeline of the communica-
+tion and computations to largely hide the remote data access
+overhead. Our key observation is that there are many opportu-
+nities for overlapping operations at different granularities in
+GNNs. For instance, for the neighbor aggregation on a single
+graph node, the remote neighbor access can be overlapped
+with the local neighbor computation. Among different nodes,
+the remote data access for certain nodes would potentially be
+overlapped with the local computation of other nodes.
+
+However, exploring the beneﬁts of such ﬁne-grained pipelin-
+ing requires non-trivial system-level insights and design
+efforts. The original neighbor aggregation in multi-GPU
+GNNs [25, 34, 4] just requires invoking the high-level holistic
+memory and computation APIs for the non-overlapped com-
+munication and computation phases, respectively. In contrast,
+fusing the communication and computation as a single ker-
+nel would signiﬁcantly increase the design complexity. Since
+it will break down memory and computation phases into a
+
+ 
+ 
+ 
+ 
+ 
+ 
+tition size and interleaving distance) to maintain pipelining
+effectiveness. Such a highly conﬁgurable design can conﬁ-
+dently accommodate diverse GNN inputs (e.g., graphs with a
+different number of edges and node embedding dimensionali-
+ties) and hardware platforms (e.g., different numbers of GPUs
+and the computation/memory capacity of different GPUs).
+
+We build our design on NVIDIA GPUs with NVSH-
+MEM [41] (a typical type of SHMEM [6, 2, 41]), which
+is the state-of-the-art programmatic communication library
+for ﬁne-grained inter-GPU communication. To the best of
+our knowledge, we are the ﬁrst to explore the potential of
+NVSHMEM for GPU kernel operation pipelining in the ir-
+regular multi-GPU GNN computation. Despite being tailored
+for GNN computation on multi-GPU platforms, our design
+can be generalized with minor changes towards other applica-
+tions or platforms sharing the similar demands or supports of
+ﬁne-grained irregular communication (As detailed in §6).
+
+Overall, we make the following contributions in this paper:
+• We give an in-depth analysis of existing multi-GPU solu-
+tions and identify their performance bottlenecks and key
+takeaways that inspire our design (§2).
+
+• We propose a pipeline-aware workload management strat-
+egy and a hybrid data layout design tailored for multi-GPU
+GNNs, to facilitate the communication-computation pipelin-
+ing (§3.1-§3.2).
+
+• We implement an optimized pipeline-centric kernel, encom-
+passing workload interleaving and warp-based mapping for
+ﬁne-grained computation-communication overlapping and
+specialized memory designs and optimizations for better
+data access performance (§3.3-§3.4).
+
+• We introduce lightweight analytical modeling and optimiza-
+tion heuristics to dynamically improve the performance of
+GNN training at runtime (§4).
+
+• Comprehensive experiments demonstrate that MGG outper-
+forms state-of-the-art multi-GPU systems across various
+GNN settings: on average 3.65× faster than multi-GPU sys-
+tems with a uniﬁed virtual memory design and on average
+7.38× faster than DGCL framework.
+
+2. Related Work and Motivation
+
+In this section, we will ﬁrst give an in-depth analysis of the
+existing solutions (Collective Communication and Uniﬁed Vir-
+tual Memory) in addressing the communication challenges of
+multi-GPU GNNs. Then we will motivate our SHMEM-based
+design for communication-computation pipelining.
+
+2.1. Collective Communication Design
+
+The rising popularity of deep neural networks (DNNs) on
+multi-GPU platforms facilitates an array of Collective Commu-
+nication designs [38, 1, 35] on optimizing the inter-GPU data
+movement. Among these designs, NCCL [38] delivers state-
+of-the-art communication performance on NVIDIA GPUs.
+NCCL shows its strength in collective operations (e.g., reduce)
+
+Figure 1: Overview of MGG.
+
+set of low-level detailed operations followed by ﬁne-grained
+operation interleaving. It requires users to explicitly iden-
+tify the local and remote computation, properly layout GNN
+input data to improve data access efﬁciency, and effectively
+schedule operations to beneﬁt pipelining. Moreover, the most
+effective design of operation pipelining would largely vary
+depending on the GNN inputs (e.g., the graph structures and
+the node embedding dimensionality) and hardware platforms
+(e.g., different types/numbers of GPUs). This will impose
+more burdens on users to handle many low-level design details
+and complicated conﬁguration tradeoffs.
+
+To this end, we introduce, MGG, a holistic system design
+and implementation for GNN acceleration on multi-GPU plat-
+forms. The key design insight of MGG is to mitigate the
+effects of irregular remote neighbor access in GNNs via a
+ﬁne-grained GPU-based software pipeline with overlapped
+communication and computation. (Figure 1).
+
+From the workload and data perspective, we reshape the
+irregular GNN workloads to expose sufﬁcient opportunities
+for pipelining. We explicitly categorize and split GNN com-
+putation workloads based on their local and remote memory
+access patterns at different levels (e.g., inter-GPU and inter-
+graph-node) of granularity. We also carefully orchestrate the
+data layout of the graph structure (edge lists) and node embed-
+dings by identifying their key access patterns (e.g., dominated
+by remote/local access) and leveraging different types of GPU
+memory (e.g., shared and private device global memory) to
+minimize their access costs.
+
+From the GPU-kernel perspective, we tailor the GPU com-
+putation kernel for multi-GPU GNN workloads to maximize
+the computation capability of GPUs. We decompose the neigh-
+bor embedding fetching and embedding aggregation phases
+into a set of memory access and computation operations. Then
+we interleave the remote access (for fetching remote neighbor
+embeddings) with the aggregation computation (for accumu-
+lating neighbor embeddings). Such a ﬁne-grained operation
+overlapping and pipelining will effectively pair appropriate-
+size communication and computation workloads to amortize
+the communication overhead. We map memory and com-
+putation operations to GPU warps to maximize computation
+parallelization and improve the scheduling efﬁciency of GPU
+Streaming Multiprocessors (SMs).
+
+From the design conﬁgurability perspective, we parame-
+terize MGG with a set of tunable knobs (e.g., workload par-
+
+2
+
+Kernel & Runtime Manager (§)GNN Workload &Data Manage. (§ - §) Pipeline-centric Kernel Design (§ - §)  MGGSHMEM Library (e.g., NVSHMEM)Optimized  Param.Graph Loader &Model InitializerRuntimeParam.Optimizer(§)Performance  FeedbacksGNNModelNodeEmbe-ddingGraphStruc-tureNVIDIA DGX  Multi-GPU PlatformOptimized DesignHybrid Data  PlacementWarp-based  Mapping &PipeliningSpecializedMemory Design& OptimizationPipeline-awareWorkloadManagementFigure 2: NCCL proﬁling for a 1-layer GNN.
+
+for DNN training, which follows a low-communication data-
+parallel scheme. However, in the communication-intensive
+GNNs, NCCL could hardly demonstrate its advantages due
+to two major reasons. First, NCCL is designed for regular
+communication patterns, while the communication in sparse
+GNN computation is highly irregular. For instance, the well-
+known NCCL’s collective operation. all-reduce, follows the
+ring-based reduction across GPUs [5, 49]. While in GNNs, the
+remote access among different GPUs largely relies on irreg-
+ular point-to-point data transferring in a ﬁne-grained manner.
+Second, NCCL’s APIs can only be used in the CPU program
+outside the GPU kernel. It has to interrupt (or wait until the
+exit of) the current GPU kernel execution for communication,
+leading to non-trivial transitioning costs between communica-
+tion and computation.
+
+To show the performance of NCCL in multi-GPU GNN
+computation, we build a basic NCCL-based GNN layer, where
+each GPU maintains a subset of node embeddings in its device
+memory, and it will forward its current node embedding subset
+to the next GPU (a ring-based node embedding forwarding)
+once it ﬁnishes its aggregation. The whole program will end
+after each GPU has “traversed” all node embeddings. And we
+select two graph datasets: Reddit with 232 thousand nodes
+and 114 million edges, and enwiki-2013 with 4 million nodes
+and 202 million edges. Figure 2 shows that data transfer-
+ring via NCCL could take more than 5× latency compared
+to the latency of aggregation computation. This is mainly
+because of NCCL’s inefﬁciency in transferring vector-based
+node embeddings and the huge bandwidth gap between the
+high-speed global memory (around 1TB/s) and inter-GPU con-
+nections, like NVLink (around 100GB/s). There are several
+potential optimizations that could be applied to improve the
+performance of NCCL-based GNNs, such as 1) increasing the
+node embedding chunk size/granularity to avoid redundant
+communication and 2) mixing the collective communication
+with point-to-point communication based on the node embed-
+ding access pattern at runtime. However, these optimizations
+may 1) increase the frequency of initialing/invoking the NCCL
+communication function and context switching between the
+GPU device kernels and the CPU hosts and 2) introduce ad-
+ditional runtime cost and latency overhead for dynamically
+determining the communication pattern. This motivates us to
+incorporate multi-GPU SHMEM [41, 2] to exploit the ﬁne-
+grained communication-computation pipelining.
+
+3
+
+Figure 3: Page fault analysis of the basic UVM-based GNN ker-
+nel on DGX-A100 (Normalized total page fault count (left) and
+Normalized total page fault duration (right)).
+
+2.2. Uniﬁed Virtual Memory Design
+
+Uniﬁed Virtual Memory (UVM) [43] maintains a global “vir-
+tual” view of a single address space spanning across the mem-
+ory of different devices (CPUs and GPUs). By employing
+UVM, multi-GPU programming can be simpliﬁed as single-
+GPU programming without worrying about the data’s physical
+location on different devices [43, 56, 27]. UVM has also been
+demonstrated in accelerating the irregular graph analytical
+workload (such as graph traversal [18] and PageRank anal-
+ysis [27]). In UVM, a global uniﬁed virtual memory space
+is allocated by invoking cudaMallocAsync API on CPUs
+and the whole memory space is organized as memory pages
+that reside on different device memory. When a GPU ker-
+nel wants to access the data which is not presented on GPU
+memory, a GPU-side memory page fault would happen and a
+CPU-to-GPU page migration would be triggered to fetch the
+corresponding data from the host memory to GPU memory.
+
+Even though UVM offers the easiest way for programming
+and handling out-of-GPU-memory GNN inputs, the perfor-
+mance of such a design is usually unsatisfactory. There are
+several major challenges. First, GNN computation relies on
+highly irregular memory access. Therefore, using UVM would
+trigger lots of GPU-side page-fault for frequently fetching re-
+mote data. In addition, the memory page size is ﬁxed and
+large (around 4KB) while the embedding size of an individual
+neighbor node is small (less than 0.4KB). Thus, most of the
+4KB memory pages migrated through costly page-faulting
+are largely wasted. Second, using UVM has to count on the
+relatively low-speed CPU processor for host data management
+and low-bandwidth PCIe connection for CPU-to-GPU data
+transferring, which largely stall the GPU execution. Besides,
+the irregular GNN computation can easily cause UVM page
+thrashing [17, 16] (i.e., the same memory page is bouncing
+among different device memory), which further exacerbates
+such a situation, leading to severe GPU under-utilization. To
+better understand the bottleneck of UVM, we use the NVIDIA
+NSight System proﬁler [40] to extract the page-fault-related
+information of UVM-based GNN design across different set-
+tings of GPUs (from 2 to 8 GPUs) on the latest NVIDIA
+DGX-A100 platform. Figure 3 shows that the increase in
+the number of GPUs would lead to more page-fault events
+and page-fault handling cycles, which would largely hinder
+performance scaling. Note that we start with the 2-GPU set-
+ting since our problem setting is about multi-GPU GNN for
+
+02004006008001000120014001600NCCL-CommAggregationNCCL-CommAggregationNCCL-CommAggregation2GPU3GPU4GPULatency (ms)Redditenwiki-20130.01.02.03.04.05.06.02-GPU3-GPU4-GPU5-GPU6-GPU7-GPU8-GPUNorm. PageFault Cnt.redditogbn-protein0.01.02.03.04.05.06.07.08.02-GPU3-GPU4-GPU5-GPU6-GPU7-GPU8-GPUNorm. UVM-PF Dur.redditogbn-proteinListing 1: NVSHMEM APIs in CUDA C.
+
+1 // Initialize the NVSHMEM context on CPU.
+2 nvshmem_init();
+3 // Get the current GPU device ID on CPU.
+4 int gpu_id = nvshmem_team_my_pe(NVSHMEMX_TEAM_NODE);
+5 // Set the GPU based its device ID on CPU.
+6 cudaSetDevice(gpu_id);
+7 // Define NVSHMEM memory visible for all GPUs on CPU.
+8 d_shared_mem = (void*) nvshmem_malloc (num_bytes);
+9 // Define global memory visible only for current GPUs.
+10 cudaMalloc((void**) &d_mem, num_bytes);
+11 // NVSHMEM kernel-level APIs (in a __global__ function)
+12 // (called by a thread, warp, and block)
+13 // for fetching data from remote GPUs.
+14 __device__ nvshmem_float_get(void *dst, const void *src,
+
+size_t nelems, int src_gpu_id);
+
+15 __device__ nvshmem_float_get_{warp/block}(void *dst, const
+
+void *src, size_t nelems, int src_gpu_id);
+16 // Sync all GPUs within the same NVSHMEM context on CPU.
+17 nvshmem_barrier_all();
+18 // Release NVSHMEM objects on CPU.
+19 nvshmem_free(d_shared_mem);
+20 // Terminate the current NVSHMEM context on CPU.
+21 nvshmem_finalize();
+
+scaling datasets that cannot ﬁt into a single GPU. The poten-
+tial optimization of UVM is to increase the data movement
+granularity through batching more data on the same memory
+page [27]. However, in the highly irregular GNN computation,
+such a strategy would incur non-trivial time costs for careful
+batch-size selection and data batching, which are essential to
+maximizing the memory-page utilization and communication
+efﬁciency. To conclude, we remark that a design that can
+offer more ﬂexibility in data movement granularity and lever-
+age high-bandwidth GPU interconnects (e.g., NVLink) would
+beneﬁt the overall multi-GPU GNN execution performance.
+
+2.3. SHMEM Design
+
+SHMEM [6, 41, 2] is a typical parallel programming model
+that follows the Partitioned Global Address Space (PGAS)
+design principle. It consists of a global memory address space
+that logically concatenates the device memory subspace of
+each worker (e.g., CPU/GPU). Among existing SHMEM im-
+plementations, the recently released NVHSMEM [41] facili-
+tates inter-GPU communication across NVIDIA GPUs. List-
+ing 1 illustrates the basic NVSHMEM APIs in CUDA C. Note
+that in NVSHMEM, each CPU thread/process manages one
+GPU device, and the same NVSHMEM-based kernel will
+be executed on different GPUs concurrently. In the follow-
+ing of this paper, we will mainly discuss our design with
+NVHSMEM and the same design principles can be applied to
+other platforms with minor efforts, such as AMD GPUs with
+ROC_SHMEM [2, 22]. We compare qualitatively SHMEM
+with Collective Communication and UVM in Table 2.
+
+Despite such potential of NVSHMEM, using NVSHMEM
+to improve GNN’s runtime performance on multi-GPU plat-
+forms is still non-trivial. The existing explorations of NVSH-
+
+Table 1: Speedup of Direct NVSHMEM vs. UVM.
+
+RDD ENWIKI
+
+PROD PROT ORKT
+
+Speedup
+
+0.56×
+
+1.24×
+
+1.44×
+
+0.48×
+
+0.20×
+
+Table 2: Comparison among Collective Communication, UVM,
+and SHMEM designs. Note that “CG”: communication gran-
+ularity; “GI”: initiate communication from GPU; “PG”: pro-
+grammability; “RA”: random access.
+
+Solution
+
+CG
+
+GI
+
+PG
+
+RA
+
+Collect. (§2.1)
+UVM (§2.2)
+SHMEM (§2.3)
+
+Flexible
+Fixed
+Flexible Yes High
+
+No
+No
+
+High
+Low Moderate
+
+Poor
+
+Good
+
+MEM are limited to traditional deep-learning (e.g., Livermore
+Big Artiﬁcial Neural Network [47]) and scientiﬁc computing
+(e.g., quantum chromodynamics [53]), which are regular in
+remote data access with a relatively lower communication-to-
+computation ratio. For illustration, we build a baseline design
+(Direct NVSHMEM) by directly applying NVSHMEM for re-
+mote neighbor access to compare with the UVM-based design
+on GNN aggregation across several representative datasets
+(detailed in §5). Table 1 shows that NVSHMEM is in fact
+not a free lunch. Directly applying NVSHMEM would barely
+show performance advantages (in fact 23% lower on aver-
+age) over the UVM-based design. Directly applying NVSH-
+MEM on-demand to fetch individual remote neighbor embed-
+dings would initiate many separated NVSHMEM requests and
+incur non-trivial overheads (e.g., communication warm-up
+costs). Besides, highly irregular execution of each warp (fre-
+quently switching between local computation and remote ac-
+cess) would lead to inefﬁcient warp-level scheduling on GPU
+SMs, thus, lowering the utilization of GPUs and NVLinks.
+UVM-based design can potentially merge multiple separated
+remote access into a single memory page movement based on
+the locality of remote data, thus, amortizing the communica-
+tion cost.
+
+2.4. Other Related Work
+
+Existing GNN computing systems are optimized to maximize
+the computing parallelism while minimizing the impact of the
+intensive and irregular data communication/access. ROC [25]
+proposes a distributed GNN computing system with learning-
+based graph partitioning and dynamic-programming optimized
+memory management strategy to maximize the efﬁciency of
+multi-GPU parallelism of GNNs. P3 [15] introduces pipelined
+push-pull parallelism and graph-structure-based inter-GPU
+communication for multi-GPU GNN computation. design
+differs from these existing GNN systems in several aspects.
+Pipelining optimization in [15, 34] aims at coarse-grained
+overlapping of computation of different mini-batched graphs
+or overlapping of streaming vertex chunks to GPUs with
+the GNN computation on GPUs. While our design explores
+
+4
+
+a new type of pipelining optimization through ﬁne-grained
+computation-communication overlapping when processing ev-
+ery single graph on individual GPUs. In addition, prior work
+has yet to leverage the recent software/hardware advancement
+in communication, such as NVSHMEM-based on NVLink.
+They tailor their design/optimization for the low-bandwidth
+PCIe [34, 25, 15] with naturally high communication cost.
+
+2.5. Motivation
+
+Our key research motivation in this paper is to investigate
+the potential of communication-computation pipelining in ad-
+dressing the communication bottleneck of multi-GPU GNNs.
+However, directly applying SHMEM for overlapping the
+communication and computation in GNN still encounters sev-
+eral key challenges: 1) How to manage the irregular GNN
+input data systematically so that we could balance data lo-
+cality, communication & computation workload, and graph
+partition overhead? 2) How to decompose the communication
+workload effectively so that we could overlap the communi-
+cation and computation? 3) how to make the design and
+optimization ﬂexible enough so that we could accommodate
+the diverse hardware platforms, GNN models, and inputs?
+
+Since this is the ﬁrst system work to demonstrating the
+communication-computation pipelining in multi-GPU GNN
+computation, we ﬁrst investigate the communication patterns.
+For the following sections, §3.1-§3.2 address the ﬁrst question
+with pipeline-aware workload management and hybrid GNN
+data placement. §3.3-§3.4 address the second question with
+warp-based mapping & pipelining and specialized memory
+design & optimization. §4 tackles the third question with
+modeling and design optimization. §5 extensively evaluates
+MGG in various aspects and compares with existing solutions.
+
+3. MGG Design
+
+In this section, we detail two major components of MGG that
+collaborate with each other: GNN Workload & Data Manage-
+ment (§3.1-§3.2) and Pipeline-centric Kernel (§3.3-§3.4).
+
+3.1. Pipeline-aware Workload Management
+
+To facilitate efﬁcient GPU kernel operation pipelining, the key
+enabler is to properly distribute the computation workloads to
+exploit the opportunity of computation-communication over-
+lapping. In GNNs, the irregularity of graph-based data (e.g.,
+graph structure) makes it hard to distribute GNN workloads
+among different GPUs for effective pipelining. We propose a
+novel pipeline-aware workload management technique based
+on three key metrics, the number of devices, the types of
+workload, and the number of neighbors. Unlike prior de-
+signs [34, 4, 25] which tend to minimize inter-GPU commu-
+nication, our MGG design aims to maximize the workload
+balancing while facilitating the overlap of computation and
+
+remote memory access. GNNAdvisor [51] introduces a 2D
+workload management with adjustable workload granularity
+for GNN computing. However, GNNAdvisor is designed
+and optimized for single-GPU GNN computation, where all
+node embedding access is local on the same GPU. Therefore,
+GNNAdvisor only needs to balance homogeneous GNN ag-
+gregation workloads with local memory access demands. In
+contrast, MGG can support multi-GPU GNN computation and
+effectively handle heterogeneous GNN aggregation workloads
+with local and remote memory access demands. Speciﬁcally,
+there are three key strategies of our MGG design:
+
+Edge-balanced Node Split: This solution is to partition
+the GNN input graph by nodes while considering the number
+of edges within each partition. On the one hand, our strategy
+would demonstrate the advantage of node split, where each
+node will only be handled by one GPU. This can avoid addi-
+tional overhead to synchronizing partial aggregation results on
+different GPUs. On the other hand, our strategy can enjoy the
+beneﬁt of the balanced edge split, where different partitions
+will maintain an approximately equal number of edges for
+computation across GPUs. We cut the whole graph by select-
+ing n − 1 node-split points, where n is the number of GPUs.
+To determine these points, we will ﬁrst get the total number
+of edges of the whole graph and divide this number by the
+number of GPUs to get the approximate number of edges pro-
+cessed for each GPU. Then we develop a range-constrained
+binary search (Algorithm 1) to determine the node-split points
+such that each GPU would process an approximately equal
+number of edges.
+
+Locality-aware Edge Split: This step is to split the work-
+load on each GPU based on its type after the above node split.
+We categorize the sparse multi-GPU GNN computation into
+two categories. The ﬁrst type of aggregation involves only
+the local GPU device memory. The key character of process-
+ing these types of neighbors is the low-cost neighbor access,
+leading to shorter execution latency. The second type of aggre-
+gation triggers remote access for non-local neighbors, which
+features high latency and overhead. To delicately handle these
+two types of workloads, we group the same types of neighbors
+together (Figure 4(a)- 1 ) to build two separate CSRs for local
+and remote virtual graphs, respectively. The aggregation will
+be conducted on local and remote virtual graphs in parallel,
+and the partial aggregation result of the same node in both lo-
+cal and remote virtual graphs will be accumulated to generate
+the ﬁnal output embedding.
+
+Workload-aware Neighbor Split: This step is to handle
+the workload imbalance among nodes within each virtual
+graph. Different nodes would have a different number of
+neighbors from each other in the virtual local and remote
+graphs. Therefore, the aggregation workload among different
+nodes would also be largely diverse. This makes it challeng-
+ing for massively parallel GPU devices to harvest the real
+performance gains due to the imbalance workload and di-
+verged execution ﬂow. Our neighbor partitioning strategy is
+
+5
+
+Figure 4: a) Illustration of Pipeline-aware Workload Management. (b) Conceptual exempliﬁcation of workload decomposition and
+interleaving/pipelining. “RNP”/“LNP” are the remote/local neighbor partitions. Local neighbor access is omitted in (b).
+
+Algorithm 1: Range-constrained Binary Search.
+
+input
+
+:Graph node pointer array (nPtr), edge list array
+(eList) , and the number of GPUs (numGPUs).
+output :list of graph edge split points (numGPUs − 1).
+
+1 outList = []; lastPos = 0;
+
+/* Compute approximated #edges per GPU.
+
+*/
+
+2 ePerGPU = (len(eList) + numGPUs − 1)/numGPUs;
+3
+
+for sId in [0, ..., numGPUs − 1] do
+
+nid =
+
+binSearch(nPtr, ePerGPU, lastPos, numNodes);
+
+4
+
+5
+
+lastPos = nid;
+outList.append(nid);
+
+6
+7 end
+8 return outList;
+
+/* Search split points on nPtr.
+
+9 Function binSearch(nPtr, ePerGPU, lastPos,
+
+*/
+
+numNodes):
+
+10
+
+11
+
+12
+
+13
+
+14
+
+15
+
+16
+
+17
+
+18
+
+19
+
+i = lastPos; j = numNodes;
+target = min(nPtr[i] + ePerGPU, nPtr[numNodes]);
+while i < j do
+
+mid = (nPtr[i] + nPtr[ j])/2;
+if mid > target then
+j = (i + j)/2;
+
+else
+
+end
+return i;
+
+i = (i + j)/2;
+
+to further divide the local/remote neighbors of each node into
+ﬁxed-sized partitions such that the workload irregularity and
+imbalance across nodes can be amortized. As exempliﬁed in
+Figure 4(a)- 2 , by setting the size of each neighbor partition-
+ing as 2, we can get a more balanced workload among different
+nodes in their local and remote virtual graph aggregation. On
+the DGX-A100 platform, all GPUs are connected all-to-all
+through NVSwitch. Therefore, the inter-GPU communication
+on DGX-A100 has the same bandwidth performance and does
+not have NUMA effect [31]. Finally, we conceptually exem-
+plify the decomposed workload and its execution pipelining in
+Figure 4(b). Here, we demonstrate the pipelined execution of
+
+a single warp for simplicity. In reality, our design will sched-
+ule execution pipelines from different warps to maximize the
+utilization (more than 70%) of SM cycles.
+
+3.2. Hybrid GNN Data Placement
+
+In collaboration with our workload management strategy to fa-
+cilitate efﬁcient communication-computation pipelining (Fig-
+ure 4(b)), we introduce a hybrid GNN data placement strategy
+that can exploit the beneﬁts of different types of memory in
+SHMEM-enabled multi-GPU systems. Speciﬁcally, we en-
+force two types of strategies, as exempliﬁed on the left of Fig-
+ure 5. For node embeddings (NE), we leverage NVSHMEM
+“shared” global memory to store the whole graph embeddings,
+which essentially distributes node embeddings to different
+GPUs’ global memory space. We ﬁrst partition the input
+graphs into n partitions (where n is the number of GPUs) and
+each partition is placed in one GPU’s “shared” global mem-
+ory space, created by nvshmem_malloc API. Compared to
+the traditional cudaMalloc that allocates the “private” global
+memory space dedicated for the current GPU, the global mem-
+ory space allocated by nvshmem_malloc can be accessed by
+all GPUs involved in the current NVSHMEM context via GPU
+device IDs and memory address offsets. Our key design in-
+sight is that node embedding vectors (NE) (i) are usually large
+(high dimensionality) and have to be distributed among differ-
+ent GPUs, and (ii) require remote access support when stored
+on different GPUs. Therefore, shared global memory space in
+NVSHMEM is a good ﬁt for NE since it provides (i) a large
+space (by aggregating device memory of different GPUs) and
+(ii) direct remote access support across GPUs.
+
+On the other hand, for storing partitioned graph structure
+(GP) data (e.g., the edge list), we use cudaMalloc to allocate
+the “private” global memory space that is only visible to the
+current GPU. Considering that NVSHMEM “shared” global
+memory offset would start from zero for each GPU, the orig-
+inal global node ID in the edge list should be converted to
+a GPU local memory index for accessing the correct neigh-
+bor embeddings according to the node-ID range on different
+
+6
+
+GPU-0: 0-3GPU-1: 4-6GPU-0 CSR0121352567041345677701012201313Remote  CSR01244545335677667RNP-0RNP-1RNP-2RNP-3RNP-4RNP-5LNP-0LNP-1LNP-201LNP-3122edge  splitneighbor  partitioningneighbor  partitioning345664Local  CSR891011GPU-2: 7-11......Holistic WorkloadDecomposed WorkloadPipelined & InterleavedWorkload Timeline(a)(b)  Pipelines of different  graph nodesAggregation forRemoteNeighborsRemoteNeighbor AccessAggregation forLocal Neighbors1Breakdown Computation  and Communication2Interleave Computation  and CommunicationRNPLNP211435423523451115123223344554GPUSM......ScheduleFigure 5: MGG Storage Layout and Communication Pattern.
+Note that “NE-i” is the node embedding partition stored on
+the i-th GPU. “GP-i” is the neighbor partition processed by the
+i-th GPU. “GPU-i [lb, ub]” is the node-id range [lowerbound,
+upperbound] of the node embeddings on the i-th GPU.
+
+GPUs, as illustrated in the right side of Figure 5. The obtained
+insights are that partitioned graph data (GP), such as edge
+lists, (i) are all scalar indices and usually small in size and (ii)
+will only be accessed by the local GPU. Therefore, individual
+GPUs’ DRAM is a good ﬁt for partitioned graph data.
+
+3.3. Warp-based Mapping & Pipelining
+
+In addition to effective workload management and data place-
+the next key step is to map such logically parti-
+ment,
+tioned workloads to the low-level GPU programming ab-
+stractions (e.g., GPU threads/warps/threadblocks) for efﬁcient
+computation-communication pipelining.
+
+Firstly, we choose GPU warp as the basic working unit
+for handling the workload of each partition. This is because
+threads in a warp can collaboratively work on different dimen-
+sions of a node embedding simultaneously. Whereas using
+a single or several threads (less than the size of a warp, 32
+threads) would hardly explore the computation parallelism
+and would cause warp-level divergence. Besides, NVSHMEM
+remote access initiated by a warp of threads would merge
+the requests into one remote memory transaction to reduce
+the overhead. The method we choose for remote access is
+GET, which is initiated by the GPU kernel that requests cer-
+tain neighbor embeddings for aggregation. Compared with
+the PUT method, GET will simplify the overall design. When
+using PUT, we have to employ a complex receiver-side syn-
+chronization mechanism to consistently check the local mem-
+ory buffer for making sure that the required node embedding
+arrives before its aggregation begins. This would lead to ex-
+tra computation costs that would degrade the performance.
+Secondly, we will decide how to map each workload to the
+underlying GPU warp. The most straightforward way is to
+continuously map the neighbor partitions from the local and
+remote workload list to GPU warps with continuous IDs, as
+shown in Figure 6. However, this strategy would easily suffer
+from workload imbalance among GPU SMs. Because warps
+with continuous IDs are more likely to be placed into the
+same thread block, which is assigned to one SM for process-
+ing. Therefore, SMs assigned with warps for handling remote
+neighbor partitions would lead to much longer latency than
+SMs assigned with warps for processing local neighbor par-
+
+7
+
+Figure 6: Warp-based Mapping and Pipelining. Note that
+“LNP” refers to the local neighbor partitions; “RNP” refers
+to the remote neighbor partitions. Workload and Warps are
+matched based on colors. Tiny boxes in GPU SM indicate de-
+composed workload operations for overlapped execution.
+
+titions. Such a workload imbalance would lead to poor GPU
+utilization and runtime execution performance.
+
+To this end, we introduce our novel workload interleaving
+strategy to balance the workload among SMs on GPUs. Each
+warp of threads running on GPU would handle one or more
+pairs of local/remote workload partitions. We introduce a new
+metric – interleaving distance to more precisely calibrate the
+warp-to-SM mapping for different pipeline stages to achieve
+efﬁcient pipelining. We give examples with the interleaving
+distance equals 1 and 2 in Figure 6 for illustration. The major
+design insight is that by mixing different types (local/remote)
+of workload together, we can achieve better GPU utilization
+since when one warp is blocked for high-cost remote access,
+other warps that are working on local computation can still be
+served by the SMs warp scheduler for ﬁlling up these idle GPU
+cycles. Such a design would also improve the design ﬂexibility:
+given an input graph with a selected neighbor partition size, we
+can adjust the size of interleaving distance and the workload
+per warp so that waiting cycles of the remote access can be
+hidden by the computation cycles of the neighbor aggregation.
+Thus, each warp can be fully utilized while the overall design
+can achieve sufﬁcient parallelism.
+
+3.4. Specialized Memory Design & Optim.
+
+To achieve highly efﬁcient communication-computation
+pipelining at the GPU kernel level, it is indispensable to care-
+fully manage the high-bandwidth shared memory of GPU SMs
+for high data access efﬁciency and asynchronized primitives
+for exploiting intra-warp operation pipelining.
+
+GPU SM Shared Memory Layout: Based on our MGG’s
+warp-based workload design, we propose a block-level shared
+memory orchestration to maximize the performance gains.
+We have several key insights for such a dedicated memory
+layout design within each thread block. First, our neighbor-
+partition-based workload will generate the intermediate re-
+sults that can be cached at the high-speed shared memory
+for reducing the frequent low-speed global memory access.
+Second, NVSHMEM-based remote data access demands a
+local scratch-pad memory to hold the remote data for local op-
+
+GPU-0GPU-1GPU-2RemoteOffsetTargetedGPU idLocalOffsetRemote Node idLocal Node idGPU-0  [lb, ub]Address Trans.GPU-1  [lb, ub]GPU-2  [lb, ub]GPU-0 [lb, ub]Shared Global   MemoryNE-0GP-0NE-1GP-1GP-2NE-2Local Agg.Rem. Agg.Local Agg.Rem. Agg.Local Agg.Rem. Agg.LNP-0LNP-1LNP-2RNP-0RNP-1RNP-2RNP-3RNP-4RNP-5LNP-0LNP-1LNP-2RNP-0RNP-1RNP-4RNP-5LNP-3LNP-3w/o InterleavingInterleaving  (dist=1)1Warp-based Mapping on dist=1GPUSM-0GPUSM-1..................RNP-2RNP-32LNP-0LNP-1LNP-2RNP-0RNP-1RNP-3RNP-4RNP-5LNP-3Interleaving  (dist=2)...RNP-2Mapping  2-to-1 Warp-0Warp-1Warp-2Warp-3Warp-4... ... GPUSM-2......GPUSM-3......Mapping  1-to-1 Warp-0Warp-1Warp-2Warp-3Warp-4Warp-5Warp-6Warp-7Warp-8Warp-9..................Listing 2: GPU SM Shared Memory Design.
+
+1 // GPU Kernel with Computation and Communication
+2 __global__ MGG_kernel (param1, param2, ...){
+3
+
+// Get the global thread ID.
+int tid = blockIdx.x * blockDim.x + threadIdx.x;
+// Get the global warp ID.
+int warpId = tid / WARP_SIZE;
+// Get the block-level warp ID.
+int block_warpId = threadIdx.x / WARP_SIZE;
+// Get the warp-level thread ID (laneid).
+int laneid = threadIdx.x % WARP_SIZE;
+// Define the dynamic shared memory.
+extern __shared__ int part_meta[];
+// Starting address for node neighbors IDs.
+int *partial_ids = part_meta;
+// Starting address for partial aggregation result.
+float *partial_results = (float*)&part_meta[partSize*
+warpPerBlock];
+
+// Starting address for remotely-fetched embeddings.
+float *tmp_local = (float*)&partial_results[partSize*
+warpPerBlock*dim];
+// Calculate the offset for each warp.
+int ids_offset = warpId*partSize;
+int partial_offset = warpId*partSize*dim;
+int tmp_offset = warpId*partSize*dim;
+// Warp-level NVSHMEM for remote neighbor fetching...
+// Warp-level aggregation computation ...
+
+4
+
+5
+
+6
+
+7
+
+8
+
+9
+
+10
+
+11
+
+12
+
+13
+
+14
+
+15
+
+16
+
+17
+
+18
+
+19
+
+20
+
+21
+
+22
+
+23
+
+24
+25 }
+26 // ----------launching the kernel on CPU HOST-------------
+27 MGG_host (param1, param2, ...){
+28
+
+// Calculate the kernel configuration.
+int n_parts = max(lc_parts, re_parts);
+int block = warpPerBlock * WARP_SIZE;
+int grid = (n_parts * WARP_SIZE + block
+- 1) / block;
+int shared_memory_size = partSize*warpPerBlock*sizeof(
+int) + 2*partSize*warpPerBlock*dim*sizeof(float);
+// Launch the GPU kernel.
+MGG_kernel <<<grid, block, shared_memory_size>>> (
+param1, param2, ...);
+
+// Other following operations ...
+
+29
+
+30
+
+31
+
+32
+
+33
+
+34
+
+35
+36 }
+
+erations. There are several steps for us to utilize the block-level
+shared memory. For the local neighbor aggregation, we re-
+serve a shared memory space (4 × Dim bytes for ﬂoating-point
+embeddings) for the target node of each neighbor partition so
+that threads from a warp can cache the intermediate results of
+reduction in shared memory. For the remote neighbor aggrega-
+tion, the shared memory space is doubled (2 × nps × D). The
+reason is that we need the ﬁrst half (nps × D) for caching the
+partial aggregation results of each warp but also the second half
+(nps×D) for the remotely accessed neighbor embeddings. The
+detailed customization procedure is described in Listing 2. For
+each MGG kernel design, we will ﬁrst identify the warp-level
+information at Line 3 to 10, such as the warp IDs. Then within
+each thread block, we deﬁne the customized shared memory
+layout by splitting the contiguous shared memory address into
+three different parts for neighbor ids (partial_ids), partial
+aggregation results (partial_results), and the remotely-
+fetched node embeddings (tmp_local), at Line 12 to 18. We
+also calculate the relative address offset for each warp within
+each part of shared memory space, at Line 20 to 22. Note
+
+8
+
+Figure 7: Illustration of (a) w/o and (b) w/ asynchronized prim-
+itives for overlapping computation and communication of an
+individual warp. Note that the length of each rectangular box
+indicates the estimated latency cost of each operation.
+
+that we use the dynamic shared memory technique in MGG
+for design ﬂexibility, since those parameters (e.g., partSize,
+warpPerBlock, and dim) can only be determined at runtime.
+We will ﬁrst calculate the shared memory size (Line 32) and
+then pass it as a kernel launching parameter (Line 34).
+
+Pipelined Memory Operation: In §3.3, we have discussed
+assigning local (LNP) and remote (RNP) neighbor aggregation
+workload to warps so that different warps can overlap their
+computation and communication to fully saturate the active
+cycles of the GPU SM scheduler. However, only exploiting the
+inter-warp communication-computation overlap is not enough
+to maximize the utilization of GPU resources. We further ex-
+plore the overlapping of the computation and communication
+at the intra-warp level by carefully scheduling the memory op-
+erations. As shown in Figure 7(a) for the case with two LNPs
+and two RNPs by using the synchronized remote access, we
+can just sequentially process the two LNPs and the two RNPs.
+The long-latency remote access can happen only after the
+completion of its preceding LNP. This could lead to a longer
+GPU stall for memory operations and low GPU SM utilization.
+Based on our proﬁling, we ﬁnd that without overlapping, the
+remote access usually dominates the overall execution (around
+60% of overall latency) compared to the time for local data
+access plus the time for aggregation computation (around 40%
+of overall latency). Such an observation also motivates our
+current design to mainly hide the remote access latency. To
+amortize the cost of remote access for each warp, we introduce
+the asynchronized remote memory operations (Figure 7(b)).
+This improved design consists of two major steps. First, we
+can simultaneously launch the local memory access while
+initializing the remote memory access for fetching the node
+embedding ( 1 ), therefore, the time for remote access can be
+amortized by the processing of LNP. Second, once the remote
+access is completed, the current warp will start aggregation on
+the remotely-fetched node embedding data ( 2 ). The next step
+will start the new iteration of the previous two steps, which
+will process a new pair of LNP and RNP.
+
+4. Modeling and Design Optimization
+
+In this section, we will discuss our performance/resource ana-
+lytical modeling and design optimization strategy.
+
+timetimeAggregationComputationLocalAccessRemoteAccess1Launch sync local accessand async remote access2Start the remote-aggregation once the remote data arrives3Proceed to the next pair of workload(a)(b)LNPRNPAnalytical Modeling: The performance/resource model
+of MGG has two variables: workload per warp (WPW) and
+shared memory usage per block (SMEM), which can be mea-
+sured by the following formulas
+
+WPW = 2 · ps · D · dist,
+
+SMEM = ps · wpb · IntS + 2 · wpb · D · FloatS
+
+(1)
+
+where ps, wpb, and D are the sizes of neighbor partition, warp
+per block, and node embedding dimension, respectively; dist
+is the interleaved distance of local/remote workloads (§3.3);
+Dim is the node embedding dimension; IntS and FloatS are
+both 4 bytes on GPUs. To determine the value of the ps, wpb,
+and dist of a given input graph, we will ﬁrst compute the total
+number of warps by using
+
+numWarps =
+
+max{local, remote}
+dist
+
+(2)
+
+where local and remote are the number of local and remote
+partitions, respectively. Then we compute the total number of
+blocks and the estimated block per SMs by using
+
+numBlocks =
+
+blocksPerSM =
+
+,
+
+numWarps
+wpb
+numBlocks
+numSMs
+
+(3)
+
+Later, based on our micro-benchmarking results on diverse
+datasets, we deﬁne our parameter search space and constraints:
+1) ps ∈ [1 . . . 32] to balance the computation parallelism and
+synchronization overhead; 2) dist ∈ [1 . . . 16] to effectively
+overlap the computation and remote memory access; 3) wpb ∈
+[1 . . . 16] to maintain SM warp scheduling ﬂexibility for high
+occupancy and throughput; 4) numSMs ≤ c1, SMEM ≤ c2,
+where c1 and c2 are hardware constraints [52], e.g., NVIDIA
+A100 GPU has 108 SMs and 164KB shared memory per SM.
+Cross Iteration Optimization ps, dist, and wpb are initial-
+ized as the value 1 at the beginning. Then we optimize one
+parameter in each of the following iterations. First, we in-
+crease the ps to maximize the warp utilization. When further
+increasing the ps would also increase the latency, we would
+stop the search on ps and switch to dist. Second, we apply a
+similar strategy to locate the value of dist that can maximize
+the overlap of local computation and remote access. Third, we
+increase wbp to maximize the utilization of the entire SM. If
+any increase of wpb would increase the latency, we know that
+there may be too large thread blocks or too heavy workloads
+on individual warps that lower SM warp scheduling efﬁciency
+or computation parallelism. We would “retreat” (i.e., decrease)
+ps to its second-highest value if necessary and restart the in-
+crease of wpb. This optimization algorithm will stop when
+any decrease of ps and increase of wpb would lead to higher
+latency than the top-3 lowest latency. The latency of each
+iteration during the optimization will be recorded by a con-
+ﬁguration lookup table. At the end of the optimization, the
+conﬁguration with the lowest latency will be applied for all
+following iterations.
+
+Table 3: Datasets for Evaluation.
+
+Dataset
+
+reddit(RDD)
+enwiki-2013(ENWIKI)
+ogbn-products(PROD)
+ogbn-proteins(PROT)
+com-orkut(ORKT)
+
+#Vertex
+
+232,965
+4,203,323
+2,449,029
+132,534
+3,072,441
+
+#Edge
+
+#Dim #Class
+
+114,615,892
+202,623,226
+61,859,140
+39,561,252
+117,185,083
+
+602
+96
+100
+128
+128
+
+41
+128
+64
+112
+32
+
+This particular optimization order of parameters (ps, dist,
+and wpb) is based on two major aspects: (i) Spatially speaking,
+the granularity is from coarse-grained algorithm-level parti-
+tioning through ps, to medium-grained pipeline construction
+through dist (according to the partition plan), to ﬁne-grained
+pipeline-to-warp ﬁne-tuning through wpb (according to the
+pipeline design). (ii) Temporally speaking, the three optimiza-
+tions are applied at loading-time (ps to decide layout), kernel
+initialization (dist to decide pipeline), and runtime (wpb to
+decide pipeline mapping), respectively.
+
+5. Evaluation
+
+Benchmarks & Datasets We choose two representative
+GNN models for node classiﬁcation tasks to cover different
+types of operations in aggregation:
+
+1) Graph Convolutional Network (GCN) [28] is one of
+the most popular GNN architectures. It is also the key back-
+bone network for many other GNNs, such as GraphSAGE [23],
+and Differentiable Pooling [55]. Improving the performance
+of GCN will also beneﬁt a broad range of GNNs. We use the
+setting: 2 layers with 16 hidden dimensions for GCN, which is
+also the setting from the original paper [28]; The computation
+of a 2-layer GCN can be expressed as
+
+Z = Softmax( ˆA ReLU( ˆAXW 1)W 2).
+
+(4)
+
+where ˆA is the adjacent matrix of the input graph with self-
+loop edges, and X is the input node embedding matrix, where
+X ∈ RN×D; N is the number of nodes in a graph; D is the
+size of node embedding dimension. W 1 and W 2 are trainable
+weight matrices in the layer-1 and layer-2, respectively.
+
+2) Graph Isomorphism Network (GIN) [54] is another
+typical type of GNN, which aims to distinguish the graph-
+structure that cannot be identiﬁed by GCN. Each layer of GIN
+can be expressed as
+
+v = MLPl((1 + ε l)˙hl + ∑
+hl+1
+u∈N(v)
+
+hl
+u).
+
+(5)
+
+where l is the layer ID and l ∈ {0, 1}, MLP is a fully-connected
+neural network, hv is the node embedding for node v, and N(v)
+stands for the neighbors of node v. GIN mainly differs from
+GCN in its aggregation function, which introduces a weight
+parameter as the ratio of contribution from its neighbors and
+the node itself. In addition, GIN is the reference architecture
+for many other advanced GNNs with more edge properties,
+such as Graph Attention Network [48]. Note that for GIN
+
+9
+
+evaluation, we use the setting: 5 layers with 64 hidden dimen-
+sions, which is also the setting used in the original paper [54].
+Graphs used in our evaluation [30, 28] are large in their num-
+ber of nodes and edges that demand multi-GPU capability for
+effective GNN computation. Details of the above datasets are
+listed in Table 3. #Class is the dimension of the output layer
+and is used for the node classiﬁcation task.
+
+Baselines We choose several representative implementa-
+tions for comparison. 1) UVM-based Design has been high-
+lighted in recent work [27] in handling irregular graph com-
+putations (such as PageRank) on out-of-GPU-memory graphs.
+Note that [27] is not open-sourced, we implement the UVM-
+based kernel design by following the design strategies from
+[27] and incorporating optimizations from MGG (§3) except
+the hybrid GNN data placement (which is speciﬁc to SHMEM-
+based design) and hierarchical workload management (since
+all graph structural data, e.g., edge lists, and node embed-
+dings are maintained in the same uniﬁed virtual memory space
+regardless of their physical location); 2) DGCL [4] is the state-
+of-the-art system work that extends DGL [50] for full-graph
+GNNs on the multi-GPU platform. The core of DGCL is
+GCCL [4] (graph collective communication library), a dis-
+tributed graph communication library with GNN-tailored opti-
+mizations. DGCL also stores the partitioned subgraphs with
+their node embeddings in the device memory of different
+GPUs. DGCL will ﬁrst apply the graph-based Allgather to
+fetch the remote node embedding to local GPU memory. It
+then applies a local neighbor aggregation by leveraging the
+single-GPU GNN kernel in DGL. Additional multi-GPU de-
+signs, such as NeuGraph [34] and P3 [15], are not publicly
+available. We initially plan to evaluate our design on AMD
+ROC_SHMEM [2]. However, as indicated in its document and
+email responses from its authors, the existing ROC_SHMEM
+is an experimental prototype and is not ofﬁcially ready to be
+applied in practice due to very strict limitations on software
+(e.g., only supports ROCm v2.10) and hardware (e.g., only
+supports AMD GFX9 GPUs), which are quite challenging to
+ﬁnd and hard to deploy. We believe that once ROC_SHMEM
+becomes ready and generally applicable, MGG can be easily
+migrated to the AMD multi-GPU platform.
+
+Platforms & Tools Our major evaluation platform is an
+NVIDIA DGX-A100 platform with dual AMD Rome 7742
+processors (each with 64 cores, 2.25 GHz base clock), 1TB
+host memory, and 8×NVIDIA Ampere A100 GPUs (each
+with 40 GB device memory) connected via NVSwitch, which
+comes with 600 GB/s GPU-to-GPU bi-directional bandwidth.
+For the modeling study, we also leverage the NVIDIA DGX-1
+platform with 4×NVIDIA Tesla V100 GPUs connected via
+NVLINKs. We use CUDA (v11.7) and NVSHMEM (v2.6.0)
+for building our MGG design. Other NN operators (such as
+the fully-connected layer and softmax layer) use cuBLAS [37]
+and cuDNN (v8.4) [36] library for implementation. For kernel-
+level proﬁling, we use NVIDIA NSight Compute to get the de-
+
+Figure 8: Performance comparison with UVM-based design on
+GCN (left) and GIN (right) on DGX-A100.
+
+tailed performance metrics. We calculate the averaged speedup
+based on 100 runs of each setting.
+
+5.1. Compared with UVM-based GNN
+
+We comprehensively compare MGG with UVM-based design
+on the DGX-A100 for the end-to-end GNN computation. For
+UVM-based design, we put graph and embedding data in a
+global virtual memory space spanning across CPUs and GPUs
+without knowing its underlying layout and management strat-
+egy. Figure 8 shows that MGG achieves 3.16× speedup and
+4.15× speedup on average compared to UVM-based design
+on GCN and GIN, respectively. It is mainly because MGG can
+fetch remote node embeddings through NVSHMEM-based
+ﬁne-grained remote access. Such remote access can also fully
+overlap with the local aggregation computation to fully uti-
+lize the GPU resources. Comparing among different datasets,
+we can observe that for graphs (e.g., ogbn-products) with a
+more edges, MGG would demonstrate more speedup under the
+same number of GPUs. This is because our hierarchical work-
+load management can manage to create an appropriate size
+of workload for each warp, meanwhile achieving sufﬁcient
+computation parallelism among different warps. Comparing
+among different numbers of GPUs, An overall trend that when
+increasing the number of GPUs, MGG would achieve higher
+speedup. This is because of our effective usage of ﬁne-grained
+data transfer in NVSHMEM. In contrast, UVM-based design
+leverages the page-faulting-based remote data access that is
+more coarse-grained (around 64 KB) in comparison with a
+single node embedding size (less than 4KB), which leads to
+higher overhead and lower bandwidth usage. This would also
+make UVM-based design challenging for GPU SM schedulers
+to effectively dispatch instructions for the next available warps
+since most of the warps are waiting for the long-cycle page-
+faulting and page-migration operations. To gain more insights
+from the performance strength of MGG, we further measure
+two performance-critical GPU kernel metrics: Achieved Occu-
+pancy and SM utilization, where the former is the utilization of
+all available SMs on a single GPU while the latter is the ratio of
+the average active warps per active cycle to the maximum num-
+
+10
+
+1248RDDENWIKIPRODPROTORKTSpeedup (x)2GPU4GPU8GPU124816RDDENWIKIPRODPROTORKTSpeedup (x)2GPU4GPU8GPUTable 4: Performance comparison with DGCL on 1-layer GCN
+model on DGX-A100 with 8 GPUs.
+
+Settings
+
+RDD
+ENWIKI
+PROD
+PROT
+ORKT
+
+Graph Preprocessing
+
+GCN
+
+DGCL(ms) MGG(ms) DGCL(ms) MGG(ms)
+82.82×103
+6.95
+401.56×103
+12.79
+134.35×103
+3.35
+59.15×103
+2.66
+274.41×103
+17.20
+
+0.59×103
+1.22×103
+1.41×103
+0.54×103
+1.60×103
+
+12.74
+153.06
+35.64
+11.36
+140.99
+
+ber of warps supported in an individual SM. MGG achieves
+an average of 21.15% better SM utilization and an average of
+39.20% higher achieved occupancy and compared with UVM-
+based design, which indicates that neighbor partitioning and
+workload interleaving can 1) effectively distribute workload
+to more SMs to improve the overall GPU computing resource
+utilization, and 2) overlap the remote access and local ag-
+gregation computation from different warps to maximize the
+utilization of individual SMs.
+
+5.2. Compared with DGCL
+
+In this section, we compare our design with DGCL [4]. We
+build DGCL [4] from their source. We select the 8-GPU set-
+ting (the major setting used in their paper) on DGX-A100 and
+1-layer GCN model with 16 hidden dimensions for compari-
+son. Table 4 shows that MGG can outperform DGCL with an
+average 7.38× speedup on GCN computation. This is mainly
+because 1) MGG can effectively overlap the computation and
+the ﬁne-grained remote memory access, whereas DGCL has
+to fully complete the communication for fetching the remote
+neighbor embeddings before its local neighbor aggregation
+computation starts. And 2) our hierarchical workload man-
+agement strategy can maximize the utilization of the available
+GPU resources, whereas DGCL relies on the ofﬂine-optimized
+single-GPU kernel design that cannot adapt towards different
+GNN inputs. Another evident drawback of the DGCL is its
+extremely long data prepossessing time (Table 4 at Column-2)
+which limits its practical usage in many real-world settings.
+This is because DGCL requires applying its dedicated algo-
+rithm to generate communication-optimized partitioning and
+device mapping for each input graph. This algorithm comes
+with high overhead, making their design scales poorly when
+the incoming graph is large. In contrast, the graph partition
+and workload balancing in our MGG design is lightweight,
+which is much faster (more than 100× speedup) compared
+with DGCL during the graph prepossessing phase.
+
+5.3. Additional Studies & Analysis
+
+Neighbor Partitioning We compare MGG with a baseline
+design without applying the neighbor partitioning technique
+(i.e., each aggregation workload consists of all local/remote
+neighbors) on 4 GPUs. We apply the workload interleaving
+for both implementations and ﬁx the warp-per-block size to 2
+
+11
+
+(a)
+
+(b)
+
+Figure 9: Optimization Analysis: (a) Neighbor Partitioning; (b)
+Workload Interleaving.
+
+to eliminate the impact from other performance-related factors.
+Figure 9(a) shows higher latency (3.47× on average) for de-
+signs without applying neighbor partitioning, since the work-
+load imbalance becomes more severe across different warps
+without neighbor partitioning, especially for those graphs with
+many remote access demand, leading to limited computing
+parallelism and underutilization of GPU resources.
+
+Workload Interleaving We also compare MGG with a
+baseline design without workload interleaving (i.e., remote
+neighbor aggregation and local neighbor aggregation are
+mapped separately to the GPU warps. We ﬁx the size of
+the neighbor partition to 16 and the warp-per-block size to 2.
+Figure 9(b) shows that MGG consistently outperforms the non-
+interleaved baseline with an average of 1.32× speedup. Since
+without interleaving the local/remote workload, the workload
+distribution would be highly skewed, where the heavy and
+intensive remote aggregation would be gathered on certain
+warps close to each other while the lightweight local aggre-
+gation would be gathered on some other warps close to each
+other. This leads to inﬂexible warp scheduling and higher
+latency.
+
+Modeling and Optimization We further analyze the effec-
+tiveness of our lightweight analytical model for design space
+search. Speciﬁcally, three key parameters are studied, the
+size of neighbor partitioning, the interleaving distance, and
+the warps per block. Speciﬁcally, we consider three differ-
+ent settings: I: Reddit GCN on 4×A100 as the basic setting.
+II: Reddit GCN on 8×A100 to demonstrate the adaptability
+toward the different number of GPUs. III: Reddit GCN on
+4×V100 [42] to demonstrate the adaptability toward the dif-
+ferent types of GPUs. As shown in Figure 10, we decompose
+searching results into two parts corresponding to the output
+of the second and third step of the optimization discussed in
+§4: 1) searching for the “optimal” combination of partition
+size (ps) and interleaved distance (dist). The initial value of
+ps, dist, and wpb is set to all ones; and 2) searching for the
+“optimal” value of warp-per-block (wpb) based on the ps and
+dist. ps could be adjusted if necessary depending on speciﬁc
+problem settings and here we show the ﬁnal value of ps for
+simplicity. From the result, we observe that our performance
+modeling and parameter selection strategy can pinpoint the
+low-latency design for the above three settings. The overall
+searching process only requires about 10 iterations to reach
+ﬁnal “optimal” settings. Note that in this study, we show la-
+tency results for all possible settings for comparison to our
+
+04080120160200RDDENWIKIPRODLatency (ms)w/o_NPw/_NP0204060RDDENWIKIPRODLatency (ms)w/o_WLw/_WLaccuracy would make signiﬁcant proﬁt gains when deploying
+services at scale while the latency penalty is relatively minor
+for non-sampling GNNs.
+
+6. Discussion
+
+Graph Partitioning: Our NVSHMEM-based designs/opti-
+mizations could also support other graph partitioning strate-
+gies from prior graph processing and GNN work. There
+are several major categories. 1) Locality-driven partitioning
+(e.g., Rabbit order [3]) minimizes the communication/syn-
+chronization cost in distributed graph processing/GNN com-
+puting. MGG can effectively accommodate such reduced-
+communication cases through dynamic kernel re-conﬁguration
+(e.g., ﬁnetuning the interleaving distance and warp-to-block
+mapping) to maximize the communication and computa-
+tion efﬁciency. 2) Workload-driven partitioning (e.g., Neu-
+Graph [34]) balances the irregular graph/GNN workload
+among different devices. Our current design be easily adapted
+to handle such cases by inserting device synchronization prim-
+itives (NVSHMEM collective communication primitives, such
+as nvshmem_float_sum_reduce) for maintaining data con-
+sistency among different replicas.
+
+Application Generality: Besides our current demonstra-
+tion on GNN-based computation, our design could also be
+generalized to other applications and hardware platforms.
+For instance, in the deep-learning recommendation model
+(DLRM) [58, 21], the large embedding tables could be parti-
+tioned by rows/columns and stored in shared multi-GPU mem-
+ory space and training/inference embedding access queries can
+be evenly distributed among GPUs for balancing workload.
+Our pipelined design could be used to overlap embedding
+collecting and the embedding interaction with associative op-
+erators (e.g., sum/min/max reduction) to reduce the overall
+computing latency and improve system utilization. However,
+for embedding iterations with non-associative operators (e.g.,
+concatenation with orders), such computation-communication
+overlapping design would be less effective due to the necessary
+synchronization to guarantee the output correctness.
+
+Hardware Generality: Our design can also be adapted
+toward other hardware platforms with similar communication
+support. For instance, on the multi-CPU based platform with
+OpenSHMEM [6], our current GPU kernel design can be
+rewritten as regular C++ functions mixed with OpenSHMEM
+primitives (in place of NVSHMEM primitives) to be executed
+on CPU-based distributed platforms. On the CPU, since there
+is no notion of thread warp/block, the program mainly relies on
+thread/process-level parallelism. Thus, we need to determine
+the runtime conﬁgurations (e.g., the total number of CPU
+threads) so that we can balance the computation parallelism
+and the computation-communication pipelining efﬁciency. We
+need to do additional proﬁling to get the relative latency cost
+of computation and communication on multi-CPU platforms
+and adjust the way/pattern of overlapping the computation and
+
+Figure 10: Parameter selection for three different settings. (a),
+(b), and (c) are for setting I, II, and III, respectively. Note that
+the left-side ﬁgures show the runtime latency for different com-
+binations of ps and dist, while the right-side ﬁgures show the
+latency for different combinations of wpb and dist. The solid
+black triangle with “E” is the searched “optimal” combina-
+tion for ps and dist, while the black solid star with “E” is the
+searched “optimal” wpb given dist and ps.
+
+Table 5: Accuracy-Latency of GNNs w/ and w/o sampling.
+
+Dataset
+
+RDD
+PROT
+
+Accuracy w/
+sampling
+
+Accuracy
+w/o sampling
+
+Latency (w/o vs.
+w/ sampling)
+
+0.937
+0.776
+
+0.957
+0.825
+
+1.07×
+1.25×
+
+searched design points. Whereas in the actual cross-iteration
+optimization phase, we only need to traverse a small part of the
+whole design space. By comparing the ﬁnal optimal runtime
+conﬁguration setting and the initial conﬁguration, we can see
+that modeling and cross-iteration optimization can decrease
+the execution time by up to 68%. In the end-to-end GNN train-
+ing which usually consists of more than 100 iterations, such a
+latency saving in the later iterations would also be signiﬁcant.
+This experimental study demonstrates the effectiveness of our
+analytical modeling in assisting parameter selection.
+
+Accuracy-latency Tradeoff This study will analyze the
+accuracy-latency tradeoff between GNNs w/ and w/o sampling
+on 8×A100. Table 5 shows an evident node classiﬁcation
+accuracy increase (2% to 5%) of GNN w/o sampling over
+GNN w/ sampling. The accuracy of sampling-based GNN
+would be affected by many factors (e.g., sampling rate at each
+GNN layer and graph structure). Therefore, it is highly tricky
+to choose the “optimal” value for those factors. Here we
+follow the conventional way for GNN sampling [50]. The
+accuracy difference agrees with previous GNN algorithmic
+work [23]. In many real-world applications (e.g, e-commerce),
+such an accuracy advantage of non-sampling GNN would
+be much more favorable to users. This is because even 1%
+
+12
+
+36.51mspsdist34.84ms(a)(b)31.51ms30.24ms40.03ms40.93ms(c)distpsdistpsdist43.46ms16.53ms30.45ms10.12ms40.21mswpbwpbdist28.19mswpbdist111EEEE12E12E1communication (e.g., the interleaving distance).
+
+7. Conclusion
+
+In this paper, we introduce MGG, a novel multi-GPU system
+design and implementation to exploit the potential of GPU-
+based software pipeline for accelerating GNNs. MGG consists
+of a pipeline-aware workload management technique to tackle
+irregular GNN workload, a highly optimized pipeline-centric
+kernel to effectively overlap the decoupled communication
+and computation, and lightweight analytical modeling and
+optimization heuristics to dynamically improve the GNN run-
+time performance. Comprehensive experiments demonstrate
+that MGG outperforms state-of-the-art multi-GPU systems
+across various GNN settings: on average 3.65× faster than
+multi-GPU systems with a uniﬁed virtual memory design and
+on average 7.38× faster than DGCL framework.
+
+References
+
+[1] AMD. Rocm communication collectives library (rccl). github.com/
+
+ROCmSoftwarePlatform/rccl.
+
+[2] AMD. Rocm openshmem. github.com/ROCm-Developer-Tools/
+
+ROC_SHMEM.
+
+[3] J. Arai, H. Shiokawa, T. Yamamuro, M. Onizuka, and S. Iwamura.
+Rabbit order: Just-in-time parallel reordering for fast graph analy-
+sis. In 2016 IEEE International Parallel and Distributed Processing
+Symposium (IPDPS), 2016.
+
+[4] Zhenkun Cai, Xiao Yan, Yidi Wu, Kaihao Ma, James Cheng, and
+Fan Yu. Dgcl: an efﬁcient communication library for distributed gnn
+training. In Proceedings of the Sixteenth European Conference on
+Computer Systems (EuroSys), pages 130–144, 2021.
+
+[5] Zixian Cai, Zhengyang Liu, Saeed Maleki, Madanlal Musuvathi, Todd
+Mytkowicz, Jacob Nelson, and Olli Saarikivi. Synthesizing optimal
+collective algorithms. In Proceedings of the 26th ACM SIGPLAN Sym-
+posium on Principles and Practice of Parallel Programming (PPoPP),
+pages 62–75, 2021.
+
+[6] Barbara Chapman, Tony Curtis, Swaroop Pophale, Stephen Poole, Jeff
+Kuehn, Chuck Koelbel, and Lauren Smith. Introducing openshmem:
+Shmem for the pgas community. In Proceedings of the Fourth Confer-
+ence on Partitioned Global Address Space Programming Model, PGAS
+’10, 2010.
+
+[7] Hsinchun Chen, Xin Li, and Zan Huang. Link prediction approach to
+collaborative ﬁltering. In Proceedings of the 5th ACM/IEEE-CS Joint
+Conference on Digital Libraries (JCDL). IEEE, 2005.
+
+[8] Jie Chen, Tengfei Ma, and Cao Xiao. Fastgcn: fast learning with
+graph convolutional networks via importance sampling. arXiv preprint
+arXiv:1801.10247, 2018.
+
+[9] Xiaobing Chen, Yuke Wang, Xinfeng Xie, Xing Hu, Abanti Basak,
+Ling Liang, Mingyu Yan, Lei Deng, Yufei Ding, Zidong Du, Yunji
+Chen, and Yuan Xie. Rubik: A hierarchical architecture for efﬁcient
+graph learning. In IEEE Transactions on Computer Aided Design of
+Integrated Circuits & Systems. (TCAD’21), 2021.
+
+[10] De Cheng, Yihong Gong, Xiaojun Chang, Weiwei Shi, Alexander
+Hauptmann, and Nanning Zheng. Deep feature learning via struc-
+tured graph laplacian embedding for person re-identiﬁcation. Pattern
+Recognition, 2018.
+
+[11] Wei-Lin Chiang, Xuanqing Liu, Si Si, Yang Li, Samy Bengio, and
+Cho-Jui Hsieh. Cluster-gcn: An efﬁcient algorithm for training deep
+and large graph convolutional networks. In Proceedings of the 25th
+ACM SIGKDD International Conference on Knowledge Discovery &
+Data Mining, 2019.
+
+[12] Alberto Garcia Duran and Mathias Niepert. Learning graph representa-
+tions with embedding propagation. In Advances in neural information
+processing systems (NeurIPS), 2017.
+
+[13] Boyuan Feng, Yuke Wang, and Yufei Ding. Uag: Uncertainty-aware
+attention graph neural network for defending adversarial attacks. In
+AAAI Conference on Artiﬁcial Intelligence. (AAAI’21), 2021.
+
+13
+
+[14] Boyuan Feng, Yuke Wang, Xu Li, Shu Yang, Xueqiao Peng, and Yufei
+Ding. Sgquant: Squeezing the last bit on graph neural networks with
+specialized quantization. In International Conference on Tools with
+Artiﬁcial Intelligence (ICTAI’20), 2020.
+
+[15] Swapnil Gandhi and Anand Padmanabha Iyer. P3: Distributed deep
+graph learning at scale. In 15th USENIX Symposium on Operating Sys-
+tems Design and Implementation (OSDI 21), pages 551–568. USENIX
+Association, July 2021.
+
+[16] Debashis Ganguly, Ziyu Zhang, Jun Yang, and Rami Melhem. Adaptive
+page migration for irregular data-intensive applications under gpu
+memory oversubscription. In 2020 IEEE International Parallel and
+Distributed Processing Symposium (IPDPS), pages 451–461.
+
+[17] Debashis Ganguly, Ziyu Zhang, Jun Yang, and Rami Melhem. Interplay
+between hardware prefetcher and page eviction policy in cpu-gpu
+In Proceedings of the 46th International
+uniﬁed virtual memory.
+Symposium on Computer Architecture (ISCA), pages 224–235, 2019.
+[18] Prasun Gera, Hyojong Kim, Piyush Sao, Hyesoon Kim, and David
+Bader. Traversing large graphs on gpus with uniﬁed memory. Proceed-
+ings of the VLDB Endowment, 13(7):1119–1133, 2020.
+
+[19] Jaume Gibert, Ernest Valveny, and Horst Bunke. Graph embedding in
+vector spaces by node attribute statistics. Pattern Recognition, 2012.
+[20] Aditya Grover and Jure Leskovec. node2vec: Scalable feature learning
+for networks. In Proceedings of the 22nd ACM international conference
+on Knowledge discovery and data mining (SIGKDD), 2016.
+
+[21] Udit Gupta, Carole-Jean Wu, Xiaodong Wang, Maxim Naumov, Bran-
+don Reagen, David Brooks, Bradford Cottel, Kim M. Hazelwood,
+Mark Hempstead, Bill Jia, Hsien-Hsin S. Lee, Andrey Malevich, Dhee-
+vatsa Mudigere, Mikhail Smelyanskiy, Liang Xiong, and Xuan Zhang.
+The architectural implications of facebook’s dnn-based personalized
+recommendation. In 2020 IEEE International Symposium on High
+Performance Computer Architecture (HPCA), pages 488–501. IEEE,
+2020.
+
+[22] Khaled Hamidouche and Michael LeBeane. Gpu initiated openshmem:
+correct and efﬁcient intra-kernel networking for dgpus. In Proceedings
+of the 25th ACM SIGPLAN Symposium on Principles and Practice of
+Parallel Programming (PPoPP), pages 336–347, 2020.
+
+[23] Will Hamilton, Zhitao Ying, and Jure Leskovec. Inductive represen-
+tation learning on large graphs. In Advances in neural information
+processing systems (NeurIPS), 2017.
+
+[24] Zexi Huang, Arlei Silva, and Ambuj Singh. A broader picture of
+random-walk based graph embedding. In Proceedings of the 27th ACM
+SIGKDD Conference on Knowledge Discovery & Data Mining, pages
+685–695, 2021.
+
+[25] Zhihao Jia, Sina Lin, Mingyu Gao, Matei Zaharia, and Alex Aiken.
+Improving the accuracy, scalability, and performance of graph neural
+networks with roc. In Proceedings of the 3rd MLSys Conference, 2020.
+[26] Riesen Kaspar and Bunke Horst. Graph classiﬁcation and clustering
+
+based on vector space embedding. World Scientiﬁc, 2010.
+
+[27] Hyojong Kim, Jaewoong Sim, Prasun Gera, Ramyad Hadidi, and
+Hyesoon Kim. Batch-aware uniﬁed memory management in gpus for
+irregular workloads. In Proceedings of the Twenty-Fifth International
+Conference on Architectural Support for Programming Languages and
+Operating Systems (ASPLOS), pages 1357–1370, 2020.
+
+[28] Thomas N Kipf and Max Welling. Semi-supervised classiﬁcation with
+graph convolutional networks. International Conference on Learning
+Representations (ICLR), 2017.
+
+[29] Jérôme Kunegis and Andreas Lommatzsch. Learning spectral graph
+transformations for link prediction. In Proceedings of the 26th Annual
+International Conference on Machine Learning (ICML), 2009.
+[30] Jure Leskovec and Andrej Krevl. SNAP Datasets: Stanford large net-
+
+work dataset collection. http://snap.stanford.edu/data, 2014.
+[31] Ang Li, Shuaiwen Leon Song, Jieyang Chen, Jiajia Li, Xu Liu,
+Nathan R Tallent, and Kevin J Barker. Evaluating modern gpu intercon-
+nect: Pcie, nvlink, nv-sli, nvswitch and gpudirect. IEEE Transactions
+on Parallel and Distributed Systems, 31(1):94–110, 2019.
+
+[32] Dijun Luo, Chris Ding, Heng Huang, and Tao Li. Non-negative lapla-
+cian embedding. In 2009 Ninth IEEE International Conference on
+Data Mining (ICDM). IEEE, 2009.
+
+[33] Dijun Luo, Feiping Nie, Heng Huang, and Chris H Ding. Cauchy
+graph embedding. In Proceedings of the 28th International Conference
+on Machine Learning (ICML), 2011.
+
+[34] Lingxiao Ma, Zhi Yang, Youshan Miao, Jilong Xue, Ming Wu, Lidong
+Zhou, and Yafei Dai. Neugraph: parallel deep neural network compu-
+tation on large graphs. In 2019 USENIX Annual Technical Conference.
+developer.nvidia.com/blog/
+
+Cuda-aware mpi.
+
+[35] NVIDIA.
+
+introduction-cuda-aware-mpi/.
+
+[36] Nvidia. Cuda deep neural network library (cudnn). developer.
+
+nvidia.com/cudnn.
+
+[37] Nvidia. Dense linear algebra on gpus. developer.nvidia.com/
+
+cublas.
+
+[38] Nvidia. Nvidia collective communication library (nccl). developer.
+
+nvidia.com/nccl.
+
+[39] Nvidia. Nvidia dgx a100. www.nvidia.com/content/dam/en-zz/
+
+Solutions/Data-Center/nvidia-dgx-a100-datasheet.pdf.
+
+[40] Nvidia.
+
+Nvidia nsight systems.
+
+nsight-systems.
+
+developer.nvidia.com/
+
+[41] Nvidia. Nvshmem communication library. developer.nvidia.com/
+
+nvshmem.
+
+[42] Nvidia. Tesla v100. www.nvidia.com/en-us/data-center/v100/.
+[43] NVIDIA. Uniﬁed memory for cuda. developer.nvidia.com/blog/
+
+unified-memory-cuda-beginners/.
+
+[44] Bryan Perozzi, Rami Al-Rfou, and Steven Skiena. Deepwalk: Online
+learning of social representations. In Proceedings of the 20th ACM
+International Conference on Knowledge Discovery and Data Mining
+(SIGKDD), 2014.
+
+[45] Erich Strohmaier, Jack Dongarra, Horst Simon, and Martin Meuer.
+
+Top500 the list. https://www.top500.org/.
+
+[46] Tomasz Tylenda, Ralitsa Angelova, and Srikanta Bedathur. Towards
+time-aware link prediction in evolving social networks. In Proceedings
+of the 3rd workshop on social network mining and analysis, 2009.
+[47] Brian Van Essen, Hyojin Kim, Roger Pearce, Koﬁ Boakye, and
+Barry Chen. Lbann: Livermore big artiﬁcial neural network hpc
+toolkit. In Proceedings of the Workshop on Machine Learning in High-
+Performance Computing Environments, MLHPC ’15, New York, NY,
+USA, 2015. Association for Computing Machinery.
+
+[48] Petar Veliˇckovi´c, Guillem Cucurull, Arantxa Casanova, Adriana
+Romero, Pietro Liò, and Yoshua Bengio. Graph attention networks. In
+International Conference on Learning Representations (ICLR), 2018.
+[49] Guanhua Wang, Shivaram Venkataraman, Amar Phanishayee, Jorgen
+Thelin, Nikhil Devanur, and Ion Stoica. Blink: Fast and generic
+collectives for distributed ml. arXiv preprint arXiv:1910.04940, 2019.
+[50] Minjie Wang, Lingfan Yu, Da Zheng, Quan Gan, Yu Gai, Zihao Ye,
+Mufei Li, Jinjing Zhou, Qi Huang, Chao Ma, Ziyue Huang, Qipeng
+Guo, Hao Zhang, Haibin Lin, Junbo Zhao, Jinyang Li, Alexander J
+Smola, and Zheng Zhang. Deep graph library: Towards efﬁcient and
+scalable deep learning on graphs. ICLR Workshop on Representation
+Learning on Graphs and Manifolds, 2019.
+
+[51] Yuke Wang, Boyuan Feng, Gushu Li, Shuangchen Li, Lei Deng, Yuan
+Xie, and Yufei Ding. Gnnadvisor: An efﬁcient runtime system for gnn
+acceleration on gpus. In USENIX Symposium on Operating Systems
+Design and Implementation (OSDI), 2021.
+
+[52] wikipedia. Nvidia gpu micro-architecture. en.wikipedia.org/wiki/
+
+CUDA.
+
+[53] Frank Wilczek. Qcd made simple. Phys. Today, 53(8):22–28, 2000.
+[54] Keyulu Xu, Weihua Hu, Jure Leskovec, and Stefanie Jegelka. How
+powerful are graph neural networks? In International Conference on
+Learning Representations (ICLR), 2019.
+
+[55] Rex Ying, Jiaxuan You, Christopher Morris, Xiang Ren, William L.
+Hamilton, and Jure Leskovec. Hierarchical graph representation learn-
+ing with differentiable pooling. In The 32nd International Conference
+on Neural Information Processing Systems (NeurIPS), 2018.
+
+[56] Qi Yu, Bruce Childers, Libo Huang, Cheng Qian, and Zhiying Wang.
+Hierarchical page eviction policy for uniﬁed memory in gpus. In 2019
+IEEE International Symposium on Performance Analysis of Systems
+and Software (ISPASS), pages 149–150. IEEE, 2019.
+
+[57] Hanqing Zeng, Hongkuan Zhou, Ajitesh Srivastava, Rajgopal Kannan,
+and Viktor Prasanna. Graphsaint: Graph sampling based inductive
+learning method. In International Conference on Learning Representa-
+tions (ICLR), 2020.
+
+[58] Shuai Zhang, Lina Yao, Aixin Sun, and Yi Tay. Deep learning based
+recommender system: A survey and new perspectives. ACM Comput-
+ing Surveys (CSUR), 52(1):1–38, 2019.
+
+[59] Yufeng Zhang, Xueli Yu, Zeyu Cui, Shu Wu, Zhongzhen Wen, and
+Liang Wang. Every document owns its structure: Inductive text clas-
+siﬁcation via graph neural networks. Proceedings of the 58th Annual
+Meeting of the Association for Computational Linguistics (ACL), 2020.
+
+14
+
+

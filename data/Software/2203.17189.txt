@@ -1,0 +1,616 @@
+2
+2
+0
+2
+
+r
+a
+
+M
+1
+3
+
+]
+
+G
+L
+.
+s
+c
+[
+
+1
+v
+9
+8
+1
+7
+1
+.
+3
+0
+2
+2
+:
+v
+i
+X
+r
+a
+
+Scaling Up Models and Data with t5x and seqio
+
+Lead Authors
+Adam Roberts
+Hyung Won Chung
+Anselm Levskaya
+Gaurav Mishra
+James Bradbury
+
+adarob@google.com
+hwchung@google.com
+levskaya@google.com
+mishragaurav@google.com
+jekbradbury@google.com
+
+Technical Contributors
+Daniel Andor, Sharan Narang, Brian Lester, Colin Gaﬀney, Afroz Mohiuddin,
+Curtis Hawthorne, Aitor Lewkowycz, Alex Salcianu, Marc van Zee, Jacob Austin,
+Sebastian Goodman, Livio Baldini Soares, Haitang Hu, Sasha Tsvyashchenko,
+Aakanksha Chowdhery, Jasmijn Bastings, Jannis Bulian, Xavier Garcia
+Jianmo Ni, Andrew Chen, Kathleen Kenealy, Jonathan H. Clark, Stephan Lee
+Dan Garrette, James Lee-Thorp
+
+Technical Advisors
+Colin Raﬀel, Noam Shazeer, Marvin Ritter, Maarten Bosma, Alexandre Passos,
+Jeremy Maitin-Shepard
+
+Leadership
+Noah Fiedel, Mark Omernick, Brennan Saeta, Ryan Sepassi,
+Alexander Spiridonov, Joshua Newlan, Andrea Gesmundo
+
+*Authors are ordered by impact within groups.
+
+Abstract
+
+Recent neural network-based language models have beneﬁted greatly from scaling up the
+size of training datasets and the number of parameters in the models themselves. Scaling
+can be complicated due to various factors including the need to distribute computation on
+supercomputer clusters (e.g., TPUs), prevent bottlenecks when infeeding data, and ensure
+reproducible results. In this work, we present two software libraries that ease these issues:
+t5x simpliﬁes the process of building and training large language models at scale while
+maintaining ease of use, and seqio provides a task-based API for simple creation of fast
+and reproducible training data and evaluation pipelines. These open-source libraries have
+been used to train models with hundreds of billions of parameters on datasets with multiple
+terabytes of training data. Along with the libraries, we release conﬁgurations and instruc-
+tions for T5-like encoder-decoder models as well as GPT-like decoder-only architectures.
+
+t5x and seqio are open source and available at https://github.com/google-research/
+
+t5x and https://github.com/google/seqio, respectively.
+Keywords: Large language models, data parallelism, model parallelism, data processing
+
+1
+
+ 
+ 
+ 
+ 
+ 
+ 
+1. Introduction
+
+Neural network models are highly scalable.
+In particular, Transformers (Vaswani et al.,
+2017) have been scaled up to hundreds of billions of parameters, demonstrating signiﬁcant
+improvements on tasks of interest along the way. However, training models at these sizes
+is challenging and often demands specialized and hand-tuned software systems, making
+it diﬃcult to quickly iterate over experimental research ideas. Furthermore, downstream
+usage and evaluation of these models requires either ﬁnetuning or prompting, which must
+be applied consistently across competing models.
+
+These requirements motivate the development of a framework that enables easy model
+scaling while remaining research-friendly. JAX (Bradbury et al., 2018; Frostig et al., 2018)
+is uniquely positioned to provide such beneﬁts; its NumPy-like (Harris et al., 2020) API
+makes it easy to understand and develop, while the jax.pjit API backed by XLA GSPMD
+(Xu et al., 2021) provides a powerful and eﬃcient compiler-based programming model for
+parallelism. In this paper, we present t5x, a JAX-based open-source library that is focused
+on building Transformer models at a wide range of scales.
+
+As model sizes grow, it becomes increasingly important to train them on larger datasets.
+We therefore additionally introduce seqio, a fully-featured library for eﬃciently managing
+data pipelines and model evaluation with a simple, task-based API. seqio builds oﬀ of
+tensorflow.data with additional support for SPMD-based data parallelism, making it
+compatible with many modeling frameworks including JAX, TensorFlow (Abadi et al.,
+2015), and PyTorch (Paszke et al., 2019). seqio includes an option to create deterministic
+data pipelines, which we have found to be an indispensable tool for optimizing training
+performance, fairly comparing models, and diagnosing issues during training.
+
+2. t5x
+
+t5x is a library for training, evaluating, and inferring with JAX models across many scales,
+with a focus on Transformer-based language models. The typical usage involves either
+pretraining from scratch or ﬁnetuning an existing language model implemented in Flax—
+a JAX-based neural network library (Heek et al., 2020)—and then running inference for
+evaluations and/or downstream applications. GPU and CPU acceleration are supported,
+but t5x is optimized for TPU.
+
+In the following subsections, we discuss the design of t5x including how it wraps
+jax.pjit to provide a high-level interface to XLA GSPMD for simple yet eﬃcient scal-
+ing via parameter, activation, and data partitioning.
+
+2.1 Overall structure
+Figure 1 illustrates the modular structure of t5x, in particular how t5x uses open-source
+libraries to implement diﬀerent functionalities. We brieﬂy describe each of these below.
+
+2
+
+Figure 1: Overall structure of t5x, showing which dependencies are used to implement the
+
+principal functionalities contained in darker boxes.
+
+• Datasets and Evaluation - By default, we use seqio to create reproducible “tasks”,
+which we cover in detail in Section 3. Note that t5x provides a modular structure
+and may be used without seqio.
+
+• Checkpointing - For large models, straightforward tasks like checkpointing can be
+challenging, especially when using parameter and optimizer partitioning.
+In order
+to eﬃciently manage checkpoints from multiple hosts with distributed parameters,
+we built our own checkpointing library utilizing TensorStore1 as a tool for scalably
+reading and writing sliced tensors.
+
+• Conﬁguration - For fast iterations over research ideas, it is important for the code-
+base to be easily conﬁgurable.
+In particular, researchers should be able to control
+function arguments and even use custom components without needing to modify the
+core library code. We use Gin2 for this dependency injection. As a typical example,
+users can inject hyperparameters or a custom model object as function arguments
+for training. More advanced users can replace entire modules (e.g., a custom check-
+pointer) in a similar manner.
+
+• Models - To actually implement the modeling layers, we use Flax (Heek et al., 2020),
+a high-level library built on JAX. Section 2.3 discusses a few specialized features in
+Flax that are required by t5x to enable model parallelism.
+
+• Partitioning - One of the key features of t5x is its ability to parallelize over data,
+parameters, and activations. We use the XLA GSPMD partitioner (Xu et al., 2021)
+to automatically shard the computation graph and use jax.pjit as a frontend to
+interact with GSPMD, providing our own high-level API to simplify conﬁguration.
+Section 2.2 will discuss this component in further detail.
+
+1. https://github.com/google/tensorstore
+2. https://github.com/google/gin-config
+
+3
+
+T5XDatasets & EvalSeqIOCheckpointingTensorStoreConfigGinModelsFlaxformerMinimalFlaxPartitioningjax.pjitXLA GSPMD...2.2 XLA GSPMD partitioning with jax.pjit
+
+Many diﬀerent kinds of parallelism are useful for scaling large models. In data parallelism,
+the input data and intermediate activations are split over devices (“partitioned”) along
+the global batch axis. In (tensor) model parallelism, the model computation for a single
+example, and the model parameters themselves, are split across devices.
+
+These two kinds of parallelism are orthogonal, in that a system with N = M × D
+devices can use M -way model parallelism and D-way data parallelism at the same time.
+t5x assumes such a decomposition of the devices in the system into a model parallel axis
+(speciﬁed in multidimensional TPU networks as a “model parallel submesh”) and a data
+parallel axis or submesh.
+
+t5x has built-in support for multiple variants of data and model parallelism, i.e., multiple
+
+ways to use these two orthogonal axes:
+
+• Data parallelism is parallelism in the batch dimension.
+
+It can also involve either
+replicating the parameters and optimizer state or sharding them over the data parallel
+axis. The former is also termed “1D parameter partitioning”, since parameters are
+only subject to model parallel partitioning over one array axis, while the latter is “2D
+parameter partitioning” since a second array axis in each parameter is also partitioned.
+
+• Model parallelism involves partitioning model computation over axes other than the
+batch dimension. In Transformers, it involves partitioning parameters and some inter-
+mediate activations along axes like the MLP hidden dimension and the heads dimen-
+sion. Other intermediate activations (those with an embedding/model axis but not
+hidden/heads) can either be replicated over the model parallel axis (“1D activation
+partitioning”) or sharded (“2D activation partitioning”).
+
+These options correspond to previously described parallelism techniques: 2D parameter
+partitioning is also known as ZeRO-3 (Rajbhandari et al., 2020) or fully sharded data
+parallelism; 1D activation partitioning is also known as Megatron (Shoeybi et al., 2019)
+and is the default in the Mesh TensorFlow Transformer (Shazeer et al., 2018); and 2D
+activation partitioning is the “fully sharded” case described in Xu et al. (2021).
+
+t5x supports ﬂexible partitioning conﬁgurations, including these built-in options, using
+
+the Flax APIs described in the following section.
+
+2.3 Model Implementation
+
+In
+t5x is compatible with Flax-based model implementations with some minor caveats.
+order to support ﬂexible conﬁgurations for parameter and activation partitioning, t5x re-
+quires these tensors to be annotated with user-deﬁned logical named axes when they are
+deﬁned in the model implementation, via flax.partitioning.param with axes. These
+logical axes are used to group tensor dimensions that one would expect to always par-
+tition in the same way in various settings, for example “batch” (for partitioning across
+examples in a batch), “kv” (for partitioning across the dimensions of key-value matrices in
+Transformer self-attention layers), or “head” (for partitioning across heads in multi-headed
+attention). While XLA GSPMD will automatically select matching partitions for the in-
+termediate activations produced by these parameters, users may also provide overrides by
+
+4
+
+naming their axes as well via flax.partitioning.with sharding constraint to better
+optimize memory usage and between-device communication.
+
+At runtime, the user provides a mapping from each logical axis name to one of the two
+hardware axes (model and data). Alternatively, the logical axis can be mapped to None to
+specify that it should be replicated across all devices.
+
+Given a flax.nn.module module implemented as described above, one must simply
+wrap it in a subclass of t5x.BaseModel to deﬁne its loss, evaluation, and inference methods
+to make it compatible with the core t5x interface.
+
+With its modular design, the model implementations in t5x can be ﬂexible. Layers and
+modules can be written directly with Flax (e.g., the “Minimal” implementations discussed
+in Section 4) or using a higher-level library such as Flaxformer3. Dependency injection with
+Gin allows users to easily swap the module implementation in their conﬁguration. Even
+when implemented in diﬀerent libraries, the model checkpoints can be made compatible.
+Additionally, models trained with the legacy T5 codebase4 based on Mesh TensorFlow can
+be read directly by t5x. They can also be converted to the native t5x format resulting in
+faster reading based on how t5x leverages TensorStore.
+
+3. seqio
+
+seqio is a library for processing data to be fed into models for training, inference, and
+evaluation. It uses tensorflow.data to create scalable data pipelines but requires minimal
+use of TensorFlow. In particular, with one line of code, the returned dataset can be trans-
+formed to a NumPy iterator and hence it is fully compatible with other frameworks such
+as JAX or PyTorch.
+
+3.1 Task-based API
+
+Figure 2: Structure of a seqio Task, highlighting customizable use of APIs.
+
+A key diﬀerentiator of seqio from most other dataset frameworks is its use of a task-
+based API, which is illustrated in Figure 2. The Task object associates raw data sources
+
+3. https://github.com/google/flaxformer
+4. https://github.com/google-research/text-to-text-transfer-transformer
+
+5
+
+TaskSourceVocabularyPreprocessorPostprocessor MetricsTFDSFiles--- ---  -----def preprocess(dataset):   ...   ...    return preprocessed_datasetdef metric_fn(predictions, targets):   ...   ...   return metricswith preprocessing steps—to deﬁne the inputs and targets—and evaluation metrics—to
+create consistent benchmarks. Feature converters are used to convert task features into the
+raw values that will be fed into the model itself. This way the same task can be made
+compatible with various architectures (e.g., encoder-decoder or decoder-only).
+
+Multiple Tasks can also be combined into a Mixture for multi-task training, with user-
+
+provided mixing rates.
+
+3.2 Deterministic Pipelines
+
+seqio also provides the ability to generate deterministic data pipelines with following key
+features:
+
+• Reproducibility - Data read from a deterministic Task/Mixture is always in the
+same order, which is important for dataset debugging and inspection. It also allows
+the dataset to be held constant for more accurate benchmarking or when debugging
+training issues.
+
+• Recoverability - A deterministic dataset can be continued from an arbitrary point
+in training. This avoids repeating data on intentional or unintentional (e.g., due to
+preemption) training restarts, which can lead to reduced performance and memoriza-
+tion (Lee et al., 2022). We have also found it useful for manually skipping batches of
+a dataset that produce instabilities during training.
+
+• Sharding - Data can be arbitrarily sharded across any number of readers to enable
+
+eﬃcient distributed reads from data-parallel workers.
+
+• Global Shuﬄing - Deterministic datasets are prepared by an oﬄine job that ensures
+data is well-shuﬄed. This is particularly important when examples are correlated (e.g.,
+they are based on the same source document) or multiple epochs are used.
+
+To achieve these requirements, once a Deterministic Task/Mixture is deﬁned, a dis-
+tributed caching job (implemented in Apache Beam5) loads the raw data, preprocesses and
+shuﬄes the examples, assigns ordered indices, and writes the data to sharded ﬁles. Impor-
+tantly, the examples are sharded by the modulo of their index to the number of ﬁles. This
+enables each set of data parallel hosts to sequentially read an interleave an exclusive set of
+ﬁles at train time, helping to optimize throughput and greatly reducing the chance of an
+input bottleneck.
+
+We have found these four features to be beneﬁcial when training extremely large models.
+They increase throughput, protect against overﬁtting, ease debugging, and provide ﬁne-
+grained control over the examples seen during training in order to avoid instabilities. We
+expect this control to also be useful for researchers interested in understanding how speciﬁc
+aspects of the dataset (e.g., order and repeats) might aﬀect the model’s ability to generalize
+or memorize.
+
+5. https://beam.apache.org
+
+6
+
+4. Example Models
+
+With t5x, we provide well-tested6 “Minimal” model implementations with checkpoints:
+
+• T5 from Raﬀel et al. (2020) and T5.1.1 (introduced after the paper).
+• Scalable T5
+• mT5 (Xue et al., 2021)
+• ByT5 (Xue et al., 2022)
+
+These model implementations are minimal in the sense that they only use Flax with limited
+abstractions as opposed to using higher-level libraries built on top of Flax (e.g. Flaxformer).
+They closely mimic the pedagogical Flax examples7.
+
+Scalable T5 is an implementation of T5.1.1 using jax.scan to signiﬁcantly reduce com-
+
+pilation time and provide ﬁner-grained control over activation memory.
+
+We also provide a model conﬁguration (without any checkpoints) for a decoder-only
+
+architecture that is compatible with LaMDA (Thoppilan et al., 2022).
+
+5. Related Work
+
+There are many open source libraries for training sequence models. Previous Google-released
+systems based on TensorFlow include Tensor2Tensor (Vaswani et al., 2018), Lingvo (Shen
+et al., 2019), and the Mesh TensorFlow (Shazeer et al., 2018)-based T5 (Raﬀel et al., 2020).
+Comparable projects from other research groups include model libraries such as fairseq
+(Ott et al., 2019), large-scale parallelism libraries such as FairScale (Baines et al., 2021),
+and libraries that include both kinds of functionality such as DeepSpeed (Rasley et al.,
+2020) and Megatron (Smith et al., 2022).
+
+Some major diﬀerentiators of t5x are its use of JAX and Flax for model expression,
+its support for TPU (including TPU v4), and its Gin-based conﬁguration system that
+allows uses to modify nearly everything about the model and training procedure. t5x also
+doesn’t support pipeline parallelism, a major component of systems like DeepSpeed. This
+is because the inter-chip network of TPUs has performance similar to within-node GPU
+interconnects but scales to thousands of chips, so model and data parallelism are suﬃcient
+to train eﬃciently at large scale.
+
+6. Project Status and Adoption
+
+We started the project in the fall of 2020 and open sourced the library code in October
+2021. During that time, t5x and seqio achieved widespread adoption by teams across
+Google: t5x has been launched on TPU hundreds of thousands of times at Google, and the
+total number of internal t5x and seqio users exceeds 1,000. Teams are using these libraries
+for research projects (from small-scale research to the largest language models trained at
+Google) and user-facing products. External adopters include academic and commercial
+users of Cloud TPUs, such as portions of the the Big Science project (Wang et al., 2022).
+
+6. We validated these models by reproducing the T5 models from Raﬀel et al. (2020), originally implemented
+
+in Mesh TensorFlow Transformer.
+
+7. https://github.com/google/flax/tree/main/examples
+
+7
+
+Users of t5x and seqio cite the usability and research-friendliness of the libraries as
+reasons for adoption. We are continuing to actively develop both libraries, prioritizing
+future work based on researcher needs and feedback.
+
+7. Contributions
+
+Adam Roberts founded and leads the project, designed and wrote much of seqio and t5x,
+and co-authored the paper. Hyung Won Chung designed and wrote much of t5x, led its
+open sourcing, and co-authored the paper. Anselm Levskaya built the initial prototype for
+t5x and wrote much of the code. Gaurav Mishra leads seqio, implemented deterministic
+pipelines, and co-authored the paper. James Bradbury implemented partitioning in t5x
+and co-wrote the paper.
+
+Daniel Andor, Sharan Narang, Brian Lester, Colin Gaﬀney, Afroz Mohiuddin, Curtis
+Hawthorne, Aitor Lewkowycz, Alex Salcianu, Marc van Zee, Jacob Austin, Sebastian Good-
+man, Livio Baldini Soares, Haitang Hu, Sasha Tsvyashchenko, Aakanksha Chowdhery, Jas-
+mijn Bastings, Jannis Bulian, Xavier Garcia, Jianmo Ni, Andrew Chen, Kathleen Kenealy,
+Jonathan H. Clark, Stephan Lee, Dan Garrette, and James Lee-Thorp made substantial
+code contributions.
+
+Colin Raﬀel and Noam Shazeer helped design seqio. Marvin Ritter advised on deter-
+ministic pipelines and the use of CLU Metrics. Maarten Bosma helped design deterministic
+pipelines. Jeremy Maitin-Shepard advised on the use of TensorStore. Alexandre Passos and
+Ryan Sepassi advised on overall technical design.
+
+Noah Fiedel is a member of the leadership team, contributed to the high level design
+and roadmap, and co-wrote the paper. Mark Omernick, Brennan Saeta, Ryan Sepassi,
+Alexander Spiridonov (Product Manager), and Josh Newlan (Technical Program Manager)
+are members of the leadership team and co-wrote the paper. Andrea Gesmundo is a member
+of the leadership team and contributed to the internal infrastructure component.
+
+Thanks to the many other contributors to the project: Ian Simon, Reiner Pope, Vin-
+cent Zhao, Pierre Ruyssen, Linting Xue, Junwhan Ahn, Barret Zoph, David Dohan, Ma-
+sumi Parekh, Chang Lan, Frederick Liu, Julien Amelot, Luheng He, Fede Lebron, Rebecca
+Chen, Anosh Raj, Mandy Guo, Ethan Dyer, Mihai Tiuca, Hongkun Yu, Kevin Brooks,
+David Soergel, Kelvin Guu, Joshua Ainslie, Luyao Xu, Ji Ma, Josh Gardner, Daphne Ip-
+polito, Peter Hawkins, Bo Pang, Marc Rasi, Wei Li, Wenhu Chen, Iulia Turc, John Wieting,
+Alex Passos, Zonglin Li, Katie Everett, Marvin Ritter, Olivier Bachem, Francesco Piccinno,
+Jakub Adamek, Jonathan Heek, Parker Schuh, Hexiang Hu, Du Phan, Max Moroz, David
+Miller, Ryan Doherty, David Elworthy, Alfonso Casta˜no, Julian Eisenschlos, Vlad-Doru Ion,
+Lucas Dixon, Ron Shapiro, Dinghua Li, Aaron Parisi, Xi Chen, Nan Ding, Chung-ching
+Chang, Timothy Dozat, Natalia Ponomareva, Delesley Hutchins, Ankush Garg, Yu-Han
+Liu, Mehrdad Khatir, Costanza Conforti, Philipp Keck, Rapha¨el Marinier, Marie Pellat,
+Raghuram Vadapalli, Joshua Maynez, Yi Tay, Xihui Wu, David Belanger, Luke Metz, Dan
+Zheng, Deepti Bhatia, Hariharan Shanmugavadivel, Rewon Child, Rigel Swavely, Mihir San-
+jay Kale, Arash Afkanpour, Roberto Rama, Juro Gottweis, Jonathan Herzig, Yilei Yang,
+Elias Mizan, Pedram Pejman, Jiayu Ye, Smit Sanghavi, Rahul Joshi, Ziqiang Feng, Charles
+Sutton, Weikang Zhou, Liam Fedus, Shanqing Cai, Ginger Perng, Yash Katariya, Urvashi
+Khandelwal, Sebastian Gehrmann, Edward Loper, Tianze Shi, Luke Vilnis, Amelia Archer,
+
+8
+
+Tom Weingarten, David Zats, Murtaza Dhuliawala, Xin Xie, Sahil Dua, Andr´e Susano
+Pinto, Piotr Padlewski, Sascha Rothe, Erik Aas, Felix Stahlberg, Ken Durden, Christina
+Sorokin, Jaehoon Lee, Roy Frostig, Jacob Devlin, Jorge Gonzalez Mendez, Deepak Ra-
+machandran, Santiago Ontanon, Karthik Raman, Yi Sun, Ali Elqursh, Reuben La Haye,
+Adam Fahrenkopf, Alex Polozov, Vinay Ramasesh, Ian Tenney
+
+Thanks to Douglas Eck and Zoubin Ghahramani for sponsoring the project.
+
+References
+
+Mart´ın Abadi, Ashish Agarwal, Paul Barham, Eugene Brevdo, Zhifeng Chen, Craig Citro,
+Greg S. Corrado, Andy Davis, Jeﬀrey Dean, Matthieu Devin, Sanjay Ghemawat, Ian
+Goodfellow, Andrew Harp, Geoﬀrey Irving, Michael Isard, Yangqing Jia, Rafal Joze-
+fowicz, Lukasz Kaiser, Manjunath Kudlur, Josh Levenberg, Dandelion Man´e, Rajat
+Monga, Sherry Moore, Derek Murray, Chris Olah, Mike Schuster, Jonathon Shlens,
+Benoit Steiner, Ilya Sutskever, Kunal Talwar, Paul Tucker, Vincent Vanhoucke, Vijay
+Vasudevan, Fernanda Vi´egas, Oriol Vinyals, Pete Warden, Martin Wattenberg, Martin
+Wicke, Yuan Yu, and Xiaoqiang Zheng. TensorFlow: Large-scale machine learning on
+heterogeneous systems, 2015. URL https://www.tensorflow.org/. Software available
+from tensorﬂow.org.
+
+Mandeep Baines, Shruti Bhosale, Vittorio Caggiano, Naman Goyal, Siddharth Goyal, Myle
+Ott, Benjamin Lefaudeux, Vitaliy Liptchinsky, Mike Rabbat, Sam Sheiﬀer, Anjali Srid-
+har, and Min Xu. Fairscale: A general purpose modular pytorch library for high perfor-
+mance and large scale training. https://github.com/facebookresearch/fairscale,
+2021.
+
+James Bradbury, Roy Frostig, Peter Hawkins, Matthew James Johnson, Chris Leary, Dougal
+Maclaurin, George Necula, Adam Paszke, Jake VanderPlas, Skye Wanderman-Milne, and
+Qiao Zhang. JAX: composable transformations of Python+NumPy programs, 2018. URL
+http://github.com/google/jax.
+
+Roy Frostig, Matthew Johnson, and Chris Leary. Compiling machine learning programs via
+high-level tracing. 2018. URL https://mlsys.org/Conferences/doc/2018/146.pdf.
+
+Charles R. Harris, K. Jarrod Millman, St´efan J. van der Walt, Ralf Gommers, Pauli Vir-
+tanen, David Cournapeau, Eric Wieser, Julian Taylor, Sebastian Berg, Nathaniel J.
+Smith, Robert Kern, Matti Picus, Stephan Hoyer, Marten H. van Kerkwijk, Matthew
+Brett, Allan Haldane, Jaime Fern´andez del R´ıo, Mark Wiebe, Pearu Peterson, Pierre
+G´erard-Marchant, Kevin Sheppard, Tyler Reddy, Warren Weckesser, Hameer Abbasi,
+Christoph Gohlke, and Travis E. Oliphant. Array programming with NumPy. Na-
+ture, 585(7825):357–362, September 2020. doi: 10.1038/s41586-020-2649-2. URL https:
+//doi.org/10.1038/s41586-020-2649-2.
+
+Jonathan Heek, Anselm Levskaya, Avital Oliver, Marvin Ritter, Bertrand Rondepierre,
+Andreas Steiner, and Marc van Zee. Flax: A neural network library and ecosystem for
+JAX, 2020. URL http://github.com/google/flax.
+
+9
+
+Katherine Lee, Daphne Ippolito, Andrew Nystrom, Chiyuan Zhang, Douglas Eck, Chris
+Callison-Burch, and Nicholas Carlini. Deduplicating training data makes language models
+better. Association for Computational Linguistics, 2022.
+
+Myle Ott, Sergey Edunov, Alexei Baevski, Angela Fan, Sam Gross, Nathan Ng, David
+Grangier, and Michael Auli. fairseq: A fast, extensible toolkit for sequence modeling. In
+Proceedings of the 2019 Conference of the North American Chapter of the Association
+for Computational Linguistics (Demonstrations), pages 48–53, Minneapolis, Minnesota,
+June 2019. Association for Computational Linguistics. doi: 10.18653/v1/N19-4009. URL
+https://aclanthology.org/N19-4009.
+
+Adam Paszke, Sam Gross, Francisco Massa, Adam Lerer, James Bradbury, Gregory
+Chanan, Trevor Killeen, Zeming Lin, Natalia Gimelshein, Luca Antiga, Alban Des-
+maison, Andreas Kopf, Edward Yang, Zachary DeVito, Martin Raison, Alykhan
+Tejani, Sasank Chilamkurthy, Benoit Steiner, Lu Fang, Junjie Bai, and Soumith
+Chintala. Pytorch: An imperative style, high-performance deep learning library.
+In
+H. Wallach, H. Larochelle, A. Beygelzimer, F. d'Alch´e-Buc, E. Fox, and R. Gar-
+nett, editors, Advances in Neural Information Processing Systems 32, pages 8024–
+8035. Curran Associates,
+URL http://papers.neurips.cc/paper/
+9015-pytorch-an-imperative-style-high-performance-deep-learning-library.
+pdf.
+
+Inc., 2019.
+
+Colin Raﬀel, Noam Shazeer, Adam Roberts, Katherine Lee, Sharan Narang, Michael
+Matena, Yanqi Zhou, Wei Li, and Peter J. Liu. Exploring the limits of transfer learning
+with a uniﬁed text-to-text transformer. Journal of Machine Learning Research, 21(140):
+1–67, 2020. URL http://jmlr.org/papers/v21/20-074.html.
+
+Samyam Rajbhandari, Jeﬀ Rasley, Olatunji Ruwase, and Yuxiong He. Zero: Memory opti-
+mizations toward training trillion parameter models. In Proceedings of the International
+Conference for High Performance Computing, Networking, Storage and Analysis, SC ’20.
+IEEE Press, 2020. ISBN 9781728199986.
+
+Jeﬀ Rasley, Samyam Rajbhandari, Olatunji Ruwase, and Yuxiong He. Deepspeed: System
+optimizations enable training deep learning models with over 100 billion parameters. In
+Proceedings of the 26th ACM SIGKDD International Conference on Knowledge Discovery
+& Data Mining, KDD ’20, page 3505–3506, New York, NY, USA, 2020. Association
+for Computing Machinery. ISBN 9781450379984. doi: 10.1145/3394486.3406703. URL
+https://doi.org/10.1145/3394486.3406703.
+
+Noam Shazeer, Youlong Cheng, Niki Parmar, Dustin Tran, Ashish Vaswani, Penporn
+Koanantakool, Peter Hawkins, HyoukJoong Lee, Mingsheng Hong, Cliﬀ Young, Ryan
+Sepassi, and Blake Hechtman. Mesh-tensorﬂow: Deep learning for supercomputers.
+In S. Bengio, H. Wallach, H. Larochelle, K. Grauman, N. Cesa-Bianchi, and R. Gar-
+nett, editors, Advances in Neural Information Processing Systems, volume 31. Curran
+Associates, Inc., 2018. URL https://proceedings.neurips.cc/paper/2018/file/
+3a37abdeefe1dab1b30f7c5c7e581b93-Paper.pdf.
+
+10
+
+Jonathan Shen, Patrick Nguyen, Yonghui Wu, Zhifeng Chen, Mia X Chen, Ye Jia, Anjuli
+Kannan, Tara Sainath, Yuan Cao, Chung-Cheng Chiu, et al. Lingvo: a modular and
+scalable framework for sequence-to-sequence modeling. arXiv preprint arXiv:1902.08295,
+2019.
+
+Mohammad Shoeybi, Mostofa Patwary, Raul Puri, Patrick LeGresley, Jared Casper, and
+Bryan Catanzaro. Megatron-LM: Training Multi-Billion Parameter Language Models
+Using Model Parallelism. arXiv e-prints, art. arXiv:1909.08053, September 2019.
+
+Shaden Smith, Mostofa Patwary, Brandon Norick, Patrick LeGresley, Samyam Rajbhandari,
+Jared Casper, Zhun Liu, Shrimai Prabhumoye, George Zerveas, Vijay Korthikanti, Elton
+Zhang, Rewon Child, Reza Yazdani Aminabadi, Julie Bernauer, Xia Song, Mohammad
+Shoeybi, Yuxiong He, Michael Houston, Saurabh Tiwary, and Bryan Catanzaro. Using
+DeepSpeed and Megatron to Train Megatron-Turing NLG 530B, A Large-Scale Genera-
+tive Language Model. arXiv e-prints, art. arXiv:2201.11990, January 2022.
+
+Romal Thoppilan, Daniel De Freitas, Jamie Hall, Noam Shazeer, Apoorv Kulshreshtha,
+Heng-Tze Cheng, Alicia Jin, Taylor Bos, Leslie Baker, Yu Du, YaGuang Li, Hongrae
+Lee, Huaixiu Steven Zheng, Amin Ghafouri, Marcelo Menegali, Yanping Huang, Maxim
+Krikun, Dmitry Lepikhin, James Qin, Dehao Chen, Yuanzhong Xu, Zhifeng Chen, Adam
+Roberts, Maarten Bosma, Vincent Zhao, Yanqi Zhou, Chung-Ching Chang, Igor Kri-
+vokon, Will Rusch, Marc Pickett, Pranesh Srinivasan, Laichee Man, Kathleen Meier-
+Hellstern, Meredith Ringel Morris, Tulsee Doshi, Renelito Delos Santos, Toju Duke,
+Johnny Soraker, Ben Zevenbergen, Vinodkumar Prabhakaran, Mark Diaz, Ben Hutchin-
+son, Kristen Olson, Alejandra Molina, Erin Hoﬀman-John, Josh Lee, Lora Aroyo, Ravi
+Rajakumar, Alena Butryna, Matthew Lamm, Viktoriya Kuzmina, Joe Fenton, Aaron
+Cohen, Rachel Bernstein, Ray Kurzweil, Blaise Aguera-Arcas, Claire Cui, Marian Croak,
+Ed Chi, and Quoc Le. LaMDA: Language Models for Dialog Applications. arXiv e-prints,
+art. arXiv:2201.08239, January 2022.
+
+Ashish Vaswani, Noam Shazeer, Niki Parmar, Jakob Uszkoreit, Llion Jones, Aidan N
+In Advances
+
+Gomez, (cid:32)Lukasz Kaiser, and Illia Polosukhin. Attention is all you need.
+in neural information processing systems, pages 5998–6008, 2017.
+
+Ashish Vaswani, Samy Bengio, Eugene Brevdo, Francois Chollet, Aidan N Gomez, Stephan
+Gouws, Llion Jones, (cid:32)Lukasz Kaiser, Nal Kalchbrenner, Niki Parmar, et al. Tensor2tensor
+for neural machine translation. arXiv preprint arXiv:1803.07416, 2018.
+
+Thomas Wang, Adam Roberts, David Hesslow, Teven Le Scao, Hyung Won Chung, Iz Belt-
+agy, Julien Launay, and Colin Raﬀel. What language model architecture and pretraining
+objective work best for zero-shot generalization? arXiv e-prints, 2022.
+
+Yuanzhong Xu, HyoukJoong Lee, Dehao Chen, Blake Hechtman, Yanping Huang, Rahul
+Joshi, Maxim Krikun, Dmitry Lepikhin, Andy Ly, Marcello Maggioni, Ruoming Pang,
+Noam Shazeer, Shibo Wang, Tao Wang, Yonghui Wu, and Zhifeng Chen. GSPMD:
+General and Scalable Parallelization for ML Computation Graphs. arXiv e-prints, art.
+arXiv:2105.04663, May 2021.
+
+11
+
+Linting Xue, Noah Constant, Adam Roberts, Mihir Kale, Rami Al-Rfou, Aditya Siddhant,
+Aditya Barua, and Colin Raﬀel. mT5: A massively multilingual pre-trained text-to-text
+transformer. In Proceedings of the 2021 Conference of the North American Chapter of the
+Association for Computational Linguistics: Human Language Technologies, pages 483–
+498, Online, June 2021. Association for Computational Linguistics. doi: 10.18653/v1/
+2021.naacl-main.41. URL https://aclanthology.org/2021.naacl-main.41.
+
+Linting Xue, Aditya Barua, Noah Constant, Rami Al-Rfou, Sharan Narang, Mihir Kale,
+Adam Roberts, and Colin Raﬀel. ByT5: Towards a Token-Free Future with Pre-trained
+Byte-to-Byte Models. Transactions of the Association for Computational Linguistics, 10:
+291–306, 03 2022. ISSN 2307-387X. doi: 10.1162/tacl a 00461. URL https://doi.org/
+10.1162/tacl_a_00461.
+
+12
+
+

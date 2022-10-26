@@ -1,0 +1,1549 @@
+MLGO: a Machine Learning Guided Compiler
+Optimizations Framework
+
+Mircea Trofin∗
+Google, Inc.
+mtrofin@google.com
+
+Yundi Qian∗
+Google, Inc.
+yundi@google.com
+
+Zinan Lin
+Carnegie Mellon University
+zinanl@andrew.cmu.edu
+
+Krzysztof Choromanski
+Google, Inc.
+kchoro@google.com
+
+Eugene Brevdo
+Google, Inc.
+ebrevdo@google.com
+
+David Li
+Google, Inc.
+davidxl@google.com
+
+1
+2
+0
+2
+
+n
+a
+J
+
+3
+1
+
+]
+L
+P
+.
+s
+c
+[
+
+1
+v
+8
+0
+8
+4
+0
+.
+1
+0
+1
+2
+:
+v
+i
+X
+r
+a
+
+Abstract
+Leveraging machine-learning (ML) techniques for compiler
+optimizations has been widely studied and explored in academia.
+However, the adoption of ML in general-purpose, industry
+strength compilers has yet to happen.
+
+We propose MLGO1, a framework for integrating ML tech-
+niques systematically in an industrial compiler — LLVM. As
+a case study, we present the details and results of replacing
+the heuristics-based inlining-for-size optimization in LLVM
+with machine learned models. To the best of our knowledge,
+this work is the first full integration of ML in a complex
+compiler pass in a real-world setting. It is available in the
+main LLVM repository.
+
+We use two different ML algorithms: Policy Gradient and
+Evolution Strategies, to train the inlining-for-size model, and
+achieve up to 7% size reduction, when compared to state of
+the art LLVM -Oz. The same model, trained on one corpus,
+generalizes well to a diversity of real-world targets, as well as
+to the same set of targets after months of active development.
+This property of the trained models is beneficial to deploy
+ML techniques in real-world settings.
+
+1 Introduction
+Previous work [13, 25] has shown promise in replacing com-
+piler optimization heuristics with machine-learned policies.
+Heuristics are algorithms that, empirically, produce reason-
+ably optimal results for hard problems, within pragmatic con-
+straints (e.g. "reasonably fast"). In the compiler case, heuris-
+tics are widely used in optimization passes, even those lever-
+aging profile feedback, such as inlining and register alloca-
+tion. Such passes have significant impact on the performance
+of a broad variety of programs. These problems are often
+NP-hard and searching for optimal solutions may require
+exponential time or memory. Reinforcement Learning (RL) is
+a family of machine learning techniques that may be applied
+to find increasingly optimal solutions through an automated
+iterative exploration and training process.
+
+∗These authors contributed equally.
+1We welcome your feedback! Please open an issue at https://github.com/
+google/ml-compiler-opt with the label paper.
+
+1
+
+Our focus is ahead-of-time (AOT) compilers, specifically,
+C/C++. In a real-world setting, we expect two main bene-
+fits from machine learning techniques: first, heuristics are
+human-trained based on a human-manageable set of bench-
+marks and regression cases. Machine learning easily scales
+to large corpora of training examples - which we expect to
+increase the likelihood of obtaining policies that generalize
+well. This is important because, as we will explore in detail,
+we do not want to retrain policies too frequently (it is an
+adoption blocker), nor do we want to train ’online’, while the
+compiler is running in production (it would affect determin-
+ism). Second, heuristics are human-written code that needs
+to be maintained. This places a downward pressure on the
+number of program properties ("features") and the combi-
+nations between them that can be practically leveraged. We
+believe using more features and feature combinations would
+result in better optimization decisions. ML scales well with
+the addition of features, and can discover profitable feature
+combinations. While ML techniques may be able to address
+these two points, a trade-off is that maintaining and evolving
+them requires practices and approaches different from those
+used for heuristics.
+
+As pointed out, applying ML to compiler optimizations has
+been explored by academia, but it has not been adopted in
+production environments. To explore why, we chose a pilot
+optimization problem and approached it with the intention
+to deploy in production. The goal of the pilot is to inform
+problem framing and design choices. Other than performing
+better than the tip-of-tree production compiler, we did not
+aim to advance the state of the art for the pilot problem.
+
+The chosen problem is inlining-for-size in LLVM, and in
+particular, the inlining decision heuristics. The expectation
+was that this would offer representative challenges - size
+optimization is important for real-world scenarios, such as
+mobile software, and inlining is a particularly challenging
+optimization (see Section 2.2).
+
+We chose size rather than speed for the pilot because
+size is relatively easy to measure and non-noisy, which we
+expected to aid in rapid prototyping by removing one source
+of potential problems (noisy rewards). We acknowledge that
+translating our experience to performance problems may
+
+ 
+ 
+ 
+ 
+ 
+ 
+Mircea Trofin, Yundi Qian, Eugene Brevdo, Zinan Lin, Krzysztof Choromanski, and David Li
+
+"Model" refers to a neural network implementing an opti-
+mization policy. Also, we use the term heuristic to refer to
+manually-crafted decision rules.
+
+2 Background
+2.1 Machine Learning Techniques for Replacing
+
+Compiler Optimization Heuristics
+
+There are two characteristics that make reinforcement learn-
+ing (RL) a suitable tool for replacing compiler optimization
+heuristics: 1) there are no examples showing optimal strate-
+gies for these heuristics — in the inlining problem, we don’t
+know whether inlining or not for a certain call site is the op-
+timal choice; 2) we can efficiently explore different strategies,
+and improve strategies from those experiences. The absence
+of examples ("labels") means we cannot use supervised learn-
+ing. In contrast, RL is an area of machine learning that learns
+from trial and error instead of given labels. It has proven its
+success in robotics, playing Atari games, playing the game
+of Go, etc [16, 18, 24]. In RL, an agent (i.e., the compiler)
+learns by repeatedly interacting with the environment (i.e.,
+compiling) and gradually improves its policy (i.e., decision
+rules). More specifically, by compiling software again and
+again with different strategies, the compiler will come up
+with better and better policy on its own with RL algorithms.
+Previous work has shown Evolution Strategies (ES) to
+be a competitive alternative to RL algorithms in MuJoCo
+and Atari tasks [8, 22]. Motivated by this, we also tried this
+method in compiler optimization problems. ES are a class of
+black box optimization techniques. Like RL, ES training is
+also able to gradually improve the strategy with trial and er-
+ror, and thus is also a suitable tool for compiler optimization
+problems.
+
+2.2 High-level Overview of the Current LLVM
+
+Inlining Pass
+
+Today’s LLVM inliner is a pass operating on a strongly-
+connected component (SCC) of the static call graph in a
+module2, at a time in bottom up order. The inlined callee’s
+call sites are added to a work list and iteratively considered
+for inlining in a top down fashion. A pipeline of optimiza-
+tions (Inst combine, scalar replacement of aggregates (SROA),
+loop optimizations, etc) is then applied on each function in
+the SCC3, after the SCC was processed. The effects of these
+optimizations impact inlining decisions of call sites in the
+SCC calling into the last one.
+
+LLVM inlining consists of many heuristics: the choice of
+call site traversal, the set of "cleanup" function passes run
+on functions after they are modified because call sites were
+
+2in LTO or ThinLTO mode, a module can consist of IR from multiple source
+files
+3The DAG walk is repeated up to a set of times if de-virtualization happens
+in cleanups
+
+2
+
+Figure 1. MLGO Overview
+
+seem non-immediate at a first glance, but we believe that
+not to be the case: for example, inlining for speed can be
+understood partially as a "for-size" problem, with respect to
+the instruction working set (more in Section 8).
+
+From a very high level, our MLGO framework separates
+the use of the compiler from the training of policies as shown
+in Figure 1. Day-to-day production use is unchanged; as an
+implementation detail, a trained model embedded in the
+compiler is used to make decisions (in this case, inlining)
+that were previously handled by a manual heuristic. Train-
+ing happens separately using a large, representative corpus
+of intermediate representation (IR) modules. The training
+process is iterative, each step using an updated policy, so
+the policy is not embedded in the compiler. During training,
+the inliner produces a log that records the inlining process
+(features, decisions, etc). The logs are collected and fed to
+the training algorithm to produce a new model.
+
+The paper is organized as follows: Section 2 provides an
+overview of the relevant ML techniques and the LLVM in-
+liner. Section 3 gives an overview of MLGO: our framing
+of the problem of applying ML to compiler optimizations,
+and our methodology. Section 4 describes the policy train-
+ing in MLGO for the inlining problem. Section 5 details the
+implementation, in LLVM, of our pilot project. The results
+are presented in section 6 and the related work is described
+in Section 7. Finally in Section 8, we discuss our plans for
+applying the lessons learned so far to speed problems, as
+well as next steps in ML techniques that we are considering.
+Section 9 concludes the paper.
+
+A note: throughout this paper, we use interchangeably the
+terms policy and model. A compiler optimization policy
+is a decision rule that takes actions inside the optimization
+pipeline (e.g.,"should we inline this call graph edge or not?").
+
+MLGO: a Machine Learning Guided Compiler Optimizations Framework
+
+inlined, the timing of these cleanups, and finally, the decision
+to inline or not a specific call site.
+
+The decision to inline or not a call site is itself built on
+top of a rich set of heuristics. The compiler first computes
+the static "cost" of the callee post inlining by traversing the
+callee body simulating post-inline cleanup passes. If some
+call site arguments are known to be constant at compile time,
+that information is used to evaluate what instructions / basic
+blocks would be simplified, should the inlining be carried
+out. The computed cost is then compared with a threshold.
+The threshold value is based on things like call site hotness,
+inline keyword, etc. Bonuses are also given to callees with a
+single basic block or high percentage of SIMD instructions. In
+certain cases, the compiler may also choose to defer inlining
+if inlining the caller itself to its own callers first may result in
+better savings - it may be better to make a local non-optimal
+decision that, later, would open the opportunity for better
+optimizations due to more context being available, such as
+call parameters propagating from callers further up in the
+call graph.
+
+These sets of heuristics have been tuned for years and our
+pilot project replaces the manual decision process described
+above with ML models.
+
+3 MLGO
+MLGO is a set of guidelines and requirements derived from
+our understanding of the problem of leveraging ML tech-
+niques for replacing manual optimization heuristics. We start
+with our understanding of the participating personas and
+their scenarios, which then motivates MLGO guidelines and
+design decisions.
+
+3.1 Persona: Compiler User
+
+This user wants to benefit from improved compiler opti-
+mizations. They care about: correctness and performance of
+the generated code; compilation determinism (i.e. identical
+output for identical input) - to leverage incremental builds;
+avoiding the added cost and complexity of new infrastruc-
+ture requirements on build and release pipelines, such as new
+compiler run-time dependencies or new steps (like training);
+and timeliness of the build, as it impacts hardware resource
+planning and developer productivity4. Our goal is to intro-
+duce no changes to this user.
+
+To achieve this, the MLGO guidelines are:
+
+1. To maintain correctness guarantees, we replace heuris-
+tics, not semantics-preserving code. For example, we
+change the decision making process for carrying out
+function inlining, not how the inlining action is im-
+plemented. This is along the insight of separation of
+correctness vs policy observed earlier in [27]
+
+4There are non-ML driven optimization alternatives that trade off signif-
+icantly increasing compilation time for improved optimizations. An ML
+alternative needs to be competitive to justify its other trade-offs
+
+2. ’Online’ training - meaning, training while the com-
+piler is executing in production - is an anti-goal for
+us: it would hurt determinism and compilation perfor-
+mance. Instead, policy training happens offline. Trained
+policies are embedded in the compiler as statically
+linked native code, and the resulting compiler is sub-
+jected to the same release process it currently is. Build
+and release infrastructures and pipelines of targets
+using the compiler do not need to be changed. Build
+determinism using the ML-enabled compiler is ensured
+because the policies are fixed - no training happens
+when the compiler runs, only inference. While native
+compilation doesn’t guarantee timeliness, it eliminates
+one source of concern. Due engineering diligence still
+needs to be applied to ensure timely feature extraction,
+for instance.
+
+3. We require ML techniques that yield policies that gen-
+eralize well over different code bases and code changes,
+and do not need frequent retraining. The compiler user
+doesn’t have to worry about policy training (although
+they are free to do so and potentially get better re-
+sults). This is akin to how, in the context of manual
+heuristics, a compiler user doesn’t have to fine-tune
+passes (or author code in them) to get reasonable re-
+sults. In particular, we do not see automated tuning
+of existing heuristic parameters as a viable solution.
+Tuning parameters have been available in compilers
+for a long time, and the experience has been that a
+set of values does not translate well from target to tar-
+get. The policy, while adjustable, is still dominated by
+combinations/evaluations identified manually. In ad-
+dition, requiring re-tuning would complicate product
+build and release pipelines, which we want to avoid
+on behalf of our user.
+
+We refer to this use of policies as release mode (since it
+
+is encountered by users of a released/shipped compiler).
+
+3.2 Persona: Compiler Engineer
+
+This user wants to drive better optimizations in the compiler,
+diagnose regressions, and incorporate findings:
+
+1. Policy Creation. The engineer wants to incorporate
+
+ML techniques in a compiler optimization pass.
+
+2. Policy Improvement. Here, they investigate a spe-
+cific regression encountered in production, or want to
+improve a ML-enabled pass.
+
+3. "The Ship Blocker". The engineer must quickly re-
+solve a ship-blocking regression introduced by a hot
+patch, and caused by a misbehaving RL-enabled policy.
+
+In all of these cases, the compiler engineer improves a pol-
+icy through repeated exploration and training (see Section
+4.4). They want flexibility in replacing the model under train-
+ing, and have less concern with timeliness and determinism,
+especially since models under training may use small random
+
+3
+
+Mircea Trofin, Yundi Qian, Eugene Brevdo, Zinan Lin, Krzysztof Choromanski, and David Li
+
+perturbations, to facilitate exploration. We refer to this use
+of policies as development mode. Here, models are loaded
+via a command line option, the compiler may have extra
+runtime dependencies, and model evaluation may involve
+changes to the runtime behavior of the compiler — because,
+for example, the model evaluators may be multi-threaded
+and/or JIT-ing.
+
+Because of the tension between heuristic code complexity
+and hypothesized ability to improve the heuristic by incor-
+porating more features (as discussed in the introduction),
+MLGO forgoes goals of human comprehensibility of the re-
+sulting policy (in contrast to [25]). Instead, we focus on devel-
+oping and evaluating alternative methodologies to address
+the above scenarios. We discuss our current understanding
+of the trade-offs, and expect that more clarity will arise as
+we apply the approach through the lifetime of a number of
+diverse projects. Section 4 will detail our experience with
+developing Policy Creation. We have less experience, at this
+point, with Policy Improvement and "The Ship Blocker", and
+derive our direction from experiences in other domains.
+
+Policy Improvement is currently (i.e. for manual heuristics)
+an iterative engineering process. The trigger is typically
+regressions identified in the field. The compiler engineer
+diagnoses the problem, hypothesizes a solution, then ensures
+that the solution does not introduce regressions in some
+corpus of benchmarks; if regressions happen, the process is
+repeated. In the MLGO methodology, we envision a gradual
+process. We do not believe it presents significant negative
+trade-offs compared to the state of the art:
+
+1. Start by incorporating regression use-case(s) into train-
+
+ing corpus and retrain the policy.
+
+2. If that fails, hypothesize missing features. This requires
+some manual diagnosing of the current policy behavior.
+While we treat the policy as a black box, we do observe
+its effects, and can formulate hypotheses as to what
+information may be missing - since the information
+we provide (features) is also observable. The needed
+skill set is close to what compiler engineers currently
+employ for manual heuristic development, and, just
+like for manual heuristics, evolving the feature set is
+likely an iterative process. Typically, adding features
+and retraining shouldn’t result in regressions for the
+previous training corpus, which is a benefit of our
+approach over the manual heuristic case. We should
+note that, if applying feature auto-extraction [10, 13]
+proves feasible in production, this step collapses to the
+previous step.
+
+3. If the above also fails, involve an ML expert to inves-
+tigate alternative training algorithms. This is akin to
+today’s (rare) full pass rewrites (for example: new reg-
+ister allocation pass). The difference is the need for
+cross-disciplinary interaction. Our hope is that, with
+time and experience, MLGO offer a reusable library of
+
+best practices and training solutions available "off the
+shelf" to compiler engineers.
+
+Ship blockers are those cases where the compiler engineer
+doesn’t have the luxury to do deep investigations into com-
+piler behavior, since they are on a tight time budget. Assum-
+ing the pathological case is identified (i.e. which compilation
+unit causes the compiler to misbehave), in the case of man-
+ual heuristics, the levers of control are: trial-and-error with
+different compilation flag values (change policy thresholds,
+for instance); modify user code (use inlining directives, for
+instance); or disable the specific optimization for a specific
+module.
+
+In MLGO, the picture is similar. Other than policy thresh-
+olds, the control levers available to the engineer are the same.
+In addition, the engineer may choose to revert to an earlier
+version of the policy, or manual heuristics for the problem-
+atic module, and, if needed, experiment with threshold flags.
+Specific to ML-based policies, we are exploring with local
+training and overfitting: as we will detail, our experience so
+far shows that it is possible to train a policy on a single mod-
+ern, multi-core workstation, and obtain a reasonably good
+result within a day. An engineer could attempt to specialize
+a policy to overfit for the pathological case, and compile
+that case with the specialized policy (while compiling the
+rest of the project with the non-overfitted policy). This is
+similar to "experimenting with flags", with the exception
+that the exploration is directed by a training algorithm and
+more likely to quickly converge to a solution. The trade-off
+is that changing heuristic flag values does not require a train-
+ing infrastructure — even if that infrastructure could be run
+locally.
+
+4 MLGO Policy Training
+In this section, we show how we use reinforcement learning
+(RL) and evolution strategies (ES) to train inlining policies
+in the MLGO framework. Sections 4.1 and 4.2 present how
+we train the inlining policy for the inlining-for-size problem
+with RL and ES algorithms, and Section 4.3 compares the
+pros and cons of the two algorithms. Section 4.4 concludes
+this section by giving an overview of our policy training
+infrastructure5.
+
+4.1 Reinforcement Learning
+
+4.1.1 RL Problem Formulation
+
+RL aims to find an optimal policy for a Markov Decision Pro-
+cess (MDP). MDP is a mathematical framework that models
+sequential decision making — in inlining-for-size problem,
+we make sequential decisions whether to inline or not. An
+MDP can be represented by the tuple < S, A, P, R > with
+state space S, action space A, state transition distribution
+P (𝑠 ′|𝑠, 𝑎), and reward function R (𝑠, 𝑎). In the MDP formal-
+ism, at time 𝑡, the agent observes the state 𝑠𝑡 ∈ S of the
+
+5https://github.com/google/ml-compiler-opt
+
+4
+
+MLGO: a Machine Learning Guided Compiler Optimizations Framework
+
+environment, then decides to take an action 𝑎𝑡 ∈ A. It also
+receives the reward 𝑟𝑡 = R (𝑠𝑡, 𝑎𝑡 ). The environment state
+then transitions to 𝑠𝑡 +1 ∈ S by sampling from the proba-
+bility distribution P (𝑠𝑡 +1|𝑠𝑡, 𝑎𝑡 ). This process repeats until
+the agent reaches a termination state at time 𝑇 . The agent’s
+decisions are a function (we call it policy) 𝜋 = 𝑃𝑟 (𝑎|𝑠) that
+maps observed state 𝑠 to a distribution over actions. In our
+case, 𝜋 is a neural network and we call it policy network. RL
+algorithms aim to find the optimal policy 𝜋 ∗ to maximize
+the total reward6 𝑅 = (cid:205)𝑇
+𝑟𝑡 .
+
+𝑡 =0
+
+We first formulate the inlining-for-size problem as an MDP.
+The inlining pass traverses over the call sites in the call graph
+in a deterministic order and decides at each call site whether
+to inline or not. Every inlining operation changes the call
+graph. We treat this as a sequential decision process, and we
+formulate it into an MDP as:
+
+state S: we define the current call graph and the call site
+
+being visited to be the state.
+
+action A: A = {0, 1}, where 1 means inline and 0 means
+
+do not inline.
+
+state transition probability P: unlike usual MDPs, the
+state transition is deterministic (no randomness) in the inlin-
+ing problem. After an action is taken (inline or not inline),
+the compiler determines what the next state is (updates the
+call graph and decides the next call site to visit).
+
+reward R: reward is defined to be the native size reduction
+after the action is taken. If 𝑎 = 0 (do not inline), the reward
+is 0 since nothing changes; if 𝑎 = 1 (do inline), the reward is
+defined as:
+
+𝑆 (𝐶𝑎𝑙𝑙𝑒𝑟𝑏𝑒 𝑓 𝑜𝑟𝑒 )−𝑆 (𝐶𝑎𝑙𝑙𝑒𝑟𝑎𝑓 𝑡𝑒𝑟 )+
+
+(cid:40)𝑆 (𝐶𝑎𝑙𝑙𝑒𝑒),
+0,
+
+callee deleted
+callee remains
+
+(1)
+where 𝑆 (𝑓 ) is the native size of function 𝑓 . Note that we
+do not actually know what the native size would be for a
+certain function while performing inlining, since inlining
+operates at the IR level. The definition for reward here is
+not practical for training. We will discuss how we tackle this
+challenge next.
+
+4.1.2 Policy Gradient Algorithm
+
+Policy Gradient (PG) [28] is a family of RL algorithms derived
+from REINFORCE [34]. Though we use Proximal Policy Op-
+timization (PPO) [23], we first briefly introduce REINFORCE
+— as PPO is an enhancement to REINFORCE and they work
+in very similar ways.
+
+On a high level, all PG algorithms gradually improve the
+policy 𝜋𝜃 by computing the gradients of the parameters 𝜃
+in the policy network w.r.t. the total reward 𝑅, and then
+update 𝜃 with the gradient to improve the policy. With 𝐽 (𝜃 )
+denoting the expected reward under policy 𝜋𝜃 , the gradient
+
+∇𝜃 𝐽 (𝜃 ) in REINFORCE is computed as:
+
+∇𝜃 𝐽 (𝜃 ) = E
+
+(cid:34) 𝑇
+∑︁
+
+𝑡 =0
+
+(cid:35)
+
+𝑅∇𝜃 log 𝜋𝜃 (𝑎𝑡 |𝑠𝑡 )
+
+(2)
+
+Here E is an expectation over the policy 𝜋𝜃 being applied
+to an inlining pass. In practice, this expectation is approx-
+imated with Monte Carlo methods — with 𝑛 trajectories7
+collected from compiling with policy 𝜋𝜃 , the parameter 𝜃 is
+updated with:
+
+𝜃 ← 𝜃 + 𝛼 1
+𝑛
+
+𝑛
+∑︁
+
+(cid:40) 𝑇
+
+∑︁
+
+𝑖=1
+
+𝑡 =0
+
+𝑅𝑖 ∇𝜃 log 𝜋𝜃 (𝑎𝑖,𝑡 |𝑠𝑖,𝑡 )
+
+(3)
+
+(cid:41)
+
+where 𝛼 is the learning rate. As 𝜃 is updated, the policy
+𝜋 (𝜃 ) tends to evolve in the direction that increases the total
+reward. Algorithm 1 describes the process — as training pro-
+gresses, the policy gradually improves on its own by iterating
+between two stages: 1) compile with a new policy and collect
+fresh trajectories; 2) update policy network parameters 𝜃 .
+
+Algorithm 1 MLGO PG Training Algorithm
+
+1: Initialize 𝜃
+2: for iteration = 1, 2, ... do
+3:
+4:
+5: end for
+
+Compile with policy 𝜋𝜃 to collect 𝑛 trajectories
+Update 𝜃 using Equation 3
+
+The details of training with PPO, which has several addi-
+tional terms in the loss function, are available in [23]. One
+core improvement of PPO is to subtract a baseline 𝐵 from
+the reward to reduce the variance. Equation 2 is modified as:
+
+∇𝜃 𝐽 (𝜃 ) = E
+
+(cid:34) 𝑇
+∑︁
+
+𝑡 =0
+
+(𝑅 − 𝐵)∇𝜃 log 𝜋𝜃 (𝑎𝑡 |𝑠𝑡 )
+
+(4)
+
+(cid:35)
+
+Here the baseline 𝐵 describes what the 𝑅 is supposed to
+be (irrelevant to policy). By subtracting it, 𝑅 − 𝐵 provides
+better information about the effectiveness of the policy 𝜋𝜃 .
+The total reward 𝑅 in these equations can be replaced
+with the returns following action 𝑎𝑡 : (cid:205)𝑇
+𝑡 ′=𝑡 𝑟𝑡 ′. In this case,
+the baseline 𝐵 is a value network 𝑉 (𝑠𝑡 ) predicting the future
+returns (cid:205)𝑇
+𝑡 ′=𝑡 𝑟𝑡 ′ from the state 𝑠𝑡 . We choose to use the total
+reward 𝑅 since: 1) it is directly available in the inlining-
+for-size problem, while partial returns would have to be
+approximated; 2) it is difficult to build the value network
+𝑉 (𝑠𝑡 ) with the reduced state. We will discuss the details in
+the next section.
+
+6In general, the total discounted reward is 𝑅 = (cid:205)𝑇
+discounting factor; but we take 𝛾 = 1 so we ignore it here.
+
+𝑡 =0
+
+𝛾𝑡 𝑟𝑡 , where 𝛾 is the
+
+5
+
+7A trajectory is defined as (𝑠0, 𝑎0, 𝑟0, 𝑠1, 𝑎1, 𝑟1, ...𝑠𝑇 , 𝑎𝑇 , 𝑟𝑇 ), and total reward
+𝑅 = (cid:205)𝑇
+
+𝑟𝑡
+
+𝑡 =0
+
+Mircea Trofin, Yundi Qian, Eugene Brevdo, Zinan Lin, Krzysztof Choromanski, and David Li
+
+4.1.3 Challenges and Implementation Details
+
+We run into two challenges when applying PPO to the inlining-
+for-size problem: 1) complex state space; 2) impractical re-
+ward definition.
+
+Complex state space: Our MDP formulation defines the
+state as the current call graph and the call site being visited.
+Unfortunately, encoding and processing a call graph at each
+decision point may not be computationally practical for a
+general-purpose compiler to afford.
+
+Impractical reward definition: It is difficult to know a
+function’s native size 𝑆 (𝑓 ) during the inlining pass because
+native code lowering happens in a later pass, and because
+its structure may change due to more of its call sites being
+inlined.
+
+To tackle the first challenge, we approximate the true
+state by distilling the state space to 11 numerical features as
+listed in Table 1. These features describe the local call site and
+provide some global information about the call graph. Section
+5.1 details the features we use. We considered, but rejected
+for now, the use of (IR) code embedding techniques[3]; this
+allows us to minimize additional computational/memory
+costs. We plan to consider such techniques in the future.
+
+Type
+
+caller
+feature
+
+callee
+feature
+
+call site
+feature
+
+call graph
+feature
+
+Feature
+caller_basic_block_count
+caller_conditionally_executed_blocks
+caller_users
+callee_basic_block_count
+callee_conditionally_executed_blocks
+callee_users
+callsite_height
+cost_estimate
+number_constant_params
+edge_count
+node_count
+
+Table 1. Features for Inlining for Size
+
+One drawback of the simplified state is that it greatly
+reduces information available to the policy — it only contains
+a part of the local call site information, and limited global call
+graph information. We do not expect this to hurt the policy
+network because it is roughly the same information available
+to the current inlining heuristic. However, this reduced state
+vector does not allow us to build the value network 𝑉 (𝑠𝑡 )
+baseline — at a certain time 𝑡, the simplified state 𝑠𝑡 is not
+informative enough to predict the future return (cid:205)𝑇
+
+𝑡 ′=𝑡 𝑟𝑡 ′.
+
+A simple approach to side-stepping the lack of partial
+reward information and the side effect of reduced state rep-
+resentation is to use the total reward 𝑅 instead of the partial
+return as shown in Equation 2. While the per-step reward is
+difficult to get, the total reward is the sum of the individual
+
+6
+
+(unknown) rewards — it is relatively easy to evaluate: evalu-
+ate native size with / without inlining, and subtract. In the
+total reward setup, the baseline 𝐵 is defined as the estimated
+native size reduction of the module after the inlining pass.
+We can use the native size reduction under the heuristic
+policy as the baseline 𝐵.
+
+Using the total reward instead of partial rewards has its
+drawbacks: 1) more data needs to be collected to achieve the
+same performance; 2) the final model quality may be worse.
+
+4.1.4 Warmstart with Behavioral Cloning Policy
+
+Instead of having the RL algorithm learn from the scratch
+(initialize 𝜃 randomly), we facilitate training by initializing 𝜃
+from some "warmstart" policy. To facilitate the RL training,
+we need to have a "warmstart" policy that already performs
+reasonably well. An intuitive idea is the heuristic inlining
+decisions in LLVM. Therefore, we train the warmstart policy
+to imitate the heuristic inlining decisions in LLVM using be-
+havioral cloning algorithm[4]. The behavioral cloning algo-
+rithm essentially views the problem as a supervised learning
+problem where the features are the same as the RL training
+and the label is the heuristic inlining decision — it trains
+a neural network that makes inlining decisions as close as
+the heuristic inliner does. In this way, we get a policy that
+makes decisions similar to LLVM’s current inlining heuris-
+tics and thus can serve as the warmstart policy to make our
+RL training much faster.
+
+4.2 Evolution Strategies
+
+Previous work has shown that ES, as a gradient-free black
+box optimization technique, is a competitive alternative to
+RL algorithms on MuJoCo and Atari tasks [22].
+
+ES focuses on black-box optimization problems of the
+form max𝜃 𝐹 (𝜃 ), where 𝐹 can be any black-box function that
+can be evaluated. Given 𝜃 , we essentially assume we have
+an oracle that calculates 𝐹 (𝜃 ). In our specific case, 𝜃 are the
+parameters of the policy network 𝜋𝜃 and 𝐹 (𝜃 ) is the total
+reward 𝑅 — the native size reduction after inlining under
+policy 𝜋𝜃 for a certain module.
+
+Instead of directly optimizing 𝐹 (𝜃 ), ES focuses on optimiz-
+
+ing 𝐽 (𝜃 ), which is a smoothed version of 𝐹 (𝜃 ):
+E𝜀∼N (0,𝐼 ) 𝐹 (𝜃 + 𝜎𝜀).
+𝐽 (𝜃 ) = max
+
+max
+𝜃
+
+𝜃
+
+(5)
+
+Here N (0, 𝐼 ) denotes the multivariate normal distribution
+with zero mean and identity covariance matrix. Similar to
+PG, ES also takes the gradient of the parameter 𝜃 w.r.t. 𝐽 (𝜃 ):
+
+∇𝜃 𝐽 (𝜃 ) =
+
+1
+𝜎
+
+E𝜀∼N (0,𝐼 ) {𝐹 (𝜃 + 𝜎𝜀)𝜀} ,
+
+(6)
+
+and uses Monte Carlo approximation of the gradient to up-
+date 𝜃 to improve the policy:
+𝑛
+∑︁
+
+{𝐹 (𝜃 + 𝜎𝜀𝑖 )𝜀𝑖 }
+
+(7)
+
+𝜃 ← 𝜃 + 𝛼 1
+𝑛𝜎
+
+𝑖=1
+
+MLGO: a Machine Learning Guided Compiler Optimizations Framework
+
+where 𝛼 is the learning rate, and 𝜀𝑖 are vectors sampled from
+N (0, 𝐼 ).
+
+Algorithm 2 describes the ES algorithm. Similar to PG, ES
+also iterates between data collection and policy update to
+gradually improve the policy.
+
+Algorithm 2 MLGO ES Training Algorithm
+
+1: initialize 𝜃
+2: for iteration = 1, 2, ... do
+3:
+4:
+5:
+6: end for
+
+Sample 𝜀1, 𝜀2, ..., 𝜀𝑛 ∼ N (0, 𝐼 )
+Compile with policy 𝜋𝜃 +𝜎𝜀𝑖 to get 𝐹 (𝜃 + 𝜎𝜀𝑖 )
+Update 𝜃 based on Equation 7
+
+4.3 PG v.s. ES
+
+While the policy gradient algorithm and the evolution strate-
+gies algorithm are similar on a high level, they are different
+in many ways and have their pros/cons.
+
+Complexity: The key advantage of ES is that it is con-
+ceptually simpler: 1) it requires less engineering complexity
+— unlike the PG algorithm where we need the logged tra-
+jectory during inlining (𝑠1, 𝑎1, 𝑠2, 𝑎2, ..., 𝑠𝑇 , 𝑎𝑇 ) and the total
+reward 𝑅 for training, the ES algorithm only needs the total
+reward. Thus we do not need to log the trajectory while do-
+ing compilation; this reduces both engineering complexity
+and storage/network requirements; 2) it has less require-
+ments on the problem structure as long as there is an oracle
+telling the total reward 𝐹 (𝜃 ) under the policy parameters 𝜃 .
+As a result, it is easier to apply ES to other compiler optimiza-
+tion problems as PG requires formulating the optimization
+problem as an MDP.
+
+Sample Efficiency: Sample efficiency quantifies the amount
+
+of data required for training. The key advantage of PG is
+that it has much higher sample efficiency than ES. In the
+inlining-for-size problem, we observed that even though PG
+is trained using total reward, over 20𝑋 computational re-
+sources are needed to train an ES policy of similar quality.
+In problems where partial reward information is available
+after every decision point, we expect the sample efficiency
+gap to be even larger.
+
+4.4 Training Infrastructure
+
+PG and ES algorithms are very similar in policy training on a
+high level — both of them improve the policy 𝜋𝜃 by iterating
+between compiling with policy 𝜋𝜃 to collect data and update
+parameters 𝜃 . Figure 2 demonstrates their training workflow.
+Before the training, we prepare an IR corpus consisting of
+pre-inlining IR files extracted from some software. At each
+iteration, the trainer sends the policy 𝜋𝜃 to data collector,
+the data collector samples several IR files from the IR cor-
+pus, does compilation to collect training data, and sends the
+training data back to the trainer for training. The training
+
+7
+
+is done after several iterations, and the trainer exports the
+trained policy. We use TF-Agents[29] — an RL library in
+TensorFlow[1] for training and the policy is in the format of
+TensorFlow SavedModel.
+
+Figure 2. System Overview: Policy Training
+
+The bottleneck of training for the inlining problem is data
+collection. Therefore, the data collection is carried out in a
+parallel way to improve the overall training efficiency.
+
+Figure 3 details how the data collector module works. It is
+supported by the development mode in MLGO framework.
+It takes a pre-inlining IR file and a policy (optional) as inputs,
+conducts inlining on the IR file based on the policy, has the
+post-inlining IR file optimized by other opt passes after inlin-
+ing, converts the optimized IR file into native code, and gets
+the native size of this module. The native size, together with
+the log file generated during inlining by MLGO that contains
+the trajectory (𝑠1, 𝑎1, 𝑠2, 𝑎2, ..., 𝑠𝑇 , 𝑎𝑇 ), composes the output
+of the data collector module — training data. If the policy
+is not given, the inliner will conduct the current heuristic
+inlining and log the trace. It has two use-cases as discussed in
+Section 4.1: 1) collect data to train the warmstart policy with
+behavioral cloning algorithm; 2) use the heuristic inlining as
+the baseline. The ES algorithm only needs the reward (native
+size) for training so the log file is not needed.
+
+Figure 3. Data Collection for Inlining-for-Size
+
+Mircea Trofin, Yundi Qian, Eugene Brevdo, Zinan Lin, Krzysztof Choromanski, and David Li
+
+5 LLVM Implementation
+We implemented the pilot project in LLVM8, together with
+reusable support for release and development modes, as well
+as continuous integration build bots.
+
+5.1 RL Driven Inlining (for Size) in LLVM
+
+We introduced an abstraction for the inline decision-making
+policy, the InlineAdvisor, and a module analysis, InlineAdviso-
+rAnalysis, that may be used to retrieve the InlineAdvisor. The
+analysis can not be accidentally invalidated by other passes.
+This is necessary, since the inliner pass is interleaved with
+the execution of function passes, as previously discussed,
+and we want to track module-wide features throughout the
+performance of inlining and related passes over a module. In-
+stead, the analysis is managed explicitly - see ModuleInliner-
+WrapperPass (llvm/Transforms/IPO/Inliner.h). The specific
+implementation of the advisor is chosen through a LLVM
+flag (-enable-ml-inliner). By default, the implementation is
+the manual heuristic. Passing ’release’ or ’development’ to
+the flag selects the respective mode, if the compiler was built
+with support for that mode.
+
+Feature extraction is modeled as a separate analysis, Func-
+tionPropertiesAnalysis, and reused by the release and devel-
+opment implementations. The full feature set is captured in
+llvm/Analysis/InlineModelFeatureMaps.h. We capture some
+call site-local information, as well as global information, such
+as module-wide number of functions and static calls, caller/-
+callee user counts; position in the original call graph, as the
+distance of the call site to the farthest SCC; and an estimate
+of removed instructions given the call site context.
+
+We use TensorFlow [1] as the model training and infer-
+ence framework. In both modes, the interface between LLVM
+and the model is defined solely in terms of input and output
+tensor specifications (tensor name, type, and shape). The
+internal structure of the model is an implementation detail.
+This means that during training, the compiler engineer is
+free to explore hyper-parameters or add/modify hidden lay-
+ers. Also, ingesting a new model with a different internal
+structure, in release mode, is just a matter of recompiling
+LLVM.
+
+Refer to lib/Analysis/{MLInlineAdvisor | ReleaseMode-
+ModelRunner | DevelopmentModeInlineAdvisor}.cpp for more
+implementation details. At a high level, both release and de-
+velopment modes:
+
+• Handle user inlining directives and correctness aspects
+
+(these are done without model evaluation)
+
+• Extract the features associated with a call site and form
+fixed-sized tensors (primitive data type vectors), and
+efficiently maintain the module-wide features
+
+• Pass the tensors to the model evaluator, and request it
+
+perform an evaluation
+
+8Code references are made in the context of commit 71059257bd4.
+
+8
+
+• Take the result of the evaluation as advice (i.e. inline/-
+don’t) and make that available to the inliner pass.
+• It is possible that a policy misbehaves in unforeseen
+circumstances (which, as a note, should then be in-
+corporated into the training loop). The resulting IR,
+while correct, could become increasingly expensive to
+process by subsequent passes. To avoid this, we set a
+hard threshold to the amount by which the number of
+instructions may grow in a compilation unit.
+
+5.2 Release Mode Implementation in LLVM
+
+The model is encoded in the TensorFlow serialization format,
+SavedModel [31], which is compiled into native code by the
+saved_model_cli tool [32]. To use this tool, we added a build
+rule (see llvm/cmake/modules/TensorFlowCompile.cmake)
+to the LLVM build system. Applying the rule to a model
+generates a header file and an object file. From here, the
+model may be consumed as a C function; for simplicity, the
+SavedModel compiler provides a thin C++ wrapper, exposing
+plain C/C++ APIs (primitive types), which is compiled as
+part of the LLVM build process. The SavedModel is checked
+in as source9.
+
+To build with support for the release mode, the Saved-
+Model compiler must be available during the build time of
+LLVM. The compiler may be installed through a python
+pip package10. Once installed, its location is provided to the
+LLVM build via the TENSORFLOW_AOT_PATH cmake flag.
+Specifying that flag also defines a conditional compilation
+flag, HAVE_TF_AOT, which enables the compilation as part
+of the Analysis component of the support for release mode.
+Note that this mechanism would build the release mode
+implementations of all optimization passes that have RL-
+driven policies, meaning that implementers just need to reuse
+the same mechanisms - conditional compilation flag, build
+rule, etc - to plug in a ML-based policy replacement.
+
+5.3 Development Mode Implementation in LLVM
+
+As discussed, in development mode, we want to support
+loading models from the command line. For the development
+mode, the build time dependency is to the TensorFlow C API
+library, instead of the TensorFlow pip package. Model load-
+ing, initialization, and evaluation is performed via a reusable
+C++ API wrapper (see lib/Analysis/TFUtils.cpp) that simpli-
+fies the programming model of this aspect of development
+mode implementations.
+
+9The SavedModel separates the evaluation graph structure from the value
+of the trained weights used for evaluation. The graph is stored as text. The
+weights/serialized float arrays are stored as a binary blob. Their evolution
+(due to training) does not diff well, so the compactness of a binary format
+is more economical for the project repository.
+10See the buildbot setup script available at https://github.com/google/ml-
+compiler-opt/blob/58bf347286c21519b3cc418f659c485cbb7ad82f/buildbot/
+buildbot_init.sh
+
+MLGO: a Machine Learning Guided Compiler Optimizations Framework
+
+In addition to facilitating a different model ingestion mech-
+anism, the development mode is responsible for producing
+traces necessary for training ("training logs")11. These logs
+capture the succession of feature values observed when the
+policy is asked to make a decision, and the decision made
+afterwards ("trajectories"). Training logs may be produced
+for both the heuristic policy (for bootstrapping training -
+"warmstart") as well as for the ML policy currently under
+training. Exploration - i.e. deviating from policy, with the
+purpose of finding new learning opportunities - is delegated
+to a TensorFlow mechanism that introduces some random-
+ness in decisions. This mechanism is an implementation
+detail of the model as produced by the training algorithm,
+and is outside the control of the compiler. Care must be
+taken to remove such randomness before shipping a model,
+and re-validate its effectiveness. We encode the training logs
+as textual SequenceExamples[30] proto-buffers, the typical
+abstraction Tensorflow training algorithms would expect.
+We produce a textual output to avoid an additional depen-
+dency to LLVM, and to simplify diagnostics and testing of
+the feature.
+
+Analogous to the release mode, enabling development
+mode in LLVM requires the dependency be made available to
+the build system. In this case we use the TENSORFLOW_C_API
+flag, which in turn defines the HAVE_TF_API conditional
+compilation flag. More details may be obtained from the pre-
+viously noted build bot scripts. Also similar to the release
+mode, this mechanism enables all cases that have the Ten-
+sorFlow C API library dependency. Unlike release mode, the
+development mode’s use of the TensorFlow C library is a
+run-time dependency, and needs to be on the loader path.
+
+6 Evaluation
+6.1 Compilation Overhead
+Model evaluation in release mode has fixed cost, both in
+terms of compiler run-time memory utilization, as well as
+CPU utilization. This is because models are fixed size graphs
+connecting functional operators, taking fixed sized inputs,
+using constant weights, and producing fixed sized outputs.
+For the current model, we observed 0.65% increase in mem-
+ory utilization at run-time. When inlining a large IR mod-
+ule ( 33MB), we measured a 10% increase in inlining time,
+mostly attributable to feature extraction; since inlining tends
+to represent 10-15% of total compile time, the net contri-
+bution of the release mode is only 1%. Finally, clang binary
+size increase due to the inclusion of the compiled model
+was 115KB, representing 0.08% size increase.
+
+We did not formally measure the overhead of the devel-
+opment mode, mainly because timeliness is less of a con-
+cern here, and also because model evaluation may happen
+through a variety of means, including JIT-ing, which makes
+measurements more unstable. We did want to validate that
+
+11RL algorithms require these. ES algorithms do not
+
+9
+
+Size Reduction
+Parallelism in Data Collection
+Training Time
+
+ES (L)
+ES
+PG
+4.95% 3.74% 5.94%
+488
+488
+100
+~150h
+~60h
+~12h
+
+Table 2. Policy Gradient v.s. Evolution Strategies
+
+the solution is practically usable in training loops, and ob-
+served 26K IR modules being inlined in parallel on a 72 thread
+machine, 192GB RAM, in around 10 minutes, and without
+going past half of the available RAM12.
+
+6.2 Inlining for Size Results
+
+We trained the inlining for size policy on an internal search
+application containing over 28000 IR modules with a vari-
+ety of different code patterns13. The rich set of patterns will
+improve generalizability, across both time and software do-
+main, of the trained policy. As mentioned, this is important
+for real-world deployment.
+
+We trained the policy using both PG and ES on the internal
+search software. Table 2 compares their effectiveness in terms
+of reduction of the .text section compared with heuristic-
+driven -Oz. We trained 3 policies: PG and ES with a 2 hidden
+layer (40, 20) neural network, and ES(L) with a deeper 4 layer
+(20, 20, 20, 20) neural network14. We can see that: 1) PG has
+better sample efficiency than ES — it consumes ~5% training
+resources of ES (100 ∗ 12 v.s. 488 ∗ 60); 2) better policies may
+be achieved with a larger neural network at the cost of more
+training resources; 3) we can train a reasonable PG policy
+on a single multi-core (e.g. 72 threads) high-performance
+machine well within a day.
+
+6.2.1 Generalizability across Software
+
+We deploy the trained PG and ES policies to a wide range of
+software to evaluate their generalizability. Figure 4 shows
+how the 3 models we trained on the search application per-
+form on 3 different internal applications and on Clang15.
+Figure 5 shows their effectiveness on SPEC 2006. We can see
+that all the 3 policies show good generalizability — they are
+able to reduce the native size to some extent. Policy effective-
+ness is ES(L)>PG>ES for most software, which is the same
+as what we see on the search application. It also suggests
+good generalizability as a policy performs better on a certain
+software is likely to also perform better on other software.
+
+12Anecdotally, we were able to built Fuscia using a development mode clang,
+and timeliness was not a noticeable issue.
+13We also have an end-to-end demo at https://github.com/google/ml-
+compiler-opt/blob/main/docs/demo/demo.md that trains on publicly avail-
+able code and achieves similar performance.
+14Detailed hyper-parameters at https://github.com/google/ml-compiler-
+opt/tree/main/compiler_opt/rl/inlining/gin_configs
+15Specifically, clang @4ca60915bcc (2020/8/28) building clang @d469133f95b
+(2020/4/25).
+
+Mircea Trofin, Yundi Qian, Eugene Brevdo, Zinan Lin, Krzysztof Choromanski, and David Li
+
+Haj-Ali et al. [13] use reinforcement learning to instru-
+ment source code with pragma directives to drive the vector-
+ization pass. The policy does not replace a compiler heuristic,
+rather it informs one, by augmenting source code as a pre-
+build step. This does not make the technique transparently
+deployable for compiler users. That being said, we currently
+see no fundamental reason their solution cannot be adapted
+to MLGO. The main practical issue we see is understanding
+trade-offs of automated feature extraction, which we intend
+to explore as a next step as well.
+
+Supervised learning is used by Stephenson and Amaras-
+inghe [26] to predict loop unrolling factors and by Eliot
+et al. [19] to train a local (single basic block) instruction
+scheduler. It uses a machine model to predict the so called
+preference relationship given a partial schedule and two
+candidate/ready instructions. Cummins et al. [10] automati-
+cally extract features from source code, and use supervised
+learning to learn heuristics for predicting optimal mapping
+for heterogeneous parallelism and GPU thread coarsening
+factors.
+
+Instruction scheduling is a hard problem in the compiler
+that extensively uses heuristics. The application of learning
+to instruction scheduling within straight line code has been
+explored by Moss et al. [20] and McGovern et al. [17].
+
+Data prefetching plays a similar role in bringing data into
+the processor without stalls. In [15], Hashemi et al. treated
+the memory prefetching strategies as an n-gram classifica-
+tion problem in natural language processing, and used LSTM
+based Recurrent Neural Network (RNN) to do the prediction.
+Peled et al. [21] define the notion of semantic locality and use
+reinforcement learning techniques to build a context-based
+memory prefetcher that approximates semantic locality.
+
+Another approach to optimize programs without dealing
+with specific optimizations is super-optimization. This refers
+to the process of finding a better version of a given pro-
+gram that is semantically equivalent. Early efforts in super-
+optimization relied on brute force search. Recent efforts have
+focused on using stochastic search to improve the efficiency.
+Bunel et al. [5] have used reinforcement learning to optimize
+stochastic search based super-optimization techniques.
+
+Milepost GCC [12] is a self-tuning GCC-based compiler,
+where program features are used to predict compiler flags
+beneficial to some goal (such as performance or size). It does
+not use ML-trained policies as part of its implementation.
+
+8 Future Directions
+8.1 Applying MLGO to Speed Optimizations
+
+The immediately-observable difference between our pilot
+project and speed problems is that the reward is measured dif-
+ferently: speed is measured through benchmark runs, which
+are more time consuming and more noisy than size measure-
+ments. Using benchmark runs results as reward for speed
+optimization will have difficulties scaling, so our current
+
+Figure 4. Generalizability across Software
+
+6.2.2 Generalizability across Time
+
+To evaluate the trained policies’ generalizability across time,
+we deploy the 3 trained policies on the same software as in
+Figure 4 4 months later. We also use the LLVM 4 months
+later16. Both the software and the compiler have been under
+active development in that period. Figure 6 demonstrates
+the results. We can see that their effectiveness may degrade
+somewhat (compared with Figure 4), but they still have de-
+cent wins compared with the current -Oz.
+
+7 Related Work
+There have been many academic efforts in using machine
+learning and related techniques to replace hand-crafted heuris-
+tics in compilers. Our contribution is identifying the problem
+framing and design constraints that enable applying these
+techniques to production.
+
+Wang and O’Boyle [33] present an extensive survey of
+the use of machine learning in compiler optimizations. Most,
+however, employ supervised learning techniques, which, as
+explained, are not in our scope. The closest, Cavazos et all
+- [6] used unsupervised learning to automatically tune the
+inlining parameters (thresholds) of a research Java Virtual
+Machine (JVM), which features a very simple manually writ-
+ten heuristic. In subsequent work, Simon et al. [25] construct
+a heuristic as a decision tree, to address maintainability and
+evolvability. While the ML techniques are similar to what we
+are using in MLGO, both parameter tuning and direct policy
+comprehensibility are counter to our goals, as described in
+section 3.
+
+Adams et al. [2] employed ML to train a cost model to au-
+tomatically schedule Halide programs for image processing.
+With runtime sampling, the cost model is used to find the
+optimal schedule parameters using beam search. Similarly,
+Chen et al.[7] used deep learning to train a statistic model
+for TensorFlow programs.
+
+Inlining-specific, Dean et al. [11] build a database of ob-
+served decisions and their effects, and consult it in subse-
+quent compiler runs - while this is not learning, it is a pre-
+cursor of efforts in this area. In [9], Cooper et al. presented a
+scheme to parameterize the inline heuristics (decision tree)
+and the hill-climbing parameter space search.
+
+16Clang selfhost @4ca60915bcc (2020/8/28).
+
+10
+
+MLGO: a Machine Learning Guided Compiler Optimizations Framework
+
+Figure 5. SPEC 2006 Size Reduction
+
+9 Conclusion
+We investigated the problem of leveraging ML techniques for
+compiler optimization in a real-world setting. We proposed a
+particular understanding of the problem space, and derived
+the MLGO framework. We applied it to inlining-for-size and
+described the resulting implementation, available in LLVM as
+a build-time opt-in, as well as the training methodology, two
+training algorithms and their trade-offs, and results. We are
+currently applying the same principles to addressing inlining
+for speed and register allocation policies, and hope that,
+through our experience, as well as that of the community,
+we can further refine MLGO and eventually mature it to
+a solution that compiler engineers can broadly apply and
+leverage machine learning for compiler optimizations in real-
+world settings.
+
+References
+[1] Martín Abadi, Paul Barham, Jianmin Chen, Zhifeng Chen, Andy Davis,
+Jeffrey Dean, Matthieu Devin, Sanjay Ghemawat, Geoffrey Irving,
+Michael Isard, et al. 2016. Tensorflow: A system for large-scale machine
+learning. In 12th {USENIX} symposium on operating systems design
+and implementation ({OSDI} 16). 265–283.
+
+[2] Andrew Adams, Karima Ma, Luke Anderson, Riyadh Baghdadi, Tzu-
+mao Li, Michael Charbi, Benoit Steiner, Steven Johnson, Kayvon Fa-
+tahlian, Fredo Durand, and Jonathan Regan-kelley. 2019. Learning to
+optimize Halide with tree search and random programs (ACM Trans-
+actions on Graphics). 2–12.
+
+[3] Uri Alon, Meital Zilberstein, Omer Levy, and Eran Yahav. 2019.
+code2vec: Learning distributed representations of code. Proceedings of
+the ACM on Programming Languages 3, POPL (2019), 1–29.
+
+[4] Michael Bain and Claude Sammut. 1995. A Framework for Behavioural
+
+Cloning.. In Machine Intelligence 15. 103–129.
+
+[5] Rudy Bunel, Alban Desmaison, M Pawan Kumar, Philip HS Torr, and
+Pushmeet Kohli. 2016. Learning to superoptimize programs. arXiv
+preprint arXiv:1611.01787 (2016).
+
+[6] John Cavazos and Michael FP O’Boyle. 2005. Automatic tuning of inlin-
+ing heuristics. In SC’05: Proceedings of the 2005 ACM/IEEE Conference
+on Supercomputing. IEEE, 14–14.
+
+[7] Tianqi Chen, Lianmin Zheng, Eddie Q. Yan, Ziheng Jiang, Thierry
+Moreau, Luis Ceze, Carlos Guestrin, and Arvind Krishnamurthy. 2018.
+Learning to Optimize Tensor Programs. CoRR abs/1805.08166 (2018).
+arXiv:1805.08166 http://arxiv.org/abs/1805.08166
+
+11
+
+Figure 6. Generalizability across Time
+
+preference is to avoid benchmark runs altogether, and focus
+instead on using problem-specific reward approximations.
+For register allocation, for example, a natural reward is
+calculating, per function, the block frequency-weighed sum
+of introduced moves. For inlining for speed, we plan to use
+a linear combination of a per-critical call graph estimate
+of working set (i.e. cache lines needed for execution) and
+dynamic instruction count. Both approaches require profiling
+information for carrying out the analysis, which we assume
+as a pre-requisite for workloads that are concerned with
+speed.
+
+8.2 ML Techniques
+
+There are multiple directions to pursue in terms of the ML
+techniques:
+
+Richer State Representations: instead of using the 11
+numerical features to represent the state, we can have richer
+state representations. For example, we can use code em-
+bedding techniques [3] to embed the caller/callee to get
+more detailed information about the call site; or we can use
+graph neural network techniques [14] on the neighboring
+sub-graph of the call site to get more information about the
+call graph.
+
+PG with Partial Reward: PG with partial reward would
+greatly improve the sample efficiency and trainability. How-
+ever, there are two challenges to tackle: 1) find an efficient
+way to encode the global call graph information into state; 2)
+train a supervised model to predict a function’s native size
+from its IR.
+
+Mircea Trofin, Yundi Qian, Eugene Brevdo, Zinan Lin, Krzysztof Choromanski, and David Li
+
+of Go with deep neural networks and tree search. nature 529, 7587
+(2016), 484–489.
+
+[25] Douglas Simon, John Cavazos, Christian Wimmer, and Sameer Kulka-
+rni. 2013. Automatic Construction of Inlining Heuristics Using Ma-
+chine Learning. In Proceedings of the 2013 IEEE/ACM International
+Symposium on Code Generation and Optimization (CGO) (CGO ’13).
+IEEE Computer Society, Washington, DC, USA, 1–12. https://doi.org/
+10.1109/CGO.2013.6495004
+
+[26] Mark Stephenson and Saman Amarasinghe. 2005. Predicting Un-
+roll Factors Using Supervised Classification. In Proceedings of the In-
+ternational Symposium on Code Generation and Optimization (CGO
+’05). IEEE Computer Society, Washington, DC, USA, 123–134. https:
+//doi.org/10.1109/CGO.2005.29
+
+[27] Mark W. Stephenson. 2006. Automating the Construction of Compiler
+Heuristics Using Machine Learning. Ph.D. Dissertation. USA. Advisor(s)
+Amarasinghe, Saman. AAI0810106.
+
+[28] Richard S Sutton, David A McAllester, Satinder P Singh, and Yishay
+Mansour. 2000. Policy gradient methods for reinforcement learning
+with function approximation. In Advances in neural information pro-
+cessing systems. 1057–1063.
+
+[29] unspecified. 2020. Tensorflow Agents. https://www.tensorflow.org/
+
+agents
+
+[30] unspecified. 2020. Tensorflow tf.train.SequenceExample. https://www.
+
+tensorflow.org/api_docs/python/tf/train/SequenceExample
+
+[31] unspecified. 2020. Using the SavedModel format.
+
+https://www.
+
+tensorflow.org/guide/saved_model
+
+[32] unspecified. 2020. XLA — Tensorflow, Compiled. https://developers.
+
+googleblog.com/2017/03/xla-tensorflow-compiled.html
+
+[33] Zheng Wang and Michael O’Boyle. 2018. Machine Learning in Com-
+piler Optimization. Proc. IEEE PP (05 2018), 1–23. https://doi.org/10.
+1109/JPROC.2018.2817118
+
+[34] Ronald J Williams. 1992. Simple statistical gradient-following algo-
+rithms for connectionist reinforcement learning. Machine learning 8,
+3-4 (1992), 229–256.
+
+[8] Krzysztof Choromanski, Mark Rowland, Vikas Sindhwani, Richard E
+Turner, and Adrian Weller. 2018. Structured evolution with com-
+pact architectures for scalable policy optimization. arXiv preprint
+arXiv:1804.02395 (2018).
+
+[9] Waterman T. Cooper K.D., Harvey T.J. 2008. An Adaptive Strategy for
+Inline Substitution. Hendren L. (eds) Compiler Construction. CC 2008.
+Lecture Notes in Computer Science vol 4959 (2008). https://doi.org/10.
+1007/978-3-540-78791-4_5
+
+[10] Chris Cummins, Pavlos Petoumenos, Zheng Wang, and Hugh Leather.
+
+2017. End-to-end Deep Learning of Optimization Heuristics.
+
+[11] Jeffrey Dean, Jeffrey Dean, Craig Chambers, and Craig Chambers. 1993.
+Training Compilers for Better Inlining Decisions. Technical Report.
+[12] Grigori Fursin, Yuriy Kashnikov, Abdul Wahid Memon, Zbigniew
+Chamski, Olivier Temam, Mircea Namolaru, Elad Yom-Tov, Bilha
+Mendelson, Ayal Zaks, Eric Courtois, François Bodin, Phil Barnard,
+Elton Ashton, Edwin V. Bonilla, John Thomson, Christopher K. I.
+Williams, and Michael F. P. O’Boyle. 2011. Milepost GCC: Machine
+Learning Enabled Self-tuning Compiler. Int. J. Parallel Program. 39, 3
+(2011), 296–327. https://doi.org/10.1007/s10766-010-0161-2
+
+[13] Ameer Haj-Ali, Nesreen K. Ahmed, Ted Willke, Yakun Sophia Shao,
+Krste Asanovic, and Ion Stoica. 2020. NeuroVectorizer: End-to-End
+Vectorization with Deep Reinforcement Learning. In Proceedings of
+the 18th ACM/IEEE International Symposium on Code Generation and
+Optimization (CGO 2020). Association for Computing Machinery, New
+York, NY, USA, 242–255. https://doi.org/10.1145/3368826.3377928
+[14] Will Hamilton, Zhitao Ying, and Jure Leskovec. 2017. Inductive repre-
+sentation learning on large graphs. In Advances in neural information
+processing systems. 1024–1034.
+
+[15] M. Hashemi, K. Swersky, G. Ayers A. Smith, J. Chang H. Litz, C.
+Kozyrakis, and P. Ranganathan. 2018. Learning Memory Access Pat-
+terns (ICML, 2018).
+
+[16] Jens Kober, J Andrew Bagnell, and Jan Peters. 2013. Reinforcement
+learning in robotics: A survey. The International Journal of Robotics
+Research 32, 11 (2013), 1238–1274.
+
+[17] Amy McGovern, Eliot Moss, and Andrew G. Barto. 2002. Building a
+Basic Block Instruction Scheduler with Reinforcement Learning and
+Rollouts. Machine Learning 49, 2 (01 Nov 2002), 141–160. https:
+//doi.org/10.1023/A:1017976211990
+
+[18] Volodymyr Mnih, Koray Kavukcuoglu, David Silver, Alex Graves, Ioan-
+nis Antonoglou, Daan Wierstra, and Martin Riedmiller. 2013. Playing
+atari with deep reinforcement learning. arXiv preprint arXiv:1312.5602
+(2013).
+
+[19] Eliot Moss, Paul Utgoff, John Cavazos, Bordley Carla, and David
+Scheeff. [n.d.]. Learning to Schedule Straight-Line Code (NIPS 1997).
+029– 935.
+
+[20] J. Eliot B. Moss, Paul E. Utgoff, John Cavazos, Doina Precup, Darko
+Stefanovic, Carla E. Brodley, and David Scheeff. 1998. Learning to
+Schedule Straight-Line Code. In Advances in Neural Information Pro-
+cessing Systems 10, M. I. Jordan, M. J. Kearns, and S. A. Solla (Eds.).
+MIT Press, 929–935. http://papers.nips.cc/paper/1349-learning-to-
+schedule-straight-line-code.pdf
+
+[21] L. Peled, S. Mannor, U. Weiser, and Y. Etsion. 2015. Semantic local-
+ity and context-based prefetching using reinforcement learning. In
+2015 ACM/IEEE 42nd Annual International Symposium on Computer
+Architecture (ISCA). 285–297. https://doi.org/10.1145/2749469.2749473
+[22] Tim Salimans, Jonathan Ho, Xi Chen, Szymon Sidor, and Ilya Sutskever.
+2017. Evolution strategies as a scalable alternative to reinforcement
+learning. arXiv preprint arXiv:1703.03864 (2017).
+
+[23] John Schulman, Filip Wolski, Prafulla Dhariwal, Alec Radford, and
+Oleg Klimov. 2017. Proximal policy optimization algorithms. arXiv
+preprint arXiv:1707.06347 (2017).
+
+[24] David Silver, Aja Huang, Chris J Maddison, Arthur Guez, Laurent Sifre,
+George Van Den Driessche, Julian Schrittwieser, Ioannis Antonoglou,
+Veda Panneershelvam, Marc Lanctot, et al. 2016. Mastering the game
+
+12
+
+

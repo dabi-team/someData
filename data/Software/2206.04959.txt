@@ -1,0 +1,1675 @@
+Merak: An Efficient Distributed DNN Training Framework with
+Automated 3D Parallelism for Giant Foundation Models
+Zhiquan Lai, Shengwei Li, Xudong Tang, Keshi Ge, Weijie Liu, Yabo Duan, Linbo Qiao, Dongsheng
+Li
+National Key Laboratory of Parallel and Distributed Processing
+Computer College, National University of Defense Technology
+Changsha, China
+{zqlai,keshige,liuweijie,yaboduan,qiao.linbo,dsli}@nudt.edu.cn,{lucasleesw9,txacs1993}@gmail.com
+
+2
+2
+0
+2
+
+n
+u
+J
+
+1
+2
+
+]
+
+G
+L
+.
+s
+c
+[
+
+2
+v
+9
+5
+9
+4
+0
+.
+6
+0
+2
+2
+:
+v
+i
+X
+r
+a
+
+ABSTRACT
+Foundation models are becoming the dominant deep learning tech-
+nologies. Pretraining a foundation model is always time-consumed
+due to the large scale of both the model parameter and training
+dataset. Besides being computing-intensive, the training process is
+extremely memory-intensive and communication-intensive. These
+features make it necessary to apply 3D parallelism, which integrates
+data parallelism, pipeline model parallelism and tensor model par-
+allelism, to achieve high training efficiency.
+
+To achieve this goal, some custom software frameworks such
+as Megatron-LM and DeepSpeed are developed. However, current
+3D parallelism frameworks still meet two issues: i) they are not
+transparent to model developers, which need to manually modify
+the model to parallelize training. ii) their utilization of computa-
+tion, GPU memory and network bandwidth are not sufficient. We
+propose Merak, an automated 3D parallelism deep learning train-
+ing framework with high resource utilization. Merak automatically
+deploys with an automatic model partitioner, which uses a graph
+sharding algorithm on a proxy representation of the model. Merak
+also presents the non-intrusive API for scaling out foundation model
+training with minimal code modification. In addition, we design
+a high-performance 3D parallel runtime engine in Merak. It uses
+several techniques to exploit available training resources, including
+shifted critical path pipeline schedule that brings a higher compu-
+tation utilization, stage-aware recomputation that makes use of
+idle worker memory, and sub-pipelined tensor model parallelism
+that overlaps communication and computation. Experiments on
+64 GPUs show Merak can speedup the training performance over
+the state-of-the-art 3D parallelism frameworks of models with 1.5,
+2.5, 8.3, and 20 billion parameters by up to 1.42×, 1.39×, 1.43×, and
+1.61×, respectively.
+
+Artifact Availability:
+The source code, data, and/or other artifacts have been made available at
+https://github.com/HPDL-Group/Merak.
+
+1 INTRODUCTION
+Foundation deep neural networks (DNNs) [6] have been rapidly
+advanced in recent years. The state-of-the-art (SOTA) foundation
+DNN models have high-dimensional features and make the correct
+prediction over the human ability in Natural Language Processing
+(NLP) and Computer Vision (CV). However, training foundation
+models meets two issues from the scale of parameters and datasets.
+First, the model size is generally impossible to be fit in GPUs, and
+
+it is foreseeable that the model size will continuously increase in
+the future. Take the BERT-large [9] with 300 million parameters
+in 2018 and GPT-3 [7] with 175 billion raised in 2020 as exam-
+ples, the parameter numbers have already grown over a thousand
+times. Second, the giant model size and high volume dataset incur
+extremely high computation time. For example, it consumes 288
+years to train the GPT-3 with a V100 NVIDIA GPU [29]. These
+requirements demand 3D parallelism, which deploys data paral-
+lelism, tensor model parallelism and pipeline model parallelism in
+a multi-node distributed training system. Model parallel training
+techniques, including tensor model parallelism (TMP) and pipeline
+model parallelism (PMP), are developed to address the issue of giant
+models. TMP splits the parameters in a model layer over multiple
+GPUs, while PMP partitions model layers into stages and executes
+each stage in a pipelined manner. Data parallelism (DP) deploys
+multiple model replicas in the system, and each replica train a mini-
+batch data independently in an iteration, thus can accelerate large
+dataset processing. Existing 3D parallelism systems integrate these
+three parallel schemes and successfully train the representative
+transformer based models at scale, such as GPT-3 [7], MT-NLG [42]
+and PanGu-𝛼 [50].
+
+However, existing 3D parallelism systems still have drawbacks
+for two reasons: a) lack of generality. Artificial intelligence (AI)
+developers have developed hundreds and thousands of models with
+various architectures, and usually train them with local training
+scripts [45]. However, when scaling out with 3D-parallel training,
+the current 3D parallelism systems require more or less system
+expertise and manual code refactoring, especially demand the se-
+quential models that consist of a plain stack of layers. In Section 3.1,
+we summarize the generality of current 3D parallelism frameworks
+developed based on the user-friend PyTorch [31]. Among them,
+the representative DeepSpeed [37] and Megatron-LM [29] support
+automatically DP, but expect strict formatted sequential modules in
+PMP. b) inefficiency. We observe that the efficiency of current 3D
+parallelism systems suffers from resource utilization in the compu-
+tation, GPU memory, and network bandwidth. For the computation,
+the GPU idle time, which refers to as bubbles, decreases the through-
+put of PMP. The proportion of bubbles can reach 43% when training
+four microbatches on a four stage pipeline with the widely used
+one forward one backward (1F1B) schedule. For the GPU memory,
+the activation recomputation technique is necessarily applied to
+giant model training, but the inflexibility of it leaves parts of GPU
+memory unutilized. For example, 11 out of 24 GB GPU memory is
+empty when training the GPT-2.5B model with the fastest configu-
+ration on an eight stage pipeline, while the out-of-memory error
+
+ 
+ 
+ 
+ 
+ 
+ 
+Zhiquan Lai, Shengwei Li, Xudong Tang, Keshi Ge, Weijie Liu, Yabo Duan, Linbo Qiao, Dongsheng Li
+
+occurs if giving up recomputation. For both the network band-
+width and computation, the current TMP implementations need to
+perform communication in each layer to obtain complete output,
+which blocks computations of following layers, resulting in ineffi-
+cient utilization of both communication bandwidth and computing
+resources. We experiment that in GPT-1.4B model training with
+TMP on four GPUs, on average 52.5% of iteration time is used for
+intra-machine communication.
+
+To solve the two drawbacks of current 3D parallelism methods,
+we exhibit a 3D parallelism framework, Merak, in this paper. It
+orchestrates DP, PMP and TMP, and aims to provide user-friendly
+and efficient distributed foundation DNNs training. Merak features
+two novel modules to address the above drawbacks respectively:
+a) an automatic model partitioner. Merak could automatically
+partition, allocate and train a DNN model in distributed settings,
+facilitating the development of foundation models. However, auto-
+matically building such a distributed training scheme is no-trivial.
+Loading complete model properties could easily surpass a single
+device’s capacity, and the distinct model presentation of community
+models challenges sharding model graph into structured subgraphs.
+To overcome the challenges, we proxy the community models and
+get the whole model graph with much small overhead. We also pro-
+pose a graph sharding algorithm to shard a sequence of subgraphs
+which can be executed sequentially and form pipelines effortlessly.
+In addition, to relieve the burden on DNN developers, we present a
+parallelism method-agnostic API abstraction in Merak. The trans-
+parent API allows developers to reuse the local training script with
+minimal modifications. b) an efficient 3D parallel runtime en-
+gine. The 3D parallel runtime engine of Merak integrates three
+techniques to improve the efficiency of parallelism. First, we intro-
+duce a shifted critical path pipeline schedule for reducing pipeline
+bubbles. Critical path is an operation sequence that determines the
+pipeline latency. Our schedule shortens the critical path by drop-
+ping redundant recomputation and adjusting orders and start time
+of operations. In addition, we observe that a more efficient memory
+utilization can be obtained by adopting the activation recomputa-
+tion in a fine-grained way. Hence we develop a stage-aware recom-
+putation method to exploit the usage of worker memory, which
+employs idle memory for less recomputation according to pipeline
+stage rank and pipeline depth, and thereby speedup training. Fur-
+thermore, we improve the concurrency of the communication and
+computation in TMP with our sub-pipelined TMP approach, which
+applies microbatch splitting for individual sub-microbatches, and
+thereby pipelines sub-microbatches to overlap the communication
+and computation.
+
+We summarize our contributions as follows:
+
+• We present Merak, a distributed training framework for gen-
+eralizing and accelerating 3D parallelism. We simplify the
+usage of 3D parallelism and make API general for support-
+ing models in the AI community with an automatic model
+partitioner, which establishes a proxy presentation of giant
+model graph in a single worker, and slices the graph into a
+sequence of subgraph with a model sharding algorithm.
+• We develop a high-performance 3D parallel runtime engine
+to exploit available training resources. Our shifted critical
+path pipeline schedule brings a higher pipeline utilization,
+
+stage-aware recomputation makes use of idle worker mem-
+ory, and sub-pipelined TMP overlaps communication and
+computation in TMP.
+
+• We demonstrate the efficiency of Merak by conducting com-
+prehensive evaluations on up to a 20 billion parameter model
+at different train scales. Compared with baselines includ-
+ing SOTA 3D parallelism approaches, Merak accelerates the
+training process with 1.18×-1.61× throughput. We open the
+source code at https://github.com/hpdl-group/Merak.
+
+2 BACKGROUND AND RELATED WORK
+A deep learning model is usually constructed by a sequence of
+layers and trained by multiple iterations through a labeled train-
+ing dataset. One typical DNN training step involves forward pass
+(FP) and backward pass (BP). The repeating steps refine the model
+for higher accuracy. With the flexibility and expandability of trans-
+former structure, recently transformer based models [7, 9, 33, 34, 42]
+keep growing larger rapidly and renewing the accuracy records.
+To shorten the training time, researchers distribute the training
+among devices in scales with particular parallel strategies. Uniting
+data parallelism, pipeline model parallelism and tensor model par-
+allelism, 3D parallelism [4, 18, 19, 26, 29] leverages their merits
+and becomes the SOTA distribute training method for big models.
+Data parallelism (DP). The most common way to accelerate
+the model training is DP [14, 23, 40], where the data is separate
+on different workers while each worker holds a model replica and
+performs collective primitives such as AllReduce [32] at a certain
+interval to keep model synchronously. However, when the model
+is too large, a single-GPU memory cannot hold an entire model.
+ZeRO [35] of DeepSpeed [37] optimizes the memory redundancy by
+partitioning the model states among all workers; ZeRO-Offload [39],
+ZeRO-Infinity [36] and PatrickStar [13] further swap memory to
+CPU and NVMe. They trade communication volumes for scaling
+the model capacity of a single GPU, but when models keep getting
+larger, the increasing communications limit the training perfor-
+mance. DP has been well-developed by researchers and is usually
+easy to use with a few additional lines of code to single-GPU train-
+ing scripts, which offers an important usage template to Merak. The
+optimizations are orthogonal and could be adopted in accordance
+with DP part of Merak.
+
+Pipeline model parallelism (PMP). Instead of holding a whole
+model, PMP splits model into sub-modules and scatters them into
+a worker group. The batch data is also separated into microbatches
+and executed in a pipeline for better device utilization and less com-
+munication. Asynchronous PMP approaches [11, 21, 27, 28, 30] take
+full advantage of pipelining with multiple model versions or asyn-
+chronous weight updating. However, works [3, 47] demonstrate
+the convergence rate or final accuracy problems of asynchronous
+PMP methods. GPipe [16] first design a synchronous PMP sched-
+ule and has been integrated into PyTorch [51]. DAPPLE [12] and
+Megatron-LM [29] modify the pipeline schedule and reduce the
+usage of activation memory. Synchronous PMP works suffer from
+bubbles, Hippie [48] utilizes bubbles for communications with half
+step delayed parameter updating, and Chimera [22] uses a bidirec-
+tional pipeline to reduce the bubble but doubles the model memory.
+
+Merak: An Efficient Distributed DNN Training Framework with Automated 3D Parallelism for Giant Foundation Models
+
+System
+3D parallelism of
+DeepSpeed [26]
+Megatron-LM [29]
+Colossal-AI [4]
+Varuna [3]
+SageMaker [19]
+
+Merak
+
+Auto DP Auto PMP Auto TMP
+
+✓
+
+✓
+✓
+✓
+✓
+✓
+
+×
+
+×
+×
+✓*
+✓
+✓
+
+×
+
+×
+×
+-
+×
+✓
+
+Table 1: The automatically parallel strategy availability com-
+parison between PyTorch based distribute training frame-
+works. × means needing model definition code rewriting.
+Varuna does not support TMP training and requires adding
+CutPoints for PMP in model manually.
+
+Merak benefits from these approaches and develops a synchronous
+schedule with a shortened critical path in PMP part.
+
+Tensor model parallelism (TMP). Unlike PMP usually parti-
+tion models at layer level, TMP splits individual layers or operators
+across multiple workers. Megatron-LM [41] analyses the architec-
+ture of transformer [43] based models and divides weight matrices
+along row or column dimension with additional AllReduce opera-
+tions. SageMaker [19] implements a more efficient memory solution
+by adopting Reduce-Scatter. A line of workers [5, 44, 46] further
+expand TMP to more dimension of weight parameters and input
+tensors for reducing both the redundancy of activation and the
+communication overheads. Merak follows the TMP implementa-
+tion from Megatron-LM, and other optimizations could be comple-
+mentary to Merak. However, existing TMP methods bring a large
+number of synchronous communication operations during both FP
+and BP, which will block the computation and straggle training.
+We focus on improving the concurrency in TMP part of Merak.
+
+Activation recomputation. Activations are intermediate out-
+puts of FP and consumed by BP for gradients calculation. Activa-
+tion recomputation [8, 17, 20] techniques evict these values and
+recompute them when required. Although it costs about 1/3 more
+arithmetic overheads, this method could save significant memory
+footprint and make it possible to train models with larger data
+microbatches and preserve more model parameters on each device.
+Activation recomputation is widely adopted [3, 11, 24], especially
+in PMP approaches, where workers might manage a large number
+of activations simultaneously. Merak employs and fine-tunes it to
+pursue higher memory efficiency.
+
+3 MOTIVATIONS
+3.1 General and User-friendly 3D Parallelism
+DNN training frameworks PaddlePaddle [2], OneFlow [49] and
+MindSpore [50] have integrated 3D parallelism as their training
+strategy for giant models, but they need experienced developers.
+In PyTorch [31], one of the most popular DNN frameworks with a
+high reputation for friendly usage, existing 3D parallelism meth-
+ods need specially formatted models or significant changes to the
+training script thus introducing additional complexities to the train-
+ing process. We summarize the difficulties of accessing parallel
+
+strategies among PyTorch based libraries in Table 1. TMP cus-
+tomizes operators hence little work could escape from manual
+module settings. For PMP, 3D parallelism of DeepSpeed [26] and
+Megatron-LM [29] need flattening models to construct a layer se-
+quence; Colossal-AI [4] requires redefining models with its particu-
+lar interface; Varuna [3] asks for adding a specific CutPoint instance
+to model codes; and SageMaker [19] claims that it can apply PMP
+into any model but it is a proprietary solution and only available
+on AWS.
+
+Researchers are willing to share the latest progress in model
+training and model architectures. Plentiful models exist in com-
+munities such as the open-source library Transformers [45]. Users
+could build, train and deploy SOTA models without caring about
+training and model details. However, the complicated code refac-
+toring of existing 3D parallelism keeps us from the convenience of
+predefined models, and such a barrier is not good for the develop-
+ment of AI community. Therefore, our first motivation is realizing
+a general 3D parallelism without modifying original models.
+
+3.2 Inefficiencies in 3D Parallelism
+Training resource of a worker mainly includes three kinds of re-
+sources: computation, memory and network bandwidth resources.
+We observe that there are multiple inefficient resource utilizations
+in the 3D parallelism. First, synchronous PMP is widely accepted
+due to its more stable convergence. But the bubbles, lying on the
+warm-up and cool-down phases of pipelines, idle the computation
+and thus slowing each training iteration. Second, activation re-
+computation is generally employed for saving GPU memory. But
+existing 3D parallelism approaches [2, 29, 37] simply apply this
+technique for all model layers. This inflexible strategy could leave
+parts of GPU memory unutilized. In fact, it is not necessary to
+use the recomputation for all layers, and a flexible activation re-
+computation technique can exploit these GPU memory to speed
+up training in 3D parallelism. Third, in the most commonly used
+TMP implementation of Megatron-LM [41], paralleled operators
+require frequently AllReduce operations. The large amount of com-
+munications will block computations, meanwhile there is no data
+transmission during the computing. This interdependence wastes
+both communication and computation resources.
+
+Training large models involve dozens to hundreds of devices,
+and each run costs tens of thousands of dollars. Since clusters
+only charge the overall expended time, it is necessary to exploit
+any available device resources to speedup training. Hence another
+motivation of Merak is improving the training performance with
+better integration of training resources.
+
+4 MERAK OVERVIEW
+We design a distributed training system called Merak based on the
+popular DNN framework PyTorch, and a high-level overview is
+shown in Figure 1. Merak features an automatic model partitioner
+and a 3D parallel runtime engine. Merak model partitioner takes
+community models as input, which lack a specific model layout
+since there are various model definition patterns. To get perspec-
+tives of distinct models, we proxy the model operations, making
+them can be handled with a single processor. With structured model
+representation, we introduce a graph sharding algorithm to shard
+
+Zhiquan Lai, Shengwei Li, Xudong Tang, Keshi Ge, Weijie Liu, Yabo Duan, Linbo Qiao, Dongsheng Li
+
+import transformers as hf
+...
+...
+...
+# Set training args.
+args = hf.TrainingArguments()
+...
+# Set trainer.
+trainer = hf.Trainer(
+
+import Merak
+# Init Merak with parallel degrees.
+dp, tmp, pmp = 2, 2, 2
+Merak.init(dp, tmp, pmp)
+# Set our training args.
+args = Merak.MerakArguments()
+...
+# Set our trainer.
+trainer = Merak.MerakTrainer(
+
+args=args,
+model=...,
+train_data=...,
+eval_data=...,
+
+)
+...
+# Do train.
+trainer.train()
+
+args=args,
+model=...,
+train_data=...,
+eval_data=...,
+
+)
+...
+# Do train.
+trainer.train()
+
+Figure 2: Merak can enable 3D parallelism with a few lines
+of code change. The left code is the standard single GPU
+training script of Transformers [45] Trainer, while the right
+shows training the same model through 3D parallelism with
+Merak.
+
+to Transformers Trainer can bring much convenience to training
+models in Transformer library, where users could find a large num-
+ber of model resources and could get much help from the active
+community. As for models not in Transformers library, as long as a
+model is traceable, it could be trained by Merak as well. There are
+more usage examples including different situations and tasks in the
+code repository of Merak.
+
+5.1 Acquiring Complete Graph of Giant Models
+Since PyTorch has a variety of model definition methods, we need
+to get a uniform modality of disparate community model codes.
+Merak adopts trace tool torch.fx [38] in PyTorch. The tool would
+trace the whole model into a GraphModule, but it requires running
+the model for one step. However, training, even only loading, a
+DNN model on a single device could easily exceed the device’s
+memory capacity nowadays. For example, a 175 billion parameters
+GPT-3 model costs 700GB memory for parameter storing.
+
+Before the model is created, we create proxy nodes for patching
+intensive computing nodes such as GEMM operations, which usu-
+ally take the most computational load in recent DNN architectures.
+Proxy nodes do not own any parameters but could return results of
+right sizes so that they can participate in model tracing normally.
+Moreover, proxy nodes remember all functionality and can be re-
+stored to the functional node after being assigned to GPUs. Proxy
+nodes make it possible that a single worker could store a whole
+giant DNN model and swiftly executes the model tracing on CPUs,
+which typically own a larger memory capacity than a single GPU.
+In our experiments, one regular server with 96GB RAMs could
+handle the complete GPT-3 model.
+
+Furthermore, we implement auto TMP with proxy nodes. Since
+proxy nodes replace all GEMM operators, we can use a feature
+dict to map nodes with a TMP attribute, which can give the in-
+formation including how to partition the operator and conduct
+communication. When reconstructing the computation nodes from
+proxy nodes, we can adopt TMP modules according to the TMP
+attribute instead of original operations, thus achieving the auto
+TMP. We hold default feature dicts for common transformer based
+
+Figure 1: Merak overview.
+
+a model into proper subgraph slices, which can be executed se-
+quentially and form pipelines. According to parallel settings, each
+worker obtains a part of sequential subgraphs and builds it into
+a 3D parallel module. Model partitioner works in preprocessing
+before training, and we discuss its details in Section 5.
+
+The 3D parallel runtime engine (Section 6) of Merak takes the
+results of partitioner and training hyper-parameters such as global
+batch size. Then our shifted critical path schedule arranges the
+execution schedule of training operations including FP, BP and
+recomputing with a lower bubble ratio. And our stage-aware re-
+computation reduce the activation recomputation overhead in the
+sight of relations between pipeline depth and memory consumption.
+Furthermore, Merak conducts communication and computation in
+a non-blocking way through sub-pipelined TMP to improve the
+efficiency of TMP. These optimizations of Merak work together
+and greatly accelerate the distributed training.
+
+5 DEMOCRATIZING 3D PARALLELISM
+Motivated by Section 3.1, one main design principle of Merak is
+filling the gap between the complicated 3D parallelism training
+and accessibility of community models. We develop a model par-
+titioner for Merak, which will create a proxy representation of a
+model graph (Section 5.1), and automatically shard the model into
+a subgraph sequence (Section 5.2). After these two steps, Merak
+assigns subgraphs to workers, and builds them into an execution
+module for runtime engine.
+
+With the help of model partitioner, users could be free from the
+details of models and train giant models with 3D parallelism as easy
+as training on a single GPU. An example script is shown in Figure 2,
+compared to the standard training process with Transformers [45]
+Trainer, Merak only requires a few lines of code of parallel degrees
+setting and there is no model refactoring. The very similar interface
+
+Community models3D Parallelism Runtime EngineTraining argsShifted critical path scheduleStage-aware recomputationSub-pipelined TMPPyTorchNCCLcuDNNAutomatic Model PartitionerProxyShardBuildDPTMPPMP3D Parallel ModuleTMPPMPComputationMemoryBandwidthBetter training resource usageMerak: An Efficient Distributed DNN Training Framework with Automated 3D Parallelism for Giant Foundation Models
+
+Algorithm 1: Search Node Dependency
+Input: node 𝑛, current subgraph id 𝑠, common nodes to user
+
+counts dict C, graph inputs 𝑋 , graph inputs to nodes dict I,
+nodes to subgraph ids dict M, subgraph ids to subgraph
+outputs dict S𝑜𝑢𝑡𝑠 , visited nodes list 𝑁
+
+Output: minimum subgraph id 𝑠𝑚𝑖𝑛, farthest dependency node
+
+𝑛𝑚𝑖𝑛, updated C and I
+
+1 𝑠𝑚𝑖𝑛 ← 𝑠, 𝑛𝑚𝑖𝑛 ← 𝑁𝑢𝑙𝑙
+2 for 𝑎𝑟𝑔 ∈ 𝑛.𝑎𝑟𝑔𝑠 do
+
+// 𝑎𝑟𝑔 is a common node, update its user count.
+if 𝑎𝑟𝑔 ∈ C.𝑘𝑒𝑦𝑠 then C [𝑎𝑟𝑔] ← C [𝑎𝑟𝑔] − 1
+else if 𝑎𝑟𝑔 ∈ 𝑋 then
+
+// 𝑎𝑟𝑔 is a graph input.
+
+if I [𝑎𝑟𝑔] = 𝑁𝑢𝑙𝑙 then I [𝑎𝑟𝑔] ← 𝑛
+else if M [I [𝑎𝑟𝑔] ] < 𝑠𝑚𝑖𝑛 then
+
+𝑠𝑚𝑖𝑛 ← M [I [𝑎𝑟𝑔] ], 𝑛𝑚𝑖𝑛 ← I [𝑎𝑟𝑔]
+
+end
+
+// 𝑎𝑟𝑔 is a output in previous subgraphs.
+else if 𝑎𝑟𝑔 ∈ S𝑜𝑢𝑡𝑠 .𝑣𝑎𝑙𝑢𝑒𝑠 then
+if M [𝑎𝑟𝑔] + 1 < 𝑠𝑚𝑖𝑛 then
+
+𝑠𝑚𝑖𝑛 ← M [𝑎𝑟𝑔] + 1, 𝑛𝑚𝑖𝑛 ← 𝑎𝑟𝑔
+
+end
+
+// 𝑎𝑟𝑔 is the output from a previous node but not
+
+from the last visited node.
+
+else if 𝑎𝑟𝑔 ∈ M.𝑘𝑒𝑦𝑠 and 𝑎𝑟𝑔 ≠ 𝑁 [−1] then
+
+if M [𝑎𝑟𝑔] < 𝑠𝑚𝑖𝑛 then
+
+𝑠𝑚𝑖𝑛 ← M [𝑎𝑟𝑔], 𝑛𝑚𝑖𝑛 ← 𝑎𝑟𝑔
+
+end
+
+3
+
+4
+
+5
+
+6
+
+7
+
+8
+
+9
+
+10
+
+11
+
+12
+
+13
+
+14
+
+15
+
+16
+
+end
+
+17
+18 end
+19 return 𝑠𝑚𝑖𝑛, 𝑛𝑚𝑖𝑛, C, I
+
+models in Transformers community, including language models
+(e.g., BERT [9], GPT [33], T5 [34]) and image classification models
+(e.g., ViT [10], Swin [25]). In addition, users could define a feature
+dict through our interface easily.
+
+5.2 Graph Sharding Algorithm
+Although we have gotten a traced graph of community models, the
+graphs are still very distinct from each other. Besides, to realize auto
+PMP for Merak, we need to split the complete graph into subgraphs
+and construct a sequence of them, which enables us to form the
+pipeline by assigning continuous parts of subgraphs sequence with
+similar workloads to each pipeline stage. Thus partitioning the
+distinct graphs into sequential subgraphs becomes our fundamental
+problem for auto PMP.
+
+Since the graph of DNN models is a directed acyclic graph (DAG),
+we can traverse all nodes with the order of DAG and create sub-
+graphs from scratch. To determine whether a node could stay in a
+subgraph, we find its farthest dependency and related subgraph id
+with a dependency search algorithm as shown in Algorithm 1. The
+farthest dependency of a node could be a graph input(lines 4-8), an
+output of previous subgraphs (lines 9-12), or a previously visited
+node (lines 13-15). We do not consider the last visited node as a
+potential dependency because the last visited node is either in the
+current subgraph, or the output of the last subgraph. A node should
+stay in the same subgraph with its farthest dependency. However,
+
+Figure 3: The average data load time of different microbatch
+sizes with GPT models on 8 GPUs.
+
+the strict rules might yield no subgraphs at all, specially, we de-
+fine a kind of node as common nodes and allow them to become
+exceptions of dependency (line 3). Take transformer layer based
+model as an example, there are nodes asked by every transformer
+block, such as the attention mask node, thus we could refer nodes
+with a user count more than the number of transformer layers to
+the common nodes. We collect user count of common nodes from
+graph tracing and inject the count into our shard algorithms. And
+during searching dependency, we update the user count of common
+nodes to guide whether they should be returned by a subgraph, and
+record the first user of each graph input.
+
+Next, we partition the graph with an auto graph sharding algo-
+rithm as shown in Algorithm 2. We begin node traversing with
+subgraph id 0 and setting a subgraph id to each node with the help
+of farthest dependency results. Specifically, for a node with far-
+thest dependency, once the subgraph id of its farthest dependency
+is smaller than the current, we will update the current subgraph
+id, set the updated subgraph id to nodes that have a larger index
+than the farthest dependency node in the visited nodes list (lines
+5-11), and assign subgraph id for the node being traversed (line 12).
+Moreover, to accelerate the shard procedure, we can provide an
+upper bound of partition number based on the model layer number
+or device number. And we handle outputs of current subgraph and
+increase subgraph id if we create a new subgraph (lines 15-20).
+After traversing all nodes, we create subgraphs with corresponding
+nodes, inputs and outputs (lines 23-28). Inputs of each subgraph
+include all outputs of the last subgraph, thus the subgraph list could
+be executed as a sequence. Take the GPT series model as an exam-
+ple, each attention block and feed forward network block could
+become an individual subgraph module with our algorithms.
+
+The graph shard overheads could be ignored since the 3D parallel
+train process usually lasts for days. But tuning train configurations
+or restarting training procedures multiple times is common, and
+the repeating graph sharding operations will bring a considerable
+cost. Since the subgraph sequence results are only related to the
+model rather than training arguments such as GPU numbers, we
+can cache the subgraph sequence to avoid the extra overheads.
+
+5.3 Auto Dataloader for 3D Parallelism
+When we train the model with 3D parallelism, different pipeline
+stages require different data, some stages even do not load data.
+Naive solutions that all GPU workers load the full datasets and
+
+1248Microbatch Size010203040Average Time (ms)Non-split dataloaderMerak Split dataloaderZhiquan Lai, Shengwei Li, Xudong Tang, Keshi Ge, Weijie Liu, Yabo Duan, Linbo Qiao, Dongsheng Li
+
+Algorithm 2: Graph Sharding
+Input: traced graph module 𝐺, graph inputs 𝑋 , number of
+subgraphs 𝑘, nodes to number of parameters dict D,
+common nodes to user counts dict C
+
+Output: subgraph list 𝐺𝑙𝑖𝑠𝑡
+
+1 Init nodes to subgraph ids dict M; graph inputs to nodes dict I;
+
+subgraph ids to subgraph outputs dict S𝑜𝑢𝑡𝑠 ; visited nodes list 𝑁 ;
+
+2 Init parameter count threshold 𝑝 ← 𝑆𝑢𝑚 ( D.𝑣𝑎𝑙𝑢𝑒𝑠)/𝑘; current
+
+subgraph id 𝑠 ← 0
+3 for Node 𝑛 ∈ 𝐺 do
+4
+
+𝑠𝑚𝑖𝑛, 𝑛𝑚𝑖𝑛, C, I ←
+𝑆𝑒𝑎𝑟𝑐ℎ𝐷𝑒𝑝𝑒𝑛𝑑𝑒𝑛𝑐𝑦 (𝑛, 𝑠, C, 𝑋 , I, M, S𝑜𝑢𝑡𝑠, 𝑁 )
+if 𝑠𝑚𝑖𝑛 < 𝑠 then
+𝑠 ← 𝑠𝑚𝑖𝑛
+// Previous nodes between 𝑛 and 𝑛𝑚𝑖𝑛 need stay
+
+in the same subgraph.
+for 𝑛𝑝𝑟𝑒𝑣 ∈ 𝑅𝑒𝑣𝑒𝑟𝑠𝑒𝑑 (𝑁 ) do
+M [𝑛𝑝𝑟𝑒𝑣 ] ← 𝑠𝑚𝑖𝑛
+if 𝑛𝑝𝑟𝑒𝑣 = 𝑛𝑚𝑖𝑛 then break
+
+end
+
+end
+M [𝑛] ← 𝑠, 𝑁 .𝑎𝑝𝑝𝑒𝑛𝑑 (𝑛)
+// Calculate total parameter number of nodes in 𝑠.
+𝑝𝑠 ← 𝑆𝑢𝑚 ( { D [𝑛𝑖 ] | 𝑛𝑖 ∈ 𝐺, M [𝑛𝑖 ] = 𝑠 })
+if 𝑝𝑠 > 𝑝 then
+
+for 𝑛𝑐 ∈ C.𝑘𝑒𝑦𝑠 do
+
+// If a common node is visited and has
+
+remaining users, it should be included in
+the output of this subgraph.
+if 𝑛𝑐 ∈ M.𝑘𝑒𝑦𝑠 and C [𝑛𝑐 ] > 0 then
+
+S𝑜𝑢𝑡𝑠 [𝑠 ].𝑎𝑝𝑝𝑒𝑛𝑑 (𝑛𝑐 )
+
+end
+
+end
+S𝑜𝑢𝑡𝑠 [𝑠 ].𝑎𝑝𝑝𝑒𝑛𝑑 (𝑛),
+
+𝑠 ← 𝑠 + 1
+
+end
+
+21
+22 end
+
+// Create subgraphs with nodes, inputs and outputs.
+
+23 for 𝑠𝑖 ← 0 to 𝑠 − 1 do
+24
+
+𝐺𝑛𝑜𝑑𝑒𝑠 ← {𝑛𝑖 | 𝑛𝑖 ∈ 𝐺, M [𝑛𝑖 ] = 𝑠𝑖 }
+𝐺𝑖𝑛𝑝𝑢𝑡𝑠 ← S𝑜𝑢𝑡𝑠 [𝑠𝑖 − 1] + {I [𝑛𝑖 ] | 𝑛𝑖 ∈ 𝐺𝑛𝑜𝑑𝑒𝑠 }
+𝐺𝑜𝑢𝑡𝑝𝑢𝑡𝑠 ← S𝑜𝑢𝑡𝑠 [𝑠𝑖 ]
+𝐺𝑖 ← 𝐶𝑟𝑒𝑎𝑡𝑒𝐺𝑟𝑎𝑝ℎ (𝐺𝑛𝑜𝑑𝑒𝑠, 𝐺𝑖𝑛𝑝𝑢𝑡𝑠, 𝐺𝑜𝑢𝑡𝑝𝑢𝑡𝑠 )
+𝐺𝑙𝑖𝑠𝑡 .𝑎𝑝𝑝𝑒𝑛𝑑 (𝐺𝑖 )
+
+28
+29 end
+30 return 𝐺𝑙𝑖𝑠𝑡
+
+5
+
+6
+
+7
+
+8
+
+9
+
+10
+
+11
+
+12
+
+13
+
+14
+
+15
+
+16
+
+17
+
+18
+
+19
+
+20
+
+25
+
+26
+
+27
+
+dataloaders will waste memory and computing resources. In con-
+sideration of this condition, thanks to the graph inputs to nodes
+dict in auto graph sharding algorithm, we are aware of the user of
+each input data. Therefore, we could split the data so that different
+stages only load their corresponding data. We compare the average
+data load time with GPT models on 8 GPUs. And the results of
+different microbatch sizes are illustrated in Figure 3, our splitting
+method could speedup the data loading for 1.78×-1.98×.
+
+Assigned a sequence of subgraphs and a dataloader, each worker
+will restore the proxy nodes into functional modules, and con-
+struct communication groups for TMP, PMP and DP. Now our
+
+(a) One forward one backward (1F1B) schedule, the most commonly used pipeline
+schedule in 3D parallelism approaches.
+
+(b) Pipeline schedule when combining 1F1B schedule and early recomputation strategy
+of Gpipe [16].
+
+(c) Merak shifted critical path schedule, the critical path is further shortened and
+shifted to the worker 2.
+
+Figure 4: Pipeline schedules comparison with four pipeline
+stages and five microbatches.
+
+high-performance distributed runtime engine can carry out the
+training procedures.
+
+6 HIGH-PERFORMANCE TRAINING
+Motivated by Section 3.2, another design principle of Merak is en-
+hancing the model training performance. We propose a fast runtime
+engine of Merak, which comprises three techniques to exploit train-
+ing resources: shifted critical path schedule focus on efficiently
+utilizing computation resources; stage-aware recomputation con-
+centrates on manipulating more GPU memory resources; and sub-
+pipelined TMP promotes the usage of both computation and com-
+munication resources. Merak could benefit from these techniques
+simultaneously during model training tasks and greatly boosting
+the training procedures.
+
+6.1 Shifted Critical Path Schedule
+To ensure convergence and memory efficiency, Merak adopts syn-
+chronous pipeline model parallelism and activation recomputation
+with careful orchestration.
+
+We use the ratio of computation idle time (bubble time) to compu-
+tation running time for measuring the efficiency of pipeline sched-
+ules. We denote the number of microbatch as 𝑚 and the number of
+pipeline stages as 𝑠. Suppose the forward time of one microbatch is
+𝑇𝑚, the recomputation time and backward time could be estimated
+as 𝑇𝑚 and 2𝑇𝑚. The most common used one forward one backward
+(1F1B) schedule is shown in Figure 4a, where total bubble time
+would be (𝑠 − 1)(𝑇𝑚 +𝑇𝑚 + 2𝑇𝑚) = 4(𝑠 − 1)𝑇𝑚 and the running time
+would be 4𝑚𝑇𝑚. Thus the bubble overhead ratio of 1F1B schedule
+is 𝑠−1
+𝑚 . This large bubble ratio greatly wastes the computation re-
+sources of workers. The bubble time mainly lies in the start and end
+period of pipeline schedules. Gpipe [16] suggests that the activation
+recomputation operation does not depend on the output of previous
+stages. We could apply this idea to the end period of 1F1B schedule
+as shown in Figure 4b. With earlier completed recomputation, we
+
+Merak: An Efficient Distributed DNN Training Framework with Automated 3D Parallelism for Giant Foundation Models
+
+# of
+Stage
+
+4
+
+8
+
+MB
+Size Memory
+
+Default
+
+Throughput Memory
+
+Merak-SR
+
+1
+2
+4
+1
+2
+4
+
+16720
+21262
+OOM
+9066
+13130
+21438
+
+6.81
+6.84
+-
+6.39
+6.64
+6.21
+
+21150
+21922
+-
+21872
+19744
+21818
+
+Throughput
+7.61
+7.01
+-
+
+7.72
+6.83
+6.39
+
+Table 2: Example memory usage comparison with GPT-2.5B
+model on 8 RTX3090 GPUs (24 GB). The global batch size is
+128 and the TMP degree is 1. Merak-SR stands for the Merak
+stage-aware recomputation methods.
+
+could reduce the bubble time to (𝑠 − 1)(𝑇𝑚 + 2𝑇𝑚) = 3(𝑠 − 1)𝑇𝑚,
+and the bubble ratio becomes 3(𝑠−1)
+4𝑚 .
+Critical path is a sequence of computation overheads across
+stages that decides the overall execution time of a pipeline. To
+simplify, we assume the workloads are uniform among all stages
+here. As illustrated with the red dotted lines in Figure 4, the critical
+paths of 1F1B and early recomputation schedule are firmly pinned
+on the last stage. To shorten the critical path, we propose shifted
+critical path schedule of Merak, a pipeline schedule shift down
+critical path by one pipeline stage. The schedule is based on the
+following two observations: (a) when combining 1F1B schedule
+and early recomputation of Gpipe, the recomputation in the last
+stage is redundant since the last stage only stores one activation; (b)
+the critical path could be transferred to the second to last pipeline
+stage when the last stage got less amount of computation. We
+drop the recomputation of the last stage, bring one forward pass
+computation of the second to last stage ahead and fill it into the
+bubble, and adjust the recomputation in the first two backward pass
+processes accordingly. This optimization could reduce the bubble
+time further to 3(𝑠 − 2)𝑇𝑚, and the bubble ratio would be 3(𝑠−2)
+4𝑚 .
+Furthermore, a typical transformer based DNN model usually
+owns head layers that project the outputs from transformer blocks
+to a given task, such as question answering and sequence classi-
+fication. Head layers stay in the final stage and would extend the
+critical path by damaging the balance of pipeline stages since trans-
+former blocks are distributed evenly. But in shifted critical path
+schedule, the computation workload of the last stage is lighter and
+could adequately handle the extra calculations, the head layers are
+hardly possible to influence our critical path.
+
+6.2 Stage-aware Recomputation
+From bubble ratio analysis we could see that, with fixed global batch
+size and pipeline stage number, a larger number of microbatches
+will drop the bubble ratio. But a small microbatch size potentially
+affects the arithmetic intensity of operations. The default setting
+in Table 2 shows some examples, it is hard to exactly run out of
+all worker memory: there is a gap between executable microbatch
+size and OOM error when the number of stages is 4; the quickest
+configuration does not consume the most memory footprint with
+8 pipeline stages. In other words, the remaining GPU memory
+resources are wasted, and we could make use of them to pursue
+further accelerations.
+
+A straightforward solution is reducing the usage of activation
+recomputation to cut down the computation overhead. But ex-
+isting 3D parallelism libraries [2, 29, 37] only provide open and
+close options, and turning off recomputing will lead to OOM error.
+Moreover, the memory overheads of non-checkpoint parameters
+vary among stages, relating to both the pipeline depth and rank
+of each stage. We perform the activation recomputation in a more
+fine-grained pattern. We introduce Stage-aware Recomputation, an
+activation recomputation implementation with dynamics among
+pipeline stages in Merak.
+
+The memory footprint of each stage is related to the number of
+parameters, microbatch size, and the arrangement of PMP stages.
+Suppose the runtime memory of each stage is 𝑀𝑟 , which includes
+activation of one microbatch 𝑀𝑎, model states, and temporary
+buffers. We can estimate the runtime memory 𝑀𝑟 as a constant
+value among stages. When 𝛼𝑖 percent modules of the 𝑖-th stage
+are not using activation recomputation, they will require addi-
+tional memory footprint of (𝑠 − 𝑖)𝛼𝑖 𝑀𝑎. And each stage should
+hold that the total memory 𝑀𝑟 + (𝑠 − 𝑖)𝛼𝑖 𝑀𝑎 is not greater than
+device capacity. We expect the optimization goal is that all pipeline
+stages use as much memory as possible. To achieve this, we assume
+that each pipeline stage has the same memory consumption, i.e.,
+𝑀𝑟 + (𝑠 − 𝑖)𝛼𝑖 𝑀𝑎 = 𝑀𝑟 + (𝑠 − 𝑗)𝛼 𝑗 𝑀𝑎 for stage 𝑖 and stage 𝑗. Then
+we tune 𝛼1 by increasing it at intervals until catching an out-of-
+memory error. With the maximum 𝛼1, we calculate 𝛼𝑖 for 𝑖 in [2, 𝑠]
+based on the assumption. Besides, to guarantee the correctness,
+we take the smaller one between 𝛼𝑖 and 1 as the final 𝛼𝑖 . Since all
+pipeline stages use maximum percent modules without activation
+recomputation, we achieve a high memory utilization. Integrated
+with shifted critical path schedule, we finally obtain the following
+recursive formula:
+
+𝛼𝑖 =
+
+
+𝑚𝑖𝑛(1,
+
+
+
+(𝑠 − 1)𝛼1
+𝑠 − 𝑖
+
+𝛼𝑠−2,
+1,
+
+),
+
+𝑖 ∈ [2, 𝑠 − 1)
+
+𝑖 = 𝑠 − 1
+𝑖 = 𝑠
+
+The column Merak-SR in Table 2 shows the impacts of stage-
+aware recomputation. Compared with the default setting, Merak
+takes more advantage of GPU memory and could achieve 1.02×-
+1.21× speedups. We could only compare the fastest configurations as
+well, stage-aware recomputation can reach 1.13× more throughput.
+
+6.3 Sub-pipelined TMP
+When training a giant model, sometimes a single worker can not
+hold even one transformer layer. For example, one layer of GPT-3
+will consume over 34GB runtime memory with hidden size 12288,
+sequence length 2048 and microbatch size 2. TMP [41] is the solu-
+tion that can reduce the memory consumption on a single device
+near linearly. A regular transformer layer could be divided into an
+attention block and a feed forward network (FFN) block [43]. Figure
+5(a) shows a sample FP execution timeline of transformer based
+model training with TMP. TMP will bring two AllReduce commu-
+nications during the FP and another two AllReduce operations in
+the BP with a similar schema. All operations in TMP are exclusive,
+which is to the detriment of training performance.
+
+Zhiquan Lai, Shengwei Li, Xudong Tang, Keshi Ge, Weijie Liu, Yabo Duan, Linbo Qiao, Dongsheng Li
+
+(a) Default TMP. The communication and computation are interdependent, leading
+to stalls in both streams.
+
+(b) Sub-pipeline TMP of Merak. The microbatch splitting enables pipelining opera-
+tions. Computation and communication could be executed simultaneously.
+
+the other sub-microbatch will do calculations, and vice versa. Fig-
+ure 5(b) illustrates an example timeline of FP, the communication
+and computation of sub-microbatches are overlapped across trans-
+former layers, leading to better usage of network bandwidth and
+computation resources. Let 𝑇𝑚 and 𝑇𝑎 denote the computation and
+communication overheads of one transformer layer during forward
+pass. The overheads during backward can be represented as 2𝑇𝑚 and
+𝑇𝑎. Hence in a TMP module with 𝐾 transformer layers, one micro-
+batch will cost a total (3𝑇𝑚 + 2𝑇𝑎)𝐾 with the default TMP approach.
+We assume the attention blocks and FFN blocks own a similar load
+for simplification. In sub-pipelined TMP, the cost of a microbatch
+4 ) · 𝑚𝑎𝑥 {𝑇𝑚,𝑇𝑎 } + 1
+becomes 1
+4𝑇𝑎 in forward pass and
+1
+2𝑇𝑚 + (𝐾 − 1
+4𝑇𝑎 in backward pass. And the total
+overhead is reduced to 3
+4 ) ·𝑚𝑎𝑥 {3𝑇𝑚, 2𝑇𝑚 +𝑇𝑎, 2𝑇𝑎 }.
+We will further report the method efficiency in the Section 7.4.3.
+
+4 ) ·𝑚𝑎𝑥 {2𝑇𝑚,𝑇𝑎 } + 1
+
+4𝑇𝑚 + (𝐾 − 1
+
+2𝑇𝑎 + (𝐾 − 1
+
+4𝑇𝑚 + 1
+
+Figure 5: Execution timelines of computation stream
+(Comp.) and communication stream (Comm.) on different
+methods.
+
+We implement sub-pipelined TMP with asynchronous commu-
+nication operations and an alternate execution schedule for both
+forward and backward passes. We could only modify the attention
+and FFN blocks thus the usage simplicity of Merak is preserved.
+
+7 EVALUATION
+In this section, we evaluate the performance of Merak and answer
+the following main questions:
+
+• How does Merak improve the performance of end-to-end
+
+training with 3D parallelism over the baselines?
+
+• Can Merak achieve the same speedups as the training scale
+
+changes?
+
+• What are the impacts of three optimizations in Merak’s run-
+
+time engine?
+
+7.1 Experimental Setups
+Platform Configurations. All experiments are conducted on a
+high-performance cluster with 16 server nodes connected via 100Gbps
+InfiniBand. The hardware of each node includes four NVIDIA
+GeForce RTX3090 GPUs with 24GB memory, two Intel Xeon 4214R
+@ 2.40GHz CPUs, and 96GB DDR4 RAMs. All servers run 64-bits
+Ubuntu 18.04, CUDA 11.3, cuDNN 8.2.1, NCCL 2.10.3 ,[1] and Py-
+Torch 1.10.0. GPUs in each node run simultaneously, so we will
+present the total used GPU numbers in following experiments.
+
+Models and Datasets. We evaluate the performance of Merak
+with GPT-like transformer based models. We follow the parameter
+setting in previous works [3, 41] and adjust the hidden dimension
+along with transformer layer numbers for different model sizes.
+We use four models with different sizes, i.e., GPT-1.4B, GPT-2.5B,
+GPT-8.3B, and GPT-20B, where B denotes the parameter number
+in billions. The hidden size configuration is 1536, 1920, 3072, and
+4096, respectively. Benchmark models are trained with OpenWeb-
+Text [15] dataset with fixed sequence length 1024 in all cases. Merak
+is a synchronous method without compromising convergence ac-
+curacy, so we focus on the training performance comparison. All
+reported values are averaged over the same 100 training steps.
+
+It is worth noting that although we only evaluate one architec-
+ture in experiments, Merak can adapt to various tasks and work-
+loads effortlessly thanks to our user-friendly design as mentioned in
+Section 5. Since many popular models such as BERT [9] and ViT [10]
+
+Figure 6: The per microbatch size running time of a single
+transformer layer in different model sizes on RTX3090 GPU
+and V100 GPU.
+
+Pipelining is a common optimization design for stall reduction,
+and most DNN frameworks support executing the communica-
+tion stream and computation stream together. To fully utilize both
+streams, we come up with sub-pipelined TMP of Merak, a TMP
+approach that breaks the dependency between computation and
+communication by pipelining microbatches and thus improves the
+efficiency by overlapping them. At first we measure the perfor-
+mances per sample of individual transformer layers from different
+models on two kinds of GPUs, along with increasing the micro-
+batch sizes. The results are shown in the Figure 6: the computation
+efficiency of workers becomes stable when the microbatch size is
+greater than 2; with the microbatch size 1 and 2, the performance
+loss is less than 20% and tends to be smaller when the model size in-
+creases. We also evaluate the efficiency of AllReduce operations, the
+performance change is narrow due to the communication volume
+is sufficient even when microbatch size is 1. These observations
+indicate that we can scatter the microbatch and train sequentially
+at a negotiable cost.
+
+In sub-pipelined TMP, we evenly split each microbatch of TMP
+blocks into two sub-microbatches, whose procedures are indepen-
+dent of each other. And we construct an inner pipeline with the
+sub-microbatches: when one sub-microbatch is communicating,
+
+1122844607692108Microbatch Size2468Time Per Batch(s)1e−23090 GPT-1.4B3090 GPT-8.3B3090 GPT-20BV100 GPT-1.4BV100 GPT-8.3BV100 GPT-20BMerak: An Efficient Distributed DNN Training Framework with Automated 3D Parallelism for Giant Foundation Models
+
+(a) GPT-1.4B, 1.19×-1.42×
+
+(b) GPT-2.5B, 1.19×-1.39×
+
+(c) GPT-8.3B, 1.18×-1.43×
+
+(d) GPT-20B, 1.50×-1.61×
+
+Figure 7: End-to-end training throughputs on different number of GPUs and global batch size with four model sizes. The
+numbers in the captions are speedups of Merak over the best baseline.
+
+are based on transformer layers, we select the transformer decoder
+based GPT model for its representative in large-scale pretraining.
+
+Baselines. Altogether three approaches are compared with Merak
+in our experiments: (i) DeepSpeed ZeROs [35–37]: Our cluster sup-
+ports ZeRO technologies of DeepSpeed including ZeRO-1, ZeRO-2,
+ZeRO-3, and ZeRO-Infinity. Their different strategies about trade-
+offs between device capacity and communication volumes greatly
+influence training speed. Meanwhile different model sizes, device
+numbers, and microbatch sizes limit the choices of strategy. There-
+fore, comparing with any single ZeRO approach is not fair enough,
+we conduct experiments on all ZeRO methods and try our best to
+present data from the configuration with the best performance. (ii)
+Megatron-LM [29, 41]: Starting from hybrid parallelism of DP and
+TMP, Megatron-LM integrates PMP recently. Its 3D parallelism is
+the SOTA implementation for large model pretraining. To ensure
+fair judgment, we grid search the space of setting (TMP degree,
+PMP degree and microbatch numbers) in Megatron-LM to find the
+best performance for each training task. And we will only compare
+the best performance unless otherwise specified. (iii) PaddlePad-
+dle [2]: Unlike DeepSpeed and Megatron-LM are libraries of Py-
+Torch, PaddlePaddle is an individual DNN framework. It integrates
+3D parallelism but further adopts model state sharding between
+DP groups similar to ZeRO-1. Same to other baselines, we also tune
+the performance of PaddlePaddle for every experimental task and
+present the best result.
+
+Megatron-LM and PaddlePaddle require specific formatted mod-
+els for accommodating 3D parallelism, thus we use the model im-
+plementations from their official examples. Merak and DeepSpeed
+ZeROs use community implementations in Transformers 4.15 [45]
+and do not need any change on model codes.
+
+7.2 End-to-end Training Performance
+Figure 7 shows the performance comparison between four systems
+on various models and training resources. Thanks to our high-
+performance runtime engine, Merak is the fastest system in all
+cases and achieves 1.18×-1.61× speedups over the best baseline. We
+present the experiment details among different models as follows.
+GPT-1.4B. With the smallest model size, Merak could only en-
+able shifted critical path schedule and stage-aware recomputation
+since the TMP degree is 1 in best configurations of all 3D parallelism
+methods. The relatively low memory overhead of GPT-1.4B brings
+substantial space for stage-aware recomputation, while it is not
+enough for turnoff activation recomputation in other methods. It is
+worth mentioning that on 16 GPUs with global batch sizes (GBS)
+256 and 512, DeepSpeed ZeROs is the fastest baseline due to the
+accessibility of ZeRO-1 and fewer parameter updating operations.
+While ZeROs falls behind in all other experiments because of small
+microbatch size or large communication volumes in ZeRO-3 and
+ZeRO-Infinity. Another worth noting case is with GBS 64 and 128
+on 64 GPUs, where Merak only gets acceleration of 19.4%-21.9%.
+This is because large DP degrees (8-16) and small GBS result in a
+small number of microbatch, and the DP communication and model
+updates occupy a considerable portion of runtime. Merak performs
+well in other situations, with up to 41.7% performance gains.
+
+GPT-2.5B. The TMP degree is still 1 on GPT-2.5B, leading to
+a similar performance trend to GPT-1.4B. Merak outperforms the
+best baseline by 31.6%-38.6%, 27.1%-36.1%, and 19.1%-34.4% on 16,
+32, and 64 GPUs, respectively. With different implementations of
+operators, PaddlePaddle has an edge on small number of GPUs
+while Megatron-LM performs better on larger scales. But with the
+help of ZeRO-1 like model sharding, which could save memory for
+just a larger microbatch size, PaddlePaddle does a good job in larger
+
+6412816 GPUs2565126412832 GPUs2565126412864 GPUs256512GPU Numbers (Global Batch Size)0255075Throughput (samples/s)DeepSpeed ZeROsMegatron-LMPaddlePaddleMerak6412816 GPUs2565126412832 GPUs2565126412864 GPUs256512GPU Numbers (Global Batch Size)0204060Throughput (samples/s)DeepSpeed ZeROsMegatron-LMPaddlePaddleMerak6412816 GPUs2565126412832 GPUs2565126412864 GPUs256512GPU Numbers (Global Batch Size)051015Throughput (samples/s)DeepSpeed ZeROsMegatron-LMPaddlePaddleMerak6412816 GPUs2565126412832 GPUs2565126412864 GPUs256512GPU Numbers (Global Batch Size)0246Throughput (samples/s)OOMOOMOOMOOMDeepSpeed ZeROsMegatron-LMPaddlePaddleMerakZhiquan Lai, Shengwei Li, Xudong Tang, Keshi Ge, Weijie Liu, Yabo Duan, Linbo Qiao, Dongsheng Li
+
+Figure 8: Weak scaling comparison on different model sizes.
+As the GPU number scales from 2 to 64, the global batch size
+scales from 16 to 512. The iteration time is presented in log
+scale and the missing data means OOM in these cases.
+
+GBS on 32 and 64 GPUs with GPT-2.5B as well. The model sharding
+method is orthogonal to Merak, and we will attempt to integrate it
+in future work for more training flexibility.
+
+GPT-8.3B. When the model size expands to 8.3B, TMP is nec-
+essary for 3D parallelism methods. Although the speedups from
+stage-aware recomputation become minor because of larger model
+states, Merak benefits from sub-pipeline TMP and achieves appre-
+ciable acceleration with at least 1.34× in most cases. The exceptions
+are still GBS 64 and 128 on 64 GPUs but differ from relatively small
+models: PMP degree grows while our sub-pipeline TMP requires
+microbatch size is at least 2, causing less microbatch and higher
+pipeline bubble ratios than Megatron-LM, whose microbatch size
+is 1. Our performance gains maintain in 1.18×-1.28× thanks to
+sub-pipeline TMP. But when GBS increases on 64 GPUs, the best
+microbatch size of Megatron-LM becomes 2, and the benefits of
+shifted critical path schedule also come back. Now the speedups of
+Merak tend to be more stable with at least 1.39×.
+
+GPT-20B. With the largest model in our experiments, no method
+could run successfully on 16 GPUs. It is worth noting that on GBS
+128 and 32 GPUs, the max available microbatch size of DeepSpeed
+ZeRO-infinity is 4 and brings a relatively prominent performance,
+but it drops back to 2 on larger GBS because gradient accumulation
+requires extra memory. The communication of ZeRO-infinity sig-
+nificantly limits training performance especially in large models.
+While in Merak, the further usage of TMP provides more potential
+improvement, and the numbers of microbatch become sufficient
+with lower PMP and DP degrees. Our designs could fully function.
+Therefore, compared to the fastest baseline, Merak has stable and
+significant acceleration, with 1.54×-1.57× speedups on 32 GPUs
+and 1.50×-1.61× speedups on 64 GPUs.
+
+7.3 Scalability
+To demonstrate the scalability of Merak, we compare the itera-
+tion time of 3D parallelism approaches on benchmark models. For
+each model size, we scale GPU numbers with GBS. We present the
+shortest iteration time after searching the configuration of parallel
+
+Figure 9: Training performance of Merak, Merak with-
+out shifted critical path schedule (SCP), Merak with-
+out stage-aware recomputation (SR), and Merak without
+sub-pipelined TMP (ST). Throughputs are normalized by
+Megatron-LM.
+
+degree and microbatch size for all the baselines. The scaling results
+are shown in Figure 8.
+
+In GPT-1.4B model, the high proportion of communication slows
+training especially when involving inter-machine communication,
+and all methods show a more obvious performance drop. In GPT-
+2.5B and GPT-8.3B models, Merak exceeds linear scaling in some
+cases. This is because when scaling the GPU number, Merak in-
+creases PMP degree instead of DP degree like other approaches,
+which enables Merak could benefit more from stage-aware recom-
+putation. In other scaling situations, all 3D parallelism methods
+show good scalability and similar performance trends. Hence Merak
+achieves stable speedups with most training scales. We omit the
+results of GPT-20B because it requires at least 32 GPUs and all
+methods scale well; for example the speed loss of Merak is only
+3.3% when scaled from 32 GPUs to 64 GPUs. Due to the limitation of
+our cluster scope, we cannot conduct tests on more GPUs. With the
+help of good scalability, we expect that Merak will show continuous
+advantages in more large-scale training.
+
+7.4 Effectiveness of Optimizations
+We now demonstrate the contributions of Merak’s optimizations
+to end-to-end training performance. We conduct an ablation study
+on different model sizes and GPU numbers, and the results are
+illustrated in Figure 9. To better compare the benefits of each opti-
+mization, we fix the GBS to 512 and ensure all methods are using
+the same parallel degrees and microbatch size in each test.
+
+All three optimizations are crucial for training acceleration but
+have different strengths. Due to the same number of microbatch,
+shifted critical path schedule brings relative stable benefits in all
+cases. Stage-aware recomputation plays a larger role on relative
+small models GPT-1.4B and GPT-2.5B due to their more idle memory.
+And stage-aware recomputation gains more performance on 64
+GPUs because the best configuration of Merak scales the PMP
+degrees on small models and brings a larger optimization space of
+GPU memory. Our sub-pipelined TMP is the major improvement on
+large model training where TMP is unavoidable. Especially for GPT-
+20B, which greatly suffers from the blocking AllReduce operations
+in TMP, Merak results except Merak without sub-pipelined TMP
+shows significant performance advance. We further discuss the
+impact of techniques in detail as follows.
+
+ 248163264Num of GPUs212213214215Iteration Time in log scale (ms)Megatron-LM, GPT-1.4BPaddlePaddle, GPT-1.4BMerak, GPT-1.4BMegatron-LM, GPT-2.5BPaddlePaddle, GPT-2.5BMerak, GPT-2.5BMegatron-LM, GPT-8.3BPaddlePaddle, GPT-8.3BMerak, GPT-8.3B32 GPT-1.4B 6432 GPT-2.5B 6432 GPT-8.3B 6432 GPT-20B 64GPU Numbers (Models)1.01.21.41.6Normalized ThroughputMegatron-LMMerak w/o SCPMerak w/o SRMerak w/o STMerakMerak: An Efficient Distributed DNN Training Framework with Automated 3D Parallelism for Giant Foundation Models
+
+(a) Iteration time comparison between Merak shifted crit-
+ical path schedule (SCP) and 1F1B pipeline schedule on
+different PMP degrees. The lower the better.
+
+(b) The changes of training throughput and average mem-
+ory consumption for GPT-2.5B on 8 GPUs with tuning the
+non-recomputation ratio of stage-aware recomputation.
+
+Iteration time comparison between Merak sub-
+(c)
+pipelined TMP (ST) and Megatron-LM on different TMP
+degrees. The lower the better.
+
+Figure 10: Impact of Merak optimizations.
+
+Shifted critical path schedule. Figure 10(a) shows the iteration
+7.4.1
+time with Merak shifted critical path schedule and commonly used
+1F1B pipeline schedule. For fair comparisons, we disable other
+optimizations of Merak and implement 1F1B pipeline schedule in
+Merak based on Megatron-LM open-source codes. To show the
+difference in pipeline schedules, we set the number of GPUs equal
+to PMP degrees, run microbatches with twice the PMP degrees, and
+assign two GPT transformer layers with hidden size 3072 to each
+GPU for the same workload. We scale the PMP degrees from 4 to 64,
+and the overall model size will be scaled from 0.9B to 14.4B. There
+are two major advantages of our schedule: the first is lower bubble
+radio from shortened pipeline critical path; and the other is less
+pipeline imbalance caused by computation of head layers in the last
+stage. As a result, our shifted critical path schedule could reduce
+the execution time per step by 18.6%-22.0%, and the time reduction
+is maintained with all scales of GPUs.
+
+Impact of stage-aware recomputation. To validate that Merak
+7.4.2
+could achieve a better memory efficiency with stage-aware recom-
+putation, we train GPT-2.5B model with PMP degree 8 and GBS
+128 on 8 GPUs. Figure 10(b) presents the throughput along with
+related average memory usage among pipeline stages on different
+non-recomputation ratios of the first stage (𝛼1 in Section 6.2). The
+training performance and memory utilization both increase as 𝛼1
+increases. For the non-recomputation ratios larger than 0.4, the
+minimal memory usage over stages stops increasing because the
+non-recomputation ratios of latter stages reach 1, while the memory
+usage of front pipeline stages will continue to grow and so as the
+training speed. Finally we catch an out-of-memory (OOM) error
+when 70% of layers of stage 1 are not using activation recompu-
+tation. Compared to not using stage-aware recomputation 𝛼1=0,
+training throughput could be improved by up to 20.8%.
+
+Sub-pipelined TMP. The iteration time comparisons between
+7.4.3
+Merak sub-pipelined TMP and Megaton-LM TMP are illustrated in
+Figure 10(c). For fair evaluations, we integrate Megatron-LM TMP
+in Merak, fix the GBS and microbatch size, disable stage-aware
+recomputation, use our shifted critical path schedule, and train a
+24 layers transformer based model. We set the TMP degree to the
+number of GPUs and scale TMP degrees from 8 to 32. The hidden
+dimensions of model are also scaled from 1024 to 4096 for more
+diverse cases. With overlapped communication and computation
+operations, sub-pipelined TMP dramatically reduces the device idle
+
+time and boosts the training in all situations, achieving 1.48×-1.56×
+speedups over Megatron-LM TMP.
+
+8 CONCLUSION
+3D parallelism has become the SOTA training strategy for giant
+foundation deep neural networks. To address the generality and
+inefficiency in 3D parallelism, we present a user-friendly and high-
+performance distributed training framework, Merak. We design
+the automatic model partitioner in Merak to make the 3D paral-
+lelism easy to access for model developers. Merak also improves
+the training efficiency by integrating three training optimization
+techniques in its 3D Parallelism Runtime Engine. Finally, the ex-
+perimental results show that when comparing with best baselines,
+Merak achieves up to 1.61× training speedups, maintains perfor-
+mance advances on different scales, and each optimization brings
+a considerable benefit. We have open-sourced implementation of
+Merak and expect that the community will add support to more
+existing and future works.
+
+REFERENCES
+[1] 2019. NVIDIA Collective Communications Library (NCCL). https://developer.
+
+nvidia.com/nccl
+
+[2] Yulong Ao, Zhihua Wu, Dianhai Yu, Weibao Gong, Zhiqing Kui, Minxu Zhang,
+Zilingfeng Ye, Liang Shen, Yanjun Ma, Tian Wu, et al. 2021. End-to-end Adaptive
+Distributed Training on PaddlePaddle. arXiv preprint arXiv:2112.02752 (2021).
+[3] Sanjith Athlur, Nitika Saran, Muthian Sivathanu, Ramachandran Ramjee, and
+Nipun Kwatra. 2022. Varuna: scalable, low-cost training of massive deep learn-
+ing models. In Proceedings of the Seventeenth European Conference on Computer
+Systems. 472–487.
+
+[4] Zhengda Bian, Hongxin Liu, Boxiang Wang, Haichen Huang, Yongbin Li, Chuan-
+rui Wang, Fan Cui, and Yang You. 2021. Colossal-AI: A Unified Deep Learning
+System For Large-Scale Parallel Training. arXiv preprint arXiv:2110.14883 (2021).
+[5] Zhengda Bian, Qifan Xu, Boxiang Wang, and Yang You. 2021. Maximizing
+Parallelism in Distributed Training for Huge Neural Networks. arXiv preprint
+arXiv:2105.14450 (2021).
+
+[6] Rishi Bommasani, Drew A Hudson, Ehsan Adeli, Russ Altman, Simran Arora,
+Sydney von Arx, Michael S Bernstein, Jeannette Bohg, Antoine Bosselut, Emma
+Brunskill, et al. 2021. On the opportunities and risks of foundation models. arXiv
+preprint arXiv:2108.07258 (2021).
+
+[7] Tom Brown, Benjamin Mann, Nick Ryder, Melanie Subbiah, Jared D Kaplan,
+Prafulla Dhariwal, Arvind Neelakantan, Pranav Shyam, Girish Sastry, Amanda
+Askell, et al. 2020. Language models are few-shot learners. Advances in neural
+information processing systems 33 (2020), 1877–1901.
+
+[8] Tianqi Chen, Bing Xu, Chiyuan Zhang, and Carlos Guestrin. 2016. Training deep
+nets with sublinear memory cost. arXiv preprint arXiv:1604.06174 (2016).
+[9] Jacob Devlin, Ming-Wei Chang, Kenton Lee, and Kristina Toutanova. 2018. Bert:
+Pre-training of deep bidirectional transformers for language understanding. arXiv
+preprint arXiv:1810.04805 (2018).
+
+48163264PMP Degrees0.00.51.01.52.0Iteration Time (ms)1e41F1BMerak-SCP00.050.10.20.30.40.50.60.7Non-recomputation Ratio of Stage 1468Throughput (samples/s)OOM012Memory (MB)1e4ThroughputMemory8121620242832TMP Degrees0.00.51.01.5Iteration Time (ms)1e4Megatron-LM TMPMerak-STZhiquan Lai, Shengwei Li, Xudong Tang, Keshi Ge, Weijie Liu, Yabo Duan, Linbo Qiao, Dongsheng Li
+
+[10] Alexey Dosovitskiy, Lucas Beyer, Alexander Kolesnikov, Dirk Weissenborn, Xi-
+aohua Zhai, Thomas Unterthiner, Mostafa Dehghani, Matthias Minderer, Georg
+Heigold, Sylvain Gelly, et al. 2020. An image is worth 16x16 words: Transformers
+for image recognition at scale. arXiv preprint arXiv:2010.11929 (2020).
+
+[11] Saar Eliad, Ido Hakimi, Alon De Jagger, Mark Silberstein, and Assaf Schuster.
+2021. Fine-tuning giant neural networks on commodity hardware with automatic
+pipeline model parallelism. In 2021 USENIX Annual Technical Conference (USENIX
+ATC 21). 381–396.
+
+[12] Shiqing Fan, Yi Rong, Chen Meng, Zongyan Cao, Siyu Wang, Zhen Zheng, Chuan
+Wu, Guoping Long, Jun Yang, Lixue Xia, et al. 2021. DAPPLE: A pipelined
+data parallel approach for training large models. In Proceedings of the 26th ACM
+SIGPLAN Symposium on Principles and Practice of Parallel Programming. 431–445.
+[13] Jiarui Fang, Yang Yu, Zilin Zhu, Shenggui Li, Yang You, and Jie Zhou. 2021.
+PatrickStar: Parallel Training of Pre-trained Models via Chunk-based Memory
+Management. arXiv preprint arXiv:2108.05818 (2021).
+
+[14] Shaoduo Gan, Xiangru Lian, Rui Wang, Jianbin Chang, Chengjun Liu, Hongmei
+Shi, Shengzhuo Zhang, Xianghong Li, Tengxu Sun, Jiawei Jiang, et al. 2021.
+BAGUA: Scaling up Distributed Learning with System Relaxations. arXiv preprint
+arXiv:2107.01499 (2021).
+
+[15] Aaron Gokaslan and Vanya Cohen. 2019. OpenWebText Corpus. http://
+
+Skylion007.github.io/OpenWebTextCorpus.
+
+[16] Yanping Huang, Youlong Cheng, Ankur Bapna, Orhan Firat, Dehao Chen, Mia
+Chen, HyoukJoong Lee, Jiquan Ngiam, Quoc V Le, Yonghui Wu, et al. 2019. Gpipe:
+Efficient training of giant neural networks using pipeline parallelism. Advances
+in neural information processing systems 32 (2019).
+
+[17] Paras Jain, Ajay Jain, Aniruddha Nrusimha, Amir Gholami, Pieter Abbeel, Joseph
+Gonzalez, Kurt Keutzer, and Ion Stoica. 2020. Checkmate: Breaking the memory
+wall with optimal tensor rematerialization. Proceedings of Machine Learning and
+Systems 2 (2020), 497–511.
+
+[18] Xianyan Jia, Le Jiang, Ang Wang, Jie Zhang, Xinyuan Li, Wencong Xiao, Yong Li,
+Zhen Zheng, Xiaoyong Liu, Wei Lin, et al. 2020. Whale: Scaling deep learning
+model training to the trillions. arXiv preprint arXiv:2011.09208 (2020).
+
+[19] Can Karakus, Rahul Huilgol, Fei Wu, Anirudh Subramanian, Cade Daniel, Derya
+Cavdar, Teng Xu, Haohan Chen, Arash Rahnama, and Luis Quintela. 2021. Ama-
+zon SageMaker Model Parallelism: A General and Flexible Framework for Large
+Model Training. arXiv preprint arXiv:2111.05972 (2021).
+
+[20] Marisa Kirisame, Steven Lyubomirsky, Altan Haan, Jennifer Brennan, Mike He,
+Jared Roesch, Tianqi Chen, and Zachary Tatlock. 2020. Dynamic tensor remateri-
+alization. arXiv preprint arXiv:2006.09616 (2020).
+
+[21] Atli Kosson, Vitaliy Chiley, Abhinav Venigalla, Joel Hestness, and Urs Koster.
+2021. Pipelined backpropagation at scale: training large models without batches.
+Proceedings of Machine Learning and Systems 3 (2021), 479–501.
+
+[22] Shigang Li and Torsten Hoefler. 2021. Chimera: efficiently training large-scale
+neural networks with bidirectional pipelines. In Proceedings of the International
+Conference for High Performance Computing, Networking, Storage and Analysis.
+1–14.
+
+[23] Shen Li, Yanli Zhao, Rohan Varma, Omkar Salpekar, Pieter Noordhuis, Teng Li,
+Adam Paszke, Jeff Smith, Brian Vaughan, Pritam Damania, et al. 2020. Pytorch
+distributed: Experiences on accelerating data parallel training. arXiv preprint
+arXiv:2006.15704 (2020).
+
+[24] Peng Liang, Yu Tang, Xiaoda Zhang, Youhui Bai, Teng Su, Zhiquan Lai, Dong-
+sheng Li, et al. 2022. A Survey on Auto-Parallelism of Neural Networks Training.
+(2022).
+
+[25] Ze Liu, Yutong Lin, Yue Cao, Han Hu, Yixuan Wei, Zheng Zhang, Stephen Lin,
+and Baining Guo. 2021. Swin Transformer: Hierarchical Vision Transformer
+using Shifted Windows. In Proceedings of the IEEE/CVF International Conference
+on Computer Vision (ICCV).
+
+[26] Microsoft. 2020.
+
+DeepSpeed: Extreme-scale model training for every-
+one. https://www.microsoft.com/en-us/research/blog/deepspeed-extreme-scale-
+model-training-for-everyone/.
+
+[27] Deepak Narayanan, Aaron Harlap, Amar Phanishayee, Vivek Seshadri, Nikhil R
+Devanur, Gregory R Ganger, Phillip B Gibbons, and Matei Zaharia. 2019.
+PipeDream: generalized pipeline parallelism for DNN training. In Proceedings of
+the 27th ACM Symposium on Operating Systems Principles. 1–15.
+
+[28] Deepak Narayanan, Amar Phanishayee, Kaiyu Shi, Xie Chen, and Matei Zaharia.
+2021. Memory-efficient pipeline-parallel dnn training. In International Conference
+on Machine Learning. PMLR, 7937–7947.
+
+[29] Deepak Narayanan, Mohammad Shoeybi, Jared Casper, Patrick LeGresley,
+Mostofa Patwary, Vijay Korthikanti, Dmitri Vainbrand, Prethvi Kashinkunti,
+Julie Bernauer, Bryan Catanzaro, et al. 2021. Efficient large-scale language model
+training on GPU clusters using megatron-LM. In Proceedings of the International
+Conference for High Performance Computing, Networking, Storage and Analysis.
+1–15.
+
+[30] Jay H. Park, Gyeongchan Yun, Chang M. Yi, Nguyen T. Nguyen, Seungmin Lee,
+Jaesik Choi, Sam H. Noh, and Young ri Choi. 2020. HetPipe: Enabling Large
+DNN Training on (Whimpy) Heterogeneous GPU Clusters through Integration
+of Pipelined Model Parallelism and Data Parallelism. In 2020 USENIX Annual
+Technical Conference (USENIX ATC 20). USENIX Association, 307–321. https:
+
+//www.usenix.org/conference/atc20/presentation/park
+
+[31] Adam Paszke, Sam Gross, Francisco Massa, Adam Lerer, James Bradbury, Gregory
+Chanan, Trevor Killeen, Zeming Lin, Natalia Gimelshein, Luca Antiga, Alban Des-
+maison, Andreas Kopf, Edward Yang, Zachary DeVito, Martin Raison, Alykhan
+Tejani, Sasank Chilamkurthy, Benoit Steiner, Lu Fang, Junjie Bai, and Soumith
+Chintala. 2019. PyTorch: An Imperative Style, High-Performance Deep Learning
+Library. In Advances in Neural Information Processing Systems 32, H. Wallach,
+H. Larochelle, A. Beygelzimer, F. d'Alché-Buc, E. Fox, and R. Garnett (Eds.). Cur-
+ran Associates, Inc., 8024–8035. http://papers.neurips.cc/paper/9015-pytorch-
+an-imperative-style-high-performance-deep-learning-library.pdf
+
+[32] Pitch Patarasuk and Xin Yuan. 2009. Bandwidth optimal all-reduce algorithms
+for clusters of workstations. J. Parallel and Distrib. Comput. 69, 2 (2009), 117–124.
+[33] Alec Radford, Jeffrey Wu, Rewon Child, David Luan, Dario Amodei, Ilya Sutskever,
+et al. 2019. Language models are unsupervised multitask learners. OpenAI blog
+1, 8 (2019), 9.
+
+[34] Colin Raffel, Noam Shazeer, Adam Roberts, Katherine Lee, Sharan Narang,
+Michael Matena, Yanqi Zhou, Wei Li, and Peter J. Liu. 2020.
+Exploring
+the Limits of Transfer Learning with a Unified Text-to-Text Transformer.
+arXiv:1910.10683 [cs.LG]
+
+[35] Samyam Rajbhandari, Jeff Rasley, Olatunji Ruwase, and Yuxiong He. 2020. Zero:
+Memory optimizations toward training trillion parameter models. In SC20: Inter-
+national Conference for High Performance Computing, Networking, Storage and
+Analysis. IEEE, 1–16.
+
+[36] Samyam Rajbhandari, Olatunji Ruwase, Jeff Rasley, Shaden Smith, and Yuxiong
+He. 2021. Zero-infinity: Breaking the gpu memory wall for extreme scale deep
+learning. In Proceedings of the International Conference for High Performance
+Computing, Networking, Storage and Analysis. 1–14.
+
+[37] Jeff Rasley, Samyam Rajbhandari, Olatunji Ruwase, and Yuxiong He. 2020. Deep-
+Speed: System Optimizations Enable Training Deep Learning Models with Over 100
+Billion Parameters. Association for Computing Machinery, New York, NY, USA,
+3505–3506. https://doi.org/10.1145/3394486.3406703
+
+[38] James K. Reed, Zachary DeVito, Horace He, Ansley Ussery, and Jason Ansel. 2021.
+torch.fx: Practical Program Capture and Transformation for Deep Learning in
+Python. arXiv:2112.08429 [cs.LG]
+
+[39] Jie Ren, Samyam Rajbhandari, Reza Yazdani Aminabadi, Olatunji Ruwase,
+Shuangyan Yang, Minjia Zhang, Dong Li, and Yuxiong He. 2021. ZeRO-
+Offload: Democratizing Billion-Scale Model Training. In 2021 USENIX Annual
+Technical Conference (USENIX ATC 21). USENIX Association, 551–564. https:
+//www.usenix.org/conference/atc21/presentation/ren-jie
+
+[40] Alexander Sergeev and Mike Del Balso. 2018. Horovod: fast and easy distributed
+
+deep learning in TensorFlow. arXiv preprint arXiv:1802.05799 (2018).
+
+[41] Mohammad Shoeybi, Mostofa Patwary, Raul Puri, Patrick LeGresley, Jared Casper,
+and Bryan Catanzaro. 2019. Megatron-lm: Training multi-billion parameter
+language models using model parallelism. arXiv preprint arXiv:1909.08053 (2019).
+[42] Shaden Smith, Mostofa Patwary, Brandon Norick, Patrick LeGresley, Samyam
+Rajbhandari, Jared Casper, Zhun Liu, Shrimai Prabhumoye, George Zerveas, Vijay
+Korthikanti, et al. 2022. Using DeepSpeed and Megatron to Train Megatron-
+Turing NLG 530B, A Large-Scale Generative Language Model. arXiv preprint
+arXiv:2201.11990 (2022).
+
+[43] Ashish Vaswani, Noam Shazeer, Niki Parmar, Jakob Uszkoreit, Llion Jones,
+Aidan N Gomez, Łukasz Kaiser, and Illia Polosukhin. 2017. Attention is all
+you need. Advances in neural information processing systems 30 (2017).
+
+[44] Boxiang Wang, Qifan Xu, Zhengda Bian, and Yang You. 2021. 2.5-dimensional
+
+distributed model training. arXiv preprint arXiv:2105.14500 (2021).
+
+[45] Thomas Wolf, Lysandre Debut, Victor Sanh, Julien Chaumond, Clement De-
+langue, Anthony Moi, Perric Cistac, Clara Ma, Yacine Jernite, Julien Plu, Can-
+wen Xu, Teven Le Scao, Sylvain Gugger, Mariama Drame, Quentin Lhoest,
+and Alexander M. Rush. 2020. Transformers: State-of-the-Art Natural Lan-
+guage Processing. Association for Computational Linguistics, 38–45. https:
+//www.aclweb.org/anthology/2020.emnlp-demos.6
+
+[46] Qifan Xu, Shenggui Li, Chaoyu Gong, and Yang You. 2021. An Efficient 2D Method
+for Training Super-Large Deep Learning Models. arXiv preprint arXiv:2104.05343
+(2021).
+
+[47] Bowen Yang, Jian Zhang, Jonathan Li, Christopher Ré, Christopher Aberger, and
+Christopher De Sa. 2021. Pipemare: Asynchronous pipeline parallel dnn training.
+Proceedings of Machine Learning and Systems 3 (2021), 269–296.
+
+[48] Xiangyu Ye, Zhiquan Lai, Shengwei Li, Lei Cai, Ding Sun, Linbo Qiao, and Dong-
+sheng Li. 2021. Hippie: A Data-Paralleled Pipeline Approach to Improve Memory-
+Efficiency and Scalability for Large DNN Training. In 50th International Conference
+on Parallel Processing. 1–10.
+
+[49] Jinhui Yuan, Xinqi Li, Cheng Cheng, Juncheng Liu, Ran Guo, Shenghang Cai,
+Chi Yao, Fei Yang, Xiaodong Yi, Chuan Wu, Haoran Zhang, and Jie Zhao. 2022.
+OneFlow: Redesign the Distributed Deep Learning Framework from Scratch.
+arXiv:2110.15032 [cs.DC]
+
+[50] Wei Zeng, Xiaozhe Ren, Teng Su, Hui Wang, Yi Liao, Zhiwei Wang, Xin Jiang,
+ZhenZhang Yang, Kaisheng Wang, Xiaoda Zhang, Chen Li, Ziyan Gong, Yifan
+Yao, Xinjing Huang, Jun Wang, Jianfeng Yu, Qi Guo, Yue Yu, Yan Zhang, Jin
+Wang, Hengtao Tao, Dasen Yan, Zexuan Yi, Fang Peng, Fangqing Jiang, Han
+
+Merak: An Efficient Distributed DNN Training Framework with Automated 3D Parallelism for Giant Foundation Models
+
+Zhang, Lingfeng Deng, Yehong Zhang, Zhe Lin, Chao Zhang, Shaojie Zhang,
+Mingyue Guo, Shanzhi Gu, Gaojun Fan, Yaowei Wang, Xuefeng Jin, Qun Liu, and
+Yonghong Tian. 2021. PanGu-𝛼: Large-scale Autoregressive Pretrained Chinese
+Language Models with Auto-parallel Computation. arXiv:2104.12369 [cs.CL]
+
+[51] Jun Zhan and Jinghui Zhang. 2019. Pipe-torch: Pipeline-based distributed deep
+learning in a gpu cluster with heterogeneous networking. In 2019 Seventh Inter-
+national Conference on Advanced Cloud and Big Data (CBD). IEEE, 55–60.
+
+

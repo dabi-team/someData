@@ -1,0 +1,931 @@
+Eﬃcient Embedding of MPI Collectives in MXNET DAGs for
+scaling Deep Learning
+
+Amith R Mamidala
+
+IBM T J Watson Research Center
+Yorktown Heights, New York, USA
+
+amithr@us.ibm.com
+
+8
+1
+0
+2
+
+b
+e
+F
+0
+2
+
+]
+
+C
+D
+.
+s
+c
+[
+
+1
+v
+9
+4
+9
+6
+0
+.
+2
+0
+8
+1
+:
+v
+i
+X
+r
+a
+
+ABSTRACT
+
+1
+
+INTRODUCTION
+
+Availability of high performance computing infrastructures
+such as clusters of GPUs and CPUs have fueled the growth
+of distributed learning systems. Deep Learning frameworks
+express neural nets as DAGs and execute these DAGs on
+computation resources such as GPUs. In this paper, we pro-
+pose eﬃcient designs of embedding MPI collective operations
+into data parallel DAGs. Incorrect designs can easily lead to
+deadlocks or program crashes. In particular, we demonstrate
+three designs: Funneled, Concurrent communication and De-
+pendency chaining of using MPI collectives with DAGs. These
+designs automatically enable overlap of computation with
+communication by allowing for concurrent execution with
+the other tasks. We directly implement these designs into
+the KVStore API of the MXNET. This allows us to directly
+leverage the rest of the infrastructure. Using ImageNet and
+CIFAR data sets, we show the potential of our designs. In
+particular, our designs scale to 256 GPUs with as low as 50
+seconds of epoch times for ImageNet 1K datasets.
+
+KEYWORDS
+
+Deep Learning, Parameter Server, MPI, SGD, Scaling
+
+ACM Reference format:
+
+Amith R Mamidala. 2018. Eﬃcient Embedding of MPI Collectives
+in MXNET DAGs for scaling Deep Learning. In Proceedings of
+ACM Conference, Washington, DC, USA, July 2017 (Confer-
+ence’17), 9 pages.
+
+DOI: 10.1145/nnnnnnn.nnnnnnn
+
+Permission to make digital or hard copies of all or part of this work
+for personal or classroom use is granted without fee provided that
+copies are not made or distributed for proﬁt or commercial advantage
+and that copies bear this notice and the full citation on the ﬁrst
+page. Copyrights for components of this work owned by others than
+ACM must be honored. Abstracting with credit is permitted. To copy
+otherwise, or republish, to post on servers or to redistribute to lists,
+requires prior speciﬁc permission and/or a fee. Request permissions
+from permissions@acm.org.
+Conference’17, Washington, DC, USA
+© 2018 ACM. 978-x-xxxx-xxxx-x/YY/MM. . . $15.00
+DOI: 10.1145/nnnnnnn.nnnnnnn
+
+As Deep Learning(DL) continues its dominance in a mul-
+titude of disciplines such as Image Classiﬁcation, Speech
+Recognition and Natural Language Processing, the need for
+innovation in DL systems of scale to reduce training times
+gains utmost importance. In almost all of the DL frameworks,
+the neural network is expressed as a computation DAG with
+nodes representing the operators of the model and the edges
+indicating the ﬂow of data. The DNN training in a worker
+comprises of the feed forward phase where the operators
+are exercised using the existing model weights and a back
+propagation phase where these weights are updated using
+the gradients computed in this phase. Stochastic Gradient
+Descent (SGD) is the popular algorithm used to update the
+weights from the computed gradients. Frameworks such as
+MXNET, TensorFlow use symbolic programming to do the
+training. This approach is well suited for DAG executions. In
+particular, the computation is not immediately carried out
+but rather the DAG execution is optimized for eﬃciency in
+memory usage and runtime. Further, all the tasks of the DAG
+can be asynchronously executed by multiple independent
+execution units such as GPUs or CPUs providing eﬃcient
+utilization of all the resources.
+
+For data parallel SGD, a Parameter Server(PS) is typically
+used where the gradients are forwarded from workers to one
+or more servers which aggregate them. Though the PS is a
+suitable model for cloud computing as it is inherently fault
+tolerant, it doesn’t utilize all the communication links of
+the network. In particular, future generation machines such
+as Sierra and Summit[1] would deploy thousands of nodes
+featuring multiple NVIDIA GPUs per node interconnected
+by fast InﬁniBand networks. MPI has been proven to de-
+liver scalable performance on these supercomputers owing to
+the rich subset of collective algorithms designed to aggres-
+sively utilize all the available network bandwidth. Parallel
+DL training can take advantage of these collective algorithms
+by appropriately embedding them in the DAG executions of
+the workers.
+
+It is non-trivial to eﬃciently incorporate global collective
+operations in the DAGs. Unlike imperative programs the
+execution of tasks in symbolic DAGs is triggered by the
+completion of data ﬂow dependencies. This inherent asyn-
+chronicity allows the operation for a given gradient to be
+
+ 
+ 
+ 
+ 
+ 
+ 
+issued in a diﬀerent order from another worker. Naively sub-
+stituting the local operation with a global collective operator
+can easily lead to deadlocks or incorrect execution ﬂows. The
+PS design, in particular MXNET, overcomes this issue by
+"naming" each gradient and the servers aggregating all the
+gradients independently by the same "name". However, this
+cannot be translated directly to MPI calls as these operate on
+buﬀers within communicators and are agnostic to how these
+buﬀers are actually "named". Further, according to MPI se-
+mantics operations for the same communicator have to be
+issued in order from the same communicator, posing a design
+challenge. Moreover, these operations can be overlapped with
+the other independent tasks in the back propagation phase.
+We explore all these issues and propose multiple solutions to
+the problem. Importantly, our MPI Collective + DAG design
+patterns explained in the paper ensure optimal training per-
+formance, by automatically permitting overlap of collective
+communication progress with the rest of the DAG execution
+and at the same time overcoming these constraints.
+
+Speciﬁcally, our contributions in this paper are the following:
+
+• We describe diﬀerent designs for embedding the global MPI
+aggregation operator, MPI_Allreduce, in the symbolic
+execution of the DNN DAGs. Though we use MXNET,
+the problem of embedding is generic and the solutions
+can be adapted to any DAG based frameworks such as
+TensorFlow.
+
+• We propose three design alternatives: a) MPI Funneled
+("Funnel") b) MPI Dependency chaining ("DepCha") and
+c) MPI concurrent communicators ("ConCum"). In "Fun-
+nel" the main thread does all the communication while
+the other tasks are executed by separate threads of the
+DAG execution engine. In contrast,"DepCha" oﬄoads a
+chain of collective operations to the engine that are or-
+dered by artiﬁcially inserting dependencies across them.
+In "ConCom", multiple MPI communicators are used to
+concurrently execute the collective communications.
+
+• We implement these designs using MXNET framework
+and study the beneﬁts of these approaches on CIFAR10
+and ImageNet 1K [7] data sets. We show the beneﬁts of
+scaling as well as the improvements obtained due to adding
+concurrency and overlap in the collective operations.
+
+• Using large scale ImageNet 1K [7] we demonstrate the
+key beneﬁts of our approaches, namely better scaling by
+reducing the epoch times to as low as 50 seconds using
+over 256 MPI processes using one GPU per process and
+achieving more than 0.71 validation accuracies for the
+entire data set.
+
+2 BACKGROUND & MOTIVATION
+
+In this section, we ﬁrst provide a brief overview of mini-batch
+parallel SGD which is the core algorithmic component of the
+training. We then describe the challenges in using global MPI
+
+aggregation operator, with parallel DAGs. This motivates
+the need for the diﬀerent design explorations in this paper.
+
+2.1 Parallel SGD
+
+In a mini-batch SGD, the entire data is divided into several
+mini-batches, collectively known as the “epoch". The com-
+putation iterates over the epoch, one mini-batch at a time.
+The model parameters at iteration t, wt are updated by an
+increment ∆w to get the parameters for the next iteration.
+wt+1 = wt + ∆w
+(1)
+∆w is computed as ∆w = −ηg, where g is the gradient, η
+is a hyper parameter called as the learning rate. For the
+deep learning models, the model parameters and gradients
+are associated with the diﬀerent layers of the network. The
+gradients are obtained after doing a forward pass and then an
+auto-diﬀerentiation in the backward step. The ﬁnal gradient,
+g is the average of all the gradients obtained from the data
+samples in a mini-batch. Also, since the gradients are obtained
+as soon as a backward step for a layer is computed, the model
+update can be done in parallel with the remaining backward
+phase computation.
+
+In parallel synchronous SGD, the mini-batch is divided across
+all the workers who wait for the global aggregation of locally
+computed gradients. This value is multiplied by a scaling
+factor=1/mini_batch_size and used for computing the next
+set of parameters, wt+1, equation 1.
+
+2.2 MPI Aggregation Operator
+
+Due to the exponential rise of compute ﬂops, communica-
+tion quickly becomes the bottleneck in the global aggrega-
+tion. Modern interconnection networks such as InﬁniBand
+oﬀer very high bandwidth paths across the nodes. Unlike
+PS approaches, MPI collectives such as MPI_Allreduce oﬀer
+excellent performance.
+
+This global operator does distributed aggregation across all
+the processes in the same group or more commonly known
+as MPI communicator. There is a default communicator,
+MPI_COMM_WORLD created every time MPI is initialized.
+For almost all of the applications, this single communicator
+is adequate to meet all the communication demands. An
+important requirement of using the single communicator is
+to issue the operations in the same order across all the MPI
+processes. This is because the internal collective algorithms
+implicitly "tag" all the messages using this order and issuing
+them in any other manner will cause deadlocks or incorrect
+behavior. As we see below, this imposes a serious constraint
+in using them in parallel DAG aggregations.
+
+2.3 Naive MPI usage in parallel DAGs
+
+Figure 1 illustrates two DAGs constructed oﬀ a simple neural
+net comprising of three layers, run on two GPUs. The second
+
+2
+
+Figure 1: Parallel Dag Execution
+
+layer comprises of two operators that can be run in paral-
+lel. Such constructions are common in image classiﬁcation
+network architectures such as GoogleNet, inception-BN. As
+shown in the ﬁgure, the DAG also allows for concurrency of
+task execution in the backward phases. Once the gradient
+tensors g1, g2, g3 are computed, the SGD updates of the
+corresponding weight tensors w1, w2, w3 can progress concur-
+rently. As discussed earlier, MXNET uses a PS and exports a
+Key-Value Store (KVStore) to the workers. MXNET allows
+for the above mentioned concurrency by assigning diﬀerent
+key "names" to each of the tensors and issuing "push" and
+"pull" operations to the PS using these names. These opera-
+tions aggregate the gradients globally across all the workers.
+It is important to note that main thread doesn’t block for any
+of these operations to complete. It issues these operations
+asynchronously to an internal engine tagging all the opera-
+tions with explicit read/write dependencies derived from the
+DAG’s topology.
+
+leads
+
+to erroneous
+
+the KVStore operations
+
+to
+Naively translating all
+execu-
+MPI_Allreduce operators
+tions. Consider a scenario where a task from worker 0
+initiates aggregation of tensor g2 while worker 1’s task starts
+the operation on tensor g3. Using the same communicator,
+this results in silent deadlocks or program crashes. The same
+MPI ordering of collectives has to be maintained irrespective
+of how many multiple tasks may be spawned by a worker.
+In this paper, a worker is synonymous with a MPI process.
+Further, to allow for concurrency, multiple aggregations
+may proceed at the same time. This leads to an important
+question: How can MPI collectives be integrated into parallel
+DAGs ensuring correctness and at the same time allowing
+multiple simultaneous collective operations in progress?
+
+In contemporary frameworks a topological ordering of all the
+nodes of the DAG is used to issue the operations. The MPI
+collectives can use the same ordering across all the workers.
+
+3
+
++SGDUpdate+w1w3+w2w2LossGradLossw3g2g3g1w2LossGradLossw3g3g2g1w1w1WORKER 0WORKER 1Back PropagationFeed ForwardHowever, following topological order execution will not lead
+to maximum concurrency of all the tasks in the DAG. In this
+paper, we describe three diﬀerent design options to embed
+MPI collectives in DAGs. Depending on the speciﬁc design, ei-
+ther one or multiple threads execute the collective operations.
+In scenarios employing multiple threads, the MPI semantics
+are followed either by employing multiple communicators or
+injecting MPI ordering dependency when pushing the com-
+munication tasks to the MXNET engines. This technique
+can avail of the dependency tracking algorithm in MXNET
+ensuring tasks are executed in same order across all DAGs.
+
+3 MXNET PARALLEL DAG EXECUTION
+
+We ﬁrst explain the dependency tracking in a single MXNET
+worker. We then demonstrate how this is used in conjunction
+with KVStore API for parallel execution of DAGs.
+
+3.1 Dependency Tracking
+
+In MXNET, the tasks are executed by a dependency engine
+based on ordering constraints. The engine is generic and it
+can schedule any operation ranging from GPU computations
+to fetching data via IO. The key to enabling this mechanism
+is to explicitly tag the objects in the operation that are
+either to be mutated via writes or to remain constant for
+doing reads. An operation like b = a + 1 can be performed
+by constructing the following lamda function and pushing
+to the
+engine: Engine.push(lambda:b.data=a.data+1,
+read=[a.tag], mutate=[b.tag]). Only the main thread
+issues these operation and the dependencies constructed via
+tagging allows the engine to generate a DAG scheduling
+order of these operations. This also ensures the same DAG
+is constructed across all parallel instances. Also, as we
+describe in the next section, these lamda functions become
+key constructs to oﬄoad MPI communications and integrate
+into the data ﬂow graph.
+
+The dependency tracking algorithm consists of separate op-
+eration queues for each object tagged. Figure 2 shows three
+separate queues for each of objects A, B and C. The basic
+idea in the algorithm is to enqueue the operation in all the
+objects’ queue which make up its dependency list. An atomic
+counter in the operation keeps track of the dependencies com-
+pleted. Thus, if object A is ready, Ops one and two get their
+counters decremented by one. For read operations multiple
+back to back operation counters enqueued in a object’s queue
+can be decremented all at once. Once the operation counter
+hits zero from all its dependency object queues, it is ready
+to be scheduled for execution. However, operation three has
+to wait until object C is written in the previous operation.
+C’s queue tracks this dependency. Further, successive writes
+get executed in order, one at a time. We use this property
+to impose MPI ordering semantics, explained with details in
+section 4.
+
+4
+
+3.2 Task Execution
+
+Once the operations are scheduled, these tasks are executed
+on diﬀerent thread pools depending on the type of the opera-
+tion. For example, there is a separate thread pool to execute
+GPU kernels and a separate pool to copy data in and out of
+the GPUs. For tasks executing on CPU, such as the KVS-
+tore API, there is another dedicated pool of threads. Thus,
+MXNET asynchronously processes all the tasks, irrespective
+of their type. This allows for maximum overlap. We also
+use this property to break down collective operations into
+sub-tasks and enqueue them on the dependency queues for
+providing their concurrent execution, section 4.
+
+3.3 KVStore API
+
+As described in 2.1, parallel SGD needs to globally aggregate
+gradients across all the GPUs solving a synchronous SGD.
+
+The KVStore API provides distributed aggregation using PS
+by employing<key, value> pairs. Both primitives take a list
+of keys and list of tensors. The python snippet in ﬁgure 3
+illustrates the basic semantics of the operation. As shown in
+the ﬁgure, a tensor with the gradient’s shape is initialized in
+line 5 on the server with an alloted key and then push, pull
+operations are performed on it using the same key. In the DL
+neural net, MXNET linearly orders all the relevant tensors
+and assigns unique keys, starting from zero. Importantly, the
+push operation (line 6) aggregates all the gradients of the
+same key on the distributed KVStore servers.
+
+The execution of these operations is handled similarly to other
+tasks, section 3.1. The push and pull API are "oﬄoaded" to
+the dependency engine with all the relevant dependencies. For
+example, in push (line 6), the object "g" is added to the read
+dependency list of push but added to the write dependency
+of the pull (line 7). The ﬁnal operation would be updating
+the model weights using the gradient obtained from pull.
+
+4 EMBEDDING MPI OPERATORS IN DAGS
+
+As discussed earlier in section 2, the two objectives of the
+designs discussed in the paper are 1) correctly embed MPI
+collective operations in the DAG and 2) overlap these opera-
+tions with rest of the tasks as the DAGs oﬀer multiple sources
+of concurrency, ranging from the underlying architecture of
+the neural nets to the diﬀerent types of tasks getting executed.
+We now explain how the designs described in this section
+achieve them. We describe three diﬀerent designs, introduced
+in Section 1: Funneled (Funnel), Dependency Chaining (De-
+pCha) and Concurrent Communicators (ConCom). All of
+the designs consist of two components:1) Higher level model
+parallelism expressed as python code and 2) Low level system
+implementation of the primitives in C++.
+
+Moreover, we also need to transition from parameter server
+to MPI only semantics. We accomplish this by adding a
+"MPI" type to the already existing types of kvstore and
+
+Figure 2: Dependency Engine Execution
+
+1
+2
+3
+4
+5
+6
+7
+
+key= 1
+gpu= 0
+shape= (2,3)
+g= mxnet.ndarray.ones(shape,gpu)
+kvstore . init (key, g.shape)
+kvstore .push(key, g)
+kvstore . pull (key, g)
+
+Figure 3
+
+passing it to KVStore.create("type"). This type can be
+either, "funnel", "depCha" or "conCum". In all the implemen-
+tations, the workers call MPI_Init() or MPI_Init_thread()
+to create MPI_COMM_WORLD. Further the rank of the
+worker in original PS is the same as MPI_Comm_rank()
+in MPI_COMM_WORLD. Also, in this paper, we assume
+each worker owns a single GPU though MXNET supports
+more than one GPU per worker. Since there are no servers,
+KVStore.init(key, shape) translates into the C++11 code
+snippet in Figure. The lambda function "oﬄoads" MPI com-
+munication to the dependency engine in a manner similar to
+as shown in section 3. As shown in the function, MPI pro-
+cess with rank zero uses MPI_Bcast to initialize the weights
+across all the workers. For the sake of brevity, we do not
+strictly adhere to the exact MXNET APIs. Our intent is
+to capture the semantics of the operation rather than the
+syntax.
+
+shows the high level python code that summarizes the model
+execution. After the executor ﬁnished "oﬄoading" the forward
+and backward functions to the dependency engine in line 4,
+lines 6-10 deal with the parallelization. In particular, the keys
+are ordered and push, pull operations are applied on them to
+aggregate the gradients indexed by key. An update is issued
+next. This corresponds to the operations shown in ﬁgure 1.
+The global operator, MPI_Allreduce is used in push instead
+of the original PS operation, Figure 6. However, though the
+operations issued are in order, there is no guarantee that
+MPI_Allreduce will be executed in the same order on two
+separate workers. This is easily possible as two diﬀerent
+collectives can be picked up by two separate threads for ﬁnal
+execution.
+
+Executor. Forward_backward(net.symbol, net.params,
+
+for epoch in range(num_epochs):
+for batch in train_data:
+
+1 Kvstore.Create("funnel")
+2
+3
+4
+5
+6
+7
+8
+9
+10
+11 Executor.ValidationAccuracy(test_batch)
+
+for key in range(num_tensors):
+
+Kvstore.Push(key, net. grads [key])
+Kvstore.Pull(key, net. grads [key])
+SGD.Update(net.params[key], net.grads[key ],
+
+rescale =1/mini_batch_size)
+
+net. grads , batch)
+
+auto initialize_key = [ this , key, vals ]() {
+
+MPI_Bcast(vals.data, vals. len , vals .type ,0, comm);
+
+1
+2
+3
+4 Engine.Push(initialize_key , read_deps(vals. tag ), mutate(none));
+
+}
+
+Figure 4
+
+4.1 MPI Funneled
+
+This design solves the ordering problem of MPI collectives by
+making the main thread do all the communication. Figure 5
+
+5
+
+Figure 5: Funneled (Python)
+
+Thus, we enforce ordering explicitly by making the main
+thread wait till a gradient is computed. We do this in the
+push (line 3, Figure 6). Also, since the main thread does
+MPI_Allreduce after the wait, the MPI ordering semantics
+are followed. Making the main thread block until gradient
+ﬁnishes computation doesn’t impede the overlap as other
+threads continue to pull tasks from the scheduling queue and
+make independent progress. Also, note that we do all the
+MPI operations from communication buﬀers( comm_buf).
+
+[Op 1] B =. A + 1   (reads A, mutates B) [Op 2] C =  A + 2   (reads A, mutates C)[Op 3] A =  C * 2    (reads C, mutates A)Op 3A’s queue:Op 2Op 1Op 1B’s queue:Op 3C’s queue:Op 2auto send_buf = comm_buf[key];
+
+1
+2 CopyFromTo(g, send_buf);
+3
+send_buf.WaitToRead();
+4 MPI_Allreduce(MPI_IN_PLACE, send_buf.data(), send_buf.size(),
+5
+
+MPI_FLOAT, MPI_SUM, MPI_COMM_WORLD);
+
+Figure 6: Funneled: KVStore Push (C++)
+
+Figure 7, shows the copy routine to copy the gradient accumu-
+lated in the comm_buf to the gradient tensor, g on the GPU.
+The copy routine internally adds the required dependencies
+so that the engine can schedule the SGD update step: line 9,
+Figure 5 after the copy operation is done.
+
+auto recv_buf = comm_buf[key];
+
+1
+2 CopyFromTo(recv_buf, g);
+
+Figure 7: Funneled: KVStore pull(C++)
+
+4.2 MPI Concurrent Communications
+
+In the earlier design, only one MPI collective communica-
+tion can be outstanding at one time, since only the main
+thread invokes communication. In this design, more than one
+MPI_Allreduce can make progress at a time. We accomplish
+this by creating multiple communicators and hashing the keys
+to these communicators. This strategy allows the main thread
+to delegate collective communication to helper threads. An
+important design parameter is the number of communicators
+required. Ideally, the number of communicators will be the
+same as the total number of keys or gradient tensors to be
+aggregated. Practically, however, the determining factor is
+the number of worker threads spawned for communication.
+Thus, we can design the python module as shown in the
+Figure 8.
+
+Executor.Forward_backward(net.symbol, net.params,
+
+for batch in train_data:
+
+for epoch in range(num_epochs):
+
+1 Kvstore.Create("ConCum")
+2 OUTSTANDING=2
+3
+4
+5
+6
+7
+8
+9
+10
+11
+12
+13
+14 Executor.ValidationAccuracy(test_batch)
+
+if (key % OUTSTANDING == 0):
+
+for key in range(num_tensors):
+
+Kvstore. barrier ()
+
+Kvstore.Push(key, net. grads [key])
+Kvstore.Pull(key, net. grads [key])
+SGD.Update(net.params[key], net.grads[key ],
+
+rescale =1/mini_batch_size)
+
+net. grads , batch)
+
+Figure 8: Concurrent Collectives(Python)
+
+We use a parameter,outstanding to limit the number of con-
+current collective operations to be launched. We do this by
+
+6
+
+calling a barrier after every outstanding keys have been pro-
+cessed. To implement this barrier, we internally track the
+number of allreduce operations issued in line 8, ﬁgure 9. Also,
+as seen from the ﬁgure, allreduce lamda function (line 4)
+is pushed to the engine (line 10). Thus, it can be executed
+by the worker thread instead of the main thread. The bar-
+rier call simply translates to MPI_Barrier after waiting for
+mpi_outstanding to drop to zero. mpi_outstanding is incre-
+mented every time the lambda function is pushed to the
+engine and decremented after every MPI_Allreduce is done
+(line 9).The pull function, is the same as the earlier design,
+ﬁgure 7
+
+auto send_buf = comm_buf[key];
+
+1
+2 CopyFromTo(g, send_buf);
+send_buf.WaitToRead();
+3
+4
+auto allreduce = [ this , key, g ](){
+5 MPI_Allreduce(MPI_IN_PLACE, send_buf.data(),
+6
+7
+8
+9 ++mpi_outstanding;
+
+−−mpi_outstanding;
+}
+
+send_buf.size (), MPI_FLOAT, MPI_SUM, comms[key]);
+
+10 Engine.Push(allreduce,read(g. tag ), mutate(send_buf.tag()));
+
+Figure 9: Concurrent Collectives: KVStore Push(C++)
+
+4.3 MPI Dependency Chaining
+
+All the global collectives, such as MPI_Allreduce can be
+broken down into three phases: 1) reduction within a node
+across all GPUs, 2) allreduce of the result from a node across
+all the nodes and 3) broadcast of the ﬁnal result across all
+the GPUs. The previous designs limited the overlap of these
+phases. In funneled, until a key is pushed and pulled, the main
+thread doesn’t pick up the next key, limiting the number of
+outstanding collectives to only one. This is relaxed in the
+following scheme, ConCum where multiple communicators
+can progress. However, even in this design, the stages 1 and
+2 are still coupled together and we are limited by the number
+of worker threads delegated for collective communication for
+concurrency. The third design proposed here overcomes this
+restriction. It decouples these stages by making changes to
+the high level model. As shown in Figure 10, instead of calling
+push and pull of a key in successive calls, we break it into
+two separate batch invocations containing all the keys. This
+way all the KVStore "pushes" of the keys are scheduled at
+once ahead of the "pulls".
+
+Executor. Forward_backward(net.symbol, net.params,
+
+for epoch in range(num_epochs):
+for batch in train_data:
+
+1 Kvstore.Create("DepCha")
+2
+3
+4
+5
+6
+7
+8
+9
+10
+11
+12 Executor.ValidationAccuracy(test_batch)
+
+Kvstore.Push(key, net. grads [key])
+
+for key in range(num_tensors):
+
+for key in range(num_tensors):
+
+Kvstore.Pull(key, net. grads [key])
+SGD.Update(net.params[key], net.grads[key ],
+
+rescale =1/mini_batch_size)
+
+net. grads , batch)
+
+Figure 10: Dependency Chaining: Python
+
+The low level implementations of the push copies data into
+the comm buﬀer from the GPU, ﬁgure 11. This is suﬃce
+since we pair only one GPU to a MPI process. If there is
+more than one GPU attached to a process, libraries like
+NCCL can be used to do the reductions across GPUs in this
+operation. The next two stages, network reduction and local
+broadcast translate into MPI_Allreduce and copying back
+the aggregated gradient from the comm buﬀer to GPU. These
+two stages are coded in the pull, ﬁgure 12.
+
+auto send_buf = comm_buf[key];
+
+1
+2 CopyFromTo(g, send_buf);
+
+Figure 11: Dependency Chaining: KVStore Push(C++)
+
+A critical design parameter to consider is MPI ordering while
+pushing the allreduce lambda function, line 7, ﬁgure 12. Since
+the engine can schedule it in diﬀerent order across the workers,
+we ensure the same order of execution by using a dummy
+tensor. We add this to the write or mutate dependency list
+of the operation. In MXNET, writes with respect to a tensor
+are always scheduled in order.
+
+auto recv_buf = comm_buf[key];
+auto allreduce = [ this , key, g ](){
+
+1
+2
+3 MPI_Allreduce(MPI_IN_PLACE, send_buf.data(),
+4
+5
+6 CopyFromTo(recv_buf, g);
+7
+8 Engine.Push(allreduce,read(recv_buf.tag ),
+9
+
+send_buf.size (), MPI_FLOAT, MPI_SUM,
+MPI_COMM_WORLD);
+
+mutate(g.tag (), dummy.tag()));
+
+}
+
+Figure 12: Dependency Chaining: KVStore Pull(C++)
+
+In [4], the authors also use threaded progress to overlap
+computation and communication. Their approach is speciﬁc
+to the implementation and doesn’t use dependency tracking.
+
+7
+
+5 EVALUATION
+
+In this section, we explain the training eﬃciencies obtained
+using the new model of MPI + PS on CIFAR and ImageNet
+1K. CIFAR data set comprises of 50000 training images and
+10000 test images. ImageNet 1K contains about 1.2M images
+with 1000 classes. The total size of the training data used is
+336GB and test data is 13GB. We use the latest network,
+Residual networks(resnet) [5] using 50 layers (Resnet-50) for
+image classiﬁcation for CIFAR data sets. For ImageNet 1K,
+we use Resnet-50 and Inception-BN. We compare the three
+designs proposed in the paper and run the models on in-
+creasing number of GPUs. In the ﬁgures, the legends used are:
+
+• Funnel: This is the MPI Funneled design proposed in
+section 4. In this design, the main thread ensures ordering
+of MPI_Allreduce operations by blocking till the gradients
+are ready for global aggregation.
+
+• DepCha: This refers to the MPI dependency chaining pro-
+posed in section 4. In this design, all the MPI_Allreduce
+operators are "oﬄoaded" to the worker threads. The order-
+ing is guaranteed by inserting write dependencies using a
+"dummy" variable created only for this purpose.
+
+• ConCum: In this design, multiple MPI communicators are
+used and keys are hashed to them to allow concurrency
+in MPI_Allreduce operations. More than one thread runs
+these in parallel.
+
+testbed: Comprises of 64 IBM Minsky Power8 nodes with
+4 NVIDIA Pascal GPUs on each node connected with In-
+ﬁniBand CX5 adapters. On this testbed, we demonstrate
+the tensor collectives and also show the scaling behavior of
+ImageNet training using the optimizations proposed.
+
+The following metrics are used to measure the performance
+of our approaches:
+
+a) Epoch Time: It’s time taken by the workers to train the
+model over the mini-batches of the epoch assigned to it.
+For multiple workers, we take the average time over all the
+workers.
+
+b) Validation Accuracy: The accuracy obtained by using the
+model on the the separate test samples, done after every
+epoch.
+
+5.1 CIFAR dataset
+
+Figure 13 shows the average epoch time of training the
+datasets on increasing number of GPUs. As shown in the
+ﬁgure, across all the conﬁgurations, the dependency chaining
+design outperforms all the rest. However, the performance
+gap is widest at 8 GPUs and at 32 GPUs, we don’t see signiﬁ-
+cant improvements in using the dependency chaining. CIFAR
+training is not very computation intensive. As we increase the
+number of GPUs, communication quickly becomes the bot-
+tleneck. The designs proposed in the paper, essentially aim
+
+to overlap the communication with computation by allowing
+for concurrency across the diﬀerent tasks of the DAG. At
+GPU counts of 32, there is not enough compute time that can
+be overlapped with communication time in MPI_Allreduce.
+Hence, all the designs perform equally well. In contrast, Ima-
+geNet discussed next is computationally expensive providing
+ample room for hiding communication.
+
+Figure 13: CIFAR Avg Epoch time, Resnet-50 (seconds)
+
+5.2
+
+ImageNet 1K dataset
+
+Figure 15: Imagenet Avg Epoch time, Resnet-50 (seconds)
+
+Figure 16: Imagenet Training, Resnet-50
+
+communicators for concurrent MPI_Allreduce’s across dif-
+ferent keys also performs better than funneled. However,
+dependency chaining performs the best of all as it divides
+the collective into sub tasks and asynchronously progress
+each one of them. We see similar trends using Resnet with
+50 layers, Figure 15.
+
+We show the scalability of our designs in Figure 16. Our model
+scales up to more than 256 GPUs with training times as low
+as 50 seconds per epoch. We approach over 0.71 validation
+accuracies with the model trained on 256 GPUs. Since the
+mini-batch size linearly increases with the batch size, we
+correspondingly increase the initial learning rate which is 0.1
+by default. For 256 GPUs we set it to 1.0.
+
+Figure 14: Imagenet Avg Epoch time, Inception-BN (seconds)
+
+Figure 14 shows the average epoch times for the Inception-
+BN model with the diﬀerent designs proposed in the paper.
+We see that dependency chaining lowers the training time by
+a factor of more than 1.6 compared to the funneled approach
+for all the conﬁgurations up to 128 GPUs. Using multiple
+
+8
+
+0510152025481632Epoch	Times	(secs)#GPUsFunnelDepChaConCum01002003004005006007008009001000163264128Epoch	Time	(seconds)#GPUsFunnelDepChaConCum0200400600800100012001400163264128Epoch	Time	(seconds)#GPUsFunnelDepChaConCum00.10.20.30.40.50.60.70.80500010000150002000025000Validation	AccuracyTime	(second)256	GPUs128	GPUs32	GPUs6 CONCLUSION
+
+In this paper, we described designs that allow to correctly
+incorporate MPI operators such as MPI_Allreduce in parallel
+DAGs. Though MXNET is used to describe the various imple-
+mentations, the designs are generic and can be incorporated
+in any DL DAG framework. Also, by embedding MPI into the
+python modules, the framework allows the user to focus on
+the algorithms and not deal with explicit MPI parallelization.
+In this aspect, it is similar to the existing popular frameworks
+such as Spark [3, 6], Hadoop [2]. Moreover, using MPI as the
+communication glue oﬀers portability and performance for
+distributed DL optimizations across system and hardware
+architectures.
+
+REFERENCES
+
+[1] 2016. CORAL. http://www.nextplatform.com/2016/04/04/
+
+eyes-ibm-future-supercomputing-push. (2016).
+[2] 2017. Hadoop. http://hadoop.apache.org/. (2017).
+[3] 2017. Spark. http://spark.apache.org/. (2017).
+[4] Ammar Ahmad Awan, Khaled Hamidouche, Jahanzeb Maqbool
+Hashmi, and Dhabaleswar K. Panda. 2017. S-Caﬀe: Co-designing
+MPI Runtimes and Caﬀe for Scalable Deep Learning on Modern
+GPU Clusters. In Proceedings of the 22Nd ACM SIGPLAN
+Symposium on Principles and Practice of Parallel Programming
+(PPoPP ’17). ACM, New York, NY, USA, 193–205. DOI:https:
+//doi.org/10.1145/3018743.3018769
+
+[5] Kaiming He, Xiangyu Zhang, Shaoqing Ren, and Jian Sun.
+2015. Deep Residual Learning for Image Recognition. CoRR
+abs/1512.03385 (2015). http://arxiv.org/abs/1512.03385
+
+[6] Hanjoo Kim, Jaehong Park, Jaehee Jang, and Sungroh Yoon.
+2016. DeepSpark: Spark-Based Deep Learning Supporting Asyn-
+chronous Updates and Caﬀe Compatibility. arXiv preprint
+arXiv:1602.08191 (2016).
+
+[7] Olga Russakovsky, Jia Deng, Hao Su, Jonathan Krause, Sanjeev
+Satheesh, Sean Ma, Zhiheng Huang, Andrej Karpathy, Aditya
+Khosla, Michael Bernstein, Alexander C. Berg, and Li Fei-Fei.
+2015. ImageNet Large Scale Visual Recognition Challenge. In-
+ternational Journal of Computer Vision (IJCV) 115, 3 (2015),
+211–252. DOI:https://doi.org/10.1007/s11263-015-0816-y
+
+9
+
+

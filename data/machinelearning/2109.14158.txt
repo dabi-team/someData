@@ -1,0 +1,3563 @@
+1
+2
+0
+2
+
+v
+o
+N
+6
+
+]
+
+G
+L
+.
+s
+c
+[
+
+2
+v
+8
+5
+1
+4
+1
+.
+9
+0
+1
+2
+:
+v
+i
+X
+r
+a
+
+Second-Order Neural ODE Optimizer
+
+Guan-Horng Liu, Tianrong Chen, Evangelos A. Theodorou
+Georgia Institute of Technology, USA
+{ghliu, tianrong.chen, evangelos.theodorou}@gatech.edu
+
+Abstract
+
+We propose a novel second-order optimization framework for training the emerg-
+ing deep continuous-time models, speciﬁcally the Neural Ordinary Differential
+Equations (Neural ODEs). Since their training already involves expensive gradient
+computation by solving a backward ODE, deriving efﬁcient second-order methods
+becomes highly nontrivial. Nevertheless, inspired by the recent Optimal Control
+(OC) interpretation of training deep networks, we show that a speciﬁc continuous-
+time OC methodology, called Differential Programming, can be adopted to derive
+backward ODEs for higher-order derivatives at the same O(1) memory cost. We
+further explore a low-rank representation of the second-order derivatives and show
+that it leads to efﬁcient preconditioned updates with the aid of Kronecker-based
+factorization. The resulting method – named SNOpt – converges much faster than
+ﬁrst-order baselines in wall-clock time, and the improvement remains consistent
+across various applications, e.g. image classiﬁcation, generative ﬂow, and time-
+series prediction. Our framework also enables direct architecture optimization,
+such as the integration time of Neural ODEs, with second-order feedback policies,
+strengthening the OC perspective as a principled tool of analyzing optimization in
+deep learning. Our code is available at https://github.com/ghliu/snopt.
+
+1
+
+Introduction
+
+Figure 1: Our second-order method (SNOpt; green solid curves) achieves superior convergence
+compared to ﬁrst-order methods (SGD, Adam) on various Neural-ODE applications.
+
+Neural ODEs (Chen et al., 2018) have received tremendous attention over recent years. Inspired by
+taking the continuous limit of the “discrete” residual transformation, xk+1 = xk + (cid:15)F (xk, θ), they
+propose to directly parameterize the vector ﬁeld of an ODE as a deep neural network (DNN), i.e.
+
+dx(t)
+dt
+
+= F (t, x(t), θ), x(t0) = xt0,
+
+(1)
+
+where x(t) ∈ Rm and F (·, ·, θ) is a DNN parameterized by θ ∈ Rn. This provides a powerful
+paradigm connecting modern machine learning to classical differential equations (Weinan, 2017) and
+has since then achieved promising results on time series analysis (Rubanova et al., 2019; Kidger et al.,
+2020b), reversible generative ﬂow (Grathwohl et al., 2018; Nguyen et al., 2019), image classiﬁcation
+(Zhuang et al., 2020, 2021), and manifold learning (Lou et al., 2020; Mathieu & Nickel, 2020).
+
+Due to the continuous-time representation, Neural ODEs feature a distinct optimization process (see
+Fig. 2) compared to their discrete-time counterparts, which also poses new challenges. First, the
+
+35th Conference on Neural Information Processing Systems (NeurIPS 2021)
+
+00.5k1k100Train Loss00.5k1k3570Accuracy (%)01.8k2.6k5.4k102100Train Loss01.8k2.6k5.4k4080Accuracy (%)AdamSGDSNOpt(ours)Wall-Clock Time (sec)Wall-Clock Time (sec)Image Classification (CIFAR10)Time-Series Prediction (ArtWR) 
+ 
+ 
+ 
+ 
+ 
+x(t0)
+
+x(t1)
+
+(t,x(t))
+
+dx(t)/dt
+
+F (·, ·, θ)
+
+
+
+
+
+
+
+
+
+
+
+
+
+x(t0)
+∂L
+∂x(t0)
+∂L
+∂θ
+
+G
+
+
+
+
+
+
+
+
+
+
+
+
+
+x(t1)
+∂L
+∂x(t1)
+0
+
+θ
+
+F
+
+G
+
+Figure 2: Neural ODE features distinct training process: Both forward and backward passes parame-
+terize vector ﬁelds so that any generic ODE solver (which can be non-differentiable) can query time
+derivatives, e.g. dx(t)
+, to solve the ODEs (1, 5). In this work, we extend it to second-order training.
+dt
+
+forward pass of Neural ODEs involves solving (1) with a black-box ODE solver. Depending on
+how its numerical integration is set up, the propagation may be reﬁned to arbitrarily small step sizes
+and become prohibitively expensive to solve without any regularization (Ghosh et al., 2020; Finlay
+et al., 2020). On the other hand, to prevent Back-propagating through the entire ODE solver, the
+gradients are typically obtained by solving a backward adjoint ODE using the Adjoint Sensitivity
+Method (ASM; Pontryagin et al. (1962)). While this can be achieved at a favorable O(1) memory, it
+further increases the runtime and can suffer from inaccurate integration (Gholami et al., 2019). For
+these reasons, Neural ODEs often take notoriously longer time to train, limiting their applications to
+relatively small or synthetic datasets (Massaroli et al., 2020) until very recently (Zhuang et al., 2021).
+
+To improve the convergence rate of training, it is natural to consider higher-order optimization. While
+efﬁcient second-order methods have been proposed for discrete models (Ba et al., 2016; George
+et al., 2018), it remains unclear how to extend these successes to Neural ODEs, given their distinct
+computation processes. Indeed, limited discussions in this regard only note that one may repeat the
+backward adjoint process recursively to obtain higher-order derivatives (Chen et al., 2018). This is,
+unfortunately, impractical as the recursion will accumulate the aforementioned integration errors and
+scale the per-iteration runtime linearly. As such, second-order methods for Neural ODEs are seldom
+considered in practice, nor have they been rigorously explored from an optimization standpoint.
+
+In this work, we show that efﬁcient second-order optimization is in fact viable for Neural ODEs.
+Our method is inspired by the emerging Optimal Control perspective (Weinan et al., 2018; Liu &
+Theodorou, 2019), which treats the parameter θ as a control variable, so that the training process, i.e.
+optimizing θ w.r.t. some objective, can be interpreted as an Optimal Control Programming (OCP).
+Speciﬁcally, we show that a continuous-time OCP methodology, called Differential Programming,
+provides analytic second-order derivatives by solving a set of coupled matrix ODEs. Interestingly,
+these matrix ODEs can be augmented to the backward adjoint ODE and solved simultaneously. In
+other words, a single backward pass is sufﬁcient to compute all derivatives, including the original
+ASM-based gradient, the newly-derived second-order matrices, or even higher-order tensors. Further,
+these higher-order computations enjoy the same O(1) memory and a comparable runtime to ﬁrst-order
+methods by adopting Kronecker factorization (Martens & Grosse, 2015). The resulting method –
+called SNOpt – admits superior convergence in wall-clock time (Fig. 1), and the improvement remains
+consistent across image classiﬁcation, continuous normalizing ﬂow, and time-series prediction.
+
+Our OCP framework also facilitates progressive training of the network architecture. Speciﬁcally,
+we study an example of jointly optimizing the “integration time” of Neural ODEs, in analogy to
+the “depth” of discrete DNNs. While analytic gradients w.r.t. this architectural parameter have
+been derived under the ASM framework, they were often evaluated on limited synthetic datasets
+(Massaroli et al., 2020). In the context of OCP, however, free-horizon optimization is a well-studied
+problem for practical applications with a priori unknown terminal time (Sun et al., 2015; De Marchi
+& Gerdts, 2019). In this work, we show that these principles can be applied to Neural ODEs, yielding
+a novel second-order feedback policy that adapts the integration time throughout training. On training
+CIFAR10, this further leads to a 20% runtime reduction, yet without hindering test-time accuracy.
+
+In summary, we present the following contributions.
+
+• We propose a novel computational framework for computing higher-order derivatives of deep
+continuous-time models, with a rigorous analysis using continuous-time Optimal Control theory.
+• We propose an efﬁcient second-order method, SNOpt, that achieves superior convergence (in
+wall-clock time) over ﬁrst-order methods in training Neural ODEs, while retaining constant
+memory complexity. These improvements remain consistent across various applications.
+
+• To show that our framework also enables direct architecture optimization, we derive a second-
+order feedback policy for adapting the integration horizon and show it further reduces the runtime.
+
+2
+
+              defined in (1)defined in (5)Computation flowODESolveODESolveForward ODEBackward Adjoint ODEODE solver function callQuery time derivativeForward vector fieldBackward vector fieldParameter of N-ODEODESolve2 Preliminaries
+
+Notation. We use roman and italic type to represent a variable x(t) and its realization x(t) given an
+ODE. ODESolve denotes a function call that solves an initial value problem given an initial condition,
+start and end integration time, and vector ﬁeld, i.e. ODESolve(x(t0), t0, t1, F ) where dx(t)
+
+dt = F .
+
+Forward and backward computations of Neural ODEs. Given an initial condition x(t0) and
+integration interval [t0, t1], Neural ODEs concern the following optimization over an objective L,
+
+min
+θ
+
+L(x(t1)), where x(t1) = x(t0) +
+
+(cid:90) t1
+
+t0
+
+F (t, x(t), θ) dt
+
+(2)
+
+is the solution of the ODE (1) and can be solved by calling a black-box ODE solver, i.e. x(t1) =
+ODESolve(x(t0), t0, t1, F ). The use of ODESolve allows us to adopt higher-order numerical meth-
+ods, e.g. adaptive Runge-Kutta (Press et al., 2007), which give more accurate integration compared
+with e.g. vanilla Euler discretization in residual-based discrete models. To obtain the gradient ∂L
+∂θ of
+Neural ODE, one may naively Back-propagate through ODESolve. This, even if it could be made
+possible, leads to unsatisfactory memory complexity since the computation graph can grow arbitrarily
+large for adaptive ODE solvers. Instead, Chen et al. (2018) proposed to apply the Adjoint Sensitivity
+Method (ASM), which states that the gradient can be obtained through the following integration.
+
+∂L
+∂θ
+
+(cid:90) t0
+
+= −
+
+t1
+
+a(t)T ∂F (t, x(t), θ)
+
+∂θ
+
+dt ,
+
+(3)
+
+where a(t) ∈ Rm is referred to the adjoint state whose dynamics obey a backward adjoint ODE,
+
+−
+
+da(t)
+dt
+
+= a(t)T ∂F (t, x(t), θ)
+
+∂x(t)
+
+,
+
+a(t1) =
+
+∂L
+∂x(t1)
+
+.
+
+(4)
+
+Equations (3, 4) present two coupled ODEs that can be viewed as the continuous-time expression of
+the Back-propagation (LeCun et al., 1988). Algorithmically, they can be solved through another call
+of ODESolve (see Fig. 2) with an augmented dynamics G, i.e.
+x(t1)
+a(t1)
+0
+
+ , t1, t0, G), where G
+
+x(t0)
+a(t0)
+∂L/∂θ
+
+ = ODESolve(
+
+x(t)
+a(t)
+·
+
+F (t, x(t), θ)
+−a(t)T ∂F
+∂x
+−a(t)T ∂F
+∂θ
+
+ (5)
+
+ :=
+
+ , θ
+
+t,
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+augments the original dynamics F in (1) with the adjoint ODEs (3, 4). Notice that this computation (5)
+depends only on (x(t1), a(t1)). This differs from naive Back-propagation, which requires storing
+intermediate states along the entire computation graph of forward ODESolve. While the latter requires
+O( (cid:101)T ) memory cost,1 the computation in (5) only consumes constant O(1) memory cost.
+Chen et al. (2018) noted that if we
+further encapsulate (5) by ∂
+∂θ L =
+grad(L, θ), one may compute higher-
+order derivatives by recursively calling
+∂θn = grad( ∂n−1L
+∂nL
+∂θn−1 , θ), starting from
+n=1. This can scale unfavorably due to
+its recursive dependence and accumu-
+lated integration errors. Indeed, Table 1
+suggests that the errors of second-order derivatives, ∂2L
+∂θ2 , obtained from the recursive adjoint procedure
+can be 2-6 orders of magnitude larger than the ones from the ﬁrst-order adjoint, ∂L
+∂θ . In the next
+section, we will present a novel optimization framework that computes these higher-order derivatives
+without any recursion (Section 3.1) and discuss how it can be implemented efﬁciently (Section 3.2).
+
+Table 1: Numerical errors between ground-truth and ad-
+joint derivatives using different ODESolve on CIFAR10.
+
+2.11×10−3
+2.50×10−1
+
+7.63×10−5
+6.84×10−3
+
+implicit adams
+
+3.44×10−4
+
+∂L
+∂θ
+∂2L
+∂θ2
+
+dopri5
+
+41.10
+
+rk4
+
+3 Approach
+
+3.1 Dynamics of Higher-order Derivatives using Continuous-time Optimal Control Theory
+
+OCP perspective is a recently emerging methodology for analyzing optimization of discrete DNNs.
+Central to its interpretation is to treat the layer propagation of a DNN as discrete-time dynamics, so
+
+1 (cid:101)T is the number of the adaptive steps used to solve (1), as an analogy of the “depth” of Neural ODEs.
+
+3
+
+that the training process, i.e. ﬁnding an optimal parameter of a DNN, can be understood like an OCP,
+which searches for an optimal control subjected to a dynamical constraint. This perspective has
+provided useful insights on characterizing the optimization process (Hu et al., 2019) and enhancing
+principled algorithmic design (Liu et al., 2021a). We leave a complete discussion in Appendix A.1.
+
+Lifting this OCP perspective from discrete DNNs to Neural ODEs requires special treatments from
+continuous-time OCP theory (Todorov, 2016). Nevertheless, we highlight that training Neural ODEs
+and solving continuous-time OCP are fundamentally intertwined since these models, by construction,
+represent continuous-time dynamical systems. Indeed, the ASM used for deriving (3, 4) originates
+from the celebrated Pontryagin’s principle (Pontryagin et al., 1962), which is an optimality condition
+to OCP. Hence, OCP analysis is not only motivated but principled from an optimization standpoint.
+
+We begin by ﬁrst transforming (2) to a form that is easier to adopt the continuous-time OCP analysis.
+
+(cid:20)
+Φ(xt1) +
+
+min
+θ
+
+(cid:90) t1
+
+(cid:21)
+(cid:96)(t, xt, ut)dt
+
+t0
+
+subjected to
+
+(cid:26) dxt
+
+dt = F (t, xt, ut), xt0 = xt0
+dut
+dt = 0,
+
+ut0 = θ
+
+,
+
+(6)
+
+where x(t) ≡ xt, and etc. It should be clear that (6) describes (2) without loss of generality by having
+(Φ, (cid:96)) := (L, 0). These functions are known as the terminal and intermediate costs in standard OCP.
+In training Neural ODEs, (cid:96) can be used to describe either the weight decay, i.e. (cid:96) ∝ (cid:107)ut(cid:107), or more
+complex regularization (Finlay et al., 2020). The time-invariant ODE imposed for ut makes the ODE
+of xt equivalent to (1). Problem (6) shall be understood as a particular type of OCP that searches for
+an optimal initial condition θ of a time-invariant control ut. Despite seemly superﬂuous, this is a
+necessary transformation that enables rigorous OCP analysis for the original training process (2), and
+it has also appeared in other control-related analyses (Zhong et al., 2020; Chalvidal et al., 2021).
+
+Next, deﬁne the accumulated loss from any time t ∈ [t0, t1] to the integration end time t1 as
+
+Q(t, xt, ut) := Φ(xt1) +
+
+(cid:90) t1
+
+t
+
+(cid:96)(τ, xτ , uτ ) dτ ,
+
+(7)
+
+which is also known in OCP as the cost-to-go function. Recall that our goal is to compute higher-
+order derivatives w.r.t. the parameter θ of Neural ODEs. Under the new OCP representation (6), the
+ﬁrst-order derivative ∂L
+. This is because Q(t0, xt0, ut0) accumulates
+all sources of losses between [t0, t1] (hence it sufﬁciently describes L) and ut0 = θ by construction.
+Likewise, the second-order derivatives can be captured by the Hessian ∂2Q(t0,xt0 ,ut0 )
+∂θ∂θ ≡ Lθθ.
+In other words, we are only interested in obtaining the derivatives of Q at the integration start time t0.
+
+∂θ is identical to ∂Q(t0,xt0 ,ut0 )
+
+= ∂2L
+
+∂ut0 ∂ut0
+
+∂ut0
+
+To obtain these derivatives, notice that we can rewrite (7) as
+
+0 = (cid:96)(t, xt, ut) +
+
+dQ(t, xt, ut)
+dt
+
+, Q(t1, xt1 ) = Φ(xt1 ),
+
+(8)
+
+since the deﬁnition of Q implies that Q(t, xt, ut) = (cid:96)(t, xt, ut)dt + Q(t + dt, xt+dt, ut+dt). We
+now state our main result, which provides a local characterization of (8) with a set of coupled ODEs
+expanded along a solution path. These ODEs can be used to obtain all second-order derivatives at t0.
+Theorem 1 (Second-order Differential Programming). Consider a solution path ( ¯xt, ¯ut) that solves
+the ODEs in (6). Then the ﬁrst and second-order derivatives of Q(t, xt, ut), expanded locally around
+this solution path, obey the following backward ODEs:
+
+−
+
+dQ ¯x
+dt
+dQ ¯x ¯x
+dt
+dQ ¯u ¯u
+dt
+
+−
+
+−
+
+= (cid:96) ¯x + F T
+
+¯x Q ¯x,
+
+= (cid:96) ¯x ¯x + F T
+
+¯x Q ¯x ¯x + Q ¯x ¯xF ¯x, −
+
+= (cid:96) ¯u ¯u + F T
+
+¯u Q ¯x ¯u + Q ¯u ¯xF ¯u, −
+
+−
+
+dQ ¯u
+dt
+dQ ¯x ¯u
+dt
+dQ ¯u ¯x
+dt
+
+= (cid:96) ¯u + F T
+
+¯u Q ¯x,
+
+= (cid:96) ¯x ¯u + Q ¯x ¯xF ¯u + F T
+
+¯x Q ¯x ¯u,
+
+= (cid:96) ¯u ¯x + F T
+
+¯u Q ¯x ¯x + Q ¯u ¯xF ¯x,
+
+(9a)
+
+(9b)
+
+(9c)
+
+where F ¯x(t)≡ ∂F
+∂xt
+valued or matrix-valued functions expanded at ( ¯xt, ¯ut). The terminal condition is given by
+
+|( ¯xt, ¯ut), and etc. All terms in (9) are time-varying vector-
+
+|( ¯xt, ¯ut), Q ¯x ¯x(t)≡ ∂2Q
+
+∂xt∂xt
+
+Q ¯x(t1) = Φ ¯x, Q ¯x ¯x(t1) = Φ ¯x ¯x,
+
+and Q ¯u(t1) = Q ¯u ¯u(t1) = Q ¯u ¯x(t1) = Q ¯x ¯u(t1) = 0.
+
+4
+
+The proof (see Appendix A.2) relies on rewriting (8) with differential states, δxt := xt − ¯xt, which
+view the deviation from ¯xt as an optimizing variable (hence the name “Differential Programming”).
+It can be shown that δxt follows a linear ODE expanded along the solution path. Theorem 1 has
+several important implications. First, the ODEs in (9a) recover the original ASM computation (3,4),
+as one can readily verify that Q ¯x(t) ≡ a(t) follows the same backward ODE in (4) and the solution
+of the second ODE in (9a), Q ¯u(t0) = −(cid:82) t0
+TQ ¯xdt, gives the exact gradient in (3). Meanwhile,
+t1
+solving the coupled matrix ODEs presented in (9b, 9c) yields the desired second-order matrix,
+Q ¯u ¯u(t0) ≡ Lθθ, for preconditioning the update. Finally, one can derive the dynamics of other
+higher-order tensors using the same Differential Programming methodology by simply expanding (8)
+beyond the second order. We leave some discussions in this regard in Appendix A.2.
+
+F ¯u
+
+3.2 Efﬁcient Second-order Preconditioned Update
+
+Theorem 1 provides an attractive computational framework that does not require recursive computa-
+tion (as mentioned in Section 2) to obtain higher-order derivatives. It suggests that we can obtain ﬁrst
+and second-order derivatives all at once with a single function call of ODESolve:
+
+[xt0, Q ¯x(t0), Q ¯u(t0), Q ¯x ¯x(t0), Q ¯u ¯x(t0), Q ¯x ¯u(t0), Q ¯u ¯u(t0)]
+
+= ODESolve([xt1 , Φ ¯x, 0, Φ ¯x ¯x, 0, 0, 0], t1, t0, ˜G),
+
+(10)
+
+where ˜G augments the original dynamics F in (1) with all 6 ODEs presented in (9). Despite that
+this OCP-theoretic backward pass (10) retains the same O(1) memory complexity as in (5), the
+dimension of the new augmented state, which now carries second-order matrices, can grow to an
+unfavorable size that dramatically slows down the numerical integration. Hence, we must consider
+other representations of (9), if any, in order to proceed. In the following proposition, we present one
+of which that transforms (9) into a set of vector ODEs, so that we can compute them much efﬁciently.
+Proposition 2 (Low-rank representation of (9)). Suppose (cid:96):=0 in (6) and let Q ¯x ¯x(t1)= (cid:80)R
+i=1 yi ⊗yi
+be a symmetric matrix of rank R ≤ n, where yi ∈ Rm and ⊗ is the Kronecker product. Then, for all
+t ∈ [t0, t1], the second-order matrices appeared in (9b, 9c) can be decomposed into
+
+Q ¯x ¯x(t) =
+
+R
+(cid:88)
+
+i=1
+
+qi(t) ⊗ qi(t), Q ¯x ¯u(t) =
+
+R
+(cid:88)
+
+i=1
+
+qi(t) ⊗ pi(t), Q ¯u ¯u(t) =
+
+R
+(cid:88)
+
+i=1
+
+pi(t) ⊗ pi(t),
+
+where the vectors qi(t) ∈ Rm and pi(t) ∈ Rn obey the following backward ODEs:
+
+−
+
+dqi(t)
+dt
+
+= F ¯x(t)Tqi(t), −
+
+dpi(t)
+dt
+
+= F ¯u(t)Tqi(t),
+
+(11)
+
+with the terminal condition given by (qi(t1), pi(t1)) := (yi, 0).
+
+The proof is left in Appendix A.2. Proposition 2 gives a nontrivial conversion. It indicates that the
+coupled matrix ODEs presented in (9b, 9c) can be disentangled into a set of independent vector
+ODEs where each of them follows its own dynamics (11). As the rank R determines the number of
+these vector ODEs, this conversion will be particularly useful if the second-order matrices exhibit
+low-rank structures. Fortunately, this is indeed the case for many Neural-ODE applications which
+often propagate xt in a latent space of higher dimension (Chen et al., 2018; Grathwohl et al., 2018;
+Kidger et al., 2020b).
+Based on Proposition 2, the second-order precondition matrix Lθθ is given by2
+
+Lθθ ≡ Q ¯u ¯u(t0) =
+
+R
+(cid:88)
+
+(cid:18)(cid:90) t0
+
+F ¯u
+
+Tqi dt
+
+(cid:18)(cid:90) t0
+
+(cid:19)
+
+⊗
+
+F ¯u
+
+Tqi dt
+
+(cid:19)
+
+,
+
+i=1
+
+t1
+
+t1
+
+(12)
+
+where qi ≡ qi(t) follows (11). Our ﬁnal step is to facilitate efﬁcient computation of (12) with
+Kronecker-based factorization, which underlines many popular second-order methods for discrete
+DNNs (Grosse & Martens, 2016; Martens et al., 2018). Recall that the vector ﬁeld F is represented
+
+2We drop the dependence on t for brevity, yet all terms inside the integrations of (12, 13) are time-varying.
+
+5
+
+Algorithm 1 SNOpt: Second-order Neural ODE Optimizer
+1: Input: dataset D, parametrized vector ﬁeld F (·, ·, θ), integration time [t0, t1], black-box ODE
+
+solver ODESolve, learning rate η, rank R, interval of the time grid ∆t
+
+2: repeat
+3:
+4:
+5:
+6:
+
+Solve x(t1) = ODESolve(x(t0), t0, t1, F ), where x(t0) ∼ D.
+Initialize ( ¯An, ¯Bn) := (0, 0) for each layer n and set qi(t1) := yi.
+for t(cid:48) in {t1, t1 − ∆t, · · · , t0 + ∆t, t0} do
+
+Set t := t(cid:48) − ∆t as the small integration step, then call
+
+(cid:66) Forward pass
+
+[x(t), Q ¯x(t), Q ¯u(t), {qi(t)}R
+
+i=1]
+
+= ODESolve([x(t(cid:48)), Q ¯x(t(cid:48)), Q ¯u(t(cid:48)), {qi(t(cid:48))}R
+
+i=1], t(cid:48), t, (cid:98)G),
+
+(cid:66) Backward pass
+
+where (cid:98)G augments the ODEs of state (1), ﬁrst and second-order derivatives (9a, 11).
+Evaluate zn(t), hn(t), F (t, xt, θ), then compute An(t), Bn(t) in (13).
+Update ¯An ← ¯An + An(t) · ∆t and ¯Bn ← ¯Bn + Bn(t) · ∆t.
+
+7:
+8:
+9:
+10:
+11: until converges
+
+end for
+∀n, apply θn ← θn − η · vec( ¯B−1
+
+n Q ¯un (t0) ¯A−T
+n ).
+
+
+
+
+
+
+x(t0)
+Q ¯x(t0)
+Q ¯u(t0)
+·
+
+
+
+
+
+
+tj+1
+
+(cid:40) ¯An=(cid:80)
+¯Bn=(cid:80)
+
+j An(tj )·∆t
+j Bn(tj )·∆t
+
+tj
+
+(cid:98)G
+
+(cid:66) Second-order parameter update
+
+
+
+x(t1)
+Q ¯x(t1)
+
+
+Q ¯u(t1)
+
+{yi}R
+
+i=1
+
+
+
+
+
+
+
+{tj }
+
+(cid:98)G
+
+Figure 4: Our second-order method, SNOpt, solves a new backward ODE, i.e. the (cid:98)G appeared in line
+6 of Alg. 1, which augments second-order derivatives, while simultaneously collecting the matrices
+An(tj) and Bn(tj) on a sampled time grid {tj} for computing the preconditioned update in (14).
+
+by a DNN. Let zn(t), hn(t), and un(t) denote the acti-
+vation vector, pre-activation vector, and the parameter of
+layer n when evaluating dx
+dt at time t (see Fig. 3), then the
+integration in (12) can be broken down into each layer n,
+(cid:90) t0
+
+(cid:16)
+
+F ¯u
+
+Tqi
+
+(cid:17)
+
+dt =[· · · , (cid:82) t0
+t1
+
+(cid:0)F T
+
+¯un qi
+
+(cid:1) dt, · · · ]
+
+t1
+
+=[· · · , (cid:82) t0
+t1
+
+(cid:16)
+
+zn ⊗ ( ∂F
+∂hn
+
+T
+
+(cid:17)
+
+qi)
+
+dt, · · · ],
+
+F (·, ·, θ) ≡ F (·, ·, ut)
+
+(t,x(t))
+
+zn(t)
+
+zn+1(t)
+
+dx(t)
+dt
+
+(cid:40) hn(t) = f (zn(t),un(t))
+zn+1(t) = σ(hn(t))
+
+Figure 3: The layer propagation inside
+the vector ﬁeld F , where f and σ denote
+afﬁne and nonlinear activation functions.
+
+where the second equality holds by F T
+step towards the Kronecker approximation of the layer-wise precondition matrix:
+
+∂hn
+∂un )Tqi = zn ⊗ ( ∂F
+∂hn
+
+¯un qi = ( ∂F
+∂hn
+
+T
+
+qi). This is an essential
+
+Lθnθn ≡ Q ¯un ¯un (t0) =
+
+R
+(cid:88)
+
+(cid:18)(cid:90) t0
+
+(cid:16)
+
+zn ⊗ ( ∂F
+∂hn
+
+(cid:17)
+
+T
+
+qi)
+
+(cid:19)
+
+dt
+
+⊗
+
+(cid:18)(cid:90) t0
+
+(cid:16)
+
+t1
+
+zn ⊗ ( ∂F
+∂hn
+
+(cid:19)
+
+T
+
+(cid:17)
+
+qi)
+
+dt
+
+t1
+
+i=1
+(cid:90) t0
+
+t1
+
+≈
+
+(zn ⊗ zn)
+
+dt ⊗
+
+(cid:124)
+
+(cid:123)(cid:122)
+An(t)
+
+(cid:125)
+
+(cid:90) t0
+
+R
+(cid:88)
+
+(cid:16)
+
+t1
+
+i=1
+(cid:124)
+
+T
+
+( ∂F
+∂hn
+
+qi) ⊗ ( ∂F
+∂hn
+
+T
+
+(cid:17)
+
+qi)
+
+dt.
+
+(13)
+
+(cid:123)(cid:122)
+Bn(t)
+
+(cid:125)
+
+We discuss the approximation behind (13), and also the one for (14), in Appendix A.2. Note that
+An(t) and Bn(t) are much smaller matrices in Rm×m compared to the ones in (9), and they can be
+efﬁciently computed with automatic differentiation packages (Paszke et al., 2017). Now, let {tj} be
+a time grid uniformly distributed over [t0, t1] so that ¯An= (cid:80)
+j An(tj)∆t and ¯Bn= (cid:80)
+j Bn(tj)∆t
+approximate the integrations in (13), then our ﬁnal preconditioned update law is given by
+θnθn Lθn ≈ vec (cid:0) ¯B−1
+
+n Q ¯un (t0) ¯A−T
+
+∀n, L−1
+
+(14)
+
+(cid:1) ,
+
+n
+
+where vec denotes vectorization. Our second-order method – named SNOpt – is summarized in
+Alg. 1, with the backward computation (i.e. line 4-9 in Alg. 1) illustrated in Fig. 4. In practice, we
+also adopt eigen-based amortization with Tikhonov regularization (George et al. (2018); see Alg. 2 in
+Appendix A.4), which stabilizes the updates over stochastic training.
+
+6
+
+ODESolvedefined with (1,9a,11)Query time derivativesSampled time gridCollect sampled matricesODE solver function callBackward vector fieldw/ 2nd-order derivativesODE solution pathODESolveRemark. The fact that Proposition 2 holds only for degenerate (cid:96) can be easily circumvented in
+practice. As (cid:96) typically represents weight decay, (cid:96) := 1
+(cid:107)θ(cid:107)2, which is time-independent, it can
+be separated from the backward ODEs (9) and added after solving the backward integration, i.e.
+
+t1−t0
+
+Q ¯u(t0) ← γθ + Q ¯u(t0), Q ¯u ¯u(t0) ← γI + Q ¯u ¯u(t0),
+where γ is the regularization factor. Finally, we ﬁnd that using the scaled Gaussian-Newton matrix,
+i.e. Q ¯x ¯x(t1) ≈ 1
+Φ ¯x ⊗ Φ ¯x, generally provides a good trade-off between the performance and
+runtime complexity. As such, we adopt this approximation to Proposition 2 for all experiments.
+
+t1−t0
+
+3.3 Memory Complexity Analysis
+
+Table 2: Memory complexity at different stages of our derivation in terms of xt ∈ Rm, θ ∈ Rn,
+and the rank R. Note that all methods have O(1) in terms of depth.
+
+Theorem 1
+Eqs. (9,10)
+
+Proposition 2
+Eqs. (11,12)
+backward storage O((m + n)2) O(Rm + Rn)
+parameter update
+
+O(n2)
+
+O(n2)
+
+SNOpt (Alg. 1)
+Eqs. (13,14)
+
+ﬁrst-order adjoint
+Eqs. (3,4)
+
+O(Rm + 2n)
+O(2n)
+
+O(m + n)
+O(n)
+
+Table 2 summarizes the memory complexity of different computational methods that appeared along
+our derivation in Section 3.1 and 3.2. Despite that all methods retain O(1) memory as with the
+ﬁrst-order adjoint method, their complexity differs in terms of the state and parameter dimension.
+Starting from our encouraging result in Theorem 1, which allows one to compute all derivatives with
+a single backward pass, we ﬁrst exploit their low-rank representation in Proposition 2. This reduces
+the storage to O(Rm + Rn) and paves a way toward adopting Kronecker factorization, which further
+facilitates efﬁcient preconditioning. With all these, our SNOpt is capable of performing efﬁcient
+second-order updates while enjoying similar memory complexity (up to some constant) compared
+to ﬁrst-order adjoint methods. Lastly, for image applications where Neural ODEs often consist of
+convolution layers, we adopt convolution-based Kronecker factorization (Grosse & Martens, 2016;
+Gao et al., 2020), which effectively makes the complexity to scale w.r.t. the number of feature maps
+(i.e. number of channels) rather than the full size of feature maps.
+
+3.4 Extension to Architecture Optimization
+
+Let us discuss an intriguing extension of our OCP framework
+to optimizing the architecture of Neural ODEs, speciﬁcally the
+integration bound t1. In practice, when problems contain no prior
+information on the integration, [t0, t1] is typically set to some
+trivial values (usually [0, 1]) without further justiﬁcation. However,
+these values can greatly affect both the performance and runtime.
+Take CIFAR10 for instance (see Fig. 5), the required training time
+decreases linearly as we drop t1 from 1, yet the accuracy retains
+mostly the same unless t1 becomes too small. Similar results also
+appear on MNIST (see Fig. 12 in Appendix A.5). In other words,
+we may interpret the integration bound t1 as an architectural
+parameter that needs to be jointly optimized during training.
+
+Figure 5: Training performance
+of CIFAR10 with Adam when
+using different t1, which moti-
+vates joint optimization of t1.
+Experiment setup is left in Ap-
+pendix A.4.
+
+The aforementioned interpretation ﬁts naturally into our OCP framework. Speciﬁcally, we can
+consider the following extension of Q, which introduces the terminal time T as a new variable:
+
+(cid:101)Q(t, xt, ut, T) := (cid:101)Φ(T, x(T)) +
+
+(cid:90) T
+
+t
+
+(cid:96)(τ, xτ , uτ ) dτ ,
+
+(15)
+
+where (cid:101)Φ(T, x(T)) explicitly imposes the penalty for longer integration time, e.g. (cid:101)Φ := Φ(x(T)) +
+c
+2 T2. Following a similar procedure presented in Section 3.1, we can transform (15) into its ODE
+form (as in (8)) then characterize its local behavior (as in (9)) along a solution path ( ¯xt, ¯ut, ¯T ). After
+some tedious derivations, which are left in Appendix A.3, we will arrive at the update rule below,
+
+T ← ¯T − η · δT(δθ), where
+
+δT(δθ) = [ (cid:101)Q ¯T ¯T (t0)]−1 (cid:16)
+
+(cid:101)Q ¯T (t0) + (cid:101)Q ¯T ¯u(t0)δθ
+
+(cid:17)
+
+.
+
+(16)
+
+7
+
+0.01.0t150100Relative train time (%)0.01.0t14080Accuracy (%)Similar to what we have discussed in Section 3.1, one shall view (cid:101)Q ¯T (t0) ≡ ∂L
+∂T as the ﬁrst-order
+derivative w.r.t. the terminal time T. Likewise, (cid:101)Q ¯T ¯T (t0) ≡ ∂2L
+∂T∂T , and etc. Equation (16) is a second-
+order feedback policy that adjusts its updates based on the change of the parameter θ. Intuitively, it
+moves in the descending direction of the preconditioned gradient (i.e. (cid:101)Q−1
+¯T ¯T (cid:101)Q ¯T ), while accounting for
+the fact that θ is also progressing during training (via the feedback (cid:101)Q ¯T ¯uδθ). The latter is a distinct
+feature arising from the OCP principle. As we will show later, this update (16) leads to distinct
+behavior with superior convergence compared to ﬁrst-order baselines (Massaroli et al., 2020).
+
+4 Experiments
+
+Figure 6: Hybrid model for time-series prediction.
+
+Table 3: Sample size of time-series datasets
+(input dimension, class label, series length)
+
+SpoAD
+
+ArtWR
+
+CharT
+
+(27, 10, 93)
+
+(19, 25, 144)
+
+(7, 20, 187)
+
+Dataset. We select 9 datasets from 3 distinct applications where N-ODEs have been applied, including
+image classiﬁcation (•), time-series prediction (•), and continuous normalizing ﬂow (•; CNF):
+
+• MNIST, SVHN, CIFAR10: MNIST consists of 28×28 gray-scale images, while SVHN and
+
+CIFAR10 consist of 3×32×32 colour images. All 3 image datasets have 10 label classes.
+
+• SpoAD, ArtWR, CharT: We consider UEA time series archive (Bagnall et al., 2018). Spoke-
+nArabicDigits (SpoAD) is a speech dataset, whereas ArticularyWordRecognition (ArtWR) and
+CharacterTrajectories (CharT) are motion-related datasets. Table 3 details their sample sizes.
+• Circle, Gas, Miniboone: Circle is a 2-dim synthetic dataset adopted from Chen et al. (2018). Gas
+and Miniboone are 8 and 43-dim tabular datasets commonly used in CNF (Grathwohl et al., 2018;
+Onken et al., 2020). All 3 datasets transform a multivariate Gaussian to the target distributions.
+
+Models. The models for image datasets and CNF resemble standard feedforward networks, except
+now consisting of Neural ODEs as continuous transformation layers. Speciﬁcally, the models for
+image classiﬁcation consist of convolution-based feature extraction, followed by a Neural ODE and
+linear mapping. Meanwhile, the CNF models are identical to the ones in Grathwohl et al. (2018),
+which consist of 1-5 Neural ODEs, depending on the size of the dataset. As for the time-series
+models, we adopt the hybrid models from Rubanova et al. (2019), which consist of a Neural ODE
+for hidden state propagation, standard recurrent cell (e.g. GRU (Cho et al., 2014)) to incorporate
+incoming time-series observation, and a linear prediction layer. Figure 6 illustrates this process. We
+detail other conﬁgurations in Appendix A.4.
+
+ODE solver. We use standard Runge-Kutta 4(5) adaptive solver (dopri5; Dormand & Prince (1980))
+implemented by the torchdiffeq package. The numerical tolerance is set to 1e-6 for CNF and 1e-3
+for the rest. We ﬁx the integration time to [0, 1] whenever it appears as a hyper-parameter (e.g. for
+image and CNF datasets3); otherwise we adopt the problem-speciﬁc setup (e.g. for time series).
+
+Training setup. We consider Adam and SGD (with momentum) as the ﬁrst-order baselines since
+they are default training methods for most Neural-ODE applications. As for our second-order SNOpt,
+we set up the time grid {tj} such that it collects roughly 100 samples along the backward integration
+to estimate the precondition matrices (see Fig. 4). The hyper-parameters (e.g. learning rate) are tuned
+for each method on each dataset, and we detail the tuning process in Appendix A.4. We also employ
+practical acceleration techniques, including the semi-norm (Kidger et al., 2020a) for speeding up
+ODESolve, and the Jacobian-free estimator (FFJORD; Grathwohl et al. (2018)) for accelerating CNF
+models. The batch size is set to 256, 512, and 1000 respectively for ArtWord, CharTraj, and Gas.
+The rest of the datasets use 128 as the batch size. All experiments are conducted on a TITAN RTX.
+
+4.1 Results
+
+Convergence and computation efﬁciency. Figures 1 and 7 report the training curves of each
+method measured by wall-clock time. It is obvious that our SNOpt admits a superior convergence
+
+3except for Circle where we set [t0, t1]:=[0, 10] in order to match the original setup in Chen et al. (2018).
+
+8
+
+time-series observationpredictionNeural ODEGRU cellLinear mappingFigure 7: Training performance in wall-clock runtime, averaged over 3 trials. Our SNOpt achieves
+faster convergence against ﬁrst-order baselines. See Fig. 14 in Appendix A.5 for MNIST and Circle.
+
+Table 4: Test-time performance: accuracies for image and time-series datasets; NLL for CNF datasets
+
+MNIST SVHN CIFAR10 SpoAD ArtWR CharT Circle Gas Miniboone
+
+Adam
+SGD
+
+98.83
+98.68
+
+91.92
+93.34
+
+SNOpt
+
+98.99
+
+95.77
+
+77.41
+76.42
+
+79.11
+
+94.64
+97.70
+
+97.41
+
+84.14
+85.82
+
+93.29
+95.93
+
+90.23
+
+96.63
+
+0.90
+0.94
+
+0.86
+
+-6.42
+-4.58
+
+-7.55
+
+13.10
+13.75
+
+12.50
+
+Figure 8: Relative runtime and mem-
+ory of our SNOpt compared to Adam
+(denoted by the dashed black lines)
+on all 9 datasets, where ‘Mn’ is the
+shorthand for MNIST, and etc.
+
+Figure 9: Sensitivity analysis where each sample repre-
+sents a training result using different optimizer and learn-
+ing rate (annotated by different symbol and color). Our
+SNOpt achieves higher accuracies and is insensitive to hyper-
+parameter changes. Note that x-axes are in log scale.
+
+rate compared to the ﬁrst-order baselines, and in many cases exceeds their performances by a large
+margin. In Fig. 8, we report the computation efﬁciency of our SNOpt compared to Adam on each
+dataset, and leave their numerical values in Appendix A.4 (Table 9 and 10). For image and time-series
+datasets (i.e. Mn~CT), our SNOpt runs nearly as fast as ﬁrst-order methods. This is made possible
+through a rigorous OCP analysis in Section 3, where we showed that second-order matrices can be
+constructed along with the same backward integration when we compute the gradient. Hence, only a
+minimal overhead is introduced. As for CNF, which propagates the probability density additional to
+the vanilla state dynamics, our SNOpt is roughly 1.5 to 2.5 times slower, yet it still converges faster in
+the overall wall-clock time (see Fig. 7). On the other hand, the use of second-order matrices increases
+the memory consumption of SNOpt by 10-40%, depending on the model and dataset. However,
+the actual increase in memory (less than 1GB for all datasets; see Table 10) remains affordable on
+standard GPU machines. More importantly, our SNOpt retains the O(1) memory throughout training.
+
+Test-time performance and hyper-parameter sensitivity. Table 4 reports the test-time perfor-
+mance, including the accuracies (%) for image and time-series classiﬁcation, and the negative
+log-likelihood (NLL) for CNF. On most datasets, our method achieves competitive results against
+standard baselines. In practice, we also ﬁnd that using the preconditioned updates greatly reduce the
+sensitivity to hyper-parameters (e.g. learning rate). This is demonstrated in Fig. 9, where we sample
+distinct learning rates from a proper interval for each method (shown with different color bars) and
+record their training results after convergence. It is clear that our method not only converges to higher
+
+9
+
+01.5k3k100Train Loss01.5k3k4080Accuracy (%)010k20kWall-Clock Time (sec)102100Train Loss010k20kWall-Clock Time (sec)50100Accuracy (%)AdamSGDSNOpt(ours)00.7k1.4k2.1k101100Train Loss 00.7k1.4k2.1k4080Accuracy (%)02k4k6kWall-Clock Time (sec)-707NLLGas01.2k2.4k3.6kWall-Clock Time (sec)2040NLLMinibooneSpoAD Training Loss and AccuracyCharT Training Loss and AccuracySVHN Training Loss and AccuracyMnSvCfSAAWCTClGaMi1.02.5Rel. RuntimeComputation Efficiency of SNOpt w.r.t. AdamMnSvCfSAAWCTClGaMi1.01.5Rel. Memory6080CIFAR10101100401041021001026080100ArtWRAdamSGDSNOpt(ours)104103103102103102Accuracy (%)Train LossTrain LossLearning Rate (Adam)Learning Rate (SGD)Learning Rate (SNOpt)Table 5: Performance of jointly optimizing
+the integration bound t1 on CIFAR10
+
+Method
+
+Train time (%)
+w.r.t. t1=1.0
+
+Accuracy
+(%)
+
+ASM baseline
+SNOpt (ours)
+
+96
+81
+
+76.61
+77.82
+
+Table 6: Measure of implicit regularization on SVHN
+
+# of function
+
+Regularization
+
+evaluation (NFE) ((cid:82) (cid:107)∇xF (cid:107)2 + (cid:82) (cid:107)F (cid:107)2)
+
+Adam
+SNOpt
+
+42.1
+32.6
+
+323.88
+199.1
+
+Figure 10: Dynamics of t1 over CIFAR10
+training using different methods.
+
+Figure 11: Comparison between SNOpt and second-
+order recursive adjoint. SNOpt is at least 2 times faster
+and improves the accuracies of baselines by 5-15%.
+
+accuracies with lower losses, these values are also more concentrated on the plots. In other words, our
+method achieves better convergence in a more consistent manner across different hyper-parameters.
+
+Joint optimization of the integration bound t1. Table 5 and Fig. 10 report the performance of
+optimizing t1 along with its convergence dynamics. Speciﬁcally, we compare our second-order
+feedback policy (16) derived in Section 3.4 to the ﬁrst-order ASM baseline proposed in Massaroli
+et al. (2020). It is clear that our OCP-theoretic method leads to substantially faster convergence, and
+the optimized t1 stably hovers around 0.5 without deviation (as appeared for the baseline). This drops
+the training time by nearly 20% compared to the vanilla training, where we ﬁx t1 to 1.0, yet without
+sacriﬁcing the test-time accuracy. A similar experiment for MNIST (see Fig. 13 in Appendix A.5)
+shows a consistent result. We highlight these improvements as the beneﬁt gained from introducing
+the well-established OCP principle to these emerging deep continuous-time models.
+
+Comparison with recursive adjoint. Finally, Fig. 11 reports the comparison between our SNOpt
+and the recursive adjoint baseline (see Section 2 and Table 1). It is clear that our method outperforms
+this second-order baseline by a large margin in both runtime efﬁciency and test-time performance.
+Note that we omit the comparison on CNF datasets since the recursive adjoint simply fails to converge.
+
+Remark (Implicit regularization). In some cases (e.g. SVHN in Fig. 8), our method may run slightly
+faster than ﬁrst-order methods. This is a distinct phenomenon arising exclusively from training these
+continuous-time models. Since their forward and backward passes involve solving parameterized
+ODEs (see Fig. 2), the computation graphs are parameter-dependent; hence adaptive throughout
+training. In this vein, we conjecture that the preconditioned updates in these cases may have guided
+the parameter to regions that are numerically stabler (hence faster) for integration.4 With this in
+mind, we report in Table 6 the value of Jacobian, (cid:82) (cid:107)∇xF (cid:107)2, and Kinetic, (cid:82) (cid:107)F (cid:107)2, regularization
+(Finlay et al., 2020) in SVHN training. Interestingly, the parameter found by our SNOpt indeed has
+a substantially lower value (hence stronger regularization and better-conditioned ODE dynamics)
+compared to the one found by Adam. This provides a plausible explanation of the reduction in the
+NFE when using our method, yet without hindering the test-time performance (see Table 4).
+
+5 Conclusion
+
+We present an efﬁcient higher-order optimization framework for training Neural ODEs. Our method –
+named SNOpt – differs from existing second-order methods in various aspects. While it leverages
+similar factorization inherited in Kronecker-based methods (Martens & Grosse, 2015), the two
+methodologies differ fundamentally in that we construct analytic ODE expressions for higher-order
+derivatives (Theorem 1) and compute them through ODESolve. This retains the favorable O(1)
+memory as opposed to their O(T ). It also enables a ﬂexible rank-based factorization in Proposition 2.
+Meanwhile, our method extends the recent trend of OCP-inspired methods (Li et al., 2017; Liu
+et al., 2021b) to deep continuous-time models, yet using a rather straightforward framework without
+imposing additional assumptions, such as Markovian or game transformation. To summarize, our
+work advances several methodologies to the emerging deep continuous-time models, achieving strong
+empirical results and opening up new opportunities for analyzing models such as Neural SDEs/PDEs.
+
+4In Appendix A.4, we provide some theoretical discussions (see Corollary 9) in this regard.
+
+10
+
+05k0.51.0t1t1 OptimizationASM baselineSNOpt (ours)t1=1.0Train IterationMnSvCfSAAWCT135Relative Runtime ()MnSvCfSAAWCT051015Accuracy Improvement (%) ()SNOptRecursiveAdjointRecursiveAdjoint/SNOptAcknowledgments and Disclosure of Funding
+
+The authors would like to thank Chia-Wen Kuo and Chen-Hsuan Lin for the meticulous proofreading,
+and Keuntaek Lee for providing additional computational resources. Guan-Horng Liu was supported
+by CPS NSF Award #1932068, and Tianrong Chen was supported by ARO Award #W911NF2010151.
+
+References
+
+Almubarak, H., Sadegh, N., and Taylor, D. G. Inﬁnite horizon nonlinear quadratic cost regulator. In
+
+2019 American Control Conference (ACC), pp. 5570–5575. IEEE, 2019.
+
+Amari, S.-i. and Nagaoka, H. Methods of information geometry, volume 191. American Mathematical
+
+Soc., 2000.
+
+Ba, J., Grosse, R., and Martens, J. Distributed second-order optimization using kronecker-factored
+
+approximations. 2016.
+
+Bagnall, A., Dau, H. A., Lines, J., Flynn, M., Large, J., Bostrom, A., Southam, P., and Keogh, E. The
+uea multivariate time series classiﬁcation archive, 2018. arXiv preprint arXiv:1811.00075, 2018.
+
+Botev, A., Ritter, H., and Barber, D. Practical gauss-newton optimisation for deep learning. In
+Proceedings of the 34th International Conference on Machine Learning-Volume 70, pp. 557–565.
+JMLR. org, 2017.
+
+Chalvidal, M., Ricci, M., VanRullen, R., and Serre, T. Go with the ﬂow: Adaptive control for neural
+
+odes. 2021.
+
+Chen, T. Q., Rubanova, Y., Bettencourt, J., and Duvenaud, D. K. Neural ordinary differential
+
+equations. In Advances in Neural Information Processing Systems, pp. 6572–6583, 2018.
+
+Cho, K., Van Merriënboer, B., Gulcehre, C., Bahdanau, D., Bougares, F., Schwenk, H., and Bengio,
+Y. Learning phrase representations using rnn encoder-decoder for statistical machine translation.
+arXiv preprint arXiv:1406.1078, 2014.
+
+De Marchi, A. and Gerdts, M. Free ﬁnite horizon lqr: a bilevel perspective and its application to
+
+model predictive control. Automatica, 100:299–311, 2019.
+
+Desjardins, G., Simonyan, K., Pascanu, R., and Kavukcuoglu, K. Natural neural networks. arXiv
+
+preprint arXiv:1507.00210, 2015.
+
+Dormand, J. R. and Prince, P. J. A family of embedded runge-kutta formulae. Journal of computational
+
+and applied mathematics, 6(1):19–26, 1980.
+
+Finlay, C., Jacobsen, J.-H., Nurbekyan, L., and Oberman, A. How to train your neural ode: the
+world of jacobian and kinetic regularization. In International Conference on Machine Learning,
+pp. 3154–3164. PMLR, 2020.
+
+Gao, K.-X., Liu, X.-L., Huang, Z.-H., Wang, M., Wang, Z., Xu, D., and Yu, F. A trace-restricted
+kronecker-factored approximation to natural gradient. arXiv preprint arXiv:2011.10741, 2020.
+
+George, T., Laurent, C., Bouthillier, X., Ballas, N., and Vincent, P. Fast approximate natural gradient
+descent in a kronecker factored eigenbasis. In Advances in Neural Information Processing Systems,
+pp. 9550–9560, 2018.
+
+Gholami, A., Keutzer, K., and Biros, G. Anode: Unconditionally accurate memory-efﬁcient gradients
+
+for neural odes. arXiv preprint arXiv:1902.10298, 2019.
+
+Ghosh, A., Behl, H. S., Dupont, E., Torr, P. H., and Namboodiri, V. Steer: Simple temporal
+
+regularization for neural odes. arXiv preprint arXiv:2006.10711, 2020.
+
+Grathwohl, W., Chen, R. T., Betterncourt, J., Sutskever, I., and Duvenaud, D. Ffjord: Free-form
+continuous dynamics for scalable reversible generative models. arXiv preprint arXiv:1810.01367,
+2018.
+
+11
+
+Grosse, R. and Martens, J. A kronecker-factored approximate ﬁsher matrix for convolution layers. In
+
+International Conference on Machine Learning, pp. 573–582, 2016.
+
+Gupta, V., Koren, T., and Singer, Y. Shampoo: Preconditioned stochastic tensor optimization. In
+
+International Conference on Machine Learning, pp. 1842–1850. PMLR, 2018.
+
+Hu, K., Kazeykina, A., and Ren, Z. Mean-ﬁeld langevin system, optimal control and deep neural
+
+networks. arXiv preprint arXiv:1909.07278, 2019.
+
+Ioffe, S. and Szegedy, C. Batch normalization: Accelerating deep network training by reducing
+internal covariate shift. In International conference on machine learning, pp. 448–456. PMLR,
+2015.
+
+Kelly, J., Bettencourt, J., Johnson, M. J., and Duvenaud, D. Learning differential equations that are
+
+easy to solve. arXiv preprint arXiv:2007.04504, 2020.
+
+Keskar, N. S., Mudigere, D., Nocedal, J., Smelyanskiy, M., and Tang, P. T. P. On large-batch training
+for deep learning: Generalization gap and sharp minima. arXiv preprint arXiv:1609.04836, 2016.
+
+Kidger, P., Chen, R. T., and Lyons, T. " hey, that’s not an ode": Faster ode adjoints with 12 lines of
+
+code. arXiv preprint arXiv:2009.09457, 2020a.
+
+Kidger, P., Morrill, J., Foster, J., and Lyons, T. Neural controlled differential equations for irregular
+
+time series. arXiv preprint arXiv:2005.08926, 2020b.
+
+Laurent, C., George, T., Bouthillier, X., Ballas, N., and Vincent, P. An evaluation of ﬁsher approxi-
+
+mations beyond kronecker factorization. 2018.
+
+LeCun, Y., Touresky, D., Hinton, G., and Sejnowski, T. A theoretical framework for back-propagation.
+In Proceedings of the 1988 connectionist models summer school, volume 1, pp. 21–28. CMU,
+Pittsburgh, Pa: Morgan Kaufmann, 1988.
+
+Li, Q., Chen, L., Tai, C., and Weinan, E. Maximum principle based algorithms for deep learning.
+
+The Journal of Machine Learning Research, 18(1):5998–6026, 2017.
+
+Liu, G.-H. and Theodorou, E. A. Deep learning theory review: An optimal control and dynamical
+
+systems perspective. arXiv preprint arXiv:1908.10920, 2019.
+
+Liu, G.-H., Chen, T., and Theodorou, E. A. Ddpnopt: Differential dynamic programming neural
+
+optimizer. In International Conference on Learning Representations, 2021a.
+
+Liu, G.-H., Chen, T., and Theodorou, E. A. Dynamic game theoretic neural optimizer. In International
+
+Conference on Machine Learning, 2021b.
+
+Lou, A., Lim, D., Katsman, I., Huang, L., Jiang, Q., Lim, S.-N., and De Sa, C. Neural manifold
+
+ordinary differential equations. arXiv preprint arXiv:2006.10254, 2020.
+
+Ma, L., Montague, G., Ye, J., Yao, Z., Gholami, A., Keutzer, K., and Mahoney, M. W. Inefﬁciency of
+
+k-fac for large batch size training. arXiv preprint arXiv:1903.06237, 2019.
+
+Martens, J. New insights and perspectives on the natural gradient method. arXiv preprint
+
+arXiv:1412.1193, 2014.
+
+Martens, J. and Grosse, R. Optimizing neural networks with kronecker-factored approximate
+
+curvature. In International conference on machine learning, pp. 2408–2417, 2015.
+
+Martens, J., Ba, J., and Johnson, M. Kronecker-factored curvature approximations for recurrent
+
+neural networks. In International Conference on Learning Representations, 2018.
+
+Massaroli, S., Poli, M., Park, J., Yamashita, A., and Asama, H. Dissecting neural odes. arXiv preprint
+
+arXiv:2002.08071, 2020.
+
+Mathieu, E. and Nickel, M. Riemannian continuous normalizing ﬂows.
+
+arXiv preprint
+
+arXiv:2006.10605, 2020.
+
+12
+
+Nguyen, T. M., Garg, A., Baraniuk, R. G., and Anandkumar, A. Infocnf: An efﬁcient conditional
+continuous normalizing ﬂow with adaptive solvers. arXiv preprint arXiv:1912.03978, 2019.
+
+Onken, D., Fung, S. W., Li, X., and Ruthotto, L. Ot-ﬂow: Fast and accurate continuous normalizing
+
+ﬂows via optimal transport. arXiv preprint arXiv:2006.00104, 2020.
+
+Paszke, A., Gross, S., Chintala, S., Chanan, G., Yang, E., DeVito, Z., Lin, Z., Desmaison, A., Antiga,
+
+L., and Lerer, A. Automatic differentiation in pytorch. 2017.
+
+Pontryagin, L. S., Mishchenko, E., Boltyanskii, V., and Gamkrelidze, R. The mathematical theory of
+
+optimal processes. 1962.
+
+Press, W. H., William, H., Teukolsky, S. A., Vetterling, W. T., Saul, A., and Flannery, B. P. Numerical
+
+recipes 3rd edition: The art of scientiﬁc computing. Cambridge university press, 2007.
+
+Rubanova, Y., Chen, R. T., and Duvenaud, D. Latent odes for irregularly-sampled time series. arXiv
+
+preprint arXiv:1907.03907, 2019.
+
+Santurkar, S., Tsipras, D., Ilyas, A., and Madry, A. How does batch normalization help optimization?
+
+arXiv preprint arXiv:1805.11604, 2018.
+
+Schacke, K. On the kronecker product. Master’s thesis, University of Waterloo, 2004.
+
+Sun, W., Theodorou, E., and Tsiotras, P. Model based reinforcement learning with ﬁnal time horizon
+
+optimization. arXiv preprint arXiv:1509.01186, 2015.
+
+Tassa, Y., Mansard, N., and Todorov, E. Control-limited differential dynamic programming. In 2014
+IEEE International Conference on Robotics and Automation (ICRA), pp. 1168–1175. IEEE, 2014.
+
+Theodorou, E., Tassa, Y., and Todorov, E. Stochastic differential dynamic programming.
+
+In
+
+Proceedings of the 2010 American Control Conference, pp. 1125–1132. IEEE, 2010.
+
+Todorov, E. Optimal control theory. Bayesian brain: probabilistic approaches to neural coding, pp.
+
+269–298, 2016.
+
+Weinan, E. A proposal on machine learning via dynamical systems. Communications in Mathematics
+
+and Statistics, 5(1):1–11, 2017.
+
+Weinan, E., Han, J., and Li, Q. A mean-ﬁeld optimal control formulation of deep learning. arXiv
+
+preprint arXiv:1807.01083, 2018.
+
+Wu, Y., Zhu, X., Wu, C., Wang, A., and Ge, R. Dissecting hessian: Understanding common structure
+
+of hessian in neural networks. arXiv preprint arXiv:2010.04261, 2020.
+
+Zhang, G., Martens, J., and Grosse, R. Fast convergence of natural gradient descent for overparame-
+
+terized neural networks. arXiv preprint arXiv:1905.10961, 2019.
+
+Zhong, Y. D., Dey, B., and Chakraborty, A. Symplectic ode-net: Learning hamiltonian dynamics
+
+with control. 2020.
+
+Zhuang, J., Dvornek, N., Li, X., Tatikonda, S., Papademetris, X., and Duncan, J. Adaptive checkpoint
+adjoint method for gradient estimation in neural ode. In International Conference on Machine
+Learning, pp. 11639–11649. PMLR, 2020.
+
+Zhuang, J., Dvornek, N. C., Tatikonda, S., and Duncan, J. S. Mali: A memory efﬁcient and reverse
+
+accurate integrator for neural odes. arXiv preprint arXiv:2102.04668, 2021.
+
+13
+
+A Appendix
+
+A.1 Review of Optimal Control Programming (OCP) Perspective of Training Discrete
+
+DNNs and Continuous-time OCP
+
+Here, we review the OCP perspective of training discrete DNNs and discuss how the continuous-time
+OCP can be connected to the training process of Neural ODEs. For a complete treatment, we refer
+readers to e.g. Weinan (2017); Li et al. (2017); Weinan et al. (2018); Liu & Theodorou (2019); Liu
+et al. (2021a), and their references therein.
+
+Abuse the notation and let the layer propagation rule in standard feedforward DNNs with depth T be
+
+zt+1 =f (zt, ut),
+
+t ∈ {0, 1, · · · , T }.
+
+(17)
+
+Here, zt and ut represent the (vectorized) hidden state and parameter of layer t. For instance, consider
+the propagation of a fully-connected layer, i.e. zt+1 = σ(Wtzt+bt), where Wt, bt, and σ(·) are
+respectively the weight, bias, and nonlinear activation function. Then, (17) treats ut := vec([Wt, bt])
+as the vectorized parameter and f as the composition of σ(·) and the afﬁne transformation (Do not
+confuse with Fig. 3 which denotes f as the afﬁne transformation).
+
+The OCP perspective notices that (17) can also be interpreted as a discrete-time dynamical system
+that propagates the state zt with the control variable ut. In this vein, computing the forward pass of a
+DNN can be seen as propagating a nonlinear dynamical system from time t = 0 to T . Furthermore,
+the training process, i.e. ﬁnding optimal parameters {ut : ∀t} for all layers, can be seen as a
+discrete-time Optimal Control Programming (OCP), which searches for an optimal control sequence
+{ut : ∀t} that minimizes some objective.
+
+In the case of Neural ODEs, the discrete-time layer propagation rule in (17) is replaced with the ODE
+in (1). However, as we have shown in Section 3.1, the interpretation between the trainable parameter
+θ and control variable (hence the connection between the training process and OCP) remains valid.
+In fact, consider the vanilla form of continuous-time OCP,
+
+min
+u(t):t∈[t0,t1]
+
+(cid:20)
+Φ(xt1) +
+
+(cid:90) t1
+
+t0
+
+(cid:21)
+
+(cid:96)(t, xt, ut)dt
+
+,
+
+˙xt = F (t, xt, ut), xt0 = xt0,
+
+(18)
+
+which resembles the one we used in (6) except considering a time-varying control process u(t). The
+necessary condition to the programming (18) can be characterized by the celebrated Pontryagin’s
+maximum principle (Pontryagin et al., 1962).
+Theorem 3 (Pontryagin’s maximum principle). Let u∗
+minimum of (18). Then, there exists continuous processes, x∗
+x∗
+a∗
+t1
+∀ut ∈ Rm,
+
+t , u∗
+t )
+t , a∗
+t , u∗
+t ) ,
+t , a∗
+t ) ≤ H (t, x∗
+where the Hamiltonian function is deﬁned as
+
+t = ∇aH (t, x∗
+˙x∗
+t = −∇xH (t, x∗
+˙a∗
+t , a∗
+H (t, x∗
+
+= ∇xΦ (cid:0)x∗
+t1
+t ∈ [t0, t1] ,
+
+t ≡ u∗(t) be a solution that achieved the
+
+t and a∗
+0 = x0 ,
+
+t , such that
+
+t , ut) ,
+
+t , u∗
+
+t , a∗
+
+(19b)
+
+(19a)
+
+(19c)
+
+(cid:1) ,
+
+H (t, xt, at, ut) := at · F (t, xt, ut) + (cid:96)(t, xt, ut).
+
+It can be readily veriﬁed that (19b) gives the same backward ODE in (4). In other words, the Adjoint
+Sensitivity Method used for deriving (3, 4) is a direct consequence arising from the OCP optimization
+theory. In this work, we provide a full treatment of continuous-time OCP theory and show that it
+opens up new algorithmic opportunities to higher-order training methods for Neural ODEs.
+
+A.2 Missing Derivations and Discussions in Section 3.1 and 3.2
+
+Proof of Theorem 1. Rewrite the backward ODE of the accumulated loss Q in (8) below
+
+0 = (cid:96)(t, xt, ut) +
+
+dQ(t, xt, ut)
+dt
+
+, Q(t1, xt1 ) = Φ(xt1 ).
+
+Given a solution path ( ¯xt, ¯ut) of the ODEs in (6), deﬁne the differential state and control variables
+(δxt, δut) by
+
+δxt := xt − ¯xt
+
+and
+
+δut := ut − ¯ut.
+
+14
+
+We ﬁrst perform second-order expansions for (cid:96) and Q along the solution path, which are given by
+
+(cid:96) ≈ (cid:96)(t, ¯xt, ¯ut) + (cid:96) ¯x
+
+Tδxt + (cid:96) ¯u
+
+Tδut +
+
+1
+2
+
+Q ≈ Q(t, ¯xt, ¯ut) + Q ¯x
+
+Tδxt + Q ¯u
+
+Tδut +
+
+(cid:21)
+
+(cid:20)δxt
+δut
+(cid:20)δxt
+δut
+
+(cid:21)T (cid:20)(cid:96) ¯x ¯x
+(cid:96) ¯x ¯u
+(cid:96) ¯u ¯x
+(cid:96) ¯u ¯u
+(cid:21)T (cid:20)Q ¯x ¯x Q ¯x ¯u
+Q ¯u ¯x Q ¯u ¯u
+
+(cid:21) (cid:20)δxt
+δut
+(cid:21) (cid:20)δxt
+δut
+
+,
+
+1
+2
+
+(20a)
+
+(20b)
+
+(cid:21)
+
+,
+
+where all derivatives, i.e. (cid:96) ¯x, (cid:96) ¯u, Q ¯x ¯x, Q ¯u ¯u, and etc, are time-varying. We can thereby obtain the
+time derivative of the second-order approximated Q in (20b) following standard ordinary calculus.
+
+dQ
+dt
+
+≈
+
+dQ(t, ¯xt, ¯ut)
+dt
+
++
+
+(cid:32)
+
+T
+
+dQ ¯x
+dt
+
+δxt + Q ¯x
+
+T dδxt
+dt
+
+(cid:33)
+
+(cid:32)
+
++
+
+T
+
+dQ ¯u
+dt
+
+δut + Q ¯u
+
+(cid:33)
+
+T dδut
+dt
+
+(cid:32)
+
+δxt
+
+(cid:32)
+
+δut
+
+(cid:32)
+
+δxt
+
+(cid:32)
+
+δut
+
+T dQ ¯x ¯x
+dt
+
+T dQ ¯u ¯u
+dt
+
+T dQ ¯x ¯u
+dt
+
+T dQ ¯u ¯x
+dt
+
+1
+2
+
+1
+2
+
+1
+2
+
+1
+2
+
++
+
++
+
++
+
++
+
+δxt +
+
+T
+
+dδxt
+dt
+
+Q ¯x ¯xδxt + δxt
+
+TQ ¯x ¯x
+
+(cid:33)
+
+dδxt
+dt
+
+δut +
+
+T
+
+dδut
+dt
+
+Q ¯u ¯uδut + δut
+
+TQ ¯u ¯u
+
+(cid:33)
+
+dδut
+dt
+
+δut +
+
+δxt +
+
+T
+
+T
+
+dδxt
+dt
+
+dδut
+dt
+
+Q ¯x ¯uδut + δxt
+
+TQ ¯x ¯u
+
+Q ¯u ¯xδxt + δut
+
+TQ ¯u ¯x
+
+(cid:33)
+
+(cid:33)
+
+.
+
+dδut
+dt
+
+dδxt
+dt
+
+(21)
+
+Next, we need to compute dδxt
+dt and dδut
+can be achieved by linearizing the ODE dynamics along ( ¯xt, ¯ut).
+
+dt , i.e. the dynamics of the differential state and control. This
+
+d
+dt
+
+( ¯xt + δxt) = F (t, ¯xt, ¯ut) + F ¯x(t)Tδxt + F ¯u(t)Tδut ⇒
+
+d
+dt
+
+( ¯ut + δut) = 0 ⇒
+
+dδxt
+dt
+dδut
+dt
+
+= F ¯x(t)Tδxt + F ¯u(t)Tδut,
+
+= 0,
+
+(22)
+
+since d ¯xt
+with (22) yield the following set of backward ODEs.
+
+dt = F (t, ¯xt, ¯ut). Finally, substituting (20a) and (21) back to (8) and replacing all ( dδxt
+
+dt , dδut
+dt )
+
+−
+
+dQ ¯x
+dt
+dQ ¯x ¯x
+dt
+dQ ¯u ¯u
+dt
+
+−
+
+−
+
+= (cid:96) ¯x + F T
+
+¯x Q ¯x,
+
+= (cid:96) ¯x ¯x + F T
+
+¯x Q ¯x ¯x + Q ¯x ¯xF ¯x, −
+
+= (cid:96) ¯u ¯u + F T
+
+¯u Q ¯x ¯u + Q ¯u ¯xF ¯u, −
+
+−
+
+dQ ¯u
+dt
+dQ ¯x ¯u
+dt
+dQ ¯u ¯x
+dt
+
+= (cid:96) ¯u + F T
+
+¯u Q ¯x,
+
+= (cid:96) ¯x ¯u + Q ¯x ¯xF ¯u + F T
+
+¯x Q ¯x ¯u,
+
+= (cid:96) ¯u ¯x + F T
+
+¯u Q ¯x ¯x + Q ¯u ¯xF ¯x.
+
+Remark 4 (Relation to continuous-time OCP algorithm). The proof of Theorem 1 resembles standard
+derivation of continuous-time Differential Dynamic Programming (DDP), a second-order OCP
+method that has shown great successes in modern autonomous systems (Tassa et al., 2014). However,
+our derivation was modiﬁed accordingly to account for the particular OCP proposed in (6), which
+concerns only the initial condition of the time-invariant control. As this equivalently leaves out the
+“dynamic” aspect of DDP, we shorthand our methodology by Differential Programming.
+Remark 5 (Computing higher-order derivatives). The proof of Theorem 1 can be summarized by
+
+Step 1. Expand Q and (cid:96) up to second-order, i.e. (20).
+
+Step 2. Derive the dynamics of differential variables. In our case, we consider the linear ODE
+
+presented in (22).
+
+Step 3. Substitute the approximations from Step 1 and 2 back to (8), expand all terms using ordinary
+
+calculus (21), then collect the dynamics of each derivative.
+
+15
+
+For higher-order derivatives, we simply need to consider a higher-order expansion of Q and (cid:96) in
+Step 1 (see e.g. Almubarak et al. (2019) and their reference therein). It is also possible to consider
+higher-order expression of the linear differential ODEs in Step 2, which may further improve the
+convergence at the cost of extra overhead (Theodorou et al., 2010).
+Remark 6 (Complexity of Remark 5). Let k be the optimization order. Development of higher-order
+(k ≥3) optimization based on Theorem 1 certainly has few computational obstacles, just like what
+we have identiﬁed and resolved in the case of k =2 (see Section 3.2). In terms of memory, while
+the number of backward ODEs suggested by Theorem 1 can grow exponentially w.r.t. k, Kelly et al.
+(2020) has developed an efﬁcient truncated method that reduces the number to O(k2) or O(k log k).
+In terms of runtime, analogous to the Kronecker approximation that we use to factorize second-order
+matrices, Gupta et al. (2018) provided an extension to generic higher-order tensor programming.
+Hence, it may still be plausible to avoid impractical training.
+
+Proof of Proposition 2. We will proceed the proof by induction. Recall that when (cid:96) degenerates, the
+matrix ODEs presented in (9b, 9c) from Theorem 1 take the form,
+
+−
+
+−
+
+−
+
+dQ ¯x ¯x
+dt
+dQ ¯u ¯u
+dt
+dQ ¯x ¯u
+dt
+
+= F T
+
+¯x Q ¯x ¯x + Q ¯x ¯xF ¯x,
+
+Q ¯x ¯x(t1) = Φ ¯x ¯x,
+
+= F ¯u
+
+TQ ¯x ¯u + Q ¯u ¯xF ¯u,
+
+Q ¯u ¯u(t1) = 0,
+
+= Q ¯x ¯xF ¯u + F ¯x
+
+TQ ¯x ¯u,
+
+Q ¯x ¯u(t1) = 0,
+
+(24a)
+
+(24b)
+
+(24c)
+
+where we leave out the ODE of Q ¯u ¯x since Q ¯u ¯x(t) = QT
+From (24), it is obvious that the decomposition given in Proposition 2 holds at the terminal stage t1.
+Now, suppose it also holds at t ∈ (t0, t1), then the backward dynamics of second-order matrices at
+this speciﬁc time step t, take dQ ¯x ¯x(t)
+
+¯x ¯u(t) for all t ∈ [t0, t1].
+
+for instance, become
+
+dt
+
+−
+
+dQ ¯x ¯x
+dt
+
+= F T
+
+¯x Q ¯x ¯x + Q ¯x ¯xF ¯x
+(cid:33)
+
+(cid:32) R
+(cid:88)
+
+qi ⊗ qi
+
++
+
+i=1
+
+(cid:33)
+
+qi ⊗ qi
+
+F ¯x
+
+(cid:32) R
+(cid:88)
+
+i=1
+
+(cid:2)(cid:0)F T
+
+¯x qi
+
+(cid:1) ⊗ qi + qi ⊗ (cid:0)F T
+
+¯x qi
+
+(cid:1)(cid:3) ,
+
+= F T
+¯x
+
+=
+
+R
+(cid:88)
+
+i=1
+
+where qi ≡ qi(t) for brevity. On the other hand, the LHS of (25) can be expanded as
+
+−
+
+dQ ¯x ¯x
+dt
+
+= −
+
+d
+dt
+
+(cid:33)
+
+qi ⊗ qi
+
+= −
+
+(cid:32) R
+(cid:88)
+
+i=1
+
+R
+(cid:88)
+
+i=1
+
+(cid:20) dqi
+dt
+
+⊗ qi + qi ⊗
+
+(cid:21)
+
+,
+
+dqi
+dt
+
+(25)
+
+(26)
+
+which follows by standard ordinary calculus. Equating (25) and (26) implies that following relation
+should hold at time t,
+
+−
+
+dqi
+dt
+
+= F T
+
+¯x qi,
+
+which yields the ﬁrst ODE appeared in (11). Similarly, we can repeat the same process (25, 26) for
+the matrices Q ¯x ¯u and Q ¯u ¯u. This will give us
+
+−
+
+dQ ¯u ¯u
+dt
+
+=F ¯u
+
+TQ ¯x ¯u + Q ¯u ¯xF ¯u
+
+⇒ −
+
+R
+(cid:88)
+
+i=1
+
+(cid:20) dpi
+dt
+
+⊗ pi + pi ⊗
+
+(cid:21)
+
+dpi
+dt
+
+=
+
+R
+(cid:88)
+
+i=1
+
+(cid:2)(cid:0)F T
+
+¯u qi
+
+(cid:1) ⊗ pi + pi ⊗ (cid:0)F T
+
+¯u qi
+
+(cid:1)(cid:3)
+
+−
+
+dQ ¯x ¯u
+dt
+
+=Q ¯x ¯xF ¯u + F ¯x
+
+TQ ¯x ¯u
+
+⇒ −
+
+R
+(cid:88)
+
+i=1
+
+(cid:20) dqi
+dt
+
+⊗ pi + qi ⊗
+
+(cid:21)
+
+dpi
+dt
+
+=
+
+R
+(cid:88)
+
+i=1
+
+(cid:2)(cid:0)F T
+
+¯x qi
+
+(cid:1) ⊗ pi + qi ⊗ (cid:0)F T
+
+¯u qi
+
+(cid:1)(cid:3) ,
+
+16
+
+which implies that following relation should also hold at time t,
+
+−
+
+dpi
+dt
+
+= F T
+
+¯u qi.
+
+Hence, we conclude the proof.
+
+Derivation and approximation in (13, 14). We ﬁrst recall two formulas related to the Kronecker
+product that will be shown useful in deriving (13, 14).
+
+(A ⊗ B)(C ⊗ D)T = ACT ⊗ BDT,
+(A ⊗ B)−1vec(W ) = vec(B−1W A−T),
+
+(27)
+
+(28)
+
+where W ∈ Rl×p, A, C ∈ Rp×p, and B, D ∈ Rl×l. Further, A, B are invertible.
+
+Now, we provide a step-by-step derivation of (13). For brevity, we will denote gn
+
+i ≡ ∂F
+∂hn
+
+T
+
+qi.
+
+Lθnθn ≡ Q ¯un ¯un (t0) =
+
+R
+(cid:88)
+
+(cid:18)(cid:90) t0
+
+(zn ⊗ gn
+
+i ) dt
+
+(cid:19) (cid:18)(cid:90) t0
+
+t1
+
+(cid:19)T
+
+(zn ⊗ gn
+
+i ) dt
+
+t1
+
+(zn ⊗ gn
+
+i ) (zn ⊗ gn
+
+i )T dt
+
+(cid:0)znznT(cid:1) ⊗ (cid:0)gn
+
+i gn
+i
+
+T(cid:1) dt
+
+by (27)
+
+(cid:0)znznT(cid:1) dt ⊗
+
+(cid:90) t0
+
+t1
+
+(cid:0)gn
+
+i gn
+i
+
+T(cid:1) dt
+
+(cid:90) t0
+
+t1
+
+(cid:90) t0
+
+t1
+
+(cid:90) t0
+
+t1
+
+i=1
+
+R
+(cid:88)
+
+i=1
+
+R
+(cid:88)
+
+i=1
+
+R
+(cid:88)
+
+i=1
+(cid:90) t0
+
+t1
+
+≈
+
+=
+
+≈
+
+=
+
+(zn ⊗ zn) dt ⊗
+
+(cid:90) t0
+
+R
+(cid:88)
+
+t1
+
+i=1
+
+i ⊗ gn
+gn
+
+i dt.
+
+by Fubini’s Theorem
+
+There are two approximations in the above derivation. The ﬁrst one assumes that the contributions
+i (t)” are uncorrelated across time, whereas the second one assumes zn
+of the quantity “zn(t) ⊗ gn
+and gn
+i are pair-wise independents. We stress that both are widely adopted assumptions for deriving
+practical Kronecker-based methods (Grosse & Martens, 2016; Martens et al., 2018). While the ﬁrst
+assumption can be rather strong, the second approximation has been veriﬁed in some empirical study
+(Wu et al., 2020) and can be made exact under certain conditions (Martens & Grosse, 2015). Finally,
+(14) follows readily from (28) by noticing that Lθnθn = ¯An ⊗ ¯Bn under our computation.
+Remark 7 (Uncorrelated assumption of zn ⊗ gn
+i )). This assumption is indeed strong yet almost
+necessary to yield tractable Kronecker matrices for efﬁcient second-order operation. Tracing back to
+the development of Kronecker-based methods, similar assumptions also appear in convolution layers
+(e.g. uncorrelated between spatial-wise derivatives (Grosse & Martens, 2016)) and recurrent units (e.g.
+uncorrelated between temporal-wise derivatives (Martens et al., 2018)). The latter may be thought of
+as the discretization of Neural ODEs. We note, however, that it is possible to relax this assumption by
+considering tractable graphical models (e.g. linear Gaussian (Martens et al., 2018)) at the cost of 2-3
+times more operations per iteration. In terms of the performance difference, perhaps surprisingly,
+adopting tractable temporal models provides only minor improvement in test-time performance (see
+Fig. 4 in Martens et al. (2018)). In some cases, it has been empirically observed that methods adopting
+the uncorrelated assumption yields better performance (Laurent et al., 2018).
+Remark 8 (Relation to Fisher Information Matrix). Recall that for all experiments we apply Gaussian-
+Newton approximation to the terminal Hessian Q ¯x ¯x(t1). This speciﬁc choice is partially based on
+empirical performance and computational purpose, yet it turns out that the resulting precondition
+matrices (12, 13) can be interpreted as Fisher information matrix (FIM). In other words, under this
+speciﬁc setup, (12, 13) can be equivalently viewed as the FIM of Neural ODEs. This implies SNOpt
+may be thought of as following Natural Gradient Descent (NGD), which is well-known for taking
+the steepest descent direction in the space of model distributions (Amari & Nagaoka, 2000; Martens,
+2014). Indeed, it has been observed that NGD-based methods converge to equally good accuracies,
+even though its learning rate varies across 1-2 orders (see Fig 10 in Ma et al. (2019) and Fig 4 in
+George et al. (2018)). These observations coincide with our results (Fig. 9) for Neural ODEs.
+
+17
+
+A.3 Discussion on the Free-Horizon Optimization in Section 3.4
+
+Derivation of (16). Here we present an extension of our OCP framework to jointly optimizing the
+architecture of Neural ODEs, speciﬁcally the integration bound t1. The proceeding derivation, despite
+being rather tedious, follows a similar procedure in Section 3.1 and the proof of Theorem 1.
+
+Recall the modiﬁed cost-to-go function that we consider for free-horizon optimization,
+
+(cid:101)Q(t, xt, ut, T) := (cid:101)Φ(T, x(T)) +
+
+(cid:90) T
+
+t
+
+(cid:96)(τ, xτ , uτ ) dτ ,
+
+where we introduce a new variable, i.e. the terminal horizon T, that shall be jointly optimized. We
+use the expression x(T) to highlight the fact that the terminal state is now a function of T.
+
+Similar to what we have explored in Section 3.1, our goal is to derive an analytic expression for the
+derivatives of (cid:101)Q at the integration start time t0 w.r.t. this new variable T. This can be achieved by
+characterizing the local behavior of the following ODE,
+
+0 = (cid:96)(t, xt, ut) +
+
+d (cid:101)Q(t, xt, ut, T)
+dt
+
+,
+
+(cid:101)Q(T, xT) = (cid:101)Φ(T, x(T)),
+
+(29)
+
+expanded on some nominal solution path ( ¯xt, ¯ut, ¯T ).
+Let us start from the terminal condition in (29). Given (cid:101)Q( ¯T , ¯x ¯T ) = (cid:101)Φ( ¯T , ¯x( ¯T )), perturbing the
+terminal horizon ¯T by an inﬁnitesimal amount δT yields
+
+(cid:101)Q( ¯T + δT, ¯x ¯T +δT) = (cid:96)( ¯x ¯T , ¯u ¯T )δT + (cid:101)Φ( ¯T + δT, ¯x( ¯T + δT)).
+
+(30)
+
+It can be shown that the second-order expansion of the last term in (30) takes the form,
+
+(cid:101)Φ (cid:0) ¯T + δT, ¯x( ¯T + δT)(cid:1) ≈ (cid:101)Φ (cid:0) ¯T , ¯x( ¯T )(cid:1) + (cid:101)ΦT
+
+¯xδx ¯T +
+(cid:17)
+
+(cid:17)
+
+(cid:16)
+
+¯F
+
+δxT
+
+δT +
+
+(cid:101)Φ ¯T + (cid:101)ΦT
+¯x
+1
+2
+¯F + ¯F T (cid:101)Φ ¯x ¯T + ¯F T (cid:101)Φ ¯x ¯x ¯F
+
+1
+2
+(cid:101)Φ ¯T ¯x + ¯F T (cid:101)Φ ¯x ¯x
+(cid:17)
+
+δT +
+
+δT,
+
+δT
+
+(cid:16)
+
+(cid:101)Φ ¯x ¯T + (cid:101)Φ ¯x ¯x ¯F
+
+(cid:101)Φ ¯T ¯T + (cid:101)Φ ¯T ¯x
+
+¯T (cid:101)Φ ¯x ¯xδx ¯T
+
+(cid:17)
+
+δx ¯T
+
+(31)
+
+(cid:16)
+
+δxT
+¯T
+(cid:16)
+
+δT
+
++
+
++
+
+1
+2
+1
+2
+
+which relies on the fact that the following formula holds for any generic function that takes t and x(t)
+as its arguments:
+
+d
+dt
+
+(·) =
+
+∂
+∂t
+
+(·) +
+
+∂
+∂x
+
+(·)T ¯F , where ¯F = F (t, ¯xt, ¯ut).
+
+Substituting (31) to (30) gives us the local expressions of the terminal condition up to second-order,
+
+(cid:101)Q ¯x( ¯T ) = (cid:101)Φ ¯x,
+(cid:101)Q ¯T ¯x( ¯T ) = (cid:101)Φ ¯T ¯x + ¯F T (cid:101)Φ ¯x ¯x,
+(cid:101)Q ¯x ¯x( ¯T ) = (cid:101)Φ ¯x ¯x,
+
+(cid:101)Q ¯T ( ¯T ) = (cid:96)( ¯x ¯T , ¯u ¯T ) + (cid:101)Φ ¯T + (cid:101)ΦT
+(cid:101)Q ¯x ¯T ( ¯T ) = (cid:101)Φ ¯x ¯T + (cid:101)Φ ¯x ¯x ¯F ,
+(cid:101)Q ¯T ¯T ( ¯T ) = (cid:101)Φ ¯T ¯T + (cid:101)ΦT
+¯T ¯x
+
+¯x
+
+¯F ,
+
+¯F + ¯F T (cid:101)Φ ¯x ¯T + ¯F T (cid:101)Φ ¯x ¯x ¯F ,
+
+(32a)
+
+(32b)
+
+(32c)
+
+where (cid:101)Q ¯x( ¯T ) ≡ δ (cid:101)Q
+δx ¯T
+
+= (cid:101)Q( ¯T +δT, ¯x ¯T +δT)− (cid:101)Q( ¯T , ¯x ¯T )
+δx ¯T
+
+, and etc.
+
+Next, consider the ODE dynamics in (29). Similar to (20b), we can expand (cid:101)Q w.r.t. all optimizing
+variables, i.e. (xt, ut, T), up to second-order. In this case, the approximation is given by
+
+(cid:101)Q(t, ¯xt, ¯ut, ¯T ) + (cid:101)QT
+
+¯xδxt + (cid:101)QT
+
+¯uδut + (cid:101)Q ¯T δT +
+
+1
+2
+
+
+
+
+
+δxt
+δut
+δT
+
+
+
+
+
+T 
+
+
+
+
+(cid:101)Q ¯x ¯x
+(cid:101)Q ¯u ¯x
+(cid:101)Q ¯T ¯x
+
+(cid:101)Q ¯x ¯u
+(cid:101)Q ¯u ¯u
+(cid:101)Q ¯T ¯u
+
+
+
+
+
+
+(cid:101)Q ¯x ¯T
+(cid:101)Q ¯u ¯T
+(cid:101)Q ¯T ¯T
+
+
+
+
+
+δxt
+δut
+δT
+
+
+
+ ,
+
+(33)
+
+which shares the same form as (20b) except having additional terms that account for the derivatives
+related to T (marked as green). Substitute (33) to the ODE dynamics in (29), then expand the time
+dt , dδut
+dt , and dδT
+derivatives d
+dδut
+dt
+
+dt as in (21), and ﬁnally replace dδxt
+
+¯x δxt + F T
+
+dδxt
+dt
+
+dδT
+dt
+
+dt with
+
+¯u δut,
+
+= F T
+
+= 0,
+
+= 0.
+
+and
+
+18
+
+Then, it can be shown that the ﬁrst and second-order derivatives of (cid:101)Q w.r.t. T obey the following
+backward ODEs:
+
+−
+
+d (cid:101)Q ¯T
+dt
+
+= 0, −
+
+d (cid:101)Q ¯T ¯T
+dt
+
+= 0, −
+
+d (cid:101)Q ¯T ¯x
+dt
+
+= (cid:101)Q ¯T ¯xF ¯x, −
+
+d (cid:101)Q ¯T ¯u
+dt
+
+= (cid:101)Q ¯T ¯xF ¯u,
+
+with the terminal condition given by (32). As for the derivatives that do not involve T, e.g. (cid:101)Q ¯x ¯x and
+(cid:101)Q ¯u ¯u, one can verify that they follow the same backward structures given in (9) except changing the
+terminal condition from Φ to (cid:101)Φ.
+To summarize, solving the following ODEs gives us the derivatives of (cid:101)Q related to T at t0:
+
+d
+dt
+d
+dt
+d
+dt
+d
+dt
+
+−
+
+−
+
+−
+
+−
+
+(cid:101)Q ¯T (t) = 0,
+
+(cid:101)Q ¯T ( ¯T ) = (cid:96)( ¯x ¯T , ¯u ¯T ) + (cid:101)Φ ¯T + (cid:101)ΦT
+
+¯x
+
+¯F
+
+(cid:101)Q ¯T ¯T (t) = 0,
+
+(cid:101)Q ¯T ¯x(t) = (cid:101)Q ¯T ¯xF ¯x,
+
+(cid:101)Q ¯T ¯u(t) = (cid:101)Q ¯T ¯xF ¯u,
+
+(cid:101)Q ¯T ¯T ( ¯T ) = (cid:101)Φ ¯T ¯T + (cid:101)ΦT
+¯T ¯x
+
+¯F + ¯F T (cid:101)Φ ¯x ¯T + ¯F T (cid:101)Φ ¯x ¯x ¯F
+
+(cid:101)Q ¯T ¯x( ¯T ) = (cid:101)Φ ¯T ¯x + ¯F T (cid:101)Φ ¯x ¯x
+
+(cid:101)Q ¯T ¯u( ¯T ) = 0
+
+(34a)
+
+(34b)
+
+(34c)
+
+(34d)
+
+Then, we can consider the following quadratic programming for the optimal perturbation δT∗,
+
+min
+δT
+
+Q ¯x(t0)Tδxt0 + Q ¯u(t0)Tδut0 + (cid:101)Q ¯T (t0)δT
+
+
+
+T 
+
+
+
+(cid:101)Q ¯x ¯x(t0)
+(cid:101)Q ¯u ¯x(t0)
+(cid:101)Q ¯T ¯x(t0)
+which has an analytic feedback solution given by
+
+δxt0
+δut0
+δT
+
+1
+2
+
+
+
+
++
+
+
+
+
+
+(cid:101)Q ¯x ¯u(t0)
+(cid:101)Q ¯u ¯u(t0)
+(cid:101)Q ¯T ¯u(t0)
+
+
+
+
+
+
+(cid:101)Q ¯x ¯T (t0)
+(cid:101)Q ¯u ¯T (t0)
+(cid:101)Q ¯T ¯T (t0)
+
+
+
+ ,
+
+
+
+
+
+δxt0
+δut0
+δT
+
+δT∗(δxt0, δut0) = [ (cid:101)Q ¯T ¯T (t0)]−1 (cid:16)
+
+(cid:101)Q ¯T (t0) + (cid:101)Q ¯T ¯x(t0)δxt0 + (cid:101)Q ¯T ¯u(t0)δut0
+
+(cid:17)
+
+.
+
+In practice, we drop the state differential δxt0 and only keep the control differential δut0 , which can
+be viewed as the parameter update δθ by recalling (6). With these, we arrive at the second-order
+feedback policy presented in (16).
+
+Practical implementation. We consider a vanilla quadratic cost, (cid:101)Φ(T, x(T)) := Φ(x(T)) + c
+2 T2,
+which penalizes longer integration time, and impose Gaussian-Newton approximation for the terminal
+cost, i.e. Φ ¯x ¯x ≈ Φ ¯xΦT
+
+¯x. With these, the terminal conditions in (34) can be simpliﬁed to
+¯F (cid:1) ΦT
+¯x.
+
+(cid:101)Q ¯T ¯T ( ¯T ) = c + (cid:0)ΦT
+
+(cid:101)Q ¯T ¯x( ¯T ) = (cid:0)ΦT
+
+¯F (cid:1)2
+
+¯F ,
+
+¯x
+
+¯x
+
+¯x
+
+,
+
+(cid:101)Q ¯T ( ¯T ) = c ¯T + ΦT
+
+Since (cid:101)Q ¯T (t) and (cid:101)Q ¯T ¯T (t) are time-invariant (see (34a, 34b)), we know the values of (cid:101)Q ¯T (t0) and
+¯F (cid:1) Q ¯u(t)T.
+(cid:101)Q ¯T ¯T (t0) at the terminal stage. Further, one can verify that ∀t ∈ [t0, ¯T ],
+¯F . These
+In other words, the feedback term (cid:101)Q ¯T ¯u simply rescales the ﬁrst-order derivative (cid:101)Q ¯u by ΦT
+¯x
+reasonings suggest that we can evaluate the second-order feedback policy (16) almost at no cost
+without augmenting any additional state to ODESolve. Finally, to adopt the stochastic training, we
+keep the moving averages of all terms and update T with (16) every 50-100 training iterations.
+
+(cid:101)Q ¯T ¯u(t) = (cid:0)ΦT
+
+¯x
+
+A.4 Experiment Details
+
+All experiments are conducted on the same GPU machine (TITAN RTX) and implemented with
+pytorch. Below we provide full discussions on topics that are deferred from Section 4.
+
+Model conﬁguration. Here, we specify the model for each dataset. We will adopt the following
+syntax to describe the layer conﬁguration.
+
+• Linear(input_dim, output_dim)
+• Conv(output_channel, kernel, stride)
+
+19
+
+Table 7: Conﬁguration of the vector ﬁeld F (t, xt, θ) of Neural ODEs used for each dataset
+(‡MIT License; §Apache License)
+
+Dataset
+
+DNN architecture as F (t, xt, θ)
+
+Model reference
+
+MNIST
+SVHN
+CIFAR10
+
+SpoAD
+CharT
+
+ArtWR
+
+Circle
+
+Gas
+
+Conv(64,3,1) → ReLU → Conv(64,3,1)
+
+Chen et al. (2018)‡
+
+Linear(32,32) → Tanh → Linear(32,32)
+→ Tanh → Linear(32,32) → Tanh
+→ Linear(32,32)
+
+Linear(64,64) → Tanh → Linear(64,64)
+→ Tanh → Linear(64,64) → Tanh
+→ Linear(64,64)
+Linear(2,64)?? → Tanh → Linear(64,2)6
+
+ConcatSquashLinear(8,160) → Tanh
+→ ConcatSquashLinear(160,160) → Tanh
+→ ConcatSquashLinear(160,160) → Tanh
+→ ConcatSquashLinear(160,8)
+
+Kidger et al. (2020b)§
+
+Kidger et al. (2020b)§
+
+Chen et al. (2018)‡
+
+Grathwohl et al. (2018)‡
+
+Miniboone
+
+ConcatSquashLinear(43,860) → SoftPlus
+→ ConcatSquashLinear(860,860)
+→ SoftPlus → ConcatSquashLinear(860,43)
+
+Grathwohl et al. (2018)‡
+
+Table 8: Hyper-parameter grid search considered for each method
+
+Method
+
+Learning rate
+
+Weight decay
+
+Adam { 1e-4, 3e-4, 5e-4, 7e-4, 1e-3, 3e-3, 5e-3, 7e-3, 1e-2, 3e-2, 5e-2 } {0.0, 1e-4, 1e-3 }
+{ 1e-3, 3e-3, 5e-3, 7e-3, 1e-2, 3e-2, 5e-2, 7e-2, 1e-1, 3e-1, 5e-1 } {0.0, 1e-4, 1e-3 }
+SGD
+Ours
+{ 1e-3, 3e-3, 5e-3, 7e-3, 1e-2, 3e-2, 5e-2, 7e-2, 1e-1, 3e-1, 5e-1 } {0.0, 1e-4, 1e-3 }
+
+• ConcatSquashLinear(input_dim, output_dim)5
+
+• GRUCell(input_dim, hidden_dim)
+
+Table 7 details the vector ﬁeld F (t, xt, θ) of Neural ODEs for each dataset. All vector ﬁelds are rep-
+resented by some DNNs, and their architectures are adopted from previous references as listed. The
+convolution-based feature extraction of image-classiﬁcation models consists of 3 convolution layers
+connected through ReLU, i.e. Conv(64,3,1) → ReLU → Conv(64,4,2) → ReLU → Conv(64,4,2).
+For time-series models, We set the dimension of the hidden space to 32, 64, and 32 respec-
+tively for SpoAD, ArtWR, and CharT. Hence, their GRU cells are conﬁgured by GRUCell(27,32),
+GRUCell(19,64), and GRUCell(7,32). Since these models take regular time-series with the interval
+of 1 second, the integration intervals of their Neural ODEs are set to {0, 1, · · · , K}, where K is the
+series length listed in Table 3. Finally, we ﬁnd that using 1 Neural ODE is sufﬁcient to achieve good
+performance on Circle and Miniboone, whereas for Gas, we use 5 Neural ODEs stacked in sequence.
+
+Tuning process. We perform a grid search on tuning the hyper-parameters (e.g. learning rate, weight
+decay) for each method on each dataset. The search grid for each method is detailed in Table 8. All
+ﬁgures and tables mentioned in Section 4 report the best-tuned results. For time-series models, we
+employ standard learning rate decay and note that without this annealing mechanism, we are unable
+to have ﬁrst-order baselines converge stably. We also observe that the magnitude of the gradients
+of the GRU cells is typically 10-50 larger than the one of the Neural ODEs. This can make training
+unstable when the same conﬁgured optimizer is used to train all modules. Hence, in practice we ﬁx
+Adam to train the GRUs while varying the optimizer for training Neural ODEs. Lastly, for image
+classiﬁcation models, we deploy our method together with the standard Kronecker-based method
+(Grosse & Martens, 2016) for training the convolution layers. This enables full second-order training
+
+5https://github.com/rtqichen/ffjord/blob/master/lib/layers/diffeq_layers/basic.py#L76
+
+20
+
+for the entire model, where the Neural ODE, as a continuous-time layer, is trained using our method
+proposed in Alg. 1. Finally, the momentum value for SGD is set to 0.9.
+
+Dataset. All image datasets are preprocessed with standardization. To accelerate training, we utilize
+10% of the samples in Gas, which still contains 85,217 training samples and 10,520 test samples. In
+general, the relative performance among training methods remains consistent for larger dataset ratios.
+
+Setup and motivation of Fig. 5. We initialize all Neural ODEs with the same parameters while only
+varying the integration bound t1. By manually grid-searching over t1, Fig. 5 implies that despite
+initializing from the same parameter, different t1 can yield distinct training time and accuracy; in
+other words, different t1 can lead to distinct ODE solution. As an ideal Neural ODE model should
+keep the training time as small as possible without sacriﬁcing the accuracy, there is a clear motivation
+to adaptive/optimize t1 throughout training. Additional comparison w.r.t. standard (i.e. static) residual
+models can be founded in Appendix A.5.
+
+Generating Fig. 8. The numerical values of the per-iteration runtime are reported in Table 9, whereas
+the ones for the memory consumption are given in Table 10. We use the last rows (i.e. SNOpt
+Adam ) of these
+two tables to generate Fig. 8.
+
+Table 9: Per-iteration runtime (seconds) of different optimizers on each dataset
+
+Image Classiﬁcation
+
+Time-series Prediction
+
+Continuous NF
+
+MNIST SVHN CIFAR10 SpoAD ArtWR CharT Circle Gas Minib.
+
+Adam
+SGD
+SNOpt
+
+SNOpt
+Adam
+
+0.15
+0.15
+0.15
+
+1.00
+
+0.78
+0.81
+0.68
+
+0.87
+
+0.17
+0.17
+0.20
+
+1.16
+
+5.24
+5.23
+5.18
+
+0.99
+
+9.95
+10.00
+10.05
+
+14.79
+14.77
+14.89
+
+0.34
+0.33
+0.94
+
+2.25
+2.28
+4.34
+
+1.01
+
+1.01
+
+2.75
+
+1.93
+
+0.65
+0.74
+1.04
+
+1.60
+
+Table 10: Memory Consumption (GBs) of different optimizers on each dataset
+
+Image Classiﬁcation
+
+Time-series Prediction
+
+Continuous NF
+
+MNIST SVHN CIFAR10 SpoAD ArtWR CharT Circle Gas Minib.
+
+Adam
+SGD
+SNOpt
+
+SNOpt
+Adam
+
+1.23
+1.23
+1.64
+
+1.33
+
+1.29
+1.28
+1.81
+
+1.40
+
+1.29
+1.28
+1.81
+
+1.40
+
+1.39
+1.39
+1.49
+
+1.07
+
+1.18
+1.18
+1.28
+
+1.09
+
+1.24
+1.24
+1.34
+
+1.08
+
+1.13
+1.13
+1.15
+
+1.17
+1.17
+1.34
+
+1.02
+
+1.14
+
+1.28
+1.28
+1.68
+
+1.31
+
+Tikhonov regularization in line 10 of
+Alg. 1. In practice, we apply Tikhonov
+regularization to the precondition matrix,
+i.e. Lθnθn + (cid:15)I, where θn is the parameter
+of layer n (see Fig. 3 and (13)) and (cid:15) is the
+Tikhonov regularization widely used for
+stabilizing second-order training (Botev
+et al., 2017; Zhang et al., 2019). To ef-
+ﬁciently compute this (cid:15)-regularized Kro-
+necker precondition matrix without addi-
+tional factorization or approximation (e.g.
+Section 6.3 in Martens & Grosse (2015)),
+we instead follow George et al. (2018) and
+perform eigen-decompositions, i.e. ¯An = UAΣAU T
+the property of Kronecker product (Schacke, 2004) to obtain
+
+Algorithm 2 (cid:15)-regularized Kronecker Update
+
+1: Input: Tikhonov regularization (cid:15), amortization α,
+
+Kronecker matrices ¯An ¯Bn
+
+2: UA, ΣA = EigenDecomposition( ¯An)
+3: UB, ΣB = EigenDecomposition( ¯Bn)
+4: X := vec−1((UA ⊗ UB)TLθn ) = U T
+5: S∗ := αS∗ + (1 − α)X 2
+6: X := X/(S∗ + (cid:15))
+7: δθ := (UA ⊗ UB)vec(X) =vec(UBXU T
+8: θ ← θ − ηδθ
+
+A)
+
+B (cid:101)Lθn UA
+
+A and ¯Bn = UBΣBU T
+
+B, so that we can utilize
+
+( ¯An + ¯Bn + (cid:15)I)−1 = (UA ⊗ UB)(ΣA ⊗ ΣB + (cid:15))−1(UA ⊗ UB)T.
+This, together with the eigen-based amortization which substitutes the original diagonal matrix
+S := ΣA ⊗ ΣB in (35) with S∗ := ((UA ⊗ UB)TLθn )2, leads to the computation in Alg. 2.
+Note that vec is the shorthand for vectorization, and we denote Lθn =vec( (cid:101)Lθn). Finally, α is the
+
+(35)
+
+21
+
+amortizing coefﬁcient, which we set to 0.75 for all experiments. As for (cid:15), we test 3 different values
+from {0.1, 0.05, 0.03} and report the best result.
+
+Error bar in Table 4. Table 11 reports the standard derivations of Table 4, indicating that our result
+remains statistically sound with comparatively lower variance.
+
+Table 11: Test-time performance: accuracies for image and time-series datasets; NLL for CNF
+datasets
+
+MNIST SVHN CIFAR10 SpoAD ArtWR CharT
+
+Circle
+
+Gas
+
+Minib.
+
+Adam 98.83±0.18 91.92±0.33
+SGD
+
+98.68±0.22 93.34±1.17
+
+SNOpt 98.99±0.15 95.77±0.18
+
+77.41±0.51
+
+94.64±1.12 84.14±2.53 93.29±1.59 0.90±0.02 -6.42±0.18 13.10±0.33
+
+76.42±0.51
+
+97.70±0.69 85.82±3.83 95.93±0.22 0.94±0.03 -4.58±0.23 13.75±0.19
+
+79.11±0.48
+
+97.41±0.46 90.23±1.49 96.63±0.19 0.86±0.04 -7.55±0.46
+
+12.50±0.12
+
+Discussion on Footnote 4. Here, we provide some reasoning on why the preconditioned updates
+may lead the parameter to regions that are stabler for integration. We ﬁrst adopt the theoretical results
+in Martens & Grosse (2015), particularly their Theorem 1 and Corollary 3, to our setup.
+
+Corollary 9 (Preconditioned Neural ODEs). Updating the parameter of a Neural ODE, F (·, ·, θ),
+with the preconditioned updates in (14) is equivalent to updating the parameter θ† ∈ Rn of a
+“preconditioned” Neural ODE, F †(·, ·, θ†), with gradient descent. This preconditioned Neural ODE
+has all the activations zn and derivatives F T
+
+hn qi (see Fig. 3) centered and whitened.
+
+These centering and whitening mechanisms are known to enhance convergence (Desjardins et al.,
+2015) and closely relate to Batch Normalization (Ioffe & Szegedy, 2015), which effectively smoothens
+the optimization landscape (Santurkar et al., 2018). Hence, one shall expect it also smoothens the
+diffeomorphism of both the forward and backward ODEs (1, 5) of Neural ODEs.
+
+A.5 Additional Experiments
+
+t1 optimization. Fig. 12 shows that a similar behavior (as in Fig. 5) can be found when training
+MNIST: while the accuracy remains almost stationary as we decrease t1 from 1.0, the required
+training time can drop by 20-35%. Finally, we provide additional experiments for t1 optimization
+in Fig. 13. Speciﬁcally, Fig. 13a repeats the same experiment (as in Fig. 10) on training MNIST,
+showing that our method (green curve) converges faster than the baseline. Meanwhile, Fig. 13b and
+13c suggest that our approach is also more effective in recovering from an unstable initialization of
+t1. Note that both Fig. 10 and 13 use Adam to optimize the parameter θ.
+
+Figure 12: Training performance of MNIST with Adam when using different t1.
+
+Figure 13: Dynamics of t1 over training using different methods, where we consider (a) MNIST
+training with t1 initialized to 1.0, and (b, c) CIFAR10 and MNIST training with t1 initialized to some
+unstable small values (e.g. 0.05).
+
+22
+
+0.01.02.0t150100Relative train time (%)0.01.02.0t196Accuracy (%)03k6kTrain Iteration0.050.5t1t1 Optimization (CIFAR10)ASM baselineSNOpt (ours)01k2kTrain Iteration0.40.71.0t1t1 Optimization (MNIST)01k2kTrain Iteration0.050.5t1t1 Optimization (MNIST)0.020.05(a)(b)(c)Convergence on all datasets. Figures 14 and 15 report the training curves of all datasets measured
+either by the wall-clock time or training iteration.
+
+Figure 14: Optimization performance measured by wall-clock time across 9 datasets, including
+image (1st-2nd rows) and time-series (3rd-4th rows) classiﬁcation, and continuous NF (5th row). We
+repeat the same ﬁgure with update iterations as x-axes in Fig 15. Our method (green) achieves faster
+convergence rate compared to ﬁrst-order baselines. Each curve is averaged over 3 random trials.
+
+Figure 15: Optimization performance measured by iteration updates across 9 datasets, including
+image (1st-2nd rows) and time-series (3rd-4th rows) classiﬁcation, and continuous NF (5th row). Each
+curve is averaged over 3 random trials.
+
+23
+
+101100Train Loss10010000.75k1.5k4590Accuracy (%)02k4k408000.5k1k3570101100Train Loss10210010210000.7k1.4k2.1k4080Accuracy (%)01.8k2.6k5.4k4080010k20k5010000.3k0.6k1.01.5NLL02k4k6kWall-Clock Time (sec)-70701.2k2.4k3.6k2040AdamSGDSNOpt(ours)MNISTSVHNCIFAR10SpoADArtWRCharTCircleGasMinibooneImage ClassificationTime-series PredictionContinuous NF101100Train Loss10010000.5k1k4590Accuracy (%)00.25k0.5k408000.3k0.6k3570101100Train Loss10210010210000.2k0.4k4080Accuracy (%)00.25k0.5k408000.6k1.2k5010000.6k1.2k1.8k1.01.5NLL01k2kTraining Iteration-70702k4k2040AdamSGDSNOpt(ours)MNISTSVHNCIFAR10SpoADArtWRCharTCircleGasMinibooneImage ClassificationTime-series PredictionContinuous NFComparison with ﬁrst-order methods that handle numerical errors. Table 12 and 13 report
+the performance difference between vanilla ﬁrst-order methods (e.g. Adam, SGD), ﬁrst-order
+methods equipped with error-handling modules (speciﬁcally MALI (Zhuang et al., 2021)), and our
+SNOpt. While MALI does improve the accuracies of vanilla ﬁrst-order methods at the cost of extra
+per-iteration runtime (roughly 3 times longer), our method achieves highest accuracy among all
+optimization methods and retains a comparable runtime compared to e.g. vanilla Adam.
+
+Table 12: Test-time performance (accuracies %) w.r.t. different optimization methods
+
+Adam Adam + MALI
+
+SGD SGD + MALI
+
+SNOpt
+
+SVHN
+CIFAR10
+
+91.92
+77.41
+
+91.98
+77.70
+
+93.34
+76.42
+
+94.33
+76.41
+
+95.77
+79.11
+
+Table 13: Per-iteration runtime (seconds) w.r.t. different optimization methods
+
+Adam Adam + MALI
+
+SGD SGD + MALI
+
+SNOpt
+
+SVHN
+CIFAR10
+
+0.78
+0.17
+
+2.31
+0.55
+
+0.81
+0.17
+
+1.28
+0.23
+
+0.68
+0.20
+
+Comparison with LBFGS. Table 14 reports various evaluational metrics between LBFGS and our
+SNOpt on training MNIST. First, notice that our method achieves superior ﬁnal accuracy compared
+to LBFGS. Secondly, while both methods are able to converge to a reasonable accuracy (90%) within
+similar iterations, our method runs 5 times faster than LBFGS per iteration; hence converges much
+faster in wall-clock time. In practice, we observe that LBFGS can exhibit unstable training without
+careful tuning on the hyper-parameter of Neural ODEs, e.g. the type of ODE solver and tolerance.
+
+Table 14: Comparison between LBFGS and our SNOpt on training MNIST
+
+Accuracy (%) Runtime (sec/itr)
+
+Iterations to Accu. 90% Time to Accu. 90%
+
+LBFGS
+SNOpt
+
+92.76
+98.99
+
+0.75
+0.15
+
+111 steps
+105 steps
+
+2 min 57 s
+18 s
+
+Results with different ODE solver (implicit adams). Table 15 reports the test-time performance
+when we switch the ODE solver from dopri5 to implicit adams. The result shows that our
+method retains the same leading position as appeared in Table 4, and the relative performance
+between optimizers also remains unchanged.
+
+Table 15: Test-time performance using “implicit adams” ODE solver: accuracies for image and
+time-series datasets; NLL for CNF datasets
+
+MNIST SVHN CIFAR10 SpoAD ArtWR CharT Circle Gas Miniboone
+
+Adam
+SGD
+
+98.86
+98.71
+
+91.76
+94.19
+
+SNOpt
+
+98.95
+
+95.76
+
+77.22
+76.48
+
+79.00
+
+95.33
+97.80
+
+97.45
+
+86.28
+87.05
+
+88.83
+95.38
+
+89.50
+
+97.17
+
+0.90
+0.93
+
+0.86
+
+-6.51
+-4.69
+
+-7.41
+
+13.29
+13.77
+
+12.37
+
+Comparison with discrete-time residual networks. Table 16 reports the training results where we
+replace the Neural ODEs with standard (i.e. discrete-time) residual layers, xk+1 = xk + F (xk, θ).
+dt = F (t, x, θ)
+Since ODE systems can be made invariant w.r.t.
+and τ = ct, then dx
+c )), the results of
+these residual networks provide a performance validation for our joint optimization of t1 and θ.
+Comparing Table 16 and 5 on training CIFAR10, we indeed ﬁnd that SNOpt is able to reach the
+similar performance (77.82% vs. 77.87%) of the residual network, whereas the ASM baseline gives
+only 76.61%, which is 1% lower.
+
+c , x, θ) will give the same trajectory x(t) = x( τ
+
+time rescaling (e.g. consider dx
+
+dτ = 1
+
+c F ( τ
+
+24
+
+Table 16: Accuracies (%) of residual networks trained with Adam or SGD
+
+MNIST
+
+SVHN
+
+CIFAR10
+
+resnet + Adam 98.75 ± 0.21
+
+97.28 ± 0.37
+
+77.87 ± 0.44
+
+Batch size analysis. Table 17 provides results on image classiﬁcation when we enlarge the batch
+size by the factor of 4 (i.e. 128 → 512). It is clear that our method retains the same leading position
+with a comparatively smaller variance. We also note that while enlarging batch size increases the
+memory for all methods, the ratio between our method and ﬁrst-order baselines does not scale w.r.t.
+this hyper-parameter. Hence, just as enlarging batch size may accelerate ﬁrst-order training, it can
+equally improve our second-order training. In fact, a (reasonably) larger batch size has a side beneﬁt
+for second-order methods as it helps stabilize the preconditioned matrices, i.e. ¯An and ¯Bn in (14),
+throughout the stochastic training (note that too large batch size can still hinder training (Keskar et al.,
+2016)).
+
+Table 17: Accuracies (%) when using larger (128 → 512) batch sizes
+
+MNIST
+
+SVHN
+
+CIFAR10
+
+Adam
+SGD
+
+99.14 ± 0.12
+98.92 ± 0.08
+
+94.19 ± 0.18
+95.67 ± 0.48
+
+77.57 ± 0.30
+76.66 ± 0.29
+
+SNOpt
+
+99.18 ± 0.07
+
+98.00 ± 0.12
+
+80.03 ± 0.10
+
+25
+
+

@@ -1,0 +1,1548 @@
+2
+2
+0
+2
+
+p
+e
+S
+7
+
+]
+
+R
+A
+.
+s
+c
+[
+
+1
+v
+2
+3
+4
+4
+0
+.
+9
+0
+2
+2
+:
+v
+i
+X
+r
+a
+
+Elastic RAID: When RAID Meets SSDs with Built-in Transparent Compression
+
+Zheng Gu†, Jiangpeng Li†, Yong Peng†, Yang Liu†, and Tong Zhang†‡
+
+† ScaleFlux Inc., CA, USA
+‡ Rensselaer Polytechnic Institute, NY, USA
+
+Abstract
+
+This paper studies how RAID (redundant array of indepen-
+dent disks) could take full advantage of modern SSDs (solid-
+state drives) with built-in transparent compression. In current
+practice, RAID users are forced to choose a speciﬁc RAID
+level (e.g., RAID 10 or RAID 5) with a ﬁxed storage cost
+vs. speed performance trade-off. Commercial market is wit-
+nessing the emergence of a new family of SSDs that can
+internally perform hardware-based lossless compression on
+each 4KB LBA (logical block address) block, transparent to
+host OS and user applications. Beyond straightforwardly re-
+ducing the RAID storage cost, such modern SSDs make it
+possible to relieve RAID users from being locked into a ﬁxed
+storage cost vs. speed performance trade-off. The key idea
+is simple: RAID systems opportunistically leverage higher-
+than-expected runtime user data compressibility to enable
+dynamic RAID level conversion to improve the speed perfor-
+mance without compromising the effective storage capacity.
+This paper presents design techniques to enable and optimize
+the practical implementation of such elastic RAID systems.
+For the purpose of demonstration, we implemented a Linux
+software-based elastic RAID prototype that supports dynamic
+conversion between RAID 5 and RAID 10. Compared with
+a baseline software-based RAID 5, under sufﬁcient runtime
+data compressibility that enables the conversion from RAID 5
+to RAID 10 over 60% user data, the elastic RAID could im-
+prove the 4KB random write IOPS (IO per second) by 42%
+and 4KB random read IOPS in degraded mode by 46%, while
+maintaining the same effective storage capacity.
+
+1 Introduction
+
+This paper studies the implementation of RAID (redundant
+array of independent disks) [11, 31] over SSDs (solid-state
+drives) with built-in transparent data compression. As one of
+the best known computing system design techniques, RAID
+plays an important role in building reliable computing infras-
+tructure. In current practice, when deploying a RAID system,
+
+users must choose (and subsequently stick with) one speciﬁc
+RAID level after, often painfully, deliberating the trade-off
+between the storage cost and speed performance. For example,
+between RAID 10 and RAID 5, the two most popular RAID
+levels, RAID 10 achieves a higher I/O speed performance,
+in terms of IOPS (I/O requests per second) and average/tail
+latency, at the penalty of a higher data storage cost, while
+RAID 5 reduces the data storage cost by sacriﬁcing the I/O
+speed performance. Such a storage cost vs. speed performance
+trade-off is inherent in the design of RAID, regardless whether
+its implementation is software-based (e.g., Linux mdraid [26]
+and Btrfs RAID [35]) or hardware-based (e.g., RAID con-
+troller card [5]).
+
+Commercial market currently witnesses the rise of SSDs
+with the built-in transparent data compression capability [19,
+37]. Such modern SSDs internally carry out hardware-based
+compression on each 4KB LBA (logical block address) block,
+and could expose a logical storage space that is (much) larger
+than their internal physical NAND ﬂash memory storage ca-
+pacity. Evidently, one could deploy a RAID system (regard-
+less its RAID level) over such SSDs to reduce the effective
+storage cost without any changes of the RAID implementation
+and any degradation of the RAID speed performance. This pa-
+per shows that, beyond straightforwardly reducing the storage
+cost, SSDs with built-in transparent compression brings an
+unique opportunity to improve the RAID speed performance
+by elastically mixing different RAID levels (e.g., RAID 5 and
+RAID 10) in adaptation to the runtime user data compressibil-
+ity variations. Its basic idea is simple: Suppose we deploy a
+RAID 5 over multiple SSDs with the total physical storage ca-
+pacity of 32TB and format the RAID logical storage capacity
+as 64TB, i.e., we expect that the average data compressibil-
+ity is about 2:1 and hence aim at leveraging the intra-SSD
+transparent compression capability to reduce the effective
+RAID storage cost by up to 2×. Of course, the storage system
+must accordingly adjust its monitoring and management to
+prevent out-of-space failure under worse-than-expected data
+compressibility. If the runtime data compressibility exceeds
+2:1, the RAID system could opportunistically convert the pro-
+
+1
+
+ 
+ 
+ 
+ 
+ 
+ 
+tection of some user data from RAID 5 to RAID 10 in order
+to improve the RAID speed performance, while still main-
+taining the total 64TB effective RAID data storage capacity.
+As the runtime data compressibility dynamically varies, the
+RAID system adaptively adjusts the mixture of RAID 5 and
+RAID 10. Such an elastic RAID design strategy opportunis-
+tically utilizes the runtime residual data compressibility to
+improve the speed performance without compromising the ef-
+fective storage capacity. If users demand double drive failure
+protection, elastic RAID will dynamically mix RAID 6 and
+triple replication. For the purpose of simplicity, this paper fo-
+cuses on the case of elastic mixture of RAID 5 and RAID 10
+in one RAID system, and the proposed design solutions could
+be readily extended to the case of elastic mixture of RAID 6
+and triple replication.
+
+In spite of its simple concept, the practical implementa-
+tion of elastic RAID is subject to two major issues: (i) Im-
+plementing RAID level conversion: RAID 5 and RAID 10
+have different data mapping and occupy different amount
+of storage capacity, which makes it nontrivial to dynami-
+cally convert between RAID 5 and RAID 10 on the same
+array of SSDs. Meanwhile, RAID level conversion incurs
+data copy/move/delete operations, and it is highly desirable
+to minimize the conversion-induced operational overhead
+and its impact on foreground user read/write requests. More-
+over, we must retain the drive failure protection during the
+RAID level conversion. This paper presents a bloated stripe
+allocation design approach to facilitate the implementation
+of dynamic RAID level conversion. It minimizes the RAID
+level convention operational overhead and meanwhile enables
+ﬁne-grained conversion on the per-stripe basis, i.e., RAID
+level conversion can be carried out on each individual RAID
+stripe independently from all the other stripes. Such per-stripe
+RAID level conversion enables the most graceful adaptation
+to the runtime data compressibility variation. (ii) Scheduling
+RAID level conversion: The second issue is how to dynami-
+cally schedule RAID level conversion to maximize the speed
+performance gain by keeping as many hot data as possible
+under the RAID 10 protection. This paper presents a strategy
+to realize RAID level conversion both proactively in adap-
+tation to workload characteristics variation and reactively
+in response to data compressibility change. This scheduling
+strategy takes per-stripe data compressibility into account to
+increase the coverage of RAID 10, and leverages the principle
+of the well-known second chance algorithm [38] to reduce the
+implementation overhead. In addition to addressing the above
+two major issues, this paper presents a simple technique to fur-
+ther improve the implementation efﬁciency of elastic RAID.
+It is motivated by the observation that RAID parity tends to
+have much worse compressibility than user data, because par-
+ity calculation could largely destroy the data entropy. This
+suggests that a RAID 5 stripe does not necessarily always
+consume less physical storage space (post in-storage transpar-
+ent compression) than its RAID 10 counterpart. Accordingly,
+
+an elastic RAID system could proactively convert a RAID 5
+stripe to its RAID 10 counterpart if the conversion does not
+increase the physical storage space usage.
+
+For the purpose of demonstration, we implemented a Linux
+software elastic RAID prototype in support of the mixture
+of RAID 5 and RAID 10. This prototype was developed by
+modifying/enhancing the existing Linux mdraid [26] to in-
+corporate the proposed design techniques and meanwhile
+enhance the support of multi-threaded operations. We carried
+out experiments by deploying the software elastic RAID over
+commercial SSDs with built-in transparent compression from
+Scaleﬂux Inc. [37]. We applied the widely used FIO (ﬂex-
+ible I/O tester) tool [18] to generate heavy I/O workloads
+and collect the IOPS and tail latency results. When operating
+in the RADI 5 only mode, our elastic RAID implementa-
+tion could noticeably outperform the state-of-the-art software
+RAID 5 product RAIDIX [34], and both RAIDIX and our
+elastic RAID achieve ∼ 10× higher IOPS than the Linux
+mdraid. We further carried out experiments to evaluate the
+effect of elastic RAID 5 and RAID 10 mixture, and the results
+well demonstrate its efﬁcacy on improving the RAID speed
+performance without compromising the effective RAID stor-
+age capacity. For example, compared with the baseline that
+operates in the RAID 5 only mode, converting 20% and 60%
+user data from RAID 5 to RAID 10 will improve the 4KB
+random write IOPS by 10% and 42%, respectively. When the
+RAID system operates in the degraded mode (i.e., one SSD is
+off-line), converting 20% and 60% RAID 10 user data from
+RAID 5 to RAID 10 will improve the 4KB random read IOPS
+by 12% and 46%, respectively. The experimental results show
+that a small increase of user data compression ratio could
+enable a signiﬁcant increase of RAID 10 coverage. For ex-
+ample, the RAID 10 coverage could improve by over 40%
+if user data compression ratio slightly increases from 1.2 to
+1.4. The experimental results also show that the RAID level
+conversion can be carried out with a very high throughput
+and its impact on the RAID system speed performance is very
+small (e.g., less than 5%) even under very heavy foreground
+user I/O workloads. This work well demonstrates that the
+emerging SSDs with built-in transparent compression for the
+ﬁrst time make it practically feasible for a RAID system to
+opportunistically mix different RAID levels to improve the
+speed performance without compromising the effective data
+storage capacity.
+
+2
+
+In-Storage Transparent Compression
+
+Fig. 1 illustrates an SSD with built-in transparent com-
+pression: Its controller SoC (system on chip) performs
+(de)compression on each 4KB LBA data block along the I/O
+path, and manages the placement of all the post-compression
+variable-length data blocks on the NAND ﬂash memory. The
+in-storage per-4KB data compression is transparent to the
+host that accesses the SSD as a normal block data storage de-
+
+2
+
+3 Proposed Elastic RAID
+
+When users deploy RAID over SSDs with built-in transparent
+compression, they should format its logical storage capacity
+based on the expected/estimated data compressibility in or-
+der to reduce the effective data storage cost. Let us consider
+RAID 5 over n + 1 SSDs, and let C f lash denote the NAND
+ﬂash memory capacity of each SSD (excluding its internal
+over-provisioned storage capacity reserved for GC). Through-
+out this paper, we deﬁne the compression ratio as the pre-
+compressed data size being divided by the post-compressed
+data size (i.e., a larger compression ratio corresponds to a
+higher data compressibility). Let αexp ≥ 1 denote the expected
+average data compression ratio over the entire RAID 5 (includ-
+ing both user data and RAID 5 parity). Since all the user data
+and RAID 5 parity are evenly striped across the n + 1 SSDs,
+all the SSDs will experience the same average data compres-
+sion ratio. Hence, the logical storage capacity of the RAID 5
+system should be formatted as CRAID = αexp · n · C f lash, i.e.,
+users expect to increase the effective RAID storage capacity
+by up to αexp× via deploying SSDs with built-in transparent
+compression. In practice, users tend to purposely underesti-
+mate the value of αexp in order to better embrace unexpected
+data compressibility degradation and simplify the storage
+system management. Let α denote the runtime average com-
+pression ratio of all the data (both user data and parity) on
+RAID 5. Once the runtime data compressibility is better than
+expected (i.e., α > αexp), it will leave a certain amount of phys-
+ical NAND ﬂash memory storage space unused. Intuitively,
+we could utilize such opportunistically available physical
+data storage capacity to convert RAID 5 to RAID 10 over
+a portion (or even all) of user data. This can contribute to
+improving the RAID I/O speed performance including IOPS
+and latency, while still maintaining the same RAID logical
+storage capacity of CRAID.
+
+Fig. 3 further illustrates the basic concept of such elas-
+tic RAID: To materialize the storage cost reduction enabled
+by deploying SSDs with built-in transparent compression,
+an elastic RAID system exposes a logical storage capacity
+of CRAID to the host. When the runtime average data com-
+pression ratio α is less than αexp, the elastic RAID system
+
+Figure 1: Illustration of an SSD with built-in transparent
+compression.
+
+vice through a standard I/O interface (e.g., NVMe or SATA).
+The per-4KB (de)compression latency of the hardware engine
+inside the SSD controller SoC can be well below 5µs, which
+is over 10× shorter than the TLC/QLC NAND ﬂash mem-
+ory read latency (∼50µs and above) and write latency (∼1ms
+and above). Meanwhile, the hardware (de)compression en-
+gines could easily achieve a throughput higher than the aggre-
+gated bandwidth of back-end NAND ﬂash memory chips (e.g.,
+4∼8GB/s). Therefore, SSDs with built-in transparent com-
+pression can maintain the same IOPS and latency performance
+as traditional SSDs without built-in compression capability.
+In fact, by reducing the write stress on NAND ﬂash memory
+through compression, such SSDs could have (much) lower
+GC (garbage collection) overhead, leading to (much) higher
+IOPS under write-intensive workloads. For example, under
+heavy 4KB random writes with 100% LBA span, traditional
+NVMe SSDs could achieve up to 200K∼300K IOPS, while
+NVMe SSDs with built-in transparent compression (e.g., the
+one from ScaleFlux Inc. [37]) could achieve over 600K IOPS
+under 2:1 user data compression ratio.
+
+To allow the host materialize the beneﬁt of in-storage trans-
+parent data compression, such modern SSDs could expose an
+expanded LBA logical storage space that is larger (e.g., by 2×
+or 4×) than its internal physical NAND ﬂash memory storage
+capacity, as illustrated in Fig. 2. Given the runtime data com-
+pressibility variation, such SSDs with expanded LBA space
+may possibly run out of physical storage space before their
+exposed logical storage space has been used up by the host.
+Hence, to avoid running into the out-of-space error, the host
+must keep monitoring the SSD physical storage space usage
+and accordingly make its storage management aware of the
+runtime physical storage space usage, just like when using
+any thin-provisioned storage systems.
+
+Figure 2: Illustration of the expanded LBA space exposed by
+SSDs with built-in transparent compression.
+
+Figure 3: Illustration of elastic RAID enabled by in-storage
+transparent compression.
+
+3
+
+Per-4KB compressionNAND FlashPer-4KB decompressionNVMeFlash ControlController SoCHostSSDNAND Flash (e.g., 4TB)Exposed LBA space (e.g., 16TB)SSDIn-Storage Transparent CompressionRAID-10Averagedatacompression ratio 𝛼𝛼exp𝛼fullEffective user storage capacityRAID-5CRAIDentirely operates as a classical RAID 5 to transform 100%
+data compressibility into the storage cost reduction, as shown
+in Fig. 3. Being proportional to the average data compres-
+sion ratio α, the effective data storage capacity that is truly
+consumable by the users is lower than the logical storage ca-
+pacity CRAID exposed by the elastic RAID. Hence, users must
+closely monitor the true physical storage capacity usage of
+SSDs in order to avoid out-of-space errors. Once the average
+runtime data compression ratio α reaches αexp, the effective
+data storage capacity will reach CRAID (i.e., all the logical
+storage space exposed by the RAID system could be truly
+consumed by the users). As α exceeds αexp, the effective data
+storage capacity will remain as CRAID and the residual data
+compressibility (i.e., α − αexp) will be exploited to enable
+RAID 5 to RAID 10 conversion, as illustrated in Fig. 3, where
+α f ull denotes the data compression ratio under which all the
+user data could be protected by RAID 10.
+
+In summary, as the runtime average data compression ratio
+α dynamically varies between [1, αexp], the effective data stor-
+age capacity of elastic RAID will proportionately change and
+all the user data are protected by RAID 5; as α dynamically
+varies between [αexp, α f ull], elastic RAID will accordingly
+adjust the mixture of RAID 5 and RAID 10 while its effec-
+tive data storage capacity remains as CRAID; once α exceeds
+α f ull, all the user data are protected by RAID 10 and the effec-
+tive data storage capacity remains as CRAID. Although elastic
+RAID is built upon a simple idea, its practical and efﬁcient
+implementation poses unique challenges. The remainder of
+this section will present techniques to address the major im-
+plementation challenges on the realization and scheduling
+of RAID level conversion, and one additional technique to
+further improve its implementation efﬁciency.
+
+3.1 Realization of RAID Level Conversion
+
+Compared with conventional RAID implementation, one
+unique challenge of elastic RAID is the realization and man-
+agement of dynamic conversion between different RAID lev-
+els. Let n + 1 denote the total number of SSDs in the RAID
+system, and Pi denote the LBA space exposed by the i-th
+SSD. Let Lusr denote the LBA space exposed by the RAID
+system to the user. The RAID system applies a mapping
+f : Lusr → {P1, · · · ,Pn+1} to manage the user data storage
+over the SSD array. With different amounts of data redun-
+dancy, different RAID levels must use different mapping
+function f , leading to different user data placement over the
+n + 1 SSDs. As a result, dynamic conversion between dif-
+ferent RAID levels demands runtime varying the mapping
+function f (and hence the placement of user data and RAID
+parity). This could signiﬁcantly complicate the data place-
+ment and management. Meanwhile, changing the mapping
+function will incur SSD operational overheads in terms of
+data copy/move/delete operations, leading to interference with
+foreground user I/O requests. Elastic RAID should reduce
+
+such operational overheads as much as possible to maximize
+its speed performance gain.
+
+This work proposes a design technique to simplify the
+switching between different data mapping functions during
+the RAID level conversion. As pointed out above in Section 2,
+SSDs with built-in transparent compression could expose
+an expanded LBA space that is much larger than the physi-
+cal NAND ﬂash memory storage capacity. This enables the
+storage systems purposely under-utilize the SSD LBA space
+while still fully utilizing the physical NAND ﬂash memory
+storage capacity. Leveraging this simple fact, the key idea
+of the proposed design technique is to trade the SSD LBA
+space utilization efﬁciency for simpler data placement and
+management in support of dynamic RAID level conversion.
+Fig. 4 illustrates this design technique in the context of elastic
+RAID with RAID 5 and RAID 10. Given the total n + 1 SSDs,
+each RAID 5 stripe contains n user data strips (denoted as
+D1, · · · , Dn) and one parity strip (denoted as P). We partition
+the entire LBA space of all the n + 1 SSDs {P1, · · · ,Pn+1}
+into a large number of segments, where each segment is 2×
+larger than one RAID 5 stripe. As illustrated in Fig. 4, each
+segment is further partitioned into two equal-sized slots de-
+noted as slot-1 and slot-2. The two slots in each segment
+hold different content when the corresponding data stripe is
+protected by RAID 5 or RAID 10:
+
+• In case of RAID 5, slot-1 stores the entire RAID 5 stripe
+and slot-2 is empty (hence all the LBA data blocks in
+slot-2 are trimmed). The utilization of the expanded SSD
+LBA space is 50%.
+
+• In case of RAID 10, slot-1 and slot-2 each stores one
+copy of stripe user data D1, · · · , Dn. In each slot, one strip
+is left unused and hence can be trimmed. The utilization
+of the expanded SSD LBA space is n/(n + 1).
+
+Figure 4: Illustration of the bloated stripe allocation to facili-
+tate the conversion between RAID 5 and RAID 10.
+
+By under-utilizing the SSD LBA space through the bloated
+stripe allocation, we can easily switch the data mapping func-
+tion in support of dynamic RAID level conversion. Accord-
+ingly, the RAID system mapping function f can be decom-
+posed into a large number of independent segment mapping
+
+4
+
+D1(trimmed)D2(trimmed)(trimmed). . .slot-1. . .slot-2One segment (RAID 5)SSD 1SSD 2SSD n+1P. . .. . .. . .D1(trimmed)D2D1(trimmed). . .slot-1. . .slot-2One segment (RAID 10)Dnusr → {P (k)
+
+1 , · · · ,P (k)
+
+n+1}, where L (k)
+functions f (k) : L (k)
+usr denotes
+the user data covered by one RAID stripe and P (k)
+’s corre-
+spond to the LBA space occupied by one segment. This conve-
+niently enables the ﬁne-grained per-stripe RAID level conver-
+sion, i.e., RAID level conversion can be done for each individ-
+ual stripe independently from all the other stripes. Within each
+segment, elastic RAID systems could easily realize dynamic
+conversion between RAID 5 and RAID 10:
+
+i
+
+• To convert one segment from RAID 5 to RAID 10, we
+ﬁrst copy all the data strips Di’s from slot-1 to slot-2 in a
+skewed pattern so that two copies of the same data will
+not reside on the same SSD, and then trim the unused
+LBAs in slot-1.
+
+• To convert one segment from RAID 10 to RAID 5, we
+ﬁrst calculate the parity strip P based on the user data
+strips, write P to slot-1, and ﬁnally trim all the LBA data
+blocks in slot-2.
+
+During the conversion between RAID 5 and RAID 10, we
+never in-place update any data blocks, which can ensure the
+atomicity of the conversion operation and hence keep data
+being protected during the conversion. Moreover, such ﬁne-
+grained per-stripe RAID level conversion allows the most
+graceful adaptation to the runtime variations of data com-
+pressibility and/or data access locality. Accordingly, the elas-
+tic RAID system should maintain a segment bitmap in which
+each bit records whether its associated segment uses RAID 5
+or RAID 10. Moreover, since this design approach under-
+utilizes the SSD LBA space by up to 50%, given the target
+data compression ratio αexp, each SSD should be formatted
+with an LBA space expansion factor of 2αexp.
+
+3.2 Scheduling of RAID Level Conversion
+
+Elastic RAID must incorporate a scheduler that is responsible
+for two tasks: (i) determine when RAID level conversion
+should be triggered, and (ii) choose the stripes to which RAID
+level conversion should be applied. In the following, we will
+discuss the possible design approaches for accomplishing
+these two tasks.
+
+3.2.1 Triggering RAID Level Conversion
+
+RAID level conversion could be triggered reactively in re-
+sponse to data compressibility variation or proactively in adap-
+tation to workload I/O data access characteristics variation. To
+maximize the speed performance gain, elastic RAID should
+prioritize on keeping write/read-hot data in the RAID 10
+region. Moreover, when workload I/O data access locality
+changes over the time, RAID 10 region may no longer well
+cover the currently hot data, which should trigger RAID level
+conversion to accordingly adjust the RAID 10 region.
+
+5
+
+We ﬁrst discuss the scenario of reactively triggering RAID
+level conversion in response to data compressibility variation.
+The above discussion, as illustrated in Fig. 3, suggests that
+all the user data should be protected by RAID 5 until the
+average data compression ratio α reaches αexp under which
+the effective RAID storage capacity will reach CRAID. This
+implicitly assumes that the users always utilize 100% of the
+available data storage capacity. Nevertheless, it is not un-
+common that, in real-world production environment, storage
+capacity utilization can be well below 100% (e.g., 80%∼90%
+and even lower) due to factors such as runtime storage us-
+age ﬂuctuation and storage capacity over-provisioning for
+operational safety margin. Therefore, instead of triggering
+RAID level conversion only when α ∈ (αexp, α f ull), we could
+opportunistically trigger RAID level conversion even under
+α < αexp, in the case of users under-utilizing the available
+storage capacity. This can be realized by scheduling RAID
+level conversion directly based on the runtime physical stor-
+age capacity usage, other than the runtime data compression
+ratio. One simple scheduling approach is described as follows:
+The scheduler periodically samples the runtime physical stor-
+age capacity usage (denoted as Cutil) in each SSD. Recall that
+C f lash denotes the total physical storage capacity of each SSD,
+and let Cu and Cl denote two pre-deﬁned parameters (where
+C f lash > Cu > Cl). If Cutil does not exhibit signiﬁcant varia-
+tion and remains below Cl in all the SSDs, then the scheduler
+will declare that the available storage capacity is being under-
+utilized, and hence will trigger the conversion to promote
+some regions from RAID 5 to RAID 10 to trade the under-
+utilized storage capacity for higher speed performance. If
+Cutil > Cu in any SSD and elastic RAID currently contains
+RAID 10 regions, then the scheduler will trigger the conver-
+sion to demote some regions from RAID 10 to RAID 5 to
+restore sufﬁcient operational safety margin for sudden storage
+capacity usage spikes.
+
+To proactively trigger RAID level conversion in adapta-
+tion to data access locality variation, elastic RAID must keep
+monitoring the relative hotness of the data being currently
+covered by RAID 10. Let S denote the set consisting of all the
+stripes, and S (10) denote the set consisting of all the RAID 10
+stripes. Upon each I/O request, elastic RAID checks its bitmap
+to identify whether the request hits a RAID 5 or RAID 10
+region. Therefore, elastic RAID could readily obtain the cur-
+rent RAID 10 data access hit rate β (i.e., the probability of
+a data access request hitting the RAID 10 region). Given a
+pre-deﬁned factor h > 1, we claim that the RAID 10 region
+no longer well covers the currently hot data if
+
+β < h ·
+
+(cid:12)
+(cid:12)S (10)(cid:12)
+(cid:12)
+|S |
+
+,
+
+(1)
+
+where | · | denotes the number of elements in a set. This will
+accordingly trigger the RAID level conversion that aims to
+better align the RAID 10 region with currently hot data.
+
+3.2.2 Stripe Selection for RAID Level Conversion
+
+Once the scheduler has triggered the RAID level conversion,
+the next task is to choose the data stripes for RAID level con-
+version, with the objective of keeping/converting hot stripes
+into the RAID 10 region. Hence, the scheduler must incor-
+porate a hot stripe classiﬁcation mechanism. To reduce the
+scheduling-induced implementation overhead, one could ap-
+ply low-cost algorithms (e.g., the well-known second chance
+algorithm [38]) for hot stripe classiﬁcation. One possible im-
+plementation is described below: Let V(5) and V(10) denote
+bitmaps in which one bit corresponds to one stripe in RAID 5
+and RAID 10, respectively. Bitmap V(5) is used to identify
+the candidate stripes for being promoted from RAID 5 to
+RAID 10, and bitmap V(10) is used to identify the candidate
+stripes for being demoted from RAID 10 to RAID 5. The
+operations on these two bitmaps are summarized as follows:
+
+• Operations on V(5): All the bits in V(5) are periodically
+reset to zero. Whenever a stripe is accessed by an I/O
+request, its corresponding bit in V(5) will be set to 1. To
+select a candidate stripe for promotion to RAID 10, the
+scheduler chooses a stripe whose bit is 1 in V(5).
+
+• Operations on V(10): Whenever a stripe in RAID 10 is
+accessed by an I/O request, its corresponding bit in V(10)
+will be set to 1. The scheduler uses the second chance
+algorithm to select a candidate stripe for demotion to
+RAID 5, i.e., the scheduler scans V(10) to ﬁnd the ﬁrst
+zero and marks the corresponding stripe as a candidate,
+and when it encounters a one during the scan, it will
+reset it to zero and move to the next bit.
+
+If SSDs support users to query data compression ratio on
+the per-LBA basis, once the scheduler has chosen a candidate
+stripe for promotion to RAID 10 or demotion to RAID 5, it
+will decide whether to indeed promote/demote the chosen
+candidate in a probabilistic manner by incorporating the per-
+stripe compressibility information. This is because keeping
+more compressible stripes in RAID 10 helps to increase the
+coverage of RAID 10 and hence beneﬁt the RAID speed per-
+formance. Since the FTL (ﬂash translation layer) inside SSDs
+must keep track the length of each compressed LBA data
+block, it may not be too difﬁcult for SSDs to support such
+per-LBA compression ratio query. In this case, given a cho-
+sen candidate stripe for promotion to RAID 10 (or demotion
+to RAID 5), the scheduler accepts this candidate for promo-
+tion (or demotion) with a probability being proportional (or
+inversely proportional) to its compression ratio (i.e., a more
+compressible candidate has a higher chance to be promoted
+into the RAID 10 region, and a less compressible candidate
+has a higher chance to be demoted to the RAID 5 region).
+Such a simple probabilistic approach could help to increase
+the number of hot stripes covered by RADI 10, without in-
+curring signiﬁcant CPU/memory usage during the decision
+process. If SSDs do not support per-LBA compression ratio
+
+query (e.g., they only support the query of the average com-
+pression ratio of the entire SSD), then the scheduler will treat
+all the chosen candidate stripes equally and randomly pick
+some or all of the chosen candidate stripes for promotion or
+demotion.
+
+3.3 Autonomous RAID Level Conversion
+
+This subsection presents a technique to further improve the
+implementation efﬁciency of elastic RAID. It is motivated
+by an observation that user data and their RAID parity could
+have signiﬁcantly different compressibility. For the purpose
+of demonstration, using two compression benchmark corpus
+ﬁles (i.e., ﬁle kennedy in the Canterbury corpus [8] and ﬁle
+samba in the Silesia corpus [39]) as user data, we measured
+the per-4KB compression ratio of both user data and RAID 5
+parity (assuming 3+1 RAID 5). Fig. 5 shows the histogram of
+measured per-4KB compression ratio (using the GZIP com-
+pression library), which clearly shows that RAID 5 parity has
+much worse compressibility than user data. For samba-based
+experiments, the RAID 5 parity data are even almost com-
+pletely incompressible. This phenomenon can be explained
+as follows: Lossless data compression is mainly realized by
+deduplicating repeated byte strings in the data stream. Differ-
+ent user data strips within the same stripe most likely have
+repeated byte strings at different locations inside 4KB blocks.
+As a result, being obtained by bit-wise XOR over multiple
+user data strips, RAID parity tends to have much less amount
+of repeated byte strings, leading to a much worse compress-
+ibility as illustrated in Fig. 5.
+
+Figure 5: Histograms of per-4KB compression ratio of user
+data and RAID 5 parity when using two compression bench-
+mark ﬁles in the Canterbury corpus [8] and Silesia cor-
+pus [39].
+
+This observation suggests that RAID 5 does not necessarily
+always consume less amount of post-compression physical
+storage space than RAID 10. Given a RAID 5 stripe over n+1
+drives, let αusr and αpty denote the compression ratio of user
+data and RAID parity. The RAID 5 stripe consumes a post-
+compression physical storage capacity that is proportional to
+
+6
+
++ 1
+αpty
+
+n
+. In comparison, its RAID 10 counterpart consumes
+αusr
+a post-compression physical storage capacity that is propor-
+tional to 2n
+. Apparently, if αusr > n · αpty, this RAID 5 stripe
+αusr
+will consume a larger amount of post-compression physical
+storage space than its RAID 10 counterpart. Hence, convert-
+ing this stripe from RAID 5 to RAID 10 is always desirable.
+This leads to the autonomous RAID level conversion: Elastic
+RAID periodically queries SSDs about the compression ratio
+of user data and parity (i.e., αusr and αpty) of each RAID 5
+stripe. For all the RAID 5 stripes in which αusr is larger
+than n · αpty, elastic RAID automatically converts them into
+RAID 10, independent from the scheduling process discussed
+above in Section 3.2. Of course, once a RAID 5 stripe has
+been autonomously converted into RAID 10, subsequent data
+updates may possibly degrade the user data compressibility
+so that αusr becomes less than n · αpty. To simplify the im-
+plementation, elastic RAID does not proactively search for
+such degraded RAID 10 stripes. Instead, elastic RAID simply
+leaves it to the scheduler, e.g., once the degraded RAID 10
+stripes have become relatively cold, the scheduler will natu-
+rally convert them back to RAID 5 if necessary.
+
+4 Implementation of Elastic RAID
+
+The above presented elastic RAID design strategy could be
+integrated into a software RAID solution or a dedicated hard-
+ware RAID card. For the purpose of demonstration, by mod-
+ifying the existing Linux mdraid [26], we implemented a
+Linux software elastic RAID (SW eRAID) that supports the
+dynamic mixture of RAID 5 and RAID 10. It implements
+a write journal to mitigate the well-known write hole prob-
+lem [31] of RAID 5 and meanwhile reduce the write request
+latency experienced by users. The write journal spans over
+all the SSDs and is protected by RAID 5 as well. Because
+of the append-only nature of journal, RAID 5 over the write
+journal is not subject to the write hole problem. Upon re-
+ceiving a write request, SW eRAID ﬂushes the data into the
+write journal and then immediately acknowledges the write
+completion to the user. Data are migrated from the write
+journal into their destined stripes asynchronously in the back-
+ground, which is realized in batches with multiple threads in
+order to prevent background data migration from becoming
+the overall RAID speed bottleneck. Since currently available
+SSDs with built-in transparent compression (i.e., the one from
+ScaleFlux Inc. [37]) have not yet been able to support per-
+LBA compression ratio query, this prototype SW eRAID does
+not incorporate the per-stripe compressibility into its RAID
+level conversion scheduling and does not implement the au-
+tonomous RAID level conversion. Once future SSDs support
+per-LBA compression ratio query, these features could be
+easily added into the SW eRAID.
+
+The RAID 5 vs. RAID 10 speed performance difference is
+most noticeable when serving (i) random data write requests
+
+or (ii) random read requests under degraded mode when one
+SSD is ofﬂine (e.g., one SSD suffers a catastrophic failure).
+This is mainly due to the large difference in terms of the
+read ampliﬁcation under these two scenarios, which can be
+explained as follows. Let n + 1 denote the total number of
+SSDs in the RAID system. Being protected by RAID 5, the
+write journal contributes a write ampliﬁcation of (n + 1)/n.
+To update a data block in one RAID 5 stripe, we need to read
+its old version and the corresponding parity block from SSDs,
+based on which we calculate the new parity block and then
+write the new version of both data block and parity block back
+to SSDs. This leads to a write ampliﬁcation of 2 and read
+ampliﬁcation of 2. In the case of RAID 10, we directly write
+the two copies of the data block to SSDs, leading to a write
+ampliﬁcation of 2 without any read operations. Under the
+degraded mode when one SSD is ofﬂine, RAID 5 typically
+only serves read requests, while RAID 10 could still serve
+both read and write requests. In the case of RAID 5, given the
+total n + 1 SSDs, 1/(n + 1) amount of user data are lost and
+hence must be reconstructed via RAID 5 calculation at the
+read ampliﬁcation of n. Therefore, the overall read ampliﬁca-
+tion is 2n/(n + 1). In the case of RAID 10, no user data are
+lost even if one drive is ofﬂine, hence the read ampliﬁcation
+is 1. Table 1 summarizes the write/read ampliﬁcation of the
+SW eRAID when serving random writes under the normal
+mode and random reads under the degraded mode. It clearly
+shows the signiﬁcant read ampliﬁcation difference between
+RAID 5 and RAID 10, which directly results in signiﬁcant
+speed performance difference.
+
+Table 1: Write/read ampliﬁcation under random data access.
+
+Random write
+(normal mode)
+WA
+2 + (n + 1)/n
+2 + (n + 1)/n
+
+RA
+2
+0
+
+Random read
+(degraded mode)
+RA
+2n/(n + 1)
+1
+
+RAID 5
+RAID 10
+WA: write ampliﬁcation; RA: read ampliﬁcation.
+
+5 Evaluation
+
+To evaluate the effectiveness of the proposed elastic RAID de-
+sign strategy and study the involved trade-offs, we carried out
+experiments on a server with a 26-core 2.5GHz Intel Xeon
+CPU, 565GB DRAM, and commercial NVMe SSDs with
+built-in transparent compression from ScaleFlux Inc. [37].
+The NVMe SSDs carry out hardware-based zlib [48] com-
+pression on each 4KB LBA data block directly along the I/O
+path. We applied the widely used FIO (ﬂexible I/O tester)
+tool [18] to generate heavy foreground random data access
+I/O workloads and collect the IOPS and tail latency results.
+The system OS is CentOS Linux release 7.6.1810, and the
+FIO version is 3.13. In all the experiments, RAID strip size is
+set as 4KB, and the RAID system contains 4 SSDs.
+
+7
+
+Figure 6: IOPS and 99% tail latency of (a) read requests and (b) write requests under different FIO 4KB random read/write-mixed
+workloads.
+
+5.1 Baseline RAID 5 Performance
+
+5.2 RAID 5 vs. RAID 10 Performance
+
+We ﬁrst carried out experiments to evaluate the baseline speed
+performance under random write workloads when the sys-
+tem operates in the RAID 5 only mode (i.e., all the data are
+protected by RAID 5). For the purpose of comparison, we
+also tested the existing Linux mdraid and the state-of-the-art
+software RAID product RAIDIX [34]. We focused on 4KB
+random write workloads over the entire LBA span to trigger
+the worst-case scenarios for RAID 5. To ensure sufﬁcient
+I/O workload stress over all the three RAID 5 systems, we
+conﬁgured FIO to run with 16 jobs at the I/O queue depth
+of 128. The RAID system contains total 4 SSDs (i.e., 3+1
+RAID 5). Table 2 lists the IOPS and tail latency results of the
+three different RAID 5 systems.
+
+Using our SW eRAID prototype, we evaluated and compared
+the speed performance when the system operates in RAID 5
+or RAID 10 mode. Table 3 and Table 4 list the IOPS and
+tail latency under 4KB random read and write workloads,
+respectively. To ensure sufﬁcient I/O workload stress on SSDs,
+we set 16 FIO jobs at the I/O queue depth of 128. Under
+random read workloads, regardless RAID 5 or RAID 10, the
+SSD array serves the same amount of read requests, leading
+to the similar IOPS and tail latency performance as shown
+in Table 3. The slight performance advantage of RAID 10
+over RAID 5 is due to the higher ﬂexibility of RAID 10 on
+choosing which SSD serves each read request.
+
+Table 3: SW eRAID performance under 4KB random read.
+
+Table 2: RAID 5 performance under 4KB random writes.
+
+RAID Mode
+
+IOPS
+
+RAID 5
+RAID 10
+
+2,469,538
+2,592,096
+
+Tail latency (ms)
+99.9%
+99%
+1.5
+1.1
+1.4
+1.0
+
+Linux mdraid
+RAIDIX
+SW eRAID
+
+IOPS
+
+59,003
+474,389
+677,829
+
+Tail latency (ms)
+99.9%
+99%
+43.8
+40.1
+246.4
+40.1
+14.9
+9.6
+
+The results show that RAIDIX and our SW eRAID can
+achieve one order of magnitude higher 4KB random write
+IOPS than Linux mdraid. This is mainly because Linux
+mdraid uses a single management thread to control the
+RAID 5 state machine. Although such single-thread man-
+agement implementation works well on HDD-based RAID,
+it could easily become the speed performance bottleneck of
+SSD-based RAID. Compared with RAIDIX, our SW eRAID
+achieves 1.4× higher 4KB random write IOPS at 4.2× shorter
+99% tail latency. Because we do not have access to the source
+code of RAIDIX, we conjecture that this is mainly due to
+the different implementation efﬁciency of background data
+movement from the write journal to destined stripes. The re-
+sults well demonstrate that our SW eRAID matches and even
+exceeds the state of the art of SW RAID implementation.
+
+In contrast to the case of random read workloads, as shown
+in Table 4, RAID 10 achieves 1.67× higher 4KB random
+write IOPS than RAID 5, while maintaining a similar tail
+latency. This is due to the signiﬁcantly less read ampliﬁcation
+of RAID 10 compared with RAID 5 under random write
+workloads as discussed above in Section 4.
+
+Table 4: SW eRAID performance under 4KB random write.
+
+RAID Mode
+
+IOPS
+
+RAID 5
+RAID 10
+
+677,829
+1,138,546
+
+Tail latency (ms)
+99.9%
+99%
+14.9
+9.6
+16.5
+10.0
+
+Fig. 6 shows the measured read/write IOPS and 99% tail
+latency under FIO 4KB random read/write-mixed workloads
+with three different R:W ratios including 30:70, 50:50, and
+70:30. The results show that the RAID 10 over RAID 5 per-
+
+8
+
+02468100200,000400,000600,000800,0001,000,0001,200,000RAID 5RAID 10RAID 5RAID 10RAID 5RAID 10R:W=30:70R:W=50:50R:W=70:3099% Tail Latency (ms)Read IOPS(a) Read IOPS and Tail LatencyIOPS99% Tail Latency02468100200,000400,000600,000800,000RAID 5RAID 10RAID 5RAID 10RAID 5RAID 10R:W=30:70R:W=50:50R:W=70:3099% Tail Latency (ms)Write IOPS(b) Write IOPS and Tail LatencyIOPS99% Tail Latencyformance advantage increases as the I/O workloads become
+more write-intensive. For example, under the R:W ratio of
+30:70, the read/write IOPS of RAID 10 is 1.16× higher than
+that of RAID 5, and the difference drops to 1.03 under the
+R:W ratio of 70:30. This is because RAID 10 vs. RAID 5
+speed performance difference mainly comes from the read
+ampliﬁcation difference under random writes.
+
+The above results were obtained under the normal con-
+ditions where all the SSDs are functional. Once one SSD
+becomes off-line (e.g., due to a catastrophic hardware failure),
+the RAID system will operate in the degraded mode and serve
+read requests only. Given the total 4 SSDs in the system, as
+discussed above in Section 4, RAID 5 suffers from a read am-
+pliﬁcation of 1.6 under the degraded mode, while RAID 10
+does not experience any read ampliﬁcation. Therefore, under
+the degraded mode, RAID 10 should be able to achieve much
+higher random read speed performance than RAID 5. Table 5
+lists the measured 4KB random read IOPS and tail latency
+when RAID 5 and RAID 10 operate in the degraded mode.
+To further stress the SSDs under read workloads, we increase
+the FIO job number from 16 to 32 while maintaining the
+same queue depth of 128. The results well demonstrate the
+advantage of RAID 10 over RAID 5 when serving random
+read requests in the degraded mode.
+
+Table 5: 4KB random read performance in degraded mode.
+
+RAID Mode
+
+IOPS
+
+RAID 5
+RAID 10
+
+1,434,445
+2,505,795
+
+Tail latency (ms)
+99.9%
+99%
+22.9
+14.5
+4.8
+4.4
+
+5.3 SW eRAID with mixed RAID 5/10
+
+Given sufﬁcient runtime user data compressibility, SW eRAID
+could transparently convert data protection from RAID 5
+to RAID 10 without sacriﬁcing the effective RAID storage
+capacity. As discussed and demonstrated above, RAID 10
+
+Figure 7: SW eRAID 4KB random write IOPS and 99% tail
+latency under different percentage of data being protected by
+RAID 10.
+
+9
+
+outperforms RAID 5 mainly in the presence of random write
+workloads and degraded mode. Fig. 7 shows the 4KB random
+write IOPS and tail latency when different percentages of
+data are protected by RAID 10. As user data compressibility
+improves, eRAID will convert the protection of more data
+from RAID 5 to RAID 10, which will lead to a higher overall
+RAID system I/O speed performance as shown in Fig. 7.
+
+Fig. 8 shows the 4KB random read IOPS and tail latency
+under the degraded mode when different percentages of data
+are protected by RAID 10. As one could intuitively justify,
+the read speed performance will improve when more data are
+protected under RAID 10 under a higher user data compress-
+ibility. As shown in Fig. 8, the 99% read tail latency largely
+drops even as the IOPS increases. This is because a higher
+percentage of RAID 10 leads to a lower read ampliﬁcation
+and hence a smaller read I/O queue depth, which directly
+contributes to shorter read latency.
+
+Figure 8: SW eRAID 4KB random read IOPS and 99% tail
+latency in the degraded mode under different percentage of
+data being protected by RAID 10.
+
+The above results show that the performance advantage of
+SW eRAID heavily depends on the percentage (denoted as
+Pconv) of data being converted from RAID 5 to RAID 10. In
+addition to the user data compressibility, Pconv also depends
+on the storage capacity expansion factor αexp ≥ 1 and stor-
+age capacity utilization factor βutil ≤ 1. Given the total n + 1
+SSDs and per-SSD physical storage capacity of C f lash, eRAID
+exposes a total logical storage capacity of αexp · n ·C f lash to
+the user. As we increase αexp to more aggressively leverage
+data compressibility to increase the effective RAID storage
+capacity, less amount of residual data compressibility will
+be left for RAID 5 to RAID 10 conversion. Meanwhile, as
+discussed above in Section 3.2, users may not always utilize
+100% of the storage capacity, and eRAID could accordingly
+schedule the RAID level conversion in response to the run-
+time storage capacity utilization factor βutil. Fig. 9 shows
+the percentage of RAID 10 under different storage capacity
+expansion factor αexp. We considered the cases of n = 3 or
+n = 5 (i.e., the RAID systems contains 4 or 6 SSDs). The
+storage capacity utilization factor βutil is set as 100% (i.e.,
+user fully utilizes the entire storage capacity exposed by the
+
+024681012 - 200,000 400,000 600,000 800,000 1,000,000 1,200,0000%20%40%60%80%100%99% Tail Latency (ms)Write IOPSRAID 10 PercentageIOPS99% Tail Latency - 2 4 6 8 10 12 14 16 - 500,000 1,000,000 1,500,000 2,000,000 2,500,000 3,000,0000%20%40%60%80%100%99% Tail Latency (ms)Read IOPSRAID 10 PercentageIOPS99% Tail LatencyFigure 9: Percentage of RAID 10 under different storage
+capacity expansion factor αexp.
+
+Figure 10: Percentage of RAID 10 under different storage
+capacity utilization factor βutil.
+
+RAID system). As discussed above in Section 3.3, RAID 5
+parity tends to have much worse compression ratio than user
+data. Let αusr and αpty denote the compression ratio of user
+data and RAID 5 parity, according to the results presented
+in Section 3.3, we set (αusr − 1) = 4(αpty − 1) so that the
+RAID 5 parity is incompressible (i.e., αpty = 1) when user
+data is incompressible (i.e., αusr = 1), and RAID 5 parity
+compression ratio is 1.5 when user data compression ratio
+is 3. As shown in Fig. 9, as we increase the storage capacity
+expansion factor αexp, a larger user data compression ratio is
+required to enable RAID 5 to RAID 10 conversion. Under a
+larger storage capacity expansion factor αexp, the RAID 10
+percentage will increase more slowly with the user data com-
+pression ratio αusr. For example, when αexp = 1.0, the user
+data compression ratio should increase from 1 to 1.6 in order
+to enable the 100% RAID 5 to RAID 10 conversion; when
+αexp = 1.8, the user data compression ratio must jump from
+1.8 to 2.8 in order to enable 100% RAID 5 to RAID 10 con-
+version. The results also show the noticeable impact of the
+total number of SSDs on the relationship between user data
+compressibility and RAID 10 coverage percentage, i.e., the
+more SSDs are deployed in the RAID system, the slower the
+RAID 10 coverage percentage will grow with the user data
+compression ratio.
+
+Fig. 10 shows the percentage of RAID 10 under different
+storage utilization factor βutil. We set the storage capacity
+expansion factor αexp as 1.8. The results show that under-
+utilized storage capacity could be effectively leveraged to
+improve the RAID 10 coverage percentage. For example,
+under the user data compression ratio of 2, the RAID 10
+coverage percentage is almost 0% when the storage capacity
+utilization factor βutil is 100%, and it will improve to 25%
+and 68% when βutil reduces to 90% and 80%, respectively.
+Since it is not uncommon for real production environment
+to have a storage capacity utilization factor of 80%∼90%
+or even below, the results suggest that the adaptive RAID
+level conversion scheduling could very noticeably improve
+the RAID 10 coverage percentage.
+
+The above results show that a small increase of user
+data compression ratio could enable noticeable increase of
+RAID 10 coverage percentage. Meanwhile, real-world I/O
+workloads typically exhibit considerable degrees of access
+locality. As discussed above in Section 3.2, eRAID could
+schedule RAID level conversion in adaptation to the runtime
+data access locality. Fig. 11 shows the 4KB random read
+IOPS in the degraded mode under random workload (i.e.,
+zero data access locality) and 80/20 skewed workload (i.e.,
+80% of reads hit 20% of data). The eRAID system storage
+capacity expansion factor αexp is set to 1.4, and the RAID
+storage capacity utilization factor βutil is set to 100%. The
+RAID 10 coverage percentage increases from 0% to 100%
+when the user data compression ratio increases from 1.4 to
+2.2. As shown in Fig. 11, under the 80/20 skewed workload,
+read IOPS could improve by 33% even when the user data
+compression ratio only increases from 1.4 to 1.6.
+
+Figure 11: SW eRAID 4KB random read IOPS in the de-
+graded mode under random and 80/20 skewed workloads.
+
+5.4 RAID Level Conversion
+
+We further evaluated the RAID level conversion and its impact
+on RAID system I/O speed performance. As discussed above,
+our SW eRAID implementation uses multiple background
+threads to carry out RAID level conversion between RAID 5
+
+10
+
+11.21.41.61.822.22.42.62.83User Data Compression Ratio0%50%100%150%RAID 10 Pecentagen=3, exp=1.0n=3, exp=1.4n=3, exp=1.8n=3, exp=2.2n=5, exp=1.0n=5, exp=1.4n=5, exp=1.8n=5, exp=2.21.41.61.822.22.42.62.83User Data Compression Ratio0%50%100%150%RAID 10 Pecentagen=3, util=80%n=3, util=90%n=3, util=100%n=5, util=80%n=5, util=90%n=5, util=100% - 500,000 1,000,000 1,500,000 2,000,000 2,500,000 3,000,0001.41.61.822.2Read IOPSUser Data Compuression RatioRandom80/20 SkewedTable 6: RAID level conversion throughput.
+Conversion
+mode
+
+# of conversion
+threads
+8
+24
+8
+24
+
+Throughput
+(GB/s)
+3.1
+6.4
+2.6
+5.1
+
+RAID 5 to RAID 10
+
+RAID 10 to RAID 5
+
+and RAID 10. The RAID level conversion throughput im-
+proves as we increase the number of RAID level conversion
+threads. Table 6 shows the RAID level conversion throughput
+in the absence of foreground user read/write requests. The
+RAID system contains 4 SSDs, and the user data compression
+ratio is set as 2:1. As discussed above in Section 3.1, RAID
+level conversion is performed on the per-stripe basis. To con-
+vert one stripe from RAID 5 to RAID 10, we only need to
+duplicate the data once within the stripe segment; to convert
+one stripe from RAID 10 to RAID 5, we need to fetch the
+data stripe, and calculate and write the RAID 5 parity. Hence,
+RAID 10 to RAID 5 conversion tends to have a lower through-
+put than RAID 5 to RADI 10 conversion, as shown in Table 6.
+The results show that the RAID level conversion can eas-
+ily achieve multi-GB/s throughput (without foreground user
+read/write requests), which well demonstrates the efﬁciency
+of the proposed elastic RAID implementation strategy.
+
+Next, we evaluated the impact of background RAID level
+conversion on the performance of SW eRAID serving fore-
+ground user read/write requests. It is reasonable to expect
+that average user data compression ratio typically does not
+signiﬁcantly vary over a short period (e.g., it is unlikely for
+the average user data compression ratio on a 32TB RAID sys-
+tem drops from 2 to 1.2 within just couple hours). Therefore,
+we could control the performance impact by throttling the
+background RAID level conversion throughput without com-
+promising the accuracy of RAID 10 coverage. Meanwhile, the
+impact of background RAID level conversion also depends
+
+Figure 12: Impact of background RAID 5 to RAID 10 conver-
+sion on heavy random read or write workloads with 32 FIO
+jobs.
+
+11
+
+Figure 13: Impact of background RAID 10 to RAID 5 conver-
+sion on heavy random read or write workloads with 32 FIO
+jobs.
+
+on the intensity of the foreground user read/write requests,
+i.e., the heavier the foreground I/O workloads are, the more
+severely they will be impacted by the background RAID level
+conversion. To exam the worst-case scenario, we use heavy
+4KB random read or write workloads with 32 FIO jobs to
+emulate very heavy foreground user I/O workloads. Fig. 12
+and Fig. 13 show the impact of background RAID level con-
+version under three different throttled conversion through-
+put, including 100MB/s, 200MB/s, and 400MB/s. The results
+show that, even under the very heavy 32-job FIO foreground
+I/O workloads, the impact of background RAID level conver-
+sion can be small (e.g., only few percentage of IOPS drop
+with 200MB/s background conversion). The results show that,
+compared with RAID 5 to RAID 10 conversion, RAID 10
+to RAID 5 conversion causes similar impact on random read
+speed performance but causes noticeably less impact on ran-
+dom write speed performance. This is because, compared
+with RAID 5 to RAID 10 conversion, RAID 10 to RAID 5
+conversion generates much less amount write trafﬁc to SSDs.
+
+5.5
+
+Impact of Stripe Selection Accuracy
+
+Finally, we studied the impact of non-ideal stripe selection for
+RAID level conversion. As discussed above in Section 3.2,
+elastic RAID should keep read/write-hot stripes in RAID 10,
+for which a data access classiﬁcation algorithm (e.g., second
+chance or LRU) must be used. Our SW eRAID prototype
+chose the simple and low-cost second chance algorithm. Re-
+gardless which classiﬁcation algorithm is chosen, its accuracy
+strongly depends on the runtime I/O workload characteris-
+tics, i.e., the more quickly the I/O data access locality varies,
+the less accurate the runtime data classiﬁcation will be. We
+carried out experiments to evaluate the impact of data classiﬁ-
+cation accuracy. We use two FIO processes to emulate 80/20
+skewed 4KB random write workloads. Fig. 14 shows the
+overall random write IOPS under different data classiﬁcation
+accuracy, e.g., 75% accuracy means the data classiﬁcation
+algorithm captures 75% of write-hot data under the 80/20
+
+0%20%40%60%80%100%120%140%160%0%2%4%6%8%10%12%14%16%100MB/s200MB/s400MB/s100MB/s200MB/s400MB/sRandom ReadRandom Write99% Tail Latency IncreaseIOPS DropIOPS Drop99% Tail Latency Increase0%10%20%30%40%50%60%70%80%0%2%4%6%8%10%12%100MB/s200MB/s400MB/s100MB/s200MB/s400MB/sRandom ReadRandom Write99% Tail Latency IncreaseIOPS DropIOPS Drop99% Tail Latency Increaseskewed 4KB random write workloads. For the purpose of
+comparison, we also considered a Random case where data
+are just randomly classiﬁed as write-hot. We studied four dif-
+ferent data compressibility under which 10%, 20%, 40%, and
+80% of data can be converted into RAID 10. As the data clas-
+siﬁcation accuracy improves, a higher percentage of write-hot
+data will be covered by RAID 10, leading to a higher write
+IOPS as shown in Fig. 14. Moreover, as data compressibility
+increases to enable a higher RAID 10 coverage, data classi-
+ﬁcation accuracy tends to have a less impact on the overall
+IOPS. For example, when 20% of data can be converted into
+RAID 10, write IOPS could increase by 20.6% if the data
+classiﬁcation accuracy improves from 50% to 100%. In com-
+parison, when 80% of data can be converted into RAID 10,
+increasing the data classiﬁcation accuracy from 50% to 100%
+improves write IOPS by only 6%. This further justiﬁes the
+use of low-cost data classiﬁcation algorithms (e.g., the second
+chance algorithm) in the practical implementation.
+
+Figure 14: Impact of data classiﬁcation accuracy on 4KB
+random write IOPS of 80/20 skewed workloads.
+
+6 Related Work
+
+RAID. As the most widely deployed data protection solution,
+RAID has been very well studied in the open literature. Prior
+work on RAID mainly focused on more accurately modeling
+and analyzing the RAID system reliability [2,16,17,25,27,41],
+reducing the drive rebuild time and accelerating the data recov-
+ery process [20,29,43,44,47], and better embracing the device
+characteristics of SSDs [3, 9, 22, 28]. Prior research [30, 45]
+also studied the implementation of tiered RAID systems
+consisting of a hot-data RAID 10 tier and warm/cold-data
+RAID 5/6 tier. The well-known AutoRAID [45] has been
+commercialized by HP from late 1990s to late 2000s. Operat-
+ing on traditional HDDs or SSDs, tiered RAID systems must
+employ complicated data management/migration strategies to
+realize dynamic tiering and embrace different data mapping
+functions of different RAID levels, and they are still funda-
+mentally subject to the speed performance vs. storage cost
+trade-off. These are at least part of the reason why HP termi-
+nated the AutoRAID product line. To our best knowledge, no
+
+12
+
+prior work has ever studied the feasibility of opportunistically
+leveraging runtime data compressibility to enable dynamic
+mixture of different RAID levels without sacriﬁcing the ef-
+fective data storage cost.
+
+Transparent Data Reduction. Prior research has well stud-
+ied the implementation of storage data reduction (e.g., com-
+pression and deduplication) with complete transparency to
+user applications. Transparent data reduction can be realized
+at the ﬁlesystem level [4, 6, 35, 40], block level [1, 24, 42],
+and even inside storage hardware [10, 12, 46, 49]. Modern
+all-ﬂash array products (e.g., Pure Storage FlashBlade [32])
+always come with the built-in hardware-based transparent
+compression capability. Cloud vendors have started to inte-
+grate hardware-based compression capability into their stor-
+age infrastructure, e.g., Microsoft Corsia [14] and emerging
+DPU (data processing unit) [7]. Motivated by the emergence
+of storage hardware with built-in transparent compression, re-
+searchers have recently studied its implications to the design
+of hash-based key-value store [13] and B-tree [33].
+
+SSD Sparse Addressing. Prior work studied how one could
+innovate the data management systems by making SSD ex-
+pose a sparse logical address space that is (much) larger than
+its internal physical storage capacity. FlashTier [36] utilizes
+the SSD sparse addressing to largely simplify the SSD cache
+management. FlashMap [21] integrates virtual address trans-
+lation and SSD FTL sparse address translation to efﬁciently
+support memory-mapped SSD ﬁles. Das et al. [15] presented a
+solution that leverages the SSD sparse addressing to facilitate
+application-level data compression. DFS ﬁlesystem [23] takes
+advantage of SSD sparse addressing to signiﬁcantly simplify
+its data management.
+
+7 Conclusions
+
+This paper presents an elastic RAID design strategy to take
+full advantage of modern SSDs with the built-in transparent
+compression capability. The key idea is to leverage the oppor-
+tunistically available residual data compressibility to enable
+dynamic RAID 5 to RAID 10 conversion, which can improve
+the RAID system speed performance without sacriﬁcing its ef-
+fective storage capacity. This paper develops a bloated stripe
+allocation design technique to enable simple and ﬁne-grained
+RAID level conversion by exploring the LBA space expan-
+sion capability of SSDs with built-in transparent compression,
+and presents a dynamic RAID level scheduling strategy that
+can help to realize the full potential of elastic RAID on im-
+proving the speed performance. This paper also presents a
+simple autonomous RAID level conversion method to further
+improve the effectiveness of elastic RAID. We implemented a
+software-based elastic RAID prototype in support of dynamic
+conversion between RAID 5 and RAID 10, and experimental
+results well demonstrate the effectiveness of the proposed
+elastic RAID design solution.
+
+200,000400,000600,000800,0001,000,0001,200,00010% RAID 1020% RAID 1040% RAID 1080% RAID 10Write IOPSRandom50% Accurate75% Accurate100% AccurateReferences
+
+[1] M. Ajdari, P. Park, J. Kim, D. Kwon, and J. Kim. CIDR:
+A cost-effective in-line data reduction system for terabit-
+In IEEE International
+per-second scale SSD arrays.
+Symposium on High Performance Computer Architec-
+ture (HPCA), pages 28–41. IEEE, 2019.
+
+[2] S. H. Baek, B. W. Kim, E. J. Joung, and C. W. Park.
+Reliability and performance of hierarchical RAID with
+multiple controllers. In ACM symposium on Principles
+of Distributed Computing, pages 246–254, 2001.
+
+[3] M. Balakrishnan, A. Kadav, V. Prabhakaran, and
+D. Malkhi. Differential raid: Rethinking raid for SSD
+reliability. ACM Transactions on Storage (TOS), 6(2):1–
+22, 2010.
+
+[4] J. Bonwick, M. Ahrens, V. Henson, M. Maybee, and
+M. Shellenbaum. The zettabyte ﬁle system. In Pro-
+ceedings of the Usenix Conference on File and Storage
+Technologies (FAST), volume 215, 2003.
+
+[5] Broadcom
+
+RAID
+
+Controller
+
+Cards.
+
+https://www.broadcom.com/products/storage/raid-
+controllers.
+
+[6] M. Burrows, C. Jerian, B. Lampson, and T. Mann. On-
+line data compression in a log-structured ﬁle system.
+ACM SIGPLAN Notices, 27(9):2–9, 1992.
+
+[7] I. Burstein. Nvidia Data Center Processing Unit (DPU)
+Architecture. In IEEE Hot Chips Symposium (HCS),
+pages 1–20, 2021.
+
+[8] Canterbury Corpus. https://corpus.canterbury.ac.nz.
+
+[9] H. H. Chan, Y. Li, P. P. Lee, and Y. Xu. Elastic parity
+logging for SSD RAID arrays: Design, analysis, and
+implementation. IEEE Transactions on Parallel and
+Distributed Systems, 29(10):2241–2253, 2018.
+
+[10] F. Chen, T. Luo, and X. Zhang. Caftl: A content-aware
+ﬂash translation layer enhancing the lifespan of ﬂash
+In Proceedings of
+memory based solid state drives.
+USENIX Conference on File and Storage Technologies
+(FAST), volume 11, pages 77–90, 2011.
+
+[11] P. M. Chen, E. K. Lee, G. A. Gibson, R. H. Katz, and
+D. A. Patterson. RAID: High-performance, reliable
+secondary storage. ACM Computing Surveys (CSUR),
+26(2):145–185, 1994.
+
+[12] X. Chen, Y. Li, J. Hao, H. Shin, M. Suh, and T. Zhang. Si-
+multaneously reducing cost and improving performance
+of NVM-based block devices via transparent data com-
+pression. In Proceedings of the International Sympo-
+sium on Memory Systems, pages 331–341, 2019.
+
+[13] X. Chen, N. Zheng, S. Xu, Y. Qiao, Y. Liu, J. Li, and
+T. Zhang. KallaxDB: A table-less hash-based key-value
+store on storage hardware with built-in transparent com-
+In Proceedings of the International Work-
+pression.
+shop on Data Management on New Hardware (DaMoN),
+pages 1–10, 2021.
+
+[14] D. Chiou, E. Chung, and S. Carrie. (Cloud) Acceleration
+
+at Microsoft. Tutorial at Hot Chips, 2019.
+
+[15] D. Das, D. Arteaga, N. Talagala, T. Mathiasen, and
+J. Lindström. NVM compression-hybrid ﬂash-aware
+application level compression. In Workshop on Interac-
+tions of NVM/Flash with Operating Systems and Work-
+loads (INFLOW), 2014.
+
+[16] J. Elerath and M. Pecht. A highly accurate method
+for assessing reliability of redundant arrays of inexpen-
+sive disks (RAID). IEEE Transactions on Computers,
+58(3):289–299, 2008.
+
+[17] J. G. Elerath and J. Schindler. Beyond MTTDL: A
+closed-form RAID 6 reliability equation. ACM Transac-
+tions on Storage (TOS), 10(2):1–21, 2014.
+
+[18] Flexible I/O Tester. https://github.com/axboe/ﬁo.
+
+[19] E. F. Haratsch. SSD with Compression: Implementation,
+Interface and Use Case. In Flash Memory Summit, 2019.
+
+[20] M. Holland and G. A. Gibson. Parity declustering for
+continuous operation in redundant disk arrays. ACM
+SIGPLAN Notices, 27(9):23–35, 1992.
+
+[21] J. Huang, A. Badam, M. K. Qureshi, and K. Schwan.
+Uniﬁed address translation for memory-mapped SSDs
+In Proceedings of the International
+with FlashMap.
+Symposium on Computer Architecture (ISCA), pages
+580–591, 2015.
+
+[22] S. Im and D. Shin. Flash-aware RAID techniques for
+dependable and high-performance ﬂash memory SSD.
+IEEE Transactions on Computers, 60(1):80–92, 2010.
+
+[23] W. K. Josephson, L. A. Bongo, K. Li, and D. Flynn.
+Dfs: A ﬁle system for virtualized ﬂash storage. ACM
+Transactions on Storage (TOS), 6(3):1–25, 2010.
+
+[24] Y. Klonatos, T. Makatos, M. Marazakis, M. D. Flouris,
+and A. Bilas. Transparent online storage compression
+at the block-level. ACM Transactions on Storage (TOS),
+8(2):1–33, 2012.
+
+[25] Y. Li, P. P. Lee, and J. C. Lui. Stochastic analysis on raid
+reliability for solid-state drives. In IEEE International
+Symposium on Reliable Distributed Systems, pages 71–
+80, 2013.
+
+[26] Linux mdraid. https://raid.wiki.kernel.org/.
+
+13
+
+[27] F. Machida, R. Xia, and K. S. Trivedi. Performability
+modeling for RAID storage systems by markov regener-
+ative process. IEEE Transactions on Dependable and
+Secure Computing, 15(1):138–150, 2015.
+
+[28] S. Moon and A. N. Reddy. Don’t let RAID raid the
+lifetime of your SSD array. In USENIX Workshop on
+Hot Topics in Storage and File Systems (HotStorage),
+2013.
+
+[29] R. R. Muntz and J. C. S. Lui. Performance analysis of
+disk arrays under failure. In International Conference on
+Very Large Data Bases (VLDB), pages 162–173, 1990.
+
+[39] Silesia Corpus. https://github.com/MiloszKrajewski/SilesiaCorpus.
+
+[40] K. Srinivasan, T. Bisson, G. R. Goodson, and K. Voru-
+ganti. iDedup: latency-aware, inline data deduplication
+for primary storage. In USENIX Conference on File and
+Storage Technologies (FAST), pages 1–14, 2012.
+
+[41] A. Thomasian and M. Blaum. Higher reliability redun-
+dant disk arrays: Organization, operation, and coding.
+ACM Transactions on Storage (TOS), 5(3):1–59, 2009.
+[42] Virtual Data Optimizer (VDO). https://github.com/dm-
+
+vdo/vdo.
+
+[30] N. Muppalaneni and K. Gopinath. A multi-tier RAID
+storage system with RAID1 and RAID5. In Proceed-
+ings of International Parallel and Distributed Process-
+ing Symposium (IPDPS), pages 663–671, 2000.
+
+[43] J. Wan, J. Wang, Q. Yang, and C. Xie. S2-RAID: A
+new RAID architecture for fast data recovery. In IEEE
+Symposium on Mass Storage Systems and Technologies
+(MSST), pages 1–9, 2010.
+
+[31] D. A. Patterson, G. Gibson, and R. H. Katz. A case
+for redundant arrays of inexpensive disks (RAID). In
+Proceedings of the ACM international conference on
+Management of data (SIGMOD), pages 109–116, 1988.
+
+[44] Y. Wang, X. Yin, and X. Wang. MDR codes: A new class
+of RAID-6 codes with optimal rebuilding and encoding.
+IEEE Journal on Selected Areas in Communications,
+32(5):1008–1018, 2014.
+
+[32] Pure Storage FlashBlade. https://purestorage.com/.
+
+[33] Y. Qiao, X. Chen, N. Zheng, J. Li, Y. Liu, and T. Zhang.
+Closing the b+-tree vs. lsm-tree write ampliﬁcation gap
+on modern storage hardware with built-in transparent
+compression. In USENIX Conference on File and Stor-
+age Technologies (FAST), pages 1–14, 2022.
+
+[34] RAIDIX. https://www.raidix.com.
+
+[35] O. Rodeh, J. Bacik, and C. Mason. BTRFS: The Linux
+B-tree ﬁlesystem. ACM Transactions on Storage (TOS),
+9(3):1–32, 2013.
+
+[36] M. Saxena, M. M. Swift, and Y. Zhang. Flashtier: a
+lightweight, consistent and durable storage cache. In
+Proceedings of the ACM European conference on Com-
+puter Systems, pages 267–280, 2012.
+
+[45] J. Wilkes, R. Golding, C. Staelin, and T. Sullivan. The
+HP AutoRAID hierarchical storage system. ACM Trans-
+actions on Computer Systems (TOCS), 14(1):108–136,
+1996.
+
+[46] G. Wu and X. He. Delta-FTL: improving SSD lifetime
+via exploiting content locality. In Proceedings of the
+7th ACM European Conference on Computer Systems
+(EuroSys), pages 253–266, 2012.
+
+[47] L. Xiang, Y. Xu, J. C. Lui, and Q. Chang. Optimal
+recovery of single disk failure in RDP code storage
+systems. ACM SIGMETRICS Performance Evaluation
+Review, 38(1):119–130, 2010.
+
+[48] zlib. http://zlib.net.
+
+[37] ScaleFlux Computational Storage. http://scaleﬂux.com.
+
+[38] A. Silberschatz, P. B. Galvin, and G. Gagne. Operating
+
+system concepts essentials. Wiley Publishing, 2013.
+
+[49] A. Zuck, S. Toledo, D. Sotnikov, and D. Harnik. Com-
+pression and SSDs: Where and how? In Workshop on
+Interactions of NVM/Flash with Operating Systems and
+Workloads (INFLOW), 2014.
+
+14
+
+

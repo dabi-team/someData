@@ -1,0 +1,1858 @@
+Finding and Analyzing Crash-Consistency Bugs
+in Persistent-Memory File Systems
+
+Hayley LeBlanc
+University of Texas at Austin
+
+Shankara Pailoor
+University of Texas at Austin
+
+Isil Dillig
+University of Texas at Austin
+
+James Bornholt
+University of Texas at Austin
+
+Vijay Chidambaram
+University of Texas at Austin and VMware Research
+
+2
+2
+0
+2
+
+r
+p
+A
+2
+1
+
+]
+S
+O
+.
+s
+c
+[
+
+1
+v
+6
+6
+0
+6
+0
+.
+4
+0
+2
+2
+:
+v
+i
+X
+r
+a
+
+Abstract
+
+We present a study of crash-consistency bugs in persistent-
+memory (PM) ﬁle systems and analyze their implications
+for ﬁle-system design and testing crash consistency. We de-
+velop FLYTRAP, a framework to test PM ﬁle systems for
+crash-consistency bugs. FLYTRAP discovered 18 new bugs
+across four PM ﬁle systems; the bugs have been conﬁrmed
+by developers and many have been already ﬁxed. The dis-
+covered bugs have serious consequences such as breaking
+the atomicity of rename or making the ﬁle system unmount-
+able. We present a detailed study of the bugs we found and
+discuss some important lessons from these observations. For
+instance, one of our ﬁndings is that many of the bugs are
+due to logic errors, rather than errors in using ﬂushes or
+fences; this has important applications for future work on
+testing PM ﬁle systems. Another key ﬁnding is that many
+bugs arise from attempts to improve efﬁciency by perform-
+ing metadata updates in-place and that recovery code that
+deals with rebuilding in-DRAM state is a signiﬁcant source
+of bugs. These observations have important implications for
+designing and testing PM ﬁle systems. Our code is available
+at https://github.com/utsaslab/flytrap.
+
+1 Introduction
+
+Persistent memory (PM) is a new storage-class memory
+technology that offers extremely low-latency persistent stor-
+age and ﬁne-grained access to storage over the memory
+bus [22,47]. PM technology has long been a focus of research,
+and more recently has been commercialized by Intel [3]. A
+number of ﬁle systems [8, 14, 17, 18, 24, 25, 28, 43, 45] have
+been developed that exploit PM’s advantages to build faster,
+safer storage systems.
+
+One of the main responsibilities of a ﬁle system is to keep
+the user’s data safe in the event of a crash due to a power
+loss or a kernel bug. To do so, the ﬁle system should be
+crash consistent: it should recover after the failure to a con-
+sistent state without losing data the user expected to be per-
+sistent [11, 12, 20, 41]. However, there are no open-source
+tools that can test whether a PM ﬁle system is crash consis-
+tent without annotating or modifying the ﬁle system. Existing
+
+crash consistency testing tools like CrashMonkey [38] or Hy-
+dra [27] are not compatible with the unique storage stack of
+PM ﬁle systems where the media is directly accessed using
+processor load and store instructions at ﬁne granularity.
+
+This paper makes two contributions. First, it presents FLY-
+TRAP, a framework for testing the crash consistency of PM
+ﬁle systems (§3). Given a workload, and a target PM ﬁle sys-
+tem, FLYTRAP simulates crashes at different points in the
+workload, creating crash states reﬂecting the on-PM state
+after the crash; FLYTRAP then mounts the target PM ﬁle
+system on the crash state, and checks if it recovers correctly.
+FLYTRAP does not require modifying the ﬁle system im-
+plementation, and is compatible with all PM ﬁle systems
+that implement the POSIX interface. To choose workloads
+to test, we couple FLYTRAP with a modiﬁed version of the
+ACE [38] workload generator and the Syzkaller [7] gray-box
+fuzzer. While ACE systematically generates small workloads
+for FLYTRAP to test, Syzkaller generates random workloads
+driven by code coverage.
+
+Second, this paper presents an analysis of 18 unique bugs
+found by FLYTRAP across four PM ﬁle systems (§5). We
+have reported all 18 bugs upstream; all except the two bugs in
+PMFS (which is not actively maintained) have been conﬁrmed
+by their developers, and 12 have already been ﬁxed. The bugs
+have severe consequences such as breaking the atomicity of
+the rename() system call that applications depend on for
+atomic updates [40]. To the best of our knowledge, this is the
+largest published corpus of PM ﬁle-system crash-consistency
+bugs; analyzing it yields useful insights for both PM ﬁle-
+system design and efﬁcient crash-consistency testing of PM
+ﬁle systems. For example, we observe that many bugs are
+logic or design issues in performance optimizations rather
+than the missing ﬂush/fence bugs that many PM bug-ﬁnding
+tools target [5, 16, 19, 21, 31–33, 39].
+
+Why is testing crash-consistency for PM ﬁle systems
+hard? The unique architecture of PM ﬁle systems creates two
+challenges for effective testing. The ﬁrst challenge is to inter-
+cept writes to the storage media. Existing crash-consistency
+testing tools such as CrashMonkey [38] intercept writes at the
+block layer, but PM ﬁle systems remove this natural intercep-
+tion point. Instead, they write directly to the media using pro-
+
+1
+
+ 
+ 
+ 
+ 
+ 
+ 
+cessor store instructions, which would be prohibitively expen-
+sive to instrument and require reasoning about the CPU cache
+hierarchy and store reordering to model faithfully. The second
+challenge is choosing which crash states to test. CrashMon-
+key and Hydra [27] only simulate crashes after system calls
+have returned, as most ﬁle systems only make strong crash-
+consistency guarantees after fsync() or sync() calls. PM
+ﬁle systems take advantage of the low-latency, ﬁne-grained
+media to offer stronger consistency guarantees by making
+every ﬁle-system operation synchronous and durable. This
+means that to ﬁnd crash consistency bugs, we must test crashes
+in the middle of system calls. The ﬁne granularity of PM
+writes (8 bytes) also leads to more possible crash states than
+traditional ﬁle systems with block-sized writes.
+
+FLYTRAP. FLYTRAP tackles these challenges by exploiting
+insights about the way PM ﬁle systems are built. To intercept
+writes, we observe that the PM ﬁle systems we studied all
+have centralized persistence functions that perform writes to
+PM, rather than using inline assembly at different points in
+the code. For example, there is a memcpy() implementation
+that uses non-temporal stores to write to PM. FLYTRAP uses
+Kprobes [4] to intercept these functions and record write IOs
+without modifying the ﬁle system. Intercepting writes at the
+function level rather than the instruction level greatly reduces
+overhead. We further reduce this overhead by noting that only
+data that is explicitly ﬂushed can be used to provide crash-
+consistency guarantees. Rather than intercepting all writes,
+FLYTRAP only tracks writes that are explicitly ﬂushed or are
+written with non-temporal stores.
+
+To choose which crash states to test, we build on this higher-
+level interception as well as empirical results about the write
+patterns of PM ﬁle systems. Intercepting at the function level
+allows us to see an entire ﬁle-system-level write at once, and
+so we can coalesce individual 8-byte stores when appropriate;
+for example, we need not test each 8-byte write of a 1 MB
+write() call separately. We also observe that the set of in-
+ﬂight writes (writes in volatile caches that have not yet been
+ﬂushed) at any point in a system call is typically small, re-
+ducing the number of crash states FLYTRAP must explore.
+Finally, we observe that the order in which non-overlapping
+in-ﬂight writes are written to PM does not matter, and so
+FLYTRAP only considers different subsets of in-ﬂight writes
+being persisted rather than all permutations.
+
+Generating workloads. Given a workload, FLYTRAP pro-
+vides a mechanism to generate and test crash states; an or-
+thogonal question is deciding which workloads to explore.
+CrashMonkey [38] hypothesized that systematically explor-
+ing small workloads on small ﬁle system states was effective
+in ﬁnding crash-consistency bugs; we sought to test this hy-
+pothesis for PM ﬁle systems. We modify the Automatic Crash
+Explorer (ACE) workload generator from CrashMonkey to
+account for the fact that system calls are synchronous in the
+tested systems, eliminating the need for fsync(). To try to
+
+invalidate the hypothesis, we also use the Syzkaller [7] gray-
+box kernel fuzzer that can generate longer, more complex
+workloads. We modify Syzkaller to only consider ﬁle-system-
+related system calls and to include recovery code when mea-
+suring code coverage.
+
+Testing results and observations. We use FLYTRAP to test
+four open-source in-kernel PM ﬁle systems: PMFS [18],
+NOVA [45], NOVA-Fortis [46], and WineFS [24]. FLYTRAP
+ﬁnds 18 unique bugs across the four ﬁle systems, with two
+bugs present both in PMFS and WineFS (which builds on
+PMFS). From these results, we draw some common observa-
+tions about PM ﬁle systems and how to test them:
+
+• The CrashMonkey hypothesis about simple workloads
+ﬁnding many crash-consistency bugs also holds for PM
+ﬁle systems: 15 of 18 bugs are found by the systematic
+exploration of our modiﬁed ACE.
+
+• A majority of the discovered bugs (11/18) could only be
+found by simulating a crash in the middle of a system
+call, meaning that existing tools that test only between
+system calls would not have been effective.
+
+• While a number of recent tools focus on ﬁnding missing
+or duplicate cache ﬂushes and fences in PM applica-
+tions [5, 16, 19, 21, 31–33, 39], we found that a majority
+of the bugs (14/18) did not result from such issues, but
+instead from mistakes in logic (e.g., a metadata item that
+was not added to a transaction).
+
+• PM ﬁle systems increase performance by maintaining
+some data structures only in DRAM, and rebuilding them
+when the ﬁle system is mounted [24, 25, 45]; FLYTRAP
+found seven bugs in such code.
+
+• Six bugs arose from developers trying to increase per-
+formance by updating metadata in-place, which is much
+easier to do with the ﬁne-grained access model of PM,
+rather than inside a transaction.
+
+• NOVA-Fortis [46] contains a number of features not
+present in NOVA [45] that are intended to increase re-
+silience; interestingly, FLYTRAP found ﬁve bugs in these
+complex features.
+
+The analysis contains a number of other observations, along
+with a discussion of their implications. To the best of our
+knowledge, this is the ﬁrst such analysis of crash-consistency
+bugs in PM ﬁle systems.
+
+In summary, this paper makes the following contributions:
+
+• A set of tools to test crash-consistency of PM ﬁle sys-
+
+tems, including the FLYTRAP framework (§3)
+
+• A corpus of 18 crash-consistency bugs discovered by
+
+these tools across four PM ﬁle systems (§4)
+
+• An analysis of discovered crash-consistency bugs, with
+insights for PM ﬁle-system design and crash-consistency
+testing (§5)
+
+2
+
+2 Background and Motivation
+
+This section describes ﬁle-system crash consistency. It then
+discusses why crash consistency is important, why testing it
+for PM ﬁle systems is challenging, and why existing tools do
+not solve this problem.
+
+Crash consistency. A ﬁle system is crash consistent if it
+maintains a set of guarantees about its data and metadata
+after a crash due a power loss or a kernel bug [12, 20, 41].
+For example, if there is a crash in the middle of a rename()
+system call, the POSIX standard requires that the ﬁle system
+after recovery should have the ﬁle in either the old name or
+the new name; in other words, rename must be atomic even if
+there is a crash [6].
+
+Many applications depend on the ﬁle system to be crash
+consistent [40]. Continuing with the rename example, many
+applications including text editors such as emacs and vim use
+temporary ﬁles to store user data, and rename the temporary
+ﬁles over the original ﬁles when the user saves the ﬁle. If
+rename is not atomic, these applications can lose user data in
+a crash. Unexpected power loss occurs even in professionally-
+managed data centers [34–37, 42, 44]. Thus, it is important to
+ensure that ﬁle systems are crash consistent.
+
+Persistent memory (PM). Persistent memory technology,
+recently commercialized as Intel Optane DC Persistent Mem-
+ory [2,3], combines the properties of traditional storage media
+and DRAM; it is byte-addressable and connected to the mem-
+ory bus like DRAM, but provides persistence like traditional
+storage media. Compared to DRAM, Optane PM provides
+0.33× read bandwidth, 0.17× write bandwidth, 2–4× higher
+read latency, and similar write latency.
+
+In the x86 programming model, PM is accessed via pro-
+cessor load and store instructions. Writes to PM ﬂow through
+the CPU cache hierarchy like any other memory store, and so
+do not become immediately persistent. Data can be ﬂushed
+from CPU caches to persistent media with cache line ﬂush in-
+structions (clfush, clflushopt, clwb), or can bypass cache
+entirely with non-temporal stores (movnt). Because writes to
+PM are processor stores, they are also subject to CPU store
+reordering, and so must be surrounded by store fences when
+preserving order is important for consistency. We say that data
+whose cache line has been written back, or which was written
+using non-temporal stores, is ﬂushed to PM once a subse-
+quent store fence instruction has executed, as it is guaranteed
+to reach media before any future writes. We term a write that
+has not yet been ﬂushed to persistent media an in-ﬂight write;
+in-ﬂight writes may be lost in the case of a crash. If there
+are multiple in-ﬂight writes, they may be written to persistent
+media in any order.
+
+PM ﬁle systems. PM ﬁle systems differ from traditional ﬁle
+systems in a few important aspects. First, traditional ﬁle sys-
+tems have a long software path for writes along the storage
+stack; all writes go through the block layer, and most through
+
+the page cache, before hitting the storage media. In the case
+of PM, writes are performed using processor stores, providing
+a signiﬁcantly shorter path from ﬁle system to storage media.
+Second, while traditional ﬁle systems buffer updates in mem-
+ory before writing them to storage, PM ﬁle systems tend to
+synchronously write to persistent media given the low latency
+and high bandwidth of PM [18, 24, 25, 28]. As a result, every
+system call leads to persistent writes, not just fsync() and
+sync().
+These design decisions lead to two challenges when testing
+PM ﬁle systems for crash consistency:
+
+• Intercepting writes is challenging. Existing tools to test
+crash-consistency intercept writes at the block layer and
+use the intercepted write I/O to construct crash states.
+PM ﬁle systems remove this natural interception point.
+PM ﬁle systems write to the persistent media using pro-
+cessor store instructions; the small granularity of the
+store instruction (8 bytes) also increases the number of
+instructions that would need to be intercepted. A naive
+solution such as intercepting each store instruction (even
+if we could correctly identify stores to PM) would be
+prohibitively expensive.
+
+• Increase in crash states to explore. While existing crash-
+consistency testing frameworks only simulate crashes at
+system-call boundaries, testing PM ﬁle systems requires
+simulating crashes in the middle of system calls. This is
+because PM ﬁle systems persist state synchronously in
+ﬁle-system operations, instead of buffering them until
+fsync(). The small granularity of writes also increases
+the number of potential crash states resulting from each
+write or metadata operation. Testing crash consistency
+in PM ﬁle systems requires simulating crashes in the
+middle of each ﬁle-system operation, versus just after
+fsync() or sync() calls.
+
+Why current tools are not enough. CrashMonkey [38] and
+Hydra [27] can be used to check the crash consistency of
+traditional ﬁle systems. However, they only simulate crashes
+at the end of system calls such as fsync() because that is
+when persistence is guaranteed. However, PM ﬁle systems
+have stronger persistence guarantees, and we need to simulate
+crashes in the middle of the system call, not only at the end.
+It is not straightforward to do this since the persistence guar-
+antees are unclear when crashing in the middle of a system
+call. Moreover, CrashMonkey and Hydra cannot intercept PM
+writes.
+
+Yat [29] is an internal tool used by Intel to test the crash
+consistency of PM software, including PM ﬁle systems. Yat
+uses a hypervisor-based recording technique to log all writes
+to PM and reconstructs crash states to check. It produces
+an extremely large number of crash states; one of the three
+reported test workloads used with PMFS would take over ﬁve
+
+3
+
+years to run fully. Yat is not open source, and the exact set of
+bugs it found is not available.
+
+A number of tools are available for checking PM software
+for PM programming errors: errors associated with persist-
+ing data to PM, such as missing or unnecessary cache-line
+ﬂushes or store fences [5, 16, 19, 21, 31–33, 39]. PMTest [33],
+XFDetector [32], Pmemcheck [5], and PMDebugger [16] re-
+quire manual annotation, which we seek to avoid. All of them
+are primarily focused on low-level PM programming errors
+or narrow classes of logic bugs that are directly related to
+PM management. For example, Witcher [19] looks for ﬁne-
+grained “persistence atomicity violations” in which sequences
+of writes to PM that are assumed to be atomic can be inter-
+rupted by a crash. Agamotto [39], which uses symbolic execu-
+tion to track the state of PM, also allows developers to provide
+custom bug oracles to check for precise, low-level properties
+about a program; for example, that a speciﬁc type of structure
+is always modiﬁed within a transaction. We are interested in
+checking the higher-level crash consistency guarantees pro-
+vided by PM ﬁle systems and the POSIX interface without
+requiring speciﬁcations from developers, so these tools are
+not sufﬁcient.
+
+In summary, there is a strong need for a tool that can be
+used to efﬁciently test PM ﬁle systems for crash consistency
+without requiring manual annotations.
+
+3 FLYTRAP
+
+We present FLYTRAP, a new framework to ﬁnd crash-
+consistency bugs in PM ﬁle systems. FLYTRAP tackles the
+challenges outlined in §2 by exploiting two characteristics of
+PM ﬁle systems: centralized persistence functions and limited
+number of in-ﬂight writes. FLYTRAP can be run on all PM ﬁle
+systems implementing the POSIX API, and it neither requires
+manual annotations nor modifying the ﬁle-system code.
+
+FLYTRAP takes as input a workload to execute against
+a chosen ﬁle system and outputs bug reports with enough
+details to reproduce the bug. We have developed two workload
+generators: one based on the ACE tool [38] for exhaustively
+enumerating ﬁle-system operations, and one based on the
+Syzkaller gray-box fuzzer [7]. Together, these tools offer an
+automated and off-the-shelf approach for discovering bugs in
+PM ﬁle systems.
+
+This section ﬁrst provides an overview of the end-to-end
+bug ﬁnding process (§3.1). It then describes how FLYTRAP
+tackles the main challenges in testing PM crash consistency
+(§3.2). It then presents the architecture of FLYTRAP (§3.3)
+and workload generators (§3.4), followed by a discussion of
+the limitations of the framework (§3.5).
+
+Figure 1: Architecture. Given a target ﬁle system and its
+persistence functions, FLYTRAP uses workloads from both
+ACE and Syzkaller to test the ﬁle system. FLYTRAP produces
+bug reports with enough detail to reproduce the bug.
+
+given workload (a sequence of ﬁle-system operations) and
+records the writes made by the ﬁle system. It then replays
+these writes to create crash images, which represent the state
+of the system if it had crashed at different points during the
+workload. FLYTRAP constructs crash images for crash points
+both during and after system calls. FLYTRAP mounts the tar-
+get ﬁle system on the crash image, lets it recover, and then
+checks whether it has recovered to a consistent state. Consis-
+tency is workload-speciﬁc; for example, if the crash happened
+in the middle of a rename, FLYTRAP will check whether the
+old ﬁle or the new ﬁle exists. Both ﬁles missing or both ﬁles
+existing would result in a bug report. The bug report contains
+the workload, the crash point, the ﬁle-system state after crash,
+what was expected, and the ﬁle system and kernel version.
+
+The ACE workload generator is based on a hypothesis
+outlined in the CrashMonkey work [38]: that testing small
+workloads (with a few ﬁle-system operations) on a newly
+created ﬁle system is useful for ﬁnding crash-consistency
+bugs. We use the ACE workload generator with FLYTRAP to
+test if this hypothesis holds for PM ﬁle systems. We modify
+ACE to take into account the properties of PM ﬁle systems,
+such as all operations being synchronous.
+
+To try to disprove the hypothesis, we also use the Syzkaller
+gray-box fuzzer to generate long, complex, and randomized
+workloads for FLYTRAP. Syzkaller tries to generate random
+tests that increase code coverage. We modiﬁed Syzkaller to
+take the recovery code into account when calculating code
+coverage.
+
+Finally, we cluster bug reports based on their text, such as
+the error (e.g., missing ﬁle) and the workload. This allows us
+to efﬁciently ﬁnd and report unique bugs to developers.
+
+3.1 Overview
+
+Figure 1 provides an overview of the FLYTRAP framework.
+FLYTRAP is a record and replay framework. It ﬁrst runs a
+
+FLYTRAP tackles the challenges in testing PM ﬁle systems
+for crash consistency (§2) by exploiting two characteristics
+of PM ﬁle systems.
+
+3.2 Challenges
+
+4
+
+ACE workloadsSyzkaller workloadsWrite LoggerCrash stateOracle stateCrash  Consistency CheckerBug ReportPersistence Functions for Target File SystemFlyTrapIntercepting writes. Intercepting the write trafﬁc of a PM
+ﬁle system is more complex than a traditional ﬁle system
+because PM ﬁle systems do not use the usual block layer to
+write data to the storage media, removing a convenient inter-
+ception point. Instead, PM ﬁle systems use processor store,
+fence, and cache ﬂush instructions directly. However, all in-
+kernel PM ﬁle system implementations we examined include
+centralized persistence functions to interact with the PM de-
+vice rather than directly using inline assembly at each write
+location. In particular, every ﬁle system we evaluate in this pa-
+per offered four persistence functions: non-temporal memcpy,
+non-temporal memset, cache line ﬂush, and store fence. These
+abstractions simplify reasoning about PM semantics and po-
+tentially enable portability to other architectures.
+
+We exploit this observation to simplify intercepting writes
+by requiring the ﬁle system developer to provide FLYTRAP
+with annotations to identiﬁes these four persistence functions
+for their ﬁle system. FLYTRAP then automatically instruments
+these functions at run time using the Kprobes [4] debugging
+mechanism in the Linux kernel.
+
+Increased number of crash states. PM ﬁle systems make
+very ﬁne-grained writes to storage media. Also, since these
+systems perform operations synchronously, they provide
+strong guarantees about crash consistency at all times, not
+just after fsync(). As a result, a workload can result in sig-
+niﬁcantly more crash states that are interesting to test in a PM
+ﬁle system than in a block-based ﬁle system. We handle the
+large number of crash states by exploiting three observations:
+
+• Data required for crash consistency must be ﬂushed.
+While the PM ﬁle system may write a lot of data, only
+data that is explicitly ﬂushed or is written via non-
+temporal stores can be relied upon to be persistent. Crash-
+Monkey [38] and Hydra [27] leverage a similar observa-
+tion to only simulate crashes after fsync() and sync().
+FLYTRAP exploits this observation to only track writes
+when they are ﬂushed — it collects write information
+only for cache ﬂushes and non-temporal writes. This
+drastically reduces the overhead of logging and the num-
+ber of functions FLYTRAP must track.
+
+• Order of in-ﬂight writes does not matter. If there are two
+in-ﬂight writes A and B (data in volatile CPU caches
+that has not been ﬂushed yet), the order in which A and
+B are persisted does not matter. A crash state where A
+is written ﬁrst followed by B is equivalent to a crash
+state where B is followed by A. If A and B are writes to
+the same cache line, x86 enforces sequential ordering.
+As a result, we do not have to consider re-orderings
+of in-ﬂight writes. FLYTRAP creates crash states using
+different subsets of in-ﬂight writes, taking into account
+writes to the same cache line.
+
+• Small number of in-ﬂight writes. The number of gen-
+erated crash states depends on the number of in-ﬂight
+
+Figure 2: FLYTRAP workﬂow. The ﬁgure shows how crash
+consistency is tested using a simple rename() workload. In
+this example, the old ﬁle being deleted is updated in-place,
+while the new ﬁle creation happens inside a transaction. 1)
+FLYTRAP runs the workload on the target ﬁle system, and
+logs a sequence of PM writes, ﬂushes, and fences. For the
+sake of simplicity, assume that all writes are ﬂushed and there
+is a store fence at the end of the system call. 2) FLYTRAP
+creates a crash state where only the old ﬁle is deleted; the
+other writes are lost in the crash. 3) The consistency checker
+ﬁnds that both the old ﬁle and the new ﬁle are missing 4)
+FLYTRAP creates a bug report. This bug in NOVA discovered
+by FLYTRAP (bug 4).
+
+writes. In our testing, we observed that the number of
+in-ﬂight writes at any given point of time is small: across
+the two workload generators (Section 3.4) and four ﬁle
+systems, the average number of the in-ﬂight writes is
+three, and the maximum is ten. The only exception was
+the write() system call in PMFS, which we observe
+to have up to 20 in-ﬂight writes when writing a large
+amount of data. This allows FLYTRAP to exhaustively
+enumerate and check all subsets of in-ﬂight writes.
+
+Taken together, these observations allow FLYTRAP to track
+only ﬂushed writes (leading to low overhead), consider only
+subsets (and not permutations), and exhaustively test all the
+subsets resulting from in-ﬂight writes.
+
+3.3 FLYTRAP Architecture
+
+FLYTRAP is built on top of the CrashMonkey framework [38],
+which consists of two kernel modules and user-space utilities
+to facilitate checking crash states. We adapt CrashMonkey’s
+user-space utilities to target PM ﬁle systems; the two kernel
+modules are speciﬁc to block devices and are not compatible
+
+5
+
+rename(old, new)write: deleting old write: tx begin write: creating new write: tx endwrite: deleting old write: tx begin write: creating new write: tx endCrash State with neither old or newWORKLOADSequence of writesCreating a crash state  with only ﬁrst write appliedBug Report: rename not atomic1234with PM. We replace them with modules based on Kprobes,
+a Linux kernel debugging utility, to record writes to PM.
+
+Given a workload and a target ﬁle system, FLYTRAP pro-
+ceeds in three steps (Figure 2): (1) run the workload and
+log the writes made by the ﬁle system; (2) construct crash
+states; (3) check each crash state and generate a bug report if
+required. We now describe each step in more detail.
+
+Logging writes. Recall from Section 3.2 that FLYTRAP re-
+quires PM ﬁle system developers to identify the centralized
+persistence functions. Given the locations of these functions,
+FLYTRAP uses Kprobes [4] to automatically instrument them
+at run time. Each time one of these functions is invoked by the
+ﬁle system, the instrumentation logs the operation and its argu-
+ments (including the current value of the cache line for cache
+line ﬂushes). The user-space test harness also inserts markers
+into this log to record the start and end of each system call.
+This approach requires no code changes to the ﬁle-system im-
+plementation other than to prevent the compiler from inlining
+the persistence functions. In our experience, identifying these
+functions was simple, and we expect it to be even simpler for
+ﬁle-system developers who likely already know where the
+persistence functions are in their implementation.
+
+Constructing crash states. Given a workload, FLYTRAP can
+simulate crashes both after and during system calls. FLY-
+TRAP replays a workload by walking through the log of
+writes. Whenever it encounters a cache line write back or
+non-temporal store, it adds it to an in-ﬂight vector. When it
+encounters a store fence, it ﬂushes the contents of the in-ﬂight
+vector. To generate crash states after system calls, FLYTRAP
+replays all writes that have been ﬂushed by the end of the
+system call. To generate crash states during system calls, it
+simulates a crash immediately before each store fence and
+creates a set of crash states by replaying each subset of the
+in-ﬂight vector. The number of crash states is thus dependent
+on the number of in-ﬂight writes; if there are n in-ﬂight writes,
+there will be 2n − 1 crash states. As noted in Section 3.2, we
+have observed that n is small in practice, allowing FLYTRAP
+to apply this exhaustive testing strategy. Since a small num-
+ber of in-ﬂight writes is not a guarantee and we occasionally
+see larger sets while using Syzkaller, FLYTRAP can place a
+conﬁgurable cap on the number of writes to replay. We ﬁnd
+that in practice, even a cap of two writes is sufﬁcient to reveal
+many bugs (§5.1).
+
+Testing each crash state. To check ﬁle-system consistency,
+FLYTRAP ﬁrst mounts the target ﬁle system on each crash
+state, which is itself a useful consistency check as failure to
+mount is a serious bug. Once successfully mounted, the ﬁle-
+system state is compared against two oracle ﬁle-system states:
+a before state representing the ﬁle-system state before the
+crashing system call began and an after state representing the
+ﬁle-system state if the system call during the crash success-
+fully completed. After recovery, the ﬁle-system state should
+match either the before or after state. This check validates
+
+properties implied by POSIX or widely expected by users
+in practice [11, 40]. Finally, to ensure the ﬁle system is in a
+usable state, FLYTRAP creates ﬁles in all directories and then
+deletes all ﬁles. If any of these checks fail, the checker reports
+a bug describing the inconsistency and the corresponding
+crash state.
+
+To make this implementation efﬁcient, we construct oracle
+ﬁle systems incrementally as the log is replayed because many
+crash states share the same oracle state. We also construct
+crash states in-place on the PM device, mutating them to
+generate each crash state rather than recreating them from
+scratch each time. Because the consistency checks mutate
+the state, we reuse our logging infrastructure to record an
+undo log for these mutations and roll back the changes when
+advancing to the next crash state.
+
+3.4 Workload Generation
+
+Given a workload, FLYTRAP generates crash states and tests
+them for consistency. An orthogonal challenge is generating
+workloads for FLYTRAP to test. The CrashMonkey work [38]
+introduced the hypothesis that small workloads on new ﬁle
+systems are useful in ﬁnding crash-consistency bugs. While
+this hypothesis was true on traditional block-based ﬁle sys-
+tems, we aim to test whether it holds on PM ﬁle systems. To
+this end, we modify CrashMonkey’s Automated Crash Ex-
+plorer (ACE), which systematically explores workloads of a
+given size, to work with FLYTRAP. To disprove the hypothe-
+sis, we modify the Syzkaller [7] gray-box fuzzer to work with
+FLYTRAP. Syzkaller generates long, complex, randomized
+workloads while aiming to improve code coverage.
+
+3.4.1 Automatic Crash Explorer
+
+We used a modiﬁed version of ACE [38] to systematically
+generate workloads for FLYTRAP. ACE was designed to ex-
+haustively generate workloads of a certain structure to test
+traditional ﬁle systems. It focuses on short workloads with
+frequent fsync(), fdatasync(), or sync() calls, as these
+are required to obtain strong crash-consistency guarantees
+in traditional ﬁle systems. Given a sequence length n, ACE
+generates workloads with n core ﬁle-system operations over
+a small, predetermined set of ﬁles, then ﬂeshes them out by
+satisfying dependencies and adding fsync(), fdatasync(),
+or sync() operations. A workload with n core system calls is
+called a “seq-n" workload.
+
+We modify ACE in the following manner for FLYTRAP.
+First, since system calls in the fsync family do not have the
+same crash-consistency signiﬁcance in PM ﬁle systems as
+they do in traditional ﬁle systems, we remove them from
+our version of ACE. This signiﬁcantly reduces the number
+of workloads generated because we do not need to consider
+workloads that differ only by the sync calls they use. We also
+remove system calls and options that are not supported by the
+
+6
+
+ﬁle systems under test. For example, NOVA only supports
+the FALLOC_FL_KEEP_SIZE ﬂag for the falloc system call,
+and it does not support extended attributes. Removing these
+unsupported options further reduces the number of workloads
+that ACE generates.
+
+We test all seq-1 and seq-2 workloads, as well as the sub-
+set of seq-3 workloads containing only pwrite(), link(),
+unlink(), and rename() calls (i.e. the “seq-3 metadata”
+workloads in the CrashMonkey work [38]) to make testing
+tractable. Our modiﬁed version of ACE generates 56 seq-1
+tests, 3136 seq-2 tests, and 50650 seq-3 metadata tests.
+
+3.4.2 Syzkaller
+
+We modify Syzkaller [7], a state-of-the-art gray-box kernel
+fuzzer, to generate workloads for FLYTRAP. As is standard in
+gray-box fuzzing, our fuzzer starts with an initial set of test
+cases (seeds) and uses genetic programming to generate new
+tests for FLYTRAP from those seeds. FLYTRAP tests each
+generated workload and reports back whether the workload
+produced a crash-consistency bug along with the code cov-
+erage achieved on the target kernel. If the workload covered
+new parts of the kernel, the fuzzer adds it to its set of seeds
+and generates new workloads from it.
+
+Syzkaller generates workloads by randomly selecting se-
+quences of core ﬁle-system operations and their argument
+values. It generates syntactically and semantically valid work-
+loads by using a detailed template for each system call that
+speciﬁes more precise qualiﬁed type information [13] for the
+call’s arguments. For example, the template for open speciﬁes
+that it returns a ﬁle descriptor, not just an arbitrary integer;
+the template for write speciﬁes that its ﬁrst argument is also
+a ﬁle descriptor rather than an arbitrary integer (which would
+be very unlikely to be a valid ﬁle descriptor).
+
+To adapt Syzkaller to our setting, we restrict it to only
+generate workloads that contain core ﬁle-system operations,
+and replace its workload executor with a custom one. Our
+executor invokes FLYTRAP on each workload and records
+code coverage both before the crash and during recovery. We
+add a workload to the seed set if it achieves new code coverage
+on either side of the crash.
+
+Like many fuzzers, Syzkaller can quickly generate many
+bug reports that are duplicates—we found that Syzkaller
+would frequently generate different workloads that triggered
+the same bug and produced similar bug reports. In our setting,
+this duplication also arises when multiple crash states for the
+same workload trigger the same bug, producing similar bug
+reports. To address this problem, we extended Syzkaller to au-
+tomatically triage bug reports generated by FLYTRAP during
+fuzzing. We use a simple triaging procedure that clusters bug
+reports by lexical similarity. Whenever FLYTRAP generates a
+bug report, we compute the report’s word vector v (based on
+its text), and then compute the distance from v to the closest
+cluster C of previous reports. If the distance from v to C is
+
+below a predeﬁned threshold, we add the report to C, other-
+wise we create a new cluster. This simple heuristic was more
+effective than more complex ones we tested. We also updated
+Syzkaller to display these bug report clusters (along with the
+workload that triggered each bug report) in its UI dashboard
+to make them easier for users to debug.
+
+3.5 Limitations
+
+FLYTRAP has several limitations. First, it can miss bugs be-
+cause it does not explore all workloads nor all crash states
+resulting from a given workload. FLYTRAP only tests some
+subsets of the data in write() system calls and considers
+cache line ﬂushes atomic with respect to crashes. FLYTRAP
+only tracks ﬂushed writes; a PM write that is never ﬂushed
+is invisible to FLYTRAP, and it could result in FLYTRAP
+missing a bug. For example, consider ﬁle-system writes to A,
+B, C, and a bug where the ﬁle system never ﬂushed A. FLY-
+TRAP would not explore a crash state where A and B are
+persisted, but C is not, and so if this state created inconsis-
+tency FLYTRAP would not detect it. Second, FLYTRAP does
+not support checking concurrent workloads. It assumes that
+the operations performed by the ﬁle system in each workload
+are deterministic. In our testing so far, we have not observed
+any non-determinism in the ﬁle systems that impacted our
+ability to ﬁnd and reproduce bugs with FLYTRAP. Third,
+FLYTRAP assumes that the PM ﬁle system has centralized
+persistence functions. A PM ﬁle system that uses in-line as-
+sembly to update PM at various locations in its code would
+not be compatible with FLYTRAP.
+
+Despite these limitations, we believe that FLYTRAP is a
+useful addition to the set of tools for building robust PM ﬁle
+systems. In particular, the level of automation provided by
+FLYTRAP allows developers to test new or in-development
+PM ﬁle systems efﬁciently.
+
+4 Testing PM File Systems
+
+In this section, we evaluate FLYTRAP’s effectiveness at ﬁnd-
+ing bugs across different PM ﬁle systems. We describe our
+experimental setup (§4.1) and present an evaluation of FLY-
+TRAP along with a comparison of ACE and Syzkaller as
+workload generation strategies (§4.2). We provide a brief
+overview of the bugs found by FLYTRAP (§4.3).
+
+4.1 Experimental setup
+
+File systems. We considered seven open-source PM ﬁle
+systems for testing with FLYTRAP: NOVA [45], NOVA-
+Fortis [46], PMFS [18], WineFS [24], Strata [28], Assise [8],
+and ext4-DAX [1]. ext4-DAX is a modiﬁcation of the ext4 ﬁle
+system for PM. It shares most of its code with ext4 and has the
+same crash consistency guarantees, so tools like CrashMon-
+key or Hydra that are designed for block-based ﬁle systems
+
+7
+
+are a better ﬁt for testing ext4-DAX. Strata and Assise are
+kernel-bypass ﬁle systems implemented in user space. Neither
+Strata nor Assise currently support recovering from arbitrary
+crashes. As a result, we chose to focus on the remaining four
+systems: NOVA, NOVA-Fortis, PMFS, and WineFS.
+
+Test infrastructure. All experiments described in this pa-
+per were run on QEMU/KVM virtual machines running De-
+bian Stretch. Each VM is allocated one CPU (except for those
+testing WineFS, which requires four CPUs) and 8 GB of RAM.
+Each VM also has two 128 MB emulated PM devices, which
+are used to execute the workload, construct the oracle ﬁle
+system, and check crash states.
+
+We run ACE-generated workloads on a single Amazon EC2
+m5d.metal instance with 96 vCPUs, 384 GB memory, and
+four 900 GB NVMe SSDs. We use these resources to check
+multiple ﬁle systems using workloads of multiple sequence
+lengths in parallel. We run seq-1 and seq-2 tests on individual
+VMs; we split the seq-3 metadata workloads across 10 VMs
+and ran them in parallel. All ﬁle systems were checked using
+seq-1 and seq-2 workloads, and all but WineFS were run on
+seq-3 metadata tests. At the time we ran these experiments,
+WineFS had a bug that prevented creation of the number of
+ﬁles some seq-3 tests require. The number of in-ﬂight writes
+at any time during ACE tests is consistently low, so we do not
+place a cap on the number of crash states for ACE.
+
+To evaluate FLYTRAP with Syzkaller, we run four
+Chameleon Cloud [26] bare metal instances, which have two
+Intel Xeon Gold 6240R CPUs each with 24 cores and 48
+threads, as well as 192 GB RAM, and 480 GB storage. Each
+host fuzzed a different ﬁle system using 15 virtual machines.
+Each fuzzer starts with an empty set of seeds. Syzkaller-
+generated tests can be long and generate many crash states,
+so to avoid the fuzzer getting stuck, we run FLYTRAP with a
+cap of two writes per crash state; as §5.1.2 observes, this cap
+does not affect its ability to ﬁnd bugs in practice.
+
+4.2 Evaluation
+
+ACE tests. For each ﬁle system under test, FLYTRAP took
+about 10–15 minutes to run the seq-1 workloads, 7–11 hours
+to run the seq-2 workloads, 16–26 hours to run the seq-3
+metadata workloads in parallel (160–260 total CPU hours).
+The number of crash states to check on each workload varies
+as much as 3× between ﬁle systems, with PMFS generally
+checking the most and WineFS checking the fewest. Overall,
+FLYTRAP found 15 bugs using ACE tests across all four ﬁle
+systems.
+
+Syzkaller. We ran FLYTRAP with Syzkaller for 18 hours on
+15 VMs, for a total of 270 CPU hours spent fuzzing. During
+this time, FLYTRAP checked over 40 million crash states
+across all four system calls, ﬁnding 18 unique bugs. Three of
+these bugs cannot be found with ACE-generated workloads.
+
+1,000,000
+
+)
+s
+(
+
+n
+e
+k
+a
+T
+e
+m
+T
+
+i
+
+100,000
+
+10,000
+
+1,000
+
+100
+
+10
+
+1
+1
+
+Syzkaller
+ACE
+
+1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18
+
+# of bugs found
+
+Figure 3: Cumulative time taken to ﬁnd crash-consistency
+bugs by ACE and Syzkaller.
+
+Comparison. We ran Syzkaller and ACE on each ﬁle system
+and recorded the cumulative CPU time taken to ﬁnd all bugs
+when using each workload generator. Figure 3 shows the
+result of this experiment. ACE ﬁnds the ﬁrst 15 out of 18
+bugs in less than three CPU hours total, but is unable to
+ﬁnd the ﬁnal three bugs. Syzkaller, on the other hand, takes
+almost 20× more CPU time than ACE to ﬁnd the ﬁrst 10
+bugs and almost 6× more CPU time to ﬁnd all the bugs the
+ACE tester ﬁnds. However, when we let Syzkaller run for an
+additional 27 CPU hours, it is able to ﬁnd three additional
+bugs that are not detected by ACE. ACE misses these three
+bugs because they do not conform to the patterns that it uses
+to generate workloads. For example, two of these bugs create
+two open ﬁle descriptors to the same ﬁle and modify the
+ﬁle’s contents through both ﬁle descriptors, but ACE does not
+generate workloads with multiple ﬁle descriptors for the same
+ﬁle.
+
+While the results of this experiment indicate that Syzkaller
+has greater overall bug ﬁnding capability than ACE, the
+ACE tests are considerably more resource efﬁcient. This sug-
+gests that the ACE tests can be run locally and iteratively to
+ﬁnd bugs during ﬁle-system development, whereas Syzkaller
+should be run for a long time in an environment with ample
+compute resources (such as the cloud) for more comprehen-
+sive crash-consistency testing.
+
+4.3 Results
+
+Crash-consistency bugs. Using ACE- and Syzkaller-
+generated tests, FLYTRAP ﬁnds 18 unique crash-consistency
+bugs across all four tested ﬁle systems. The number of unique
+bugs is based on the number of separate ﬁxes required to patch
+
+8
+
+System call
+
+# of bugs
+
+5 Bug Analysis
+
+mkdir
+creat
+rmdir
+fallocate
+unlink
+link
+rename
+truncate
+write/pwrite
+
+1
+1
+1
+1
+2
+3
+4
+5
+5
+
+Table 1: The number of bugs associated with each system call.
+Some bugs impact all ﬁle system operations, and some impact
+multiple system calls.
+
+all of the bugs, not different user-visible consequences. Two
+bugs are found in both WineFS and PMFS (since WineFS is
+built off PMFS), for a total of 20 bugs.
+
+Table 2 describes the consequences of each bug and the
+system calls they affect. The bugs are classiﬁed as either logic
+or PM errors (described further in §5.1). FLYTRAP found
+eight bugs in NOVA, four bugs in NOVA-Fortis, two bugs
+in PMFS, two bugs in WineFS, and two bugs in both PMFS
+and WineFS (as WineFS is an extension of PMFS). Many of
+these bugs have serious consequences that violate the crash
+consistency guarantees of the ﬁle systems. Three of the bugs
+prevent the ﬁle system from being mounted entirely. Two
+impact the atomicity of rename(), which many applications
+rely on [40]. Many others cause data loss or prevent a user
+from accessing ﬁles entirely.
+
+The bugs impact a wide variety of system calls, as Table 1
+shows. Many bugs are located in common metadata-handling
+or recovery code and thus impact multiple system calls.
+rename(), write()/pwrite(), link(), and truncate()
+are especially bug-prone and are affected by multiple bugs.
+
+Non-crash consistency bugs. While working with FLY-
+TRAP, we also found an additional eight non-crash-
+consistency bugs not included in Table 2. These bugs occur
+during regular execution and do not require a crash to be ex-
+posed. We were able to ﬁnd these bugs because they caused
+KASAN errors, segmentation faults, or incorrect behavior that
+our consistency checks could detect. For example, using the
+fuzzer, we discovered that NOVA does not properly handle
+write() calls where the number of bytes to write is extremely
+large; it will allocate all remaining space for the ﬁle, causing
+most subsequent operations to fail. FLYTRAP detected this
+bug because it found that new ﬁles could not be created in
+crash states following this write.
+
+9
+
+This sections presents an analysis of the 18 crash-consistency
+bugs found by FLYTRAP (Table 2). To the best of our knowl-
+edge, this is the ﬁrst such corpus of crash-consistency bugs in
+PM ﬁle systems. We make some observations about common
+patterns we found among the bugs (§5.1), and distill lessons
+for building and testing PM ﬁle systems (§5.2).
+
+5.1 Observations
+
+We ﬁrst present observations about the nature of the crash-
+consistency bugs found by FLYTRAP, and then present obser-
+vations about crash-consistency testing.
+
+5.1.1 Nature of crash-consistency bugs
+
+the observed crash-
+Observation 1: A majority of
+consistency bugs are logic issues rather than PM pro-
+gramming errors. When we began working on FLYTRAP,
+we expected that most bugs would be due to the subtleties
+of the persistent-memory programming model that existing
+PM application research has focused on: interaction with the
+cache hierarchy, CPU store (re)ordering, etc. However, the
+majority of bugs we found—14 of 18—are actually due to
+logic bugs in manipulating ﬁle-system data structures rather
+than mistakes in managing persistent memory. The “type”
+column in Table 2 classiﬁes bugs into logic bugs or PM bugs.
+Logic bugs are issues that cannot be ﬁxed by adding cache
+line ﬂushes or store fences. These results suggest that it is
+not sufﬁcient for a ﬁle-system crash-consistency testing tool
+to focus on exploring the persistence behavior of individual
+writes and reorderings; it must also exercise the ﬁle-system
+data structures and recovery mechanisms, and check higher-
+level consistency properties that cannot be validated at the
+level of individual writes.
+
+Observation 2: In-place update optimizations are a com-
+mon source of crash consistency bugs. One of the allures
+of persistent memory is that programs can access it as mem-
+ory, performing ﬁne-grained reads and writes directly rather
+than coalescing them into larger block-sized IO operations
+on slower storage media. This design makes it possible in
+principle to reduce the overheads of traditional consistency
+mechanisms like journaling by manipulating on-disk data
+structures directly. All four ﬁle systems we tested use a jour-
+nal for consistency, but all have performance optimizations
+to bypass the journal and perform in-place updates in certain
+circumstances. For example, NOVA updates the link count of
+a ﬁle by updating a per-inode log. Appending to this log is
+done via a journalled transaction, but if the previous operation
+on the ﬁle also updated its link count, NOVA may modify that
+log entry in place instead.
+
+We found these optimizations to be particularly error-prone:
+6 of 18 bugs in Table 2 are caused by in-place updates. For
+
+Bug #
+
+File System
+
+Consequence
+
+1
+2
+3
+
+4
+5
+
+6
+
+7
+8
+9
+10
+
+NOVA
+NOVA
+NOVA
+
+NOVA
+NOVA
+
+NOVA
+
+NOVA
+NOVA
+NOVA-Fortis
+NOVA-Fortis
+
+File system unmountable
+File is unreadable and undeletable
+File system unmountable
+
+Rename atomicity broken (ﬁle disappears)
+Rename atomicity broken (old ﬁle still
+present)
+Link count incremented before new ﬁle ap-
+pears
+File data lost
+File data lost
+Unreadable directory or ﬁle data loss
+File is undeletable
+
+11
+12
+13
+14 &15
+16
+17 &18
+19
+20
+
+FS attempts to deallocate free blocks
+NOVA-Fortis
+File is unreadable
+NOVA-Fortis
+PMFS
+File system unmountable
+PMFS&WineFS Write is not synchronous
+PMFS
+PMFS&WineFS
+WineFS
+WineFS
+
+Out-of-bounds memory access
+File data lost
+File is unreadable and undeletable
+Data write is not atomic in strict mode
+
+Affected system calls
+
+All
+mkdir, creat
+write, pwrite, link,
+unlink, rename
+rename
+rename
+
+link
+
+truncate
+fallocate
+unlink, rmdir, truncate
+write, pwrite, link,
+rename
+truncate
+truncate
+truncate
+write, pwrite
+All
+write, pwrite
+All
+write, pwrite
+
+Type
+
+Logic
+PM
+Logic
+
+Logic
+Logic
+
+Logic
+
+Logic
+Logic
+PM
+Logic
+
+Logic
+Logic
+Logic
+PM
+Logic
+PM
+Logic
+Logic
+
+Table 2: Bugs found by FLYTRAP, their consequences, and the system calls that they affect.
+
+example, in bug 4, NOVA’s rename implementation removes
+the directory entry from the parent inode in-place but journals
+the other metadata changes, allowing the ﬁle to be lost in a
+crash before the journal transaction commits.
+
+Fixing these bugs often requires journalling more data,
+which is not free. To quantify the impact of ﬁxing such bugs,
+we compared the performance of NOVA before and after ﬁx-
+ing two rename atomicity bugs (4 and 5) by journalling more
+metadata. We tested both versions on Intel Optane DC Per-
+sistent Memory media. In a microbenchmark that repeatedly
+creates and renames a ﬁle over the top of an existing ﬁle, the
+ﬁxed version of NOVA is 25% slower. A more real-world
+metadata-intensive benchmark (checking out different stable
+versions in the Linux kernel git repository) shows negligi-
+ble overhead (<1%). In some cases, journalling can even be
+better than in-place updates. The ﬁx for bug 6 replaces an
+in-place update in link with extra logging, but makes a mi-
+crobenchmark that repeatedly creates links to a ﬁle 7% faster,
+likely because checking whether the in-place update is safe
+requires an extra read from the media.
+
+Observation 3: Rebuilding volatile state during crash re-
+covery is error-prone. In a traditional ﬁle system, crash re-
+covery scans on-disk structures like journals and updates the
+durable state to match. PM ﬁle systems often perform more
+work during recovery. As a performance and write-endurance
+optimization, they avoid durably storing some metadata (e.g.,
+
+free page lists or ﬁle sizes) and instead rebuild it in volatile
+memory at mount time. This rebuilding code is subtle because
+it must account for potential inconsistencies or partial states
+after a crash, and we found that 8 of the 18 bugs in Table 2
+were in such code. For example, bug 13 is caused by a crash
+during a truncate system call on PMFS. The implementa-
+tion ﬁrst stores information about the operation in a “truncate
+list”; if the system crashes before the truncation is complete,
+the truncate list can be replayed to ﬁnish the operation. How-
+ever, replaying truncations requires accessing the free page
+list, which PMFS rebuilds in volatile memory during recovery,
+but only after replaying the truncate list. Attempts to replay
+truncations therefore cause a null pointer dereference when
+accessing the free page list.
+
+Rebuilding volatile state is more complex in PM ﬁle sys-
+tems that maintain per-CPU volatile state to improve scalabil-
+ity. In bug 19, WineFS failed to properly index into an array
+of per-CPU journals that were read during crash recovery.
+FLYTRAP can even ﬁnd bugs in rebuilding code in the ab-
+sence of crashes, because the crash states it tests include ones
+where all writes are durable. For example, bug 7 involves
+modifying the same ﬁle through multiple ﬁle descriptors on
+NOVA, which creates log entries out of chronological order,
+violating assumptions in the rebuilding code and causing data
+loss during truncate operations.
+
+Observation 4: Resilience mechanisms to recover from
+
+10
+
+Observation
+
+Many bugs occur due to logic or design issues, not PM programming errors.
+The complexity of performing in-place updates leads to bugs.
+Recovery code that deals with rebuilding in-DRAM state is a signiﬁcant source of bugs.
+Complex new features for increasing resilience can introduce new crash consistency bugs.
+A majority of observed bugs can only be exposed by simulating crashes during system calls.
+Short workloads were sufﬁcient to expose many crash consistency bugs.
+Many bugs were exposed by replaying a few small writes onto previously persistent state.
+
+Associated bugs
+
+1, 3–8, 10–13, 16, 19, 20
+4–7, 14, 15
+1, 3, 7, 11, 13, 16, 19
+2, 9–12
+3–6, 9–13, 19, 20
+1–6, 9–20
+3–6, 9–13, 19, 20
+
+Table 3: Observations and the bugs associated with them.
+
+media failures can introduce new crash-consistency bugs.
+NOVA-Fortis [46] is an extension of NOVA that adds fault
+detection and tolerance for media errors and software bugs
+by (among other techniques) replicating and checksumming
+inodes and logs and checksumming ﬁle data. While NOVA-
+Fortis is not explicitly designed to increase crash resilience,
+we tested these features to see if it is more tolerant of crashes
+than the original NOVA.
+
+We found that NOVA-Fortis has all the same crash-
+consistency bugs we found in the original version of NOVA,
+and in addition has ﬁve new bugs caused by the added com-
+plexity of maintaining redundant state and checksums. A
+common theme in these bugs is that data and metadata mod-
+iﬁcations are often not atomic with checksum and replica
+updates, allowing checksum validation to fail (and render a
+ﬁle inaccessible) even if the ﬁle system is consistent and data
+intact.
+
+5.1.2 Crash-consistency testing in PM ﬁle systems
+
+Observation 5: A majority of observed bugs require
+simulating crashes during system calls. Current crash-
+consistency testing tools for traditional ﬁle systems, like
+CrashMonkey [38] and Hydra [27], insert crashes only at
+the end of persistence system calls (fsync, fdatasync, etc.).
+This heuristic exploits the fact that most POSIX APIs only
+make crash-consistency guarantees after persistence opera-
+tions, so intermediate states are unlikely to violate the speciﬁ-
+cation. It allows these tools to scale to test larger workloads,
+and does not appear to cause them to miss bugs: CrashMon-
+key has a mode to insert crashes during system calls, but it
+did not ﬁnd any additional bugs in the ﬁle systems tested in
+that work.
+
+We found that this same heuristic does not work for PM ﬁle
+systems. 11 of the 18 bugs in Table 2 require a crash to occur
+during a system call. This is a corollary of our observation
+that most PM ﬁle systems intend to implement most system
+calls synchronously, and so their effects are fully persistent by
+the end of the system call. For example, the rename atomicity
+bugs in NOVA (bugs 4 and 5) arise when a crash during the
+
+system call leaves only some writes persisted. Waiting until
+a persistence point to check consistency would not discover
+these bugs, as NOVA correctly ﬂushes all writes by the end
+of the rename operation.
+
+Observation 6: Short workloads sufﬁce to expose many
+crash-consistency bugs. We use ACE [38] to systematically
+generate test workloads. ACE’s design focuses on exhaus-
+tively enumerating small workloads, based on an empirical
+study of historical crash-consistency bugs in block-based ﬁle
+systems that showed most could be reproduced with at most
+three operations. It was unclear whether this would hold for
+PM ﬁle systems. However, 15 of the 18 bugs we found in PM
+ﬁle systems can be found using ACE with at most three oper-
+ations, suggesting that this same small-scope hypothesis [23]
+holds for PM ﬁle systems. To try to invalidate this hypothesis,
+we also run FLYTRAP using the Syzkaller gray-box fuzzer,
+which can generate much longer workloads but without the
+exhaustiveness guarantees of ACE (§3.4). Syzkaller found 3
+bugs that ACE did not. However, all three bugs were found on
+short workloads: two would be considered seq-2 and one seq-
+3 in terms of the number of core system calls required. ACE
+missed them not because of size but because of complexities
+that ACE omits to make exhaustive enumeration tractable,
+such as testing unaligned writes.
+
+Observation 7: Most of the observed buggy crash states
+involve few writes. FLYTRAP generates crash states by snap-
+shotting known-persistent disk states between store fences,
+and then replaying all subsets of the in-ﬂight writes between
+each store fence (§3). For a system call with n in-ﬂight writes
+before a fence, this means FLYTRAP should consider all 2n −1
+possible crash states. However, we found that most bugs found
+by FLYTRAP involve crash states that include small subsets
+of the in-ﬂight writes. Of the 11 bugs in Table 2 that involve
+a crash in the middle of a system call, 10 can be exposed
+by a crash state that replays only a single write onto the last
+known-persistent state; the ﬁnal bug requires two writes. This
+observation suggests a proﬁtable heuristic for rapid crash-
+consistency testing would be to only test small subsets of
+in-ﬂight rights rather than all of them. FLYTRAP exploits
+
+11
+
+this observation by enumerating crash states in increasing
+order of subset size, allowing it to ﬁnd most crash-consistency
+bugs quickly. In our experiments, we often cap the number
+of writes that are replayed to build each crash state, primarily
+to prevent Syzkaller from spending many hours checking a
+single outlier test that has a high in-ﬂight write count. The
+highest in-ﬂight write count we observed, 20 writes in some
+PMFS write() calls, would take about 30 hours to check
+exhaustively using FLYTRAP. A cap of two is enough to ﬁnd
+all bugs presented in this paper; a cap of ﬁve is sufﬁcient to
+check all crash states for most system calls in the PM ﬁle
+systems we tested.
+
+5.2 Lessons Learned
+
+Based on our observations above, we have distilled three
+lessons for developers of PM ﬁle systems and for building the
+testing tools that support them.
+
+Lesson 1: Synchronous crash consistency on PM ﬁle sys-
+tems simpliﬁes the user experience, but complicates im-
+plementation and testing. Crash-consistency guarantees in
+modern ﬁle systems are something of a vicious cycle. File-
+system developers argue that relaxed guarantees are required
+to extract reasonable performance [30], but these weak guar-
+antees are a pain point for application developers and have
+caused severe data loss in popular applications [9, 15, 40], so
+ﬁle-system developers implement workarounds to “ﬁx” com-
+mon mistaken application patterns and make the intended
+guarantees even less clear. The ﬁne write granularity and low
+latency of persistent memory ﬁnally offers a path to strengthen
+ﬁle-system crash-consistency models, making resilient appli-
+cations easier to build and validate. PM ﬁle system developers
+have taken advantage of this opportunity by making all system
+calls synchronous and durable.
+
+While this end result is exciting, implementing it correctly
+carries new risks for PM ﬁle-system developers compared
+to traditional ﬁle systems. We found that many PM ﬁle-
+system bugs come from complex optimizations to realize high-
+performance synchronous crash-consistency—combining in-
+place updates with other consistency mechanisms, and replac-
+ing persistent state with reconstructible volatile state—that
+are uncommon techniques on slower storage media. This is
+a rich new design space for storage systems, and identifying
+the right primitives for this optimizations will be good future
+work. These optimizations also create complexity for testing
+and validation of PM ﬁle systems, which we found requires
+driving the ﬁle system into exercising deeper data structure
+manipulations and recovery mechanisms than existing crash-
+consistency tools are capable of.
+
+Lesson 2: Diverse testing mechanisms and checkers help
+invalidate assumptions about crash-consistency patterns.
+Most crash-consistency testing tools build on heuristics and
+patterns in historic bugs to select the workloads they test. We
+
+expected to bring those patterns across to PM ﬁle systems,
+focusing on short workloads and a small set of potential crash
+points and patterns. However, we found instead that most as-
+sumptions about ﬁle-system crash consistency do not carry
+across to persistent memory, where the consistency mech-
+anisms and guarantees are signiﬁcantly different. Finding
+crash consistency bugs in PM ﬁle systems requires explor-
+ing many more crash states than other ﬁle systems, including
+crashes in the middle of system calls; we had to develop new
+techniques to make this search tractable. Existing ﬁle-system
+crash-consistency testing tools would not have found these
+bugs. We also found that fuzzing was an effective way to
+invalidate assumptions we had brought along from prior ﬁle
+systems experience, such as the signiﬁcance of unaligned
+writes and exercising per-CPU code paths.
+
+Another assumption we carried into this work was that
+the difﬁculty of building a PM ﬁle system lies in correctly
+applying the PM programming model. We intended to focus
+on exhaustively testing the precise persistency behavior of
+PM ﬁle system code. However, we found instead that most
+PM ﬁle system bugs were logic errors in optimizations that
+could also have occurred in block-based ﬁle systems (though
+likely would not improve performance in that context). Exist-
+ing tools that focus on detecting speciﬁc PM programming
+error patterns [5, 16, 19, 21, 31–33, 39] would miss many of
+these bugs, but we were able to detect them even with small
+workloads and with very few in-ﬂight writes applied. Writing
+general-purpose consistency checks and applying gray-box
+fuzzing to generate workloads helped to invalidate these as-
+sumptions and gave new insights into common bug patterns
+in PM ﬁle systems.
+
+Lesson 3: Lightweight testing offers a scalable approach
+to detecting many crash-consistency bugs. FLYTRAP is,
+in principle, a bounded exhaustive testing [38] (i.e., bounded
+veriﬁcation) tool for PM ﬁle systems: given enough time,
+it can check every possible crash behavior of every possi-
+ble workload up to some bounds on its size and inputs. Of
+course, it is not tractable to exhaust this search space even
+with very small bounds. However, we found that FLYTRAP is
+an effective lightweight testing tool, in that it can quickly and
+automatically ﬁnd many bugs by checking small workloads
+and few crash states, and then run for longer to ﬁnd more
+corner-case issues. FLYTRAP runs the ACE seq-1 workloads
+on a ﬁle system in under 15 minutes and, when considering
+only crash states with one persisted write, can detect 12 of
+the 18 bugs we discovered. On the other hand, the fuzzer
+frontend to FLYTRAP takes 1–2 orders of magnitude longer
+to run (i.e., runs overnight) but ﬁnds three more bugs than
+ACE. These two frontends are complementary. They enable a
+lightweight approach that helps developers iterate quickly on
+new code, while still offering stronger conﬁdence as the code
+gets “closer to production” [10].
+
+12
+
+6 Conclusion
+
+References
+
+This paper presents FLYTRAP, a new record-and-replay frame-
+work for testing the crash consistency of PM ﬁle systems.
+We use FLYTRAP with the ACE workload generator and the
+Syzkaller gray-box fuzzer and ﬁnd 18 unique bugs across
+four PM ﬁle systems. To the best of our knowledge, this is the
+largest corpus of crash-consistency bugs on PM ﬁle systems.
+Our study of these bugs provides insights into how crash-
+consistency bugs arise in PM ﬁle systems and what types of
+tools are needed to test these systems.
+
+[1] Direct Access for ﬁles. https://www.kernel.org/
+
+doc/Documentation/filesystems/dax.txt.
+
+[2] Intel Optane DC Persistent Memory Quick Start
+https://www.intel.com/content/dam/
+Guide.
+support/us/en/documents/memory-and-storage/
+data-center-persistent-mem/Intel-Optane-
+DC-Persistent-Memory-Quick-Start-Guide.pdf.
+
+[3] Intel Optane
+
+Persistent Memory.
+
+https:
+
+//www.intel.com/content/www/us/en/
+architecture-and-technology/optane-dc-
+persistent-memory.html.
+
+[4] Kernel Probes (Kprobes). https://www.kernel.org/
+
+doc/Documentation/kprobes.txt.
+
+[5] Discover Persistent Memory Programming Errors with
+https://www.intel.com/content/
+
+Pmemcheck.
+www/us/en/developer/articles/technical/
+discover-persistent-memory-programming-
+errors-with-pmemcheck.html, 2018.
+
+[6] The Open Group Base Speciﬁcations Issue 7. https:
+//pubs.opengroup.org/onlinepubs/9699919799/,
+2018.
+
+[7] Syzkaller.
+
+https://github.com/google/
+
+syzkaller/, 2021.
+
+[8] Thomas E. Anderson, Marco Canini, Jongyul Kim, De-
+jan Kosti´c, Youngjin Kwon, Simon Peter, Waleed Reda,
+Henry N. Schuh, and Emmett Witchel. Assise: Per-
+formance and availability via client-local NVM in a
+distributed ﬁle system. In 14th USENIX Symposium on
+Operating Systems Design and Implementation (OSDI
+20), pages 1011–1027. USENIX Association, November
+2020.
+
+[9] Nicolas Boichat. Issue 502898: ext4: Filesystem corrup-
+tion on panic, June 2015. https://code.google.com/
+p/chromium/issues/detail?id=502898.
+
+[10] James Bornholt, Rajeev Joshi, Vytautas Astrauskas,
+Brendan Cully, Bernhard Kragl, Seth Markle, Kyle Sauri,
+Drew Schleit, Grant Slatton, Serdar Tasiran, Jacob Van
+Geffen, and Andrew Warﬁeld. Using lightweight formal
+methods to validate a key-value storage node in Amazon
+S3. In ACM SIGOPS 28th Symposium on Operating Sys-
+tems Principles (SOSP), pages 836–850, October 2021.
+
+[11] James Bornholt, Antoine Kaufmann, Jialin Li, Arvind
+Krishnamurthy, Emina Torlak, and Xi Wang. Specifying
+and checking ﬁle system crash-consistency models. In
+
+13
+
+Proceedings of the Twenty-First International Confer-
+ence on Architectural Support for Programming Lan-
+guages and Operating Systems, ASPLOS, pages 83–98,
+Atlanta, GA, USA, April 2016.
+
+[12] Vijay Chidambaram. Orderless and Eventually Durable
+File Systems. PhD thesis, University of Wisconsin, Madi-
+son, Aug 2015.
+
+[13] Brian Chin, Shane Markstrum, and Todd Millstein. Se-
+mantic type qualiﬁers. In Proceedings of the 2005 ACM
+SIGPLAN Conference on Programming Language De-
+sign and Implementation, PLDI ’05, page 85–95, New
+York, NY, USA, 2005. Association for Computing Ma-
+chinery.
+
+[14] Jeremy Condit, Edmund B. Nightingale, Christopher
+Frost, Engin Ipek, Benjamin Lee, Doug Burger, and Der-
+rick Coetzee. Better I/O through byte-addressable, per-
+sistent memory. In Proceedings of the ACM SIGOPS
+22nd Symposium on Operating Systems Principles,
+SOSP ’09, page 133–146, New York, NY, USA, 2009.
+Association for Computing Machinery.
+
+[15] Jonathan Corbet. ext4 and data loss, March 2009. http:
+
+//lwn.net/Articles/322823/.
+
+[16] Bang Di, Jiawen Liu, Hao Chen, and Dong Li. Fast,
+ﬂexible, and comprehensive bug detection for persistent
+memory programs. In Proceedings of the 26th ACM
+International Conference on Architectural Support for
+Programming Languages and Operating Systems, ASP-
+LOS 2021, page 503–516, New York, NY, USA, 2021.
+Association for Computing Machinery.
+
+[17] Mingkai Dong, Heng Bu, Jifei Yi, Benchao Dong, and
+Haibo Chen. Performance and protection in the ZoFS
+user-space NVM ﬁle system. Proceedings of the 27th
+ACM Symposium on Operating Systems Principles,
+2019.
+
+[18] Subramanya R. Dulloor, Sanjay Kumar, Anil Keshava-
+murthy, Philip Lantz, Dheeraj Reddy, Rajesh Sankaran,
+and Jeff Jackson. System software for persistent mem-
+In Proceedings of the Ninth European Confer-
+ory.
+ence on Computer Systems, EuroSys ’14, New York,
+NY, USA, 2014. Association for Computing Machinery.
+
+[19] Xinwei Fu, Wook-Hee Kim, Ajay Paddayuru Shreepathi,
+Mohannad Ismail, Sunny Wadkar, Dongyoon Lee, and
+Changwoo Min. Witcher: Systematic crash consistency
+testing for non-volatile memory key-value stores. In
+Proceedings of the ACM SIGOPS 28th Symposium on
+Operating Systems Principles, SOSP ’21, page 100–115,
+New York, NY, USA, 2021. Association for Computing
+Machinery.
+
+[20] Gregory R. Ganger and Yale N. Patt. Metadata up-
+In Proceedings of
+date performance in ﬁle systems.
+the 1st Symposium on Operating Systems Design and
+Implementation (OSDI ’94), pages 49–60, Monterey,
+California, November 1994.
+
+[21] Hamed Gorjiara, Guoqing Harry Xu, and Brian Demsky.
+Jaaru: Efﬁciently model checking persistent memory
+programs. In Proceedings of the 26th ACM International
+Conference on Architectural Support for Programming
+Languages and Operating Systems, ASPLOS 2021, page
+415–428, New York, NY, USA, 2021. Association for
+Computing Machinery.
+
+[22] Joseph Izraelevitz, Jian Yang, Lu Zhang, Juno Kim, Xiao
+Liu, Amirsaman Memaripour, Yun Joon Soh, Zixuan
+Wang, Yi Xu, Subramanya R. Dulloor, Jishen Zhao, and
+Steven Swanson. Basic performance measurements of
+the intel optane DC persistent memory module. CoRR,
+abs/1903.05714, 2019.
+
+[23] Daniel Jackson and Craig A. Damon. Elements of style:
+Analyzing a software design feature with a counterexam-
+ple detector. IEEE Trans. Softw. Eng., 22(7):484–495,
+July 1996.
+
+[24] Rohan Kadekodi, Saurabh Kadekodi, Soujanya Pon-
+napalli, Harshad Shirwadkar, Gregory R. Ganger,
+Aasheesh Kolli, and Vijay Chidambaram. WineFS:
+A hugepage-aware ﬁle system for persistent memory
+In Proceedings of the ACM
+that ages gracefully.
+SIGOPS 28th Symposium on Operating Systems Prin-
+ciples, SOSP ’21, page 804–818, New York, NY, USA,
+2021. Association for Computing Machinery.
+
+[25] Rohan Kadekodi, Se Kwon Lee, Sanidhya Kashyap, Tae-
+soo Kim, and Vijay Chidambaram. SplitFS: Reducing
+software overhead in ﬁle systems for persistent memory.
+In Proceedings of the 27th ACM Symposium on Oper-
+ating Systems Principles (SOSP ’19), Ontario, Canada,
+October 2019.
+
+[26] Kate Keahey, Jason Anderson, Zhuo Zhen, Pierre Riteau,
+Paul Ruth, Dan Stanzione, Mert Cevik, Jacob Colleran,
+Haryadi S. Gunawi, Cody Hammock, Joe Mambretti,
+Alexander Barnes, François Halbach, Alex Rocha, and
+Joe Stubbs. Lessons learned from the chameleon testbed.
+In Proceedings of the 2020 USENIX Annual Technical
+Conference (USENIX ATC ’20). USENIX Association,
+July 2020.
+
+[27] Seulbae Kim, Meng Xu, Sanidhya Kashyap, Jungyeon
+Yoon, Wen Xu, and Taesoo Kim. Finding semantic bugs
+in ﬁle systems with an extensible fuzzing framework. In
+Proceedings of the 27th ACM Symposium on Operating
+Systems Principles, SOSP ’19, page 147–161, New York,
+NY, USA, 2019. Association for Computing Machinery.
+
+14
+
+[28] Youngjin Kwon, Henrique Fingler, Tyler Hunt, Simon
+Peter, Emmett Witchel, and Thomas Anderson. Strata:
+A cross media ﬁle system. In Proceedings of the 26th
+Symposium on Operating Systems Principles, SOSP ’17,
+page 460–477, New York, NY, USA, 2017. Association
+for Computing Machinery.
+
+[29] Philip Lantz, Subramanya Dulloor, Sanjay Kumar, Ra-
+jesh Sankaran, and Jeff Jackson. Yat: A validation frame-
+work for persistent memory software. In 2014 USENIX
+Annual Technical Conference (USENIX ATC 14), pages
+433–438, Philadelphia, PA, June 2014. USENIX Asso-
+ciation.
+
+[30] Bug 15910 - zero-length ﬁles and performance
+degradation, 2010. https://bugzilla.kernel.org/
+show_bug.cgi?id=15910.
+
+[31] Sihang Liu, Suyash Mahar, Baishakhi Ray, and Samira
+Khan. Pmfuzz: Test case generation for persistent mem-
+ory programs. In Proceedings of the 26th ACM Inter-
+national Conference on Architectural Support for Pro-
+gramming Languages and Operating Systems, ASPLOS
+2021, page 487–502, New York, NY, USA, 2021. Asso-
+ciation for Computing Machinery.
+
+[32] Sihang Liu, Korakit Seemakhupt, Yizhou Wei, Thomas
+Wenisch, Aasheesh Kolli, and Samira Khan. Cross-
+failure bug detection in persistent memory programs.
+In Proceedings of the Twenty-Fifth International Con-
+ference on Architectural Support for Programming Lan-
+guages and Operating Systems, ASPLOS ’20, page
+1187–1202, New York, NY, USA, 2020. Association
+for Computing Machinery.
+
+[33] Sihang Liu, Yizhou Wei, Jishen Zhao, Aasheesh Kolli,
+and Samira Khan. PMTest: A fast and ﬂexible testing
+In Pro-
+framework for persistent memory programs.
+ceedings of the Twenty-Fourth International Conference
+on Architectural Support for Programming Languages
+and Operating Systems, ASPLOS ’19, page 411–425,
+New York, NY, USA, 2019. Association for Computing
+Machinery.
+
+[34] R. McMillan. Amazon Blames Generators For Blackout
+http://www.wired.com/
+
+That Crushed Netﬂix.
+wiredenterprise/2012/07/amazonexplains/,
+2012.
+
+[35] R. Miller. Power Outage Hits London Data Center.
+http://www.datacenterknowledge.com/archives/
+2012/07/10/power-outage-hits-london-data-
+center/, 2012.
+
+[36] R. Miller.
+
+Visa Downtime Across Canada.
+//www.datacenterknowledge.com/archives/
+
+Data Center Outage Cited In
+http:
+
+2013/01/28/data-center-outage-cited-in-
+visa-downtime-across-canada/, 2013.
+
+[37] R. Miller. Power Outage Knocks Dreamhost Customers
+http://www.datacenterknowledge.com/
+
+Ofﬂine.
+archives/2013/03/20/power-outage-knocks-
+dreamhost-customers-offline/, 2013.
+
+[38] Jayashree Mohan, Ashlie Martinez, Soujanya Ponna-
+palli, Pandian Raju, and Vijay Chidambaram. Crash-
+Monkey and ACE: Systematically testing ﬁle-system
+crash consistency. ACM Trans. Storage, 15(2), apr 2019.
+
+[39] Ian Neal, Ben Reeves, Ben Stoler, Andrew Quinn,
+Youngjin Kwon, Simon Peter, and Baris Kasikci. AG-
+AMOTTO: How persistent is your persistent memory
+application? In 14th USENIX Symposium on Operating
+Systems Design and Implementation (OSDI 20), pages
+1047–1064. USENIX Association, November 2020.
+
+[40] Thanumalayan Sankaranarayana Pillai, Vijay Chi-
+dambaram, Ramnatthan Alagappan, Samer Al-Kiswany,
+Andrea C. Arpaci-Dusseau, and Remzi H. Arpaci-
+Dusseau. All File Systems Are Not Created Equal:
+On the Complexity of Crafting Crash-Consistent Ap-
+plications. In Proceedings of the 11th Symposium on
+Operating Systems Design and Implementation (OSDI
+’14), Broomﬁeld, CO, October 2014.
+
+[41] Thanumalayan Sankaranarayana Pillai, Vijay Chi-
+dambaram, Ramnatthan Alagappan, Samer Al-Kiswany,
+Andrea C. Arpaci-Dusseau, and Remzi H. Arpaci-
+Dusseau. Crash consistency. Commun. ACM, 58(10):46–
+51, 2015.
+
+[42] J. Verge.
+
+Internap Data Center Outage
+Takes Down Livestream And Stackexchange.
+http://www.datacenterknowledge.com/archives/
+2014/05/16/internap-data-center-outage-
+takes-livestream-stackexchange/, 2014.
+
+[43] Haris Volos, Sanketh Nalli, Sankarlingam Panneersel-
+vam, Venkatanathan Varadarajan, Prashant Saxena, and
+Michael M. Swift. Aerie: Flexible ﬁle-system interfaces
+to storage-class memory. In Proceedings of the Ninth
+European Conference on Computer Systems, EuroSys
+’14, 2014.
+
+[44] R. S. V Wolffradt.
+
+Fire In Your Data Cen-
+http:
+
+ter: No Power, No Access, Now What?
+//www.govtech.com/state/Fire-in-your-Data-
+Center-No-Power-No-Access-Now-What.html,
+2014.
+
+[45] Jian Xu and Steven Swanson. NOVA: A log-structured
+ﬁle system for hybrid volatile/non-volatile main memo-
+ries. In 14th USENIX Conference on File and Storage
+
+15
+
+Technologies (FAST 16), pages 323–338, Santa Clara,
+CA, February 2016. USENIX Association.
+
+[46] Jian Xu, Lu Zhang, Amirsaman Memaripour, Akshatha
+Gangadharaiah, Amit Borase, Tamires Brito Da Silva,
+Steven Swanson, and Andy Rudoff. NOVA-Fortis: A
+fault-tolerant non-volatile main memory ﬁle system. In
+Proceedings of the 26th Symposium on Operating Sys-
+tems Principles, SOSP ’17, page 478–496, New York,
+NY, USA, 2017. Association for Computing Machinery.
+
+[47] Jian Yang, Juno Kim, Morteza Hoseinzadeh, Joseph
+Izraelevitz, and Steven Swanson. An empirical guide
+to the behavior and use of scalable persistent memory.
+In 18th USENIX Conference on File and Storage Tech-
+nologies, FAST 2020, Santa Clara, CA, USA, February
+24-27, 2020, pages 169–182, 2020.
+
+16
+
+

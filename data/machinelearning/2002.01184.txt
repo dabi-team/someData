@@ -1,0 +1,517 @@
+0
+2
+0
+2
+
+b
+e
+F
+4
+
+]
+
+O
+C
+
+.
+t
+a
+t
+s
+[
+
+1
+v
+4
+8
+1
+1
+0
+.
+2
+0
+0
+2
+:
+v
+i
+X
+r
+a
+
+tfp.mcmc: Modern Markov Chain Monte Carlo Tools Built for
+Modern Hardware
+
+JUNPENG LAO*, CHRISTOPHER SUTER*, IAN LANGMORE, CYRIL CHIMISOV, ASHISH
+SAXENA, PAVEL SOUNTSOV, DAVE MOORE, RIF A. SAUROUS, MATTHEW D. HOFF-
+MAN, AND JOSHUA V. DILLON, Google Research
+
+Markov chain Monte Carlo (MCMC) is widely regarded as one of the most important algorithms of the
+20th century [Brooks et al. 2011]. Its guarantees of asymptotic convergence, stability, and estimator-variance
+bounds [Brooks et al. 2011; Neal 1993; Robert and Casella 2013] using only unnormalized probability func-
+tions make it indispensable to probabilistic programming. In this paper, we introduce the TensorFlow Proba-
+bility MCMC toolkit, and discuss some of the considerations that motivated its design.
+
+1 INTRODUCTION
+The TensorFlow Probability (TFP) MCMC library design ﬂows mainly from three principles. First,
+TFP MCMC takes advantage of both vectorized computation and threading for single- and multiple-
+chain parallelism. Second, the framework is agnostic to any particular probabilistic modeling
+framework: TFP MCMC requires only a Python callable to compute the target log probability
+(TLP)1. Third, we present a user-level API of composable building blocks for constructing new
+MCMC transition kernels and for use in higher-level algorithms.
+
+The following example depicts our three contributions as a working example. First, notice that
+the target_log_prob automatically leverages vectorized hardware., since the input x, initialized as
+current_state=tf.zeros([100]) is a tf.Tensor. The result is 100 MCMC chains run in parallel. Second,
+notice that there is otherwise no domain-speciﬁc language for specifying the TLP. Third, notice that
+the transition kernel mechanics are governed, in this case, by tfp.mcmc.HamiltonianMonteCarlo which
+is used as a black box by the tfp.mcmc.sample_chain kernel driver.
+
+def target_log_prob(x):
+return −0.5 ∗ x ∗ ∗ 2
+
+hmc_kernel = tfp.mcmc. HamiltonianMonteCarlo(
+target_log_prob_fn= target_log_prob ,
+num_leapfrog_steps=3,
+step_size =1.5)
+
+samples , traced_kernel_results = tfp.mcmc. sample_chain(
+
+kernel =hmc_kernel ,
+num_results=100 ,
+num_burnin_steps=300 ,
+trace_fn =lambda _, pkr: pkr. accepted_results. step_size ,
+current_state=tf. zeros ([100]) )
+
+2 FIRST CONTRIBUTION: PERVASIVE DATA PARALLELISM
+
+Multi-chain MCMC is intrinsically embarrassingly parallel—each chain is an independent compu-
+tation.2 Most widely-used MCMC frameworks achieve chain parallelism by running one chain per
+
+1Generally the function implementation is presumed to be using TensorFlow [Abadi et al. 2016]. Some, but not all, TFP
+MCMC algorithms also rely on TF’s automatic diﬀerentiation functionality.
+2Some algorithms—like replica exchange Monte Carlo, discussed below—share information between chains, but each chain
+can still perform a single step completely independently.
+
+*The ﬁrst two authors contributed equally.
+Author’s address: Junpeng Lao*, Christopher Suter*, Ian Langmore, Cyril Chimisov, Ashish Saxena, Pavel Sountsov, Dave
+Moore, Rif A. Saurous, Matthew D. Hoﬀman, and Joshua V. Dillon, Google Research, tfprobability@tensorflow.org.
+
+ 
+ 
+ 
+ 
+ 
+ 
+Junpeng Lao*, Christopher Suter*, Ian Langmore, Cyril Chimisov, Ashish Saxena, Pavel Sountsov, Dave Moore, Rif A.
+Saurous, Matthew D. Hoﬀman, and Joshua V. Dillon
+
+2
+
+available processing unit (“task parallelism”) [Bingham et al. 2019; Carpenter et al. 2017; Salvatier et al.
+2016]. While convenient, naive task parallelism fails to leverage “single instruction, multiple data”
+(SIMD) instruction sets (“data parallelism”). SIMD capabilities are ubiquitously present on both
+general-purpose CPUs (e.g., AVX) and specialized processors (e.g., GPUs, TPUs). Since SIMD is in
+principle not mutually exclusive with task parallelism, it presents an opportunity to increase multi-
+chain MCMC parallelism by multiple orders of magnitude. For example, a 32 core/64 thread CPU
+(the desktop soon-to-be largest AMD Ryzen) could run as many as 1024 parallel MCMC chains by
+leveraging 16 way SIMD parallelism via AVX512 (at ﬂoat32 resolution).
+
+Despite the prospect of signiﬁcant speedups, SIMD parallelism across diverse hardware has not
+seen wide adoption by popular MCMC frameworks. In order to leverage SIMD parallelism, the
+MCMC framework and the user-provided model must both support vectorization. In TFP, we refer
+to vectorizable code as having “batch semantics” or simply “batching” [Dillon et al. 2017].
+
+We believe SIMD chain parallelism has not been widely adopted in MCMC frameworks because
+
+it requires multiple challenging pieces to fall into place:
+
+- The framework for specifying the model or TLP function must support batching.
+- The user-provided model or TLP function must be written to support batching (see code
+
+below for an example and counterexample).
+
+- The MCMC framework itself must at a minimum not impede batching and in some cases
+
+(discussed below) must take signiﬁcant pains to support it.
+
+Moreover, the framework should handle batches indexed by arbitrary dimensions.
+
+The following seemingly identical TLP functions illustrate the subtlety of proper batch seman-
+tics. While all are meant to produce independent Gaussian samples, only the last two compute the
+correct answer when the input is matrix-variate, i.e., with “list of vectors” semantics.
+
+def batch_hostile_target_log_prob(x):
+return −0.5 ∗ tf. reduce_sum(x ∗ ∗ 2 )
+def batch_friendly_target_log_prob(x):
+
+# Sums over batches too. Oops!
+
+return −0.5 ∗ tf. reduce_sum(x ∗ ∗ 2 , axis=−1)
+
+# Sums over just the event. Yay!
+
+def batch_easy_target_log_prob(x):
+
+return tfd. MultivariateNormalDiag(loc=tf. zeros( n_dims ), scale =1.). log_prob (x)
+
+As illustrated by this example, a primary objective of the overall TFP library is to provide
+powerful and ergonomic tools for building complex probabilistic models which leverage SIMD
+parallelism on diverse hardware “out-of-the-box” [Dillon et al. 2017]. This is in large part possi-
+ble because TensorFlow itself pervasively supports batching and execution on diverse hardware
+[Abadi et al. 2016]. By extending this ethos into probabilistic programming, TFP provides users
+with a rich modeling language that hides many of the challenges of vectorizing computation. We
+note, however, that the TFP MCMC toolbox does not require that TLP functions be built from TFP
+abstractions (e.g., Distributions, Bijectors). The library is “self agnostic,” and a user may directly
+use TensorFlow if they prefer.
+
+We now highlight several case studies internal to TFP MCMC’s implementation. These cases
+span from (1) simply needing to “get out of the way” of batching, to (2) requiring batch parallelism
+for great proﬁt, to (3) the sometimes signiﬁcant engineering challenges of maintaining vectorized
+computation.
+
+2.1 Case Study: HMC
+
+Preserving vectorized computation for Hamiltonian Monte Carlo (HMC, [Neal 2011]) and other
+similarly “simple” Metropolis-Hastings [Hastings 1970] samplers is generally straightforward. In
+the case of HMC speciﬁcally, one samples from a momentum distribution and uses an iterative
+
+tfp.mcmc: Modern Markov Chain Monte Carlo Tools Built for Modern Hardware
+
+3
+
+symplectic integrator with a ﬁxed number steps to produce a proposal. The proposal is accepted or
+rejected according to a Metropolis-Hastings scheme. Each of these operations is trivially batchable.
+We must be mindful to sample the momenta in accordance with the shapes of the inputs—one
+independent momentum per state variable per chain—and to ensure the user-provided step size is
+appropriately broadcast across the state space.
+
+Throughout TFP MCMC, the TLP for multiple chains is evaluated as a batch. For example, the
+HMC transition kernel may query the probability of a vector-variate distribution with a matrix of
+values, i.e., a “list of vectors,” wherein each row corresponds to a diﬀerent chain state. Assuming
+the supplied TLP function has “batch semantics”—and the list length is less than the processor’s
+SIMD capacity—this evaluation costs roughly the same as evaluating one chain.
+
+Vectorization of control ﬂow, such as the Metropolis-Hastings accept/reject decision, can be
+subtle. For instance, TensorFlow has two ops for implementing conditional logic: tf.where and
+tf.cond. The former is vectorized and the latter is not. TFP MCMC generally avoids using tf.cond.
+
+2.2 Case Study: Replica Exchange Monte Carlo
+Replica Exchange MCMC (REMC) is a technique for increasing mixing rates of multi-modal TLP
+functions. Also known as “parallel tempering”, it is useful when the modes of the TLP are separated
+by relatively large (with respect to the chain variance), low-probability regions. REMC generates
+a single sample by accepting or rejecting swaps among K replicas, where replica i has TLP p(x)/Ti ,
+1 = T1 < · · · < TK . In TFP, an additional batch dimension indexes the K replicas, so that each
+replica may be a number of independent chains, all sampling from p(x)/Ti .
+
+The batch dimension indexing replicas is added by the REMC kernel. By assuming the user-
+supplied TLP and kernel driver have batch semantics, the TFP MCMC REMC implementation
+need only replicate additional temperature-scaled chains per each original chain. This is essentially
+accomplished by the following:
+
+def _make_replica_target_log_prob_fn( target_log_prob_fn , inverse_temperatures):
+
+def _replica_target_log_prob( ∗ x):
+tlp = target_log_prob_fn( ∗ x)
+# Pad shape on the right with 1 ' s until its rank matches that of tlp.
+brodacastable = mcmc_util . left_justified_expand_dims_like(
+
+inverse_temperatures, tlp)
+
+# Scale tlp ' s by inverse_temperatures, taking care to match numeric types.
+return tf. cast(broadcastable , tlp.dtype ) ∗ tlp
+
+return _replica_target_log_prob
+
+That is, temperature scaling across chains is achieved simply by broadcasting. Similarly, we can
+easily implement other population-based samplers like Diﬀerential Evolution MCMC [Ter Braak
+2006] as information across chains is readily available.
+
+2.3 Case Study: No U-Turn Sampler
+
+The No U-Turn Sampler (NUTS) [Hoﬀman and Gelman 2014] has emerged as a popular MCMC
+technique, in part for its more-“turnkey” nature (vs HMC). NUTS builds on HMC by sampling
+from a Hamiltonian trajectory constructed by a recursive doubling algorithm. The recursion is
+a pre-order tree traversal that terminates when the trajectory makes a U-turn.3 The number of
+recursions is therefore dynamic, varying based on the starting position and momentum, and so
+some chains may incur more recursions than others. Achieving data parallelism for NUTS is made
+challenging by the recursive tree-building process.
+
+In devising a vectorized algorithmic variant of NUTS, we note the following:
+
+3Another termination criterion is “divergence”—an absolute change in Hamiltonian energy above some threshold.
+
+Junpeng Lao*, Christopher Suter*, Ian Langmore, Cyril Chimisov, Ashish Saxena, Pavel Sountsov, Dave Moore, Rif A.
+Saurous, Matthew D. Hoﬀman, and Joshua V. Dillon
+
+4
+
+- Typical implementations of NUTS bound the number of allowed recursions (by default we
+
+cap max_tree_depth to 10).
+
+- The overall computational cost is dominated by gradient evaluations.
+- The remaining computation is dominated by U-turn checking. Various checks require a his-
+
+tory of samples (made ﬁnite as implied by the ﬁrst point).
+
+With these observations in mind, NUTS is parallelized by “unrolling” the recursion and imple-
+
+mented using tf.while_loop. The general recipe is:
+
+- Precompute program dynamism (e.g., recursion), noting read/write accesses.
+- Inspect the computation stack, noting repeat operations and requisite intermediate state.
+- Preallocate requisite memory (conceptually, the recursion stack) based on this analysis.
+- Use conditional operations tf.where, tf.scatter to update stack state. (With care taken to
+
+ensure constant computation across batch elements.)
+
+For NUTS speciﬁcally, we note that naive data access could be implemented by saving the entire
+trajectory of size O(2max_tree_depth). However, the pattern of access to state/momentum pairs is
+such that we need only O(max_tree_depth) memory, i.e., exponentially less.4
+
+NUTS’s candidate states are stacked during the tree doubling recursion; naively this requires
+dynamic memory allocation. Following similar logic, we observe it is possible to allocate a ﬁxed-
+size memory buﬀer and update it in situ. This ensures the leapfrog computation has a ﬁxed memory
+access pattern and further aids SIMD parallelism. The remaining bookkeeping necessary for a
+NUTS transition (e.g., accumulating the energy diﬀerence) is straightforward.
+
+3 SECOND CONTRIBUTION: A PYTHON CALLABLE IS ALL YOU NEED
+While TFP provides sophisticated tools for model speciﬁcation [Dillon et al. 2017; Piponi et al.
+2020], the MCMC API neither presumes nor requires their use. This is possible since many MCMC
+techniques typically only require evaluation of the (unnormalized) TLP function. For gradient-
+based algorithms such as HMC, NUTS, and Langevin dynamics, automatic diﬀerentiation capabil-
+ity is transparently provided by TensorFlow.
+
+Bayesian applications of MCMC entail a joint generative model “pinned” at some observed data.
+
+In this case we recommend users specify the joint model distinct from the unnormalized. E.g.,
+
+jd = tfd. JointDistributionSequential([
+
+tfp. distributions.Uniform (low =0. , high =1.) ,
+lambda p: tfd. Independent(tfd. Bernoulli ( probs=p[... , tf. newaxis ]),
+
+# Prior
+
+], validate_args=True)
+unnormalized_posterior_log_prob = lambda pheads : jd ([ pheads , coin_flip_data])
+
+reinterpreted_batch_ndims=1),
+
+# Likelihood
+
+(For more details, see [Piponi et al. 2020].)
+
+4 THIRD CONTRIBUTION: USER-LEVEL TRANSITION KERNEL AND DRIVER API
+Mechanistically, we can regard MCMC as a loop whose body consists of a single Markov transi-
+tion. In TFP MCMC we reify these ideas as TransitionKernel and a “driver.” The TransitionKernel
+implements the chain mechanics, e.g., tfp.mcmc.HamiltonianMonteCarlo, tfp.mcmc.NoUTurnSampler
+, and composing kernels like tfp.mcmc.MetropolisHastings. TransitionKernels implement one_step
+and bootstrap_results. The “driver” is parameterized by a TransitionKernel instance that relatively
+weakly speciﬁed by the API. Specialized drivers serve a variety of tasks, e.g., concatenate all sam-
+ples, compute streaming statistics, interleave optimization (e.g., MCEM), or tune chain parameters.
+
+Conceptually, TKs and drivers combine as follows,
+
+4For more details see this technical note on the unrolled nuts implementation in TFP.
+
+tfp.mcmc: Modern Markov Chain Monte Carlo Tools Built for Modern Hardware
+
+5
+
+def driver (kernel , initial_state):
+
+[] = results
+side_results = kernel . bootstrap_results( initial_state)
+for _ in range ( num_samples):
+
+x, side_results = kernel . one_step ( results [−1], side_results)
+results += [x]
+
+return results
+
+results = driver ( SomeKernel( target_log_prob_callable), x0)
+
+Per requirements of tf.while_loop, TransitionKernel “side_results” must be enumerable via tf.
+nest, itself supporting tuple, list, dict, and recursive combinations thereof. The containing struc-
+ture and per-element dtypes of bootstrap_results must match that which is returned by one_step.
+Side-eﬀects in one_step are not permitted; all state must be represented by either the chain state
+(results[−1]) or the side_results.
+
+4.1 TransitionKernel
+The TransitionKernel class encapsulates the computation of a single state transition in a Markov
+chain, as well as an initial “bootstrap” operation. These methods are called one_step and
+bootstrap_results, respectively.
+
+The main work of the TransitionKernel is to generate a new chain state from an existing one. We
+typically also need to keep track of additional kernel-speciﬁc states, for example the Metropolis-
+Hastings accept/reject outcome (for diagnostics) or the previous TLP and its gradients (to avoid
+costly recomputation). The work of advancing the chain state is done by the one_step method,
+which requires two arguments: (1) the chain state, a Tensor or a list-like collection of Tensors, and
+(2) the kernel state, typically a (nested) namedtuple of Tensors. The output of one_step is a pair of
+new chain state and kernel state. As noted above, the nature of TF loops demands these inputs and
+outputs have identical structure.
+
+In order to start the chain, we need the initial chain state and kernel state. For end user, spec-
+ifying the initial chain state is suﬃcient as the bootstrap_results method generate the suitable
+kernel-speciﬁc state from a chain state. For example, it may compute the value and gradients of
+the TLP at initial chain positions. bootstrap_results method is typically called once as the code
+snippet above showed.
+
+The composable design of one_step—required by the TF loop API—means we can naturally build
+up more complicated transition operations by nesting TransitionKernels. For example, MCMC
+samplers that include a Metropolis-Hastings accept/reject step can be composed by nesting the
+MetropolisHastings kernel with an “uncalibrated” transitional kernel:
+
+randomwalk_mh = tfp.mcmc. MetropolisHastings(
+
+inner_kernel=tfp. mcmc. UncalibratedRandomWalk(
+target_log_prob_fn=target_log_prob_fn ,
+new_state_fn= new_state_fn))
+
+hmc = tfp.mcmc. MetropolisHastings(
+
+inner_kernel=tfp. mcmc. UncalibratedHamiltonianMonteCarlo(
+
+target_log_prob_fn=target_log_prob_fn ,
+step_size = step_size ))
+
+Using a similar “Matryoshka” pattern, we can design TransitionKernels that internally call the
+one_step function of another TransitionKernel, perform additional computation on the output chain
+state and/or kernel state, and output the modiﬁed chain state and kernel state. For example, we
+can perform parameter tuning during warmup/burnin by modifying the inner kernel state (e.g.
+tfp.mcmc.SimpleStepSizeAdaptation).
+
+Junpeng Lao*, Christopher Suter*, Ian Langmore, Cyril Chimisov, Ashish Saxena, Pavel Sountsov, Dave Moore, Rif A.
+Saurous, Matthew D. Hoﬀman, and Joshua V. Dillon
+
+6
+
+An especially powerful example of this pattern is the TransformedTransitionKernel, which em-
+ploys Bijectors [Dillon et al. 2017] to transparently apply smooth, volume-tracking reparameter-
+izations of the chain state space. Such reparameterizations are essential to algorithms like HMC,
+which must operate in an unconstrained space, but can also be used for preconditioning the state
+space to improve sampling eﬃciency [Hoﬀman et al. 2019].
+
+4.2 Driver
+At its simplest, a TFP MCMC driver is a Python function that iteratively invokes a Markov tran-
+sition operation and returns one or more intermediate iteration values. To leverage TensorFlow’s
+XLA compiler, low-level optimizations, and hardware acceleration, TFP drivers rely on tf.while_loop
+and derivatives tf.scan, tf.map_fn.
+
+At present, TFP oﬀers one driver, sample_chain, with 3 essential features: burnin, sampling, and
+tracing. Samples produced during burnin are not stored. Samples produced during sampling are,
+of course. Tracing allows the user to obtain traces of data from the kernel state (for diagnostics).
+
+Future plans include drivers for computing streaming expectations—useful, e.g., when the num-
+ber of state variables is so large that storing a full trace becomes impractical—as well as “multi-
+kernel” drivers which allow sequential composition of distinct TransitionKernels. The latter would,
+for instance, enable more sophisticated hyperparameter adaptation phases before burnin and sam-
+pling.
+
+5 DISCUSSION, RELATED WORK, FUTURE WORK
+We described the MCMC module in TFP, including support for data parallelism, a functional tar-
+get log probability interface, and modular building blocks for constructing performant MCMC
+algorithms runnable on modern hardware.
+
+To the best of our knowledge, TFP MCMC is the ﬁrst general purpose library for construct-
+ing MCMC algorithms, and making no strong demands on the user’s choice of model speciﬁcation
+framework, other than the choice of numerical library (TensorFlow) 5. Some examples of more spe-
+cialized libraries which do use data parallelism include emcee [Foreman-Mackey et al. 2013]) and
+elﬁ [Lintusaari et al. 2017]). Additionally, NumPyro [Phan and Pradhan 2019] implements an iter-
+ative NUTS variant (similar in spirit to TFP’s, although the two developed independently), which
+is amenable to JAX’s program transformations, including JIT compilation (@jit) and vectorizaiton
+via @vmap.
+
+The availability of massively multi-chain MCMC provides new opportunities. For example, run-
+ning many parallel chains may enable adaptive MCMC techniques to achieve faster convergence
+and lower bias, or allow for low-variance estimates with relatively short chains. Separately, one
+typically computes convergence criteria like potential scale reduction (R-hat [Vehtari et al. 2019])
+and eﬀective sample size [Gelman et al. 2013; Geyer 2011] to monitor the convergence of the chains.
+But the estimators that underlie these diagnostics require relatively long chains, which blunts the
+advantage of running many chains. Further research is needed to derive new tools and workﬂows
+that fully exploit the potential of many-chain MCMC.
+
+6 ACKNOWLEDGEMENTS
+
+We would like to acknowledge contributions to the TFP library from Karl Millar, Alexey Radul,
+Brian Patton, Srinivas Vasudevan, Danielle Kaminski, Jasper Snoek, Sebastian Nowozin, and the
+TFP Team. We also thank Alexey Radul and Ashok Popat for their review of this work.
+
+5Work is actively underway to enable TFP to be used seamlessly with alternate numerical backends, currently NumPy and
+JAX
+
+tfp.mcmc: Modern Markov Chain Monte Carlo Tools Built for Modern Hardware
+
+7
+
+REFERENCES
+Abadi, M., Agarwal, A., Barham, P., Brevdo, E., Chen, Z., Citro, C., Corrado, G. S., Davis, A., Dean, J., Devin, M., et al. (2016).
+
+Tensorﬂow: Large-scale machine learning on heterogeneous distributed systems. arXiv preprint arXiv:1603.04467.
+Bingham, E., Chen, J. P., Jankowiak, M., Obermeyer, F., Pradhan, N., Karaletsos, T., Singh, R., Szerlip, P., Horsfall, P., and
+Goodman, N. D. (2019). Pyro: Deep universal probabilistic programming. The Journal of Machine Learning Research,
+20(1):973–978.
+
+Brooks, S., Gelman, A., Jones, G., and Meng, X. (2011). Handbook of Markov Chain Monte Carlo. Chapman & Hall/CRC
+
+Handbooks of Modern Statistical Methods. CRC Press.
+
+Carpenter, B., Gelman, A., Hoﬀman, M. D., Lee, D., Goodrich, B., Betancourt, M., Brubaker, M., Guo, J., Li, P., and Riddell,
+
+A. (2017). Stan: A probabilistic programming language. Journal of statistical software, 76(1).
+
+Dillon, J. V., Langmore, I., Tran, D., Brevdo, E., Vasudevan, S., Moore, D., Patton, B., Alemi, A., Hoﬀman, M., and Saurous,
+
+R. A. (2017). Tensorﬂow distributions. arXiv preprint arXiv:1711.10604.
+
+Foreman-Mackey, D., Hogg, D. W., Lang, D., and Goodman, J. (2013). emcee: The mcmc hammer. Publications of the
+
+Astronomical Society of the Paciﬁc, 125(925):306–312.
+
+Gelman, A., Carlin, J., Stern, H., Dunson, D., Vehtari, A., and Rubin, D. (2013). Bayesian Data Analysis. Chapman & Hall/CRC
+
+Texts in Statistical Science. CRC Press.
+
+Geyer, C. J. (2011). Introduction to markov chain monte carlo. In Handbook of Markov Chain Monte Carlo, pages 139–188.
+
+Chapman and Hall/CRC.
+
+Hastings, W. K. (1970). Monte carlo sampling methods using markov chains and their applications.
+Hoﬀman, M., Sountsov, P., Dillon, J. V., Langmore, I., Tran, D., and Vasudevan, S. (2019). Neutra-lizing bad geometry in
+
+hamiltonian monte carlo using neural transport. arXiv preprint arXiv:1903.03704.
+
+Hoﬀman, M. D. and Gelman, A. (2014). The no-u-turn sampler: adaptively setting path lengths in hamiltonian monte carlo.
+
+Journal of Machine Learning Research, 15(1):1593–1623.
+
+Lintusaari, J., Vuollekoski, H., Kangasrääsiö, A., Skytén, K., Järvenpää, M., Marttinen, P., Gutmann, M. U., Vehtari, A.,
+
+Corander, J., and Kaski, S. (2017). Elﬁ: Engine for likelihood-free inference.
+
+Neal, R. M. (1993). Probabilistic inference using Markov chain Monte Carlo methods. Department of Computer Science,
+
+University of Toronto Toronto, Ontario, Canada.
+
+Neal, R. M. (2011). Mcmc using hamiltonian dynamics. In Handbook of Markov Chain Monte Carlo, pages 139–188. Chapman
+
+and Hall/CRC.
+
+Phan, D. and Pradhan, N. (2019). Iterative NUTS. https://github.com/pyro-ppl/numpyro/wiki/Iterative-NUTS.
+Piponi, D., Moore, D., and Dillon, J. V. (2020). Joint distributions for tensorﬂow probability.
+Robert, C. and Casella, G. (2013). Monte Carlo Statistical Methods. Springer Texts in Statistics. Springer New York.
+Salvatier, J., Wiecki, T. V., and Fonnesbeck, C. (2016). Probabilistic programming in python using pymc3. PeerJ Computer
+
+Science, 2:e55.
+
+Ter Braak, C. J. (2006). A markov chain monte carlo version of the genetic algorithm diﬀerential evolution: easy bayesian
+
+computing for real parameter spaces. Statistics and Computing, 16(3):239–249.
+
+Vehtari, A., Gelman, A., Simpson, D., Carpenter, B., and Bürkner, P.-C. (2019). Rank-normalization, folding, and localization:
+
+An improved bR for assessing convergence of mcmc.
+
+

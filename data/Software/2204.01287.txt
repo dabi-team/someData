@@ -1,0 +1,1347 @@
+Techreport: 2022.03.20, version 1 – In submission to a peer-reviewed venue.
+For updates and source code, visit
+https://www.cg.tuwien.ac.at/research/publications/2022/SCHUETZ-2022-PCC/
+
+Software Rasterization of 2 Billion Points in Real Time
+
+Markus Schütz, Bernhard Kerbl, Michael Wimmer
+
+TU Wien
+
+2
+2
+0
+2
+
+r
+p
+A
+4
+
+]
+
+R
+G
+.
+s
+c
+[
+
+1
+v
+7
+8
+2
+1
+0
+.
+4
+0
+2
+2
+:
+v
+i
+X
+r
+a
+
+Figure 1: A point cloud grouped into batches of 10’240 points. Each batch is rendered by a single compute workgroup using 128 threads,
+and each thread renders 80 points for a total of 128 * 80 = 10’240 points per workgroup. Workgroups utilize the bounding box of their
+batches for frustum culling and to determine the required coordinate precision. Using 10 bit ﬁxed-precision integer coordinates relative to
+the bounding box of a batch provides sufﬁcient precision for the vast majority of visible batches. If 10 bits are insufﬁcient, additional bits are
+loaded on demand.
+
+Abstract
+
+We propose a software rasterization pipeline for point clouds that is capable of brute-force rendering up to two billion points
+in real time (60fps). Improvements over the state of the art are achieved by batching points in a way that a number of batch-
+level optimizations can be computed before rasterizing the points within the same rendering pass. These optimizations include
+frustum culling, level-of-detail rendering, and choosing the appropriate coordinate precision for a given batch of points directly
+within a compute workgroup. Adaptive coordinate precision, in conjunction with visibility buffers, reduces the number of loaded
+bytes for the majority of points down to 4, thus making our approach several times faster than the bandwidth-limited state of
+the art. Furthermore, support for LOD rendering makes our software-rasterization approach suitable for rendering arbitrarily
+large point clouds, and to meet the increased performance demands of virtual reality rendering.
+
+CCS Concepts
+• Computing methodologies → Rasterization;
+
+ 
+ 
+ 
+ 
+ 
+ 
+2
+
+1. Introduction
+
+Markus Schütz & Bernhard Kerbl & Michael Wimmer /
+
+With the introduction of hardware with dedicated triangle rasteriza-
+tion units, hand-crafting rasterization routines in software became
+largely obsolete. Such custom-built rasterizers have nevertheless
+remained an ongoing topic of research in order to develop and study
+new rasterization approaches. Some of them eventually managed to
+beat hardware rasterization in speciﬁc scenarios [LHLW10], but in
+general, dedicated hardware remains the fastest approach. Nanite
+is the ﬁrst framework that promises practical improvements for 3D
+games via hybrid software and hardware rasterization [KSW21].
+They found that directly rasterizing the fragments of a small trian-
+gle with atomic min-max operations can be faster than pushing the
+triangle through the hardware rendering pipeline. Therefore, only
+larger triangles are rasterized via hardware.
+
+Point-cloud models offer additional opportunities for efﬁcient
+software rasterization, as the hardware rendering pipeline is largely
+dedicated to the rasterization of triangles and not points. In this
+paper, we consider point clouds as 3D models made of colored ver-
+tices, where each vertex is projected to exactly one pixel. Although
+this is a fairly strict limitation, it allows us to device algorithms that
+compete with graphics APIs that also only support one-pixel points,
+such as DirectX (POINTLIST primitive) and all backends that use
+it (WebGL, WebGPU, ANGLE, MS Windows games and appli-
+cations, ...). We intent to support larger point-sprites in the future
+and use the evaluated performances of one-pixel points as a base-
+line for comparisons. Point clouds have no connectivity, so index
+buffers or vertex duplication are not required. The lack of a con-
+nected surface also makes uv-maps and textures irrelevant, which is
+why colors are typically directly stored on a per-vertex basis. Fur-
+thermore, point clouds acquired by laser scanners do not contain
+surface normals. Normals could be computed in a pre-processing
+step, but computed normals are not robust in sparsely sampled re-
+gions with high-frequency details such as vegetation, strings/ca-
+bles/wires or even noise. We will therefore not consider normals in
+this paper, either.
+
+Our approach builds on [SKW21] to further optimize several as-
+pects of software rasterization of points, which leads to an up to 3x
+higher brute-force performance. Speciﬁcally, our contributions to
+the state of the art of software rasterization of point clouds are:
+
+• Assigning larger workloads to batches to enable efﬁcient batch-
+
+level optimizations.
+
+• Adaptive coordinate precision coupled with visibility-buffer ren-
+
+dering for three times higher brute-force performance.
+
+• Fine-grained frustum culling on batches of about 10’240 points,
+
+directly on the GPU.
+
+• Support for state-of-the-art level-of-detail structures for point
+
+clouds.
+
+2. Related Work
+
+2.1. Software Rasterization of Triangle Meshes
+
+Early CPU-side solutions for triangle rasterization in software
+were largely made obsolete in the 2000s by GPUs and their high-
+performance rasterization components. However, their (partly hard-
+wired) pipeline lacks the ﬂexibility to perform custom hierarchi-
+cal or context-dependent optimizations between individual stages.
+
+The continuously advancing programmability of GPUs has given
+software rasterization its second wind: Freepipe demonstrated that
+for scenes containing many, small triangles, GPU software ras-
+terization with one thread per triangle can outperform the hard-
+ware pipeline [LHLW10]. CudaRaster and Piko expanded on this
+idea, introducing optimizations for hierarchical triangle rasteriza-
+tion, achieving competitive performance with hardware rasteriza-
+tion even for larger triangles [LK11; PTSO15]. Complete software
+implementations of OpenGL-style streaming pipelines, including
+sort-middle binning and hierarchical rasterization, have been pre-
+sented for NVIDIA CUDA and OpenCL [KKSS18; KB21]: rather
+than attempting to outperform hardware rasterization, these solu-
+tions aim to provide an environment for experimenting with exten-
+sions and optimizations that may be suitable for future hardware
+pipelines. A comprehensive analysis of previous software rasteriza-
+tion approaches and the challenges they tackle is found in [FGB20].
+
+Most recently, software rasterization has received increased at-
+tention due to the launch of the Unreal Engine 5 and its virtual
+geometry feature, Nanite [KSW21]. Nanite provides both a hard-
+ware and a software pipeline for rasterization geometry and se-
+lects the proper route for rendered geometry dynamically. In scenes
+with mostly pixel-sized triangles, their software pipeline reportedly
+achieves more than 3× speedup. Its striking success begs the ques-
+tion whether high-performance software rasterization has not been
+overlooked as a viable method for other 3D representations as well.
+
+2.2. Software Raserization of Point Clouds
+
+Günther et al. proposed a GPGPU-based approach that renders
+points up to an order of magnitude faster than native OpenGL
+points primitives – a feat that is possible because the ﬁxed-function
+rendering pipeline is mainly targeted towards triangles [GKLR13].
+Whenever a point modiﬁes a pixel, their busy-loop approach locks
+that pixel, updates depth and color buffers, and then unlocks the
+pixel. Marrs et al. use atomic min/max to reproject a depth buffer
+to different views [MWH18]. Since only depth values are needed,
+32 bit atomic operations are sufﬁcient. Schütz et al. render colored
+point clouds via 64 bit atomic min-max operations by encoding
+depth and color values of each point into 64 bit integers, and using
+atomicMin to compute the points with the lowest depth value for
+each pixel inside an interleaved depth and color buffer [SKW21].
+Our paper is based on this approach and the published source
+code1, and makes it several times faster for brute-forcing, but also
+adds support for frustum culling and LOD rendering. Rückert et al.
+also adapt this approach into a differentiable novel-view synthesis
+renderer that uses one-pixel point rendering to draw multiple reso-
+lutions of a point cloud, and neural networks to ﬁll holes and reﬁne
+the results [RFS21]. They also signiﬁcantly reduce overdraw by
+stochastically discarding points whose assumed world-space size
+is considerably smaller than the pixel they are projected to.
+
+1 https://github.com/m-schuetz/compute_rasterizer/
+releases/tag/compute_rasterizer_2021
+
+Markus Schütz & Bernhard Kerbl & Michael Wimmer /
+
+3
+
+2.3. Level-of-Detail for Point Clouds
+
+Rusinkiewicz and Levoy introduced QSplat, a point-based level-
+of-detail data structure, as a means to interactively render large
+meshes [RL00]. They use a bounding-sphere hierarchy that is tra-
+versed until a sphere with a sufﬁciently small radius is encoun-
+tered, which is then drawn on screen. Sequential Point Trees are
+a more GPU-friendly approach that sequentializes a hierachical
+point-based representation of the model into a non-hierarchical list
+of points, sorted by their level of detail. From a distance, only a
+small continuous subset representing a lower level of detail needs
+to be rendered, without the need for costly traversal through a dense
+hierarchical structure [DVS03].
+
+Layered point clouds [GM04] were one of the most impactful
+improvements to LOD rendering of point clouds, and variations of
+it still serve as today’s state of the art. The original LPC consti-
+tutes a binary tree that splits the 3D space in half at each level of
+the hierachy. The key difference to the bounding-sphere hierarchy
+of QSPLATs is that each node itself is not a sphere, but a smaller
+point cloud comprising thousands of randomly selected points of
+the full point cloud. The large amount of geometry in each node re-
+duces the amount of nodes that are required to store the full data set,
+which allows utilizing GPUs that are efﬁcient at rendering hundreds
+of batches comprising thousands of points, each. Further research
+improved several aspects of layered point clouds, such as the uti-
+lized tree-structure, LOD generation times, and using density-based
+subsampling to properly support data sets without uniform den-
+sity [WBB*08; GZPG10; SW11; EBN13; MVvM*15; KJWX19;
+BK20]. Section 3.5 describes how our rasterization approach sup-
+ports layered point clouds, using the [POT] structure as a speciﬁc
+example.
+
+2.4. Coordinate Quantization
+
+Quantization is the conversion of a continuous signal to discrete
+samples. In case of coordinates, quantization typically refers to the
+conversion of ﬂoating point or double coordinates (the pseudo-
+continuous signal) to ﬁxed-precision integer coordinates with a
+carefully chosen amount of bits and a uniform coordinate pre-
+cision over the whole range. The uniform precision and control
+over the supported coordinate range, precision, and amount of
+bits makes quantization a frequently used part of coordinate com-
+pression schemes, complemented by delta and entropy encoding
+[Dee95; Ise13] or hierarchical encoding [BWK02]. In this paper,
+we use quantization to encode coordinate bits such that they can
+be adaptively loaded, i.e., to load just a few bits if low precision
+is sufﬁcient, or optionally load additional bits to reﬁne the previ-
+ously loaded low-precision coordinate. We do not, however, apply
+delta, entropy, hierarchical or similar encodings because they add
+additional computational overhead, and they make the decoding of
+one point dependant on the decoding of others, i.e., they can’t be
+decoded individually.
+
+3. Method
+
+The core aspect of our rasterization method is that we assign larger
+batches of points to be rendered by each workgroup (e.g., 128
+threads) instead of only one point per workgroup thread. These
+
+(a) Flowchart of a single workgroup invocation.
+
+Figure 2: Each workgroup renders one batch or octree node. If its
+projected bounding box is small, fewer coordinate bits are loaded,
+reducing memory bandwidth usage and boosting render perfor-
+mance accordingly.
+
+larger batches (e.g., 10k points – 80 per thread) enable several op-
+timizations that would be too costly on small batches (e.g., 128
+points – 1 per thread), but whose costs amortize with each addition-
+ally rendered point. Using larger batches with varying amounts of
+points also allows us to support several widely used level-of-detail
+structures, as discussed in Section 3.5. Figure 2 gives an overview
+of the rendering steps within a workgroup.
+
+We will ﬁrst describe our basic rendering pipeline, which we will
+then gradually expand by additional features and optimizations that
+ultimately allow us to render point clouds several times faster than
+the state of the art.
+
+3.1. Data Structure
+
+The data structure consists of a list of batches and a list of points.
+Each batch represents a number of consecutive points in the point
+list (see Figure 3), so for each batch we store the index of the ﬁrst
+point of that batch, the number of points in that batch, and their
+bounding box. Each point consists of 4 attributes: low, medium,
+and high precision parts of the coordinates (details in Section 3.3),
+and a color value. The 4 attributes are stored in a struct-of-arrays
+fashion, i.e., in separate buffers for low-precision part of the co-
+ordinate, another for medium precision part, etc., so that we only
+need to load components from memory during rendering that are
+actually needed. For the majority of points, this will just be the
+low-precision coordinate bits (4 bytes out of 16 bytes per point).
+
+For regular, unstructured point-cloud data sets, we suggest to
+simply group about 10’240 consecutive points into batches and
+compute their bounding box while loading the points. In practice,
+the majority of data sets we’ve encountered already provide sufﬁ-
+cient locality, especially data sets generated through aerial LIDAR
+or photogrammetry. But not all of them do and almost all can ben-
+eﬁt from sorting by Morton code (z-order) – an easy to implement
+and efﬁcient approach to create data sets with good locality [OM84;
+IL05; LK00; LOM*20; SKW21]. For the remainder of this sec-
+tion, we will assume that data sets exhibit sufﬁcient locality, either
+by default or through sorting by Morton-code, and we will further
+evaluate and discuss the impact of poor locality in Section 4.
+
+Figure 1 and Figure 4 show the results of grouping 10’240 con-
+secutive points of a Morton-ordered point cloud into batches. Al-
+though the locality isn’t perfect, the majority of batches are sufﬁ-
+ciently compact with only a couple of outliers that experience ex-
+tremely large jumps between different clusters of points. The main
+advantages of this approach are that it’s trivial to implement, re-
+
+4
+
+Markus Schütz & Bernhard Kerbl & Michael Wimmer /
+
+(a) Unstructured Point Clouds
+
+(b) LOD Batches / Nodes
+
+Figure 3: (a) For unstructured, Morton-code-ordered data sets, we
+group 10’240 consecutive points into a batch. (b) For LOD data,
+each octree node equals a batch and batches additionally store
+memory location and number of points inside the node/batch.
+
+quires no preprocessing, and can be done while a data set is loaded
+with negligible impact on performance.
+
+3.2. Basic Rendering Pipeline
+
+The basic pipeline spawns one compute workgroup for each batch
+to render its points. Each workgroup comprises 128 threads and
+each thread renders n points. In practice, we found n between 60 to
+200 to perform equally well on an RTX 3090, and will therefore as-
+sume n = 80 points per thread (128 * 80 = 10’240 points per batch)
+throughout the paper. The rasterization process of each individual
+point is the same as in previous work [SKW21]: Each point is pro-
+jected to pixel coordinates, its depth and color value are encoded
+into a single 64 bit integer, and atomicMin is used to compute the
+point with the smallest depth value for each pixel, as shown in List-
+ing 1. An early-depth test (a non-atomic depth comparison before
+an expensive atomic depth-compare and write) ensures that the ma-
+jority of occluded points are rejected before invoking an expensive
+atomic update.
+
+1 vec4 pos = worldViewProj * position;
+2
+3 int pixelID = toPixelID(pos);
+4 int64_t depth = floatBitsToInt(pos.w);
+5 int64_t newPoint = (depth << 32) | pointIndex;
+6 // fetch previously written point
+7 uint64_t oldPoint = framebuffer[pixelID];
+8
+9 // Early-depth test
+10 if(newPoint < oldPoint){
+11
+12 }
+
+atomicMin(framebuffer[pixelID], newPoint);
+
+Listing 1: Point rasterization, including an early-depth test.
+
+The ﬁrst improvement over [SKW21] is that the larger work-
+loads per workgroup allow implementing efﬁcient workgroup-wise
+frustum culling with a granularity of 10’240 points. At the start of
+the workgroup invocation, we ﬁrst load the bounding box of the
+current batch and abort right away if it does not intersect with the
+view frustum. Another improvement is that spawning fewer work-
+groups and giving each of them larger tasks reduces the scheduling
+overhead of the GPU.
+
+3.3. Adaptive Vertex Precision
+
+One of the main bottlenecks in previous work [SKW21] is mem-
+ory bandwidth usage. They reported a peak performance of 50 bil-
+lion points per second using 16 bytes per point, which utilizes 85%
+of the GPU’s memory bandwidth. Since this speed is limited by
+bandwidth, any signiﬁcant improvement of brute-force rendering
+performance requires some form of vertex compression.
+
+We propose an adaptive precision scheme that allows us to load
+as many bits for coordinates as necessary for a given viewpoint. We
+achieve this by splitting the bits of a coordinate into three separate
+buffers storing the low, medium, and high precision parts, as shown
+in Figure 6. The low precision part always needs to be loaded. The
+medium precision part can be optionally loaded to recover some
+of the bits that we removed, and the high precision part is used to
+optionally recover the remaining bits. The different precision levels
+are established via coordinate quantization, i.e., by converting co-
+ordinates to ﬁxed-precision integers with speciﬁc amounts of bits,
+and then splitting the quantized bits. By quantizing the point co-
+ordinates with respect to the bounding box of the batch instead of
+the bounding box of the whole 3D model, we can achieve a high
+coordinate precision with few bits. Figure 5 illustrates that the res-
+olution of the coordinates quickly approaches the resolution of the
+pixel grid. In our case, we ﬁrst convert the coordinates within a
+batch to 30 bit ﬁxed-precision integer coordinates that indicate each
+point’s position within its batch. The X-coordinate is computed as
+follows, for example:
+
+X30 = min((cid:98)230 ∗
+
+x − boxMin.x
+boxSize.x
+
+(cid:99), 230 − 1)
+
+(1)
+
+210 = 1
+
+These 30 bits are then split into three 10-bit components repre-
+senting low, medium and high precision parts. The 10 most sig-
+niﬁcant bits (bit indices 20 to 29) of this 30 bit integer are the
+low-precision bits. They tell us the coordinate of a point within a
+batch with a precision of 1
+1024 of its size. Considering that the
+majority of rendered batches in any given viewpoint are typically
+smaller than a couple of hundreds of pixels, and that 10 bits grant
+us 1024 different coordinate values, we ﬁnd that 10 bits per axis are
+sufﬁcient to render most points with sub-pixel coordinate precision.
+Due to buffer alignment recommendations, simplicity, and because
+the smallest accessible primitive values on GPUs are typically 32
+bits, we then pack the 10-bit x, y and z components into a single 32
+bit integer with the remaining 2 bits used as padding, as shown in
+Listing 2. The result is a 32-bit integer buffer where each 4-byte el-
+ement contains the 10 lowest precision bits of the three coordinate
+axes of a single point.
+
+1 uint32_t Xlow = (X30 >> 20) & 1023;
+2 uint32_t Ylow = (Y30 >> 20) & 1023;
+3 uint32_t Zlow = (Z30 >> 20) & 1023;
+4 uint32_t encoded = Xlow | (Ylow << 10) | (Zlow << 20)
+Listing 2: Encoding the most signiﬁcant 10 bits of each axis into a
+single 32 bit integer.
+
+Likewise, we generate two more buffers for the medium (bits
+10 to 19, middle) and high precision bits (bits 0 to 9, least-
+signiﬁcant). During rendering, each workgroup can now choose to
+
+Markus Schütz & Bernhard Kerbl & Michael Wimmer /
+
+5
+
+(a) Point Cloud Data Set
+
+(b) Batches
+
+(c) Bounding Boxes
+
+(d) A single batch
+
+Figure 4: A Morton-code ordered point cloud, grouped into batches of 10’240 consecutive points. The locality that is provided by the Morton
+order is sufﬁcient for frustum culling and a bounding-box-based vertex compression/quantization scheme.
+
+(a) 2 bits
+
+(b) 3 bits
+
+(c) 4 bits
+
+(d) 5 bits
+
+(e) 6 bits
+
+Figure 5: Coordinate quantization provides a trade-off between
+precision and storage size. The amount of possible coordinate val-
+ues per axis is given by 2bits.
+
+load a single 4-byte integer containing just the low precision bits
+that grants 1’024 coordinate values, 2 such integers (low+medium
+precision) granting 1’048’576 coordinate values, or 3 such integers
+(low+medium+high precision), which theoretically allows for one
+billion different coordinate values. However, we should note that
+the usefulness of 30 bit precision is limited in practice because
+we still convert the integer coordinates to ﬂoating-point coordi-
+nates during rendering, where the conversion from a 30-bit ﬁxed-
+precision integer to a 32-bit ﬂoating point value will incur a loss of
+precision due to rounding errors and the non-uniform distribution
+of precision in ﬂoats (high precision for small values, low precision
+for large values). This issue is not speciﬁc to our approach, how-
+ever, as point clouds are typically already stored in integer coordi-
+nates on disk and the conversion to ﬂoats for rendering has always
+been an issue for point clouds with a large extent. Handling this is-
+sue is out of scope of this paper, but we would like to note that stor-
+ing coordinates as 30 bit ﬁxed-precision integers would allow us to
+convert them to highly accurate double-precision coordinates (e.g.,
+for measurements), while traditional ﬂoating point storage causes
+an irrecoverable loss of precision.
+
+The coordinate precision during rendering is determined through
+the projected size of a batch. If a batch projects to less than 500
+pixels, we use 10 bit coordinates. The reason for choosing 500 pix-
+els as the threshold even though 10 bits can represent 1024 dif-
+ferent coordinates values is that quantization changes the distance
+between any two points by up to the size of a quantization grid cell,
+i.e., points that were one grid cell’s size apart might now be twice
+as far apart. Using half the size of the quantization grid as the pixel
+threshold ensures that we do not introduce additional holes between
+rasterized points.
+
+(a) Common point-cloud memory layout with 16 bytes per point.
+
+(b) Splitting coordinate bits into a low, medium and high-precision buffer.
+Each buffer stores 10 bits per coordinate axis, encoded into 4 bytes per
+point.
+
+Figure 6: (a) Point cloud renderers typically load at least 16 bytes
+per point during rendering. (b) Splitting coordinate bits into sepa-
+rate buffers allows loading just the required bits, depending on the
+viewpoint. 10-bit coordinates typically sufﬁce for the majority of
+points.
+
+Compared to previous work [SKW21], this approach reduces the
+required memory bandwidth for the majority of rendered points
+from 16 bytes down to 8, since only 4 bytes instead of 12 are needed
+for most coordinates, and another 4 for colors. However, we can
+further cut this into half by using a visibility-buffer (item-buffer)
+approach [BH13; WHG84], i.e., we render point indices rather than
+colors into the framebuffer during the geometry pass, and transform
+the point indices to vertex colors in a post-processing step. Doing so
+reduces the amount of memory accesses to color values down from
+the number of processed points to the number of visible points.
+
+3.4. Vertex Pre-Fetching
+
+To identify performance bottlenecks of the above approach, we per-
+formed a direct port of its GLSL shader code to NVIDIA CUDA.
+Doing so enabled the use of the proprietary Nsight Compute tool
+to pinpoint suboptimal behavior in our routines. Our investiga-
+tion into dominant stall reasons revealed that performance is—
+
+6
+
+Markus Schütz & Bernhard Kerbl & Michael Wimmer /
+
+unsurprisingly—governed by memory operations, with approxi-
+mately 70% of the total kernel run time spent on them.
+
+Since we choose the batch size to be a multiple of the work group
+size, threads persist and process multiple points in a loop before
+returning. Naively, the corresponding point data is fetched and ras-
+terized to the framebuffer in each iteration. Batches simply deﬁne
+a linear range in memory, thus their contents can be transferred
+by workgroups with perfect coalescence. Furthermore, the com-
+pression scheme outlined in Section 3.3 economizes on available
+bandwidth when fetching point data. However, loading each pro-
+cessed point individually at the start of its associated iteration still
+incurs a direct dependency of the steps in Listing 1 on global device
+memory latency. Due to the early-depth test in its body and the pa-
+rameterizable iteration count, the compiler cannot trivially unroll
+the loop without creating secondary issues associated with com-
+plex program ﬂow (e.g., frequent instruction cache misses). Hence,
+we perform manual pre-fetching of point data. For the lowest pre-
+cision (using 32 bits per point), we execute a vectorized 128-bit
+load in each thread, yielding enough data for four successive it-
+erations; for medium-precision points, a 128-bit load fetches the
+data for two iterations. This policy signiﬁcantly alleviates reported
+stalls due to memory latency and simultaneously reduces the num-
+ber of memory instructions, without compromising on coalesced
+accesses. Overall, we found pre-fetching to cause ≈ 30% perfor-
+mance gain. A welcome side effect, though less impactful, is the
+reduction of updates to the frame buffer by this policy, if points are
+spatially sorted. Since threads now load and process consecutive
+points in memory, the early-depth test has a higher chance of fail-
+ing: threads are now more likely to query (and ﬁnd) information in
+the L1 cache for pixels that they wrote to in a previous iteration.
+
+We note that, with pre-fetching in place, the main remaining bot-
+tleneck is the code block for early-depth testing and framebuffer
+updates. Although these accesses are somewhat localized if points
+are spatially ordered, a residual irregularity remains in their access
+pattern. The coarse-grained memory transfer policy of the GPU
+consequently causes more than 2× the amount of actually accessed
+information to be transferred. However, this update pattern is in-
+herent to the overall routine design, and any further attempts to
+improve on it without extensive revision led to diminishing returns.
+
+3.5. Level-of-Detail Rendering
+
+In this section we will describe how support for some of the most
+popular LOD structures for point clouds – Layered Point Clouds
+(LPC) [GM04] and its variations – can be added to our point ras-
+terization approach. Layered point clouds are a hierarchical, spatial
+acceleration structure where points with varying density are stored
+in the nodes of the tree. Lower levels contain coarse low-density
+subsets of the whole point cloud. With each level, the size of the
+nodes decreases, leading to an increase of the the density of points
+as the number of points in each node stays roughly the same. The
+structures are often additive – meaning that higher LODs increase
+detail by rendering more points in addition to lower LODs instead
+of replacing them – but replacing schemes are also possible.
+
+uses an octree and populates nodes with subsamples of the point
+cloud with a speciﬁc, level-dependant minimum distance. Each oc-
+tree node comprises about 1k to 50k points, and Potree itself typi-
+cally renders about 100 to 1000 nodes for any given viewpoint. Up
+until now we have assumed that each batch renders exactly 10’240
+points, but we can easily adapt our rasterization approach to sup-
+port the Potree structure by allowing varying amounts of points per
+batch, as shown in Figure 3. In addition to the bounding box, we
+will also need to store the number of points as well as the mem-
+ory location of the ﬁrst point for each batch. The workgroup size
+of 128 threads remains the same, but each thread will now render
+(cid:100) batch.numPoints
+128
+
+(cid:101) points instead of exactly 80.
+
+The Potree format is structured such that octree nodes whose
+projected bounding boxes are small can be entirely ignored, be-
+cause the points stored in their parents will already provide sufﬁ-
+cient detail. This means that the procedure in Section 3.3 that is
+used to determine the coordinate precision during rendering based
+on the screen-size of the bounding box can now be used to en-
+tirely cull the node. We suggest to cull the nodes with following
+conditions in mind: Each Potree node is cubic and stores a subsam-
+ple of points with a resolution that approximately matches a grid
+with 1283 cells, and our rasterizer maps each point to exactly 1
+pixel. To avoid holes between rendered points, we therefore sug-
+gest to cull those nodes that are smaller than 100 pixels on screen.
+However, it is also viable to cull larger octree nodes on lower end
+GPUs to improve performance and cover up the resulting holes in
+a post-processing pass, e.g., via depth-aware dilation or more so-
+phisticated hole-ﬁlling approaches [RFS21; PJW12; RL08; GD98;
+PGA11; MKC07].
+
+3.6. High-Quality Shading
+
+LOD rendering works well in conjunction with high-quality splat-
+ting (point-sprites or surfels [BHZK05]) or shading (one-pixel
+points [SKW21]), a form of color ﬁltering for point clouds that
+blends overlapping points together. Colors and amount of points in-
+side a pixel within a certain depth range (e.g., 1% behind the clos-
+est point) are summed up during the geometry processing stage,
+and a post-processing shader then divides the sum of colors by the
+counters to compute the average. Schütz et al. [SKW21] suggest
+two variations: one that uses two 64-bit atomicAdd instructions per
+point into four 32 bit integers to sum up color values and counters,
+and another variation that uses a single 64 bit atomic instruction
+per point to compute the sum of up to 255 points, with a fallback
+that uses two 64-bit atomics if more than 255 points contribute to
+the average. However, when using an LOD structure, the amount
+of overlapping points with similar depth is essentially guaranteed
+to be lower than 255, so we can safely use high-quality shading
+with just a single 64-bit atomic add instruction per point. This limit
+can even be raised to up to 1023 points by using the “non-robust"
+variation without overﬂow protection. For unstructured data sets,
+we suggest to use the variation with overﬂow protection due to the
+potentially large amount of overlaps.
+
+3.7. Virtual Reality Rendering
+
+We implement and evaluate our support for LPC structures based
+on the Potree format, which constitutes a variation of LPC that
+
+Virtual reality (stereo) rendering greatly increases the performance
+requirements – even more so for point clouds as they typically suf-
+
+Markus Schütz & Bernhard Kerbl & Michael Wimmer /
+
+7
+
+fer from aliasing artifacts that need to be addressed to provide an
+acceptable VR experience. In addition to a speciﬁc conﬁguration
+of our pipeline (use LOD rendering for performance, high-quality
+shading to reduce aliasing and large framebuffers for additional
+anti-aliasing via supersampling), we can exploit speciﬁc properties
+of VR rendering in our approach.
+
+a time; Section 3.4) and LOD (Section 3.5) approaches, and com-
+pares it with a previous one [SKW21] and with GL_POINTS. For
+unstructured point-cloud data, our approach with the prefetch opti-
+mization performs the fastest in all cases – up to three times faster
+than previous work in overview scenarios, and ﬁve times faster for
+the inside viewpoint that beneﬁts from frustum culling.
+
+First, the scene needs to be drawn twice – once for each eye. In-
+stead of duplicating the entire rasterization pipeline by calling the
+compute shaders twice, we suggest to modify the shader to simply
+draw each point into both framebuffers. While this doesn’t dou-
+ble the performance, it provides a signiﬁcant improvement, as dis-
+cussed in Section 4.
+
+Second, in a VR setup, details in the periphery aren’t as no-
+ticeable as details in the center of the view. This is partially be-
+cause most details are perceived in the gaze direction, i.e., mostly
+straight ahead in VR, but also because the rendered image will be
+distorted before it is shown inside the HMD to counter the lens dis-
+tortion [Vla15]. The applied distortion compresses peripheral re-
+gions, thus reducing the amount of detail in the image. We there-
+fore suggest to render peripheral regions of the framebuffer with
+reduced geometric complexity by raising the threshold for LOD
+culling, e.g., culling nodes smaller than 300 pixels in the periph-
+ery, nodes smaller than 100 pixels in the center of the view, and
+200 pixels in between. The resulting holes between points are then
+ﬁlled in post-processing, in our case via a simple depth-aware dila-
+tion shader that increases point sizes to up to 7x7 in the periphery
+and 3x3 in the center. Depth-aware means that the closest point
+within the pixel ranges are expanded.
+
+Table 2 shows how many nodes and points were rendered in a
+frame from the given viewpoint. Processed nodes include all batch-
+es/nodes of the data set since we spawn one workgroup per node.
+Rendered nodes are those that pass the frustum and LOD culling
+steps. Frustum culling can reduce the amount of rendered nodes
+to slightly less than half for unstructured point clouds (Banyunibo
+inside), or down to several thousand out of hundreds of thousands
+of nodes in conjunction with LOD structures. The throughput is
+computed by taking the number of processed points in Table 2
+and dividing it by the rendering time in Table 1. On the RTX
+3090 system and with the prefetch method for unstructued data
+sets, we get throughputs of 69, 126.8, 144.7, 97.5 and 142.3 bil-
+lion points per second for the ﬁve scenarios – all of them larger
+than the peak throughput of 50 billion points per second reported
+in prior work [SKW21]. We can also look at the throughput in terms
+of how many points we are able to render in real-time (60fps) by
+mapping the results from points per second to points per 1000
+60 ≈ 16
+milliseconds, which results in 1.1, 2.0, 2.3, 1.6, 2.3 billion points
+per 16 milliseconds. Thus, in three out of ﬁve scenarios we were
+able to render two billion points in real-time.
+
+4. Evaluation
+
+4.2. The Impact of Vertex Ordering
+
+The proposed method was evaluated with the test data sets shown
+in Figure 7. The smaller data sets, Eclepens and Morro Bay, are
+relatively easy to handle due to their low depth complexity, i.e., the
+number of hidden surfaces is typically small. Niederweiden poses
+a bigger challenge due to the higher point density and an interior
+room that is either occluded when viewed from the outside, or it oc-
+cludes everything else when viewed from the inside, but occluded
+points are still processed due to the lack of occlusion culling.
+
+The performance was computed through OpenGL timestamp
+queries at the start and end of each frame. All durations represent
+the average time of all frames over the course of one second. The
+evaluation was conducted on the following test systems:
+
+• NVIDIA RTX 3090 24GB, AMD Ryzen 7 2700X (8 cores),
+
+32GB RAM, running Microsoft Windows 10.
+
+• NVIDIA GTX 1060 3GB, AMD Ryzen 5 1600X (6 cores),
+
+32GB RAM, running Microsoft Windows 10.
+
+Unless speciﬁed otherwise, all reported timings are from the
+RTX 3090 system. The GTX 1060 (3GB) was only capable of keep-
+ing the smallest test data set, Eclepens (68M points), in memory.
+
+4.1. Rasterization Performance
+
+Table 1 shows the results of rendering various data sets with our
+proposed basic (with frustum culling and adaptive precision; Sec-
+tions 3.2, 3.3), prefetch (basic + each thread prefetches 4 points at
+
+The disadvantage of our naïve approach of generating batches by
+grouping 10’240 consecutive points is that the resulting perfor-
+mances depend on the vertex order of the data set. Figure 8 illus-
+trates the vertex ordering of a terrestrial laser scanner that scans
+on two rotational axis, ﬁrst top-bottom (pitch) and then right-left
+(yaw). Due to this, 10’240 consecutive points usually form a 3-
+dimensional curve along the surface of the scanned object. The re-
+sulting batch has a large extent with mostly empty space. The next
+batch is formed by the next "scan-line", with an almost identical
+bounding box. The bottom row of Figure 8 demonstrates vertex
+order and the resulting batches after the points are sorted by Mor-
+ton order. The resulting batches are more compact with less empty
+space, and therefore more suitable to frustum culling and rendering
+with lower coordinate precision.
+
+We evaluated the performance differences between scan-order
+and Morton-order on a subset of the Banyunibo data set compris-
+ing only of the laser scans. From an outside viewpoint, scan-order
+requires 5.5ms to render a frame and Morton-order requires 3.9ms,
+which is mostly attributed to the lower coordinate precision require-
+ments of the compact batches. From an inside viewpoint, the scan-
+order requires 7.8ms to render a frame and Morton-order requires
+2.1ms. In this case, the even greater performance differences can
+further be attributed to frustum culling, which culls about 68% of
+all nodes of the Morton-ordered data set, but only 35% nodes of the
+scan-ordered data set.
+
+8
+
+Markus Schütz & Bernhard Kerbl & Michael Wimmer /
+
+Data Set
+Eclepens
+Eclepens
+Morro Bay
+Banyunibo (outside)
+Banyunibo (inside)
+Niederweiden
+
+points
+
+size
+69M 1.1GB
+69M 1.1GB
+279M 4.4GB
+529M 8.5GB
+529M 8.5GB
+1000M 16GB
+
+GPU
+RTX 3090
+GTX 1060
+RTX 3090
+RTX 3090
+RTX 3090
+RTX 3090
+
+GL_POINTS
+34.9
+72.2
+231.7
+198.3
+67.9
+873.9
+
+ours (unstructured)
+prefetch
+1.0
+5.1
+2.2
+3.3
+2.2
+6.4
+
+basic
+1.1
+6.5
+2.7
+4.2
+2.6
+8.2
+
+hqs
+2.8
+16.7
+9.6
+9.0
+6.1
+20.9
+
+ours (LOD)
+hqs
+basic
+1.4
+0.7
+5.3
+2.1
+1.9
+0.8
+3.3
+1.3
+4.6
+2.1
+4.5
+1.9
+
+[SKW21]
+
+dedup
+1.9
+9.5
+6.0
+10.7
+11.1
+19.8
+
+hqs
+7.6
+26.2
+33.5
+25.4
+24.4
+69.1
+
+Table 1: Comparing rendering times (in milliseconds) of GL_POINTS with our new approach and the old one by [SKW21]. Framebuffer
+size: 2560 x 1140 (2.9MP). All point clouds sorted by Morton code.
+
+unstructured
+
+LOD
+
+nodes
+
+points
+
+nodes
+
+points
+
+Data Set
+Eclepens
+Morro Bay
+Banyunibo (outside)
+Banyunibo (inside)
+Niederweiden
+
+processed
+6.7k
+27.2k
+51.7k
+51.7k
+97.7k
+
+rendered
+6.7k
+27.2k
+46.6k
+20.9k
+88.9k
+
+processed
+68.7M
+278.5M
+477.6M
+214.5M
+910.7M
+
+rendered
+13.0M
+12.2M
+13.7M
+19.1M
+51.6M
+
+processed
+23.5k
+93.5k
+195.7k
+195.7k
+346.6k
+
+rendered
+422
+577
+3.3k
+8.2k
+2.1k
+
+processed
+3.9M
+5.6M
+26.9M
+67.1M
+27.3M
+
+rendered
+1.4M
+1.9M
+4.4M
+12.5M
+6.4M
+
+Table 2: Detailed stats about the processed and rendered nodes and points during a frame. Processed nodes: All ﬁxed-size batches (unstruc-
+tured) or variable-sized octree nodes (LOD). Rendered Nodes: Nodes that passed frustum and LOD culling. Processed points: All points that
+were loaded. Rendered points: Points that pass point-wise frustum culling and early-depth, i.e., all points for which atomicMin is called.
+
+4.3. VR Performance
+
+5. Discussion
+
+VR rendering requires several times higher performance since we
+need to render data sets with higher frame rates, twice per frame,
+and in high quality. We evaluated the VR performance of our ap-
+proach on a Valve Index HMD (1440×1600 pixels per eye) with an
+RTX 3090 GPU. The targeted framerate is 90fps, i.e., each frame
+needs to be ﬁnished in 11.1 milliseconds, or closer to about 9ms
+to account for additional computations and overhead in the VR
+pipeline. The targeted resolution is 2478 x 2740 (6.8MP) per eye,
+mandated by the 150% resolution setting in SteamVR. The high
+resolution alleviates some aliasing issues, but high-quality shading
+is also needed and used to avoid severe ﬂickering artifacts.
+
+We evaluated the VR performance with an outside-in view of
+the Candi Banyunibo data set, comprising 529 million points in
+195k octree nodes. 21.4 million points in 2k nodes passed the frus-
+tum and LOD culling routines. After early-depth testing, 8 mil-
+lion points were drawn with atomicMin. The total frame time was
+8.3 milliseconds, which provides sufﬁcient reserves for additional
+computations and overhead of the VR rendering pipeline. Render-
+ing the depth buffer for the HQS shader took 1.7 ms for both eyes,
+or 1.3 ms when rendering just a single eye, which demonstrates the
+beneﬁts of drawing each point to both render targets within a sin-
+gle compute shader invocation. Similarly, drawing the color buffer
+of the HQS approach took 2.5 ms for both eyes and 1.5 ms for a
+single eye. The resolve pass, which enlarges the more sparsely ren-
+dered points in the periphery and stores the colors into an OpenGL
+texture, takes about 2.7 ms per frame for VR rendering, which is
+mainly attributed to the large and dynamic dilation kernels of 3 x 3
+(center) to 7 x 7 (periphery) pixels. Finally, clearing the relatively
+large depth and color buffers (2468 x 2740 per eye) takes about 0.6
+ms per frame.
+
+In this section we’d like to discuss several issues and limitations, as
+well as potential improvements that we have not evaluated, yet.
+
+First, we believe that this is a signiﬁcant improvement for point
+cloud rendering, but it’s not useful for games in its current state.
+Point clouds require a large amount of colored vertices to represent
+geometry without holes and sufﬁcient color-detail, while meshes
+can use a single textured triangle in place of thousands of points.
+However, massive amounts of point cloud data sets exist as a re-
+sult of scanning the real world, and this paper provides tools to
+render them faster without the need to process the data into LOD
+structures or meshes. Still, we hope that the presented approach
+might provide useful insights in future developments of hybrid
+hardware+software rasterization approaches for triangle meshes.
+For example, we could imagine that an approach like adaptive co-
+ordinate precision could be used to treat smaller batches like a point
+cloud and only load data that is relevant for triangles for larger
+batches.
+
+The quality for virtual reality currently suffers from lack of
+proper color ﬁltering. Although high-quality shading is applied and
+improves the results via blending, the issue is that the LOD struc-
+ture removes most of the overlapping points, thus the blended result
+is not representative of all points, including the discarded ones. The
+results can be improved by applying color ﬁltering (e.g. computing
+averages) to points in lower levels of detail during the construction
+of the LOD structure [RL00; WBB*08; SKW19] (similar to mip
+mapping). Furthermore, implementing continuous LOD could im-
+prove the visual quality through a subtle transition in point density
+between LODs, and by eliminating popping artifacts as details are
+
+Markus Schütz & Bernhard Kerbl & Michael Wimmer /
+
+9
+
+(a) Eclepens
+
+(b) Morro Bay
+
+(c) Banyunibo outside
+
+(d) Banyunibo inside
+
+(e) Niederweiden
+
+Figure 7: Test data sets. (a) A quary captured with photogrammetry. (b) A coastal city, captured with aerial LIDAR. (c+d) A candi in
+indonesia, captured with photogrammetry and a terrestrial laser scanner. (e) A manor captured with terrestrial lasser scanning.
+
+But in theory they could work. Delta and entropy encoding require
+to decode the points sequentially, which could work on a per-thread
+basis as each thread renders about 80 points sequentially. Gener-
+ally, we think that compression could work on a per-batch (10’240
+points) basis, a per thread (80 points) basis and/or a per-subgroup
+(32 or 64 cooperating threads) basis.
+
+6. Conclusions
+
+We have shown that software rasterization using OpenGL compute
+shaders is capable of rendering up to 144.7 billion points per sec-
+ond (Section 4.1), which translates to 2.3 billion points at 60 frames
+per second (16 ms per frame). The data structure is simple and gen-
+erated on-the-ﬂy during loading for unstructured point clouds, but
+LOD structures may also be generated in a preprocessing step for
+further performance improvements. Peak performances were ob-
+served in Morton ordered data sets, but many other orderings, for
+example aerial lidar scans that are sorted by timestamp and split
+into tiles, also provide substantial performance improvements by
+exploiting the spatial locality between consecutive points in mem-
+ory. Data sets without sufﬁcient locality (e.g., terrestrial laser scans)
+can simply be sorted by Morton order.
+
+The source code to this paper is available at https://
+
+github.com/m-schuetz/compute_rasterizer.
+
+7. Acknowledgements
+
+The authors wish to thank Schloss Schönbrunn Kultur- und Be-
+triebs GmbH, Schloss Niederweiden and Riegl Laser Measurement
+Systems for providing the data set of Schloss Niederweiden, the
+TU Wien, Institute of History of Art, Building Archaeology and
+Restoration for the Candi Banyunibo data set [HSG*19], Open To-
+pography and PG&E for the Morro Bay (CA13) data set [CA13],
+Pix4D for the Eclepens quarry data set, Sketchfab user nedo for the
+old tyres data set (CC BY 4.0), and theStanford University Com-
+puter Graphics Laboratory for the Stanford Bunny data set.
+
+This research has been funded by the FFG project Large-
+Clouds2BIM and the Research Cluster “Smart Communities and
+Technologies (Smart CT)” at TU Wien.
+
+(a) Batches - Scan Order
+
+(b) Batch - Scan Order
+
+(c) Batches - Morton Order
+
+(d) Batch - Morton Order
+
+Figure 8: Terrestrial laser scanners typically scan along two ro-
+tation axes. (a+b) Poor locality in scan order results in huge but
+mostly empty batches. (c+d) Morton order efﬁciently establishes
+locality and results in compact batches. Both batches in (b) and (d)
+contain the same amount of points.
+
+added and removed while navigating through the scene [SKW19;
+LOM*20].
+
+The adaptive coordinate precision approach leads to signiﬁcant
+performance improvements through a reduction in memory band-
+width usage, but it does not compress the points – coordinates
+still use up 12 bytes of GPU memory. At this time, we deliber-
+ately did not employ sophisticated compression approaches such as
+delta and entropy encoding [Dee95; Ise13] or hierarchical encod-
+ing [BWK02] due to their additional computational overhead and
+because they make it impossible to decode coordinates individually.
+
+Markus Schütz & Bernhard Kerbl & Michael Wimmer /
+
+10
+
+References
+
+[BH13] BURNS, CHRISTOPHER A. and HUNT, WARREN A. “The Visibil-
+ity Buffer: A Cache-Friendly Approach to Deferred Shading”. Journal of
+Computer Graphics Techniques (JCGT) 2.2 (Aug. 2013), 55–69. ISSN:
+2331-7418. URL: http://jcgt.org/published/0002/02/
+04/ 5.
+
+[BHZK05] BOTSCH, M., HORNUNG, A., ZWICKER, M., and KOBBELT,
+L. “High-quality surface splatting on today’s GPUs”. Proceedings
+Eurographics/IEEE VGTC Symposium Point-Based Graphics, 2005.
+2005, 17–141 6.
+
+[BK20] BORMANN, PASCAL and KRÄMER, MICHEL. “A System for Fast
+and Scalable Point Cloud Indexing Using Task Parallelism”. Smart Tools
+and Apps for Graphics - Eurographics Italian Chapter Conference. Ed.
+by BIASOTTI, SILVIA, PINTUS, RUGGERO, and BERRETTI, STEFANO.
+The Eurographics Association, 2020 3.
+
+[BWK02] BOTSCH, MARIO, WIRATANAYA, ANDREAS, and KOBBELT,
+LEIF. “Efﬁcient High Quality Rendering of Point Sampled Geome-
+try”. Proceedings of the 13th Eurographics Workshop on Rendering.
+EGRW ’02. Pisa, Italy: Eurographics Association, 2002, 53–64. ISBN:
+1581135343 3, 9.
+
+[CA13] PACIFIC GAS & ELECTRIC COMPANY. PG&E Diablo Canyon
+Power Plant (DCPP): San Simeon and Cambria Faults, CA, Airborne
+Lidar survey. Distributed by OpenTopography. 2013. DOI: https://
+doi.org/10.5069/G9CN71V5 9.
+
+[Dee95] DEERING, MICHAEL. “Geometry compression”. Proceedings of
+the 22nd annual conference on Computer graphics and interactive tech-
+niques. 1995, 13–20 3, 9.
+
+[DVS03] DACHSBACHER, CARSTEN, VOGELGSANG, CHRISTIAN, and
+STAMMINGER, MARC. “Sequential Point Trees”. ACM Trans. Graph.
+22.3 (July 2003), 657–662 3.
+
+[EBN13] ELSEBERG, JAN, BORRMANN, DORIT, and NÜCHTER, AN-
+DREAS. “One billion points in the cloud – an octree for efﬁcient process-
+ing of 3D laser scans”. ISPRS Journal of Photogrammetry and Remote
+Sensing 76 (2013). Terrestrial 3D modelling, 76–88 3.
+
+[FGB20] FROLOV, V. A., GALAKTIONOV, V. A., and BARLADYAN,
+B. H. “Comparative study of high performance software rasterization
+techniques”. Mathematica Montisnigri 47 (2020), 152–175. ISSN: 0354-
+2238. DOI: 10.20948/mathmontis-2020-47-13 2.
+
+[GD98] GROSSMAN, JEFFREY P and DALLY, WILLIAM J. “Point sample
+rendering”. Eurographics Workshop on Rendering Techniques. Springer.
+1998, 181–192 6.
+
+[GKLR13] GÜNTHER, CHRISTIAN, KANZOK, THOMAS, LINSEN, LARS,
+and ROSENTHAL, PAUL. “A GPGPU-based Pipeline for Accelerated
+Rendering of Point Clouds”. J. WSCG 21 (2013), 153–161 2.
+
+[GM04] GOBBETTI, ENRICO and MARTON, FABIO. “Layered Point
+Clouds: A Simple and Efﬁcient Multiresolution Structure for Distribut-
+ing and Rendering Gigantic Point-sampled Models”. Comput. Graph.
+28.6 (Dec. 2004), 815–826 3, 6.
+
+[GZPG10] GOSWAMI, P., ZHANG, Y., PAJAROLA, R., and GOBBETTI,
+E. “High Quality Interactive Rendering of Massive Point Models Us-
+ing Multi-way kd-Trees”. 2010 18th Paciﬁc Conference on Computer
+Graphics and Applications. 2010, 93–100 3.
+
+[HSG*19] HERBIG, U., STAMPFER, L., GRANDITS, D., et al. “DEVEL-
+OPING A MONITORING WORKFLOW FOR THE TEMPLES OF
+JAVA”. The International Archives of the Photogrammetry, Remote Sens-
+ing and Spatial Information Sciences XLII-2/W15 (2019), 555–562.
+DOI: 10.5194/isprs- archives- XLII- 2- W15- 555- 2019.
+URL: https : / / www . int - arch - photogramm - remote -
+sens-spatial-inf-sci.net/XLII-2-W15/555/2019/ 9.
+[IL05] ISENBURG, M. and LINDSTROM, P. “Streaming meshes”. VIS 05.
+IEEE Visualization, 2005. 2005, 231–238. DOI: 10.1109/VISUAL.
+2005.1532800 3.
+
+[KB21] KIM, MINGYU and BAEK, NAKHOON. “A 3D graphics rendering
+pipeline implementation based on the openCL massively parallel pro-
+cessing”. The Journal of Supercomputing (Jan. 2021) 2.
+
+[KJWX19] KANG, L., JIANG, J., WEI, Y., and XIE, Y. “Efﬁcient Ran-
+domized Hierarchy Construction for Interactive Visualization of Large
+Scale Point Clouds”. 2019 IEEE Fourth International Conference on
+Data Science in Cyberspace (DSC). 2019, 593–597 3.
+
+[KKSS18] KENZEL, MICHAEL, KERBL, BERNHARD, SCHMALSTIEG,
+DIETER, and STEINBERGER, MARKUS. “A High-performance Software
+Graphics Pipeline Architecture for the GPU”. ACM Trans. Graph. 37.4
+(July 2018), 140:1–140:15 2.
+
+[KSW21] KARIS, BRIAN, STUBBE, RUNE, and WIHLIDAL, GRAHAM.
+“A Deep Dive into Nanite Virtualized Geometry”. ACM SIGGRAPH
+2021 Courses, Advances in Real-Time Rendering in Games, Part 1.
+https : / / advances . realtimerendering . com / s2021 /
+index.html [Accessed 10-September-2021]. 2021 2.
+
+[LHLW10] LIU, FANG, HUANG, MENG-CHENG, LIU, XUE-HUI, and
+WU, EN-HUA. “FreePipe: A Programmable Parallel Rendering Archi-
+tecture for Efﬁcient Multi-Fragment Effects”. I3D ’10. Washington,
+D.C.: Association for Computing Machinery, 2010, 75–82 2.
+
+[LK00] LAWDER, J. K. and KING, P. J. H. “Using Space-Filling Curves
+for Multi-dimensional Indexing”. Advances in Databases. Ed. by LINGS,
+BRIAN and JEFFERY, KEITH. Berlin, Heidelberg: Springer Berlin Hei-
+delberg, 2000, 20–35. ISBN: 978-3-540-45033-7 3.
+
+[LK11] LAINE, SAMULI and KARRAS, TERO. “High-Performance Soft-
+ware Rasterization on GPUs”. HPG ’11. Vancouver, British Columbia,
+Canada: Association for Computing Machinery, 2011, 79–88 2.
+
+[LOM*20] LIU, HAICHENG, OOSTEROM, PETER VAN, MEIJERS, MAR-
+TIJN, et al. “HistSFC: Optimization for nD massive spatial points query-
+ing”. English. International Journal of Database Management Systems
+(IJDMS) 12.3 (2020), 7–28. ISSN: 0975-5985. DOI: 10.5121/ijdms.
+2020.12302 3, 9.
+
+[MKC07] MARROQUIM, RICARDO, KRAUS, MARTIN, and CAVAL-
+CANTI, PAULO ROMA. “Efﬁcient Point-Based Rendering Using Im-
+age Reconstruction”. Proceedings Symposium on Point-Based Graphics.
+2007, 101–108 6.
+
+[MVvM*15] MARTINEZ-RUBI, OSCAR, VERHOEVEN, STEFAN, van
+MEERSBERGEN, M., et al. “Taming the beast: Free and open-source
+massive point cloud web visualization”. Capturing Reality Forum 2015,
+Salzburg, Austria. Nov. 2015 3.
+
+[MWH18] MARRS, ADAM, WATSON, BENJAMIN,
+
+and HEALEY,
+CHRISTOPHER. “View-warped Multi-view Soft Shadows for Local Area
+Lights”. Journal of Computer Graphics Techniques (JCGT) 7.3 (July
+2018), 1–28 2.
+
+[OM84] ORENSTEIN, J. A. and MERRETT, T. H. “A Class of Data Struc-
+tures for Associative Searching”. Proceedings of the 3rd ACM SIGACT-
+SIGMOD Symposium on Principles of Database Systems. PODS ’84.
+Waterloo, Ontario, Canada: Association for Computing Machinery,
+ISBN: 0897911288. DOI: 10 . 1145 / 588011 .
+1984, 181–190.
+588037. URL: https : / / doi . org / 10 . 1145 / 588011 .
+588037 3.
+
+[PGA11] PINTUS, RUGGERO, GOBBETTI, ENRICO, and AGUS, MARCO.
+“Real-Time Rendering of Massive Unstructured Raw Point Clouds Us-
+ing Screen-Space Operators”. Proceedings of the 12th International
+Conference on Virtual Reality, Archaeology and Cultural Heritage.
+VAST’11. Prato, Italy: Eurographics Association, 2011, 105–112 6.
+
+[PJW12] PREINER, REINHOLD, JESCHKE, STEFAN, and WIMMER,
+MICHAEL. “Auto Splats: Dynamic Point Cloud Visualization on the
+GPU”. Proceedings of Eurographics Symposium on Parallel Graphics
+and Visualization. Ed. by CHILDS, H. and KUHLEN, T. Eurographics
+Association 2012. Cagliari, May 2012, 139–148 6.
+
+[POT] Potree. http://potree.org, Accessed 2021.03.19 3.
+
+[Ise13] ISENBURG, MARTIN. “LASzip: lossless compression of LiDAR
+data”. Photogrammetric Engineering & Remote Sensing 79 (2013). DOI:
+10.14358/PERS.79.2.209 3, 9.
+
+[PTSO15] PATNEY, ANJUL, TZENG, STANLEY, SEITZ, KERRY A., and
+OWENS, JOHN D. “Piko: A Framework for Authoring Programmable
+Graphics Pipelines”. ACM Trans. Graph. 34.4 (July 2015) 2.
+
+Markus Schütz & Bernhard Kerbl & Michael Wimmer /
+
+11
+
+[RFS21] RÜCKERT, DARIUS, FRANKE, LINUS, and STAMMINGER,
+MARC. “Adop: Approximate differentiable one-pixel point rendering”.
+arXiv preprint arXiv:2110.06635 (2021) 2, 6.
+
+[RL00] RUSINKIEWICZ, SZYMON and LEVOY, MARC. “QSplat: A Mul-
+tiresolution Point Rendering System for Large Meshes”. Proceedings
+of the 27th Annual Conference on Computer Graphics and Interactive
+Techniques. SIGGRAPH ’00. USA: ACM Press/Addison-Wesley Pub-
+lishing Co., 2000, 343–352 3, 8.
+
+[RL08] ROSENTHAL, PAUL and LINSEN, LARS. “Image-space point
+cloud rendering”. Proceedings of Computer Graphics International.
+2008, 136–143 6.
+
+[SKW19] SCHÜTZ, MARKUS, KRÖSL, KATHARINA, and WIMMER,
+MICHAEL. “Real-Time Continuous Level of Detail Rendering of Point
+Clouds”. 2019 IEEE Conference on Virtual Reality and 3D User Inter-
+faces. Osaka, Japan: IEEE, Mar. 2019, 103–110 8, 9.
+
+[SKW21] SCHÜTZ, MARKUS, KERBL, BERNHARD, and WIMMER,
+MICHAEL. “Rendering Point Clouds with Compute Shaders and Vertex
+Order Optimization”. Computer Graphics Forum 40.4 (July 2021), 115–
+126. ISSN: 1467-8659. DOI: 10.1111/cgf.14345. URL: https:
+/ / www . cg . tuwien . ac . at / research / publications /
+2021/SCHUETZ-2021-PCC/ 2–8.
+
+[SW11] SCHEIBLAUER, CLAUS and WIMMER, MICHAEL. “Out-of-Core
+Selection and Editing of Huge Point Clouds”. Computers & Graphics
+35.2 (Apr. 2011), 342–351 3.
+
+[Vla15] VLACHOS, ALEX. Advanced VR Rendering. Game Develop-
+ers Conference, industry talk. Accessed 2018.11.20. Mar. 2015. URL:
+https://www.gdcvault.com/play/1021771/Advanced-
+VR 7.
+
+[WBB*08] WAND, MICHAEL, BERNER, ALEXANDER, BOKELOH,
+MARTIN, et al. “Processing and interactive editing of huge point clouds
+from 3D scanners”. Computers & Graphics 32.2 (2008), 204–220. DOI:
+https://doi.org/10.1016/j.cag.2008.01.010 3, 8.
+
+[WHG84] WEGHORST, HANK, HOOPER, GARY, and GREENBERG,
+DONALD P. “Improved Computational Methods for Ray Tracing”. ACM
+Trans. Graph. 3.1 (Jan. 1984), 52–69. ISSN: 0730-0301. DOI: 10 .
+1145/357332.357335. URL: https://doi.org/10.1145/
+357332.357335 5.
+
+

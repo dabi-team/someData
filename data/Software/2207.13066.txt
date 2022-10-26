@@ -1,0 +1,1782 @@
+2
+2
+0
+2
+
+l
+u
+J
+
+6
+2
+
+]
+
+G
+L
+.
+s
+c
+[
+
+1
+v
+6
+6
+0
+3
+1
+.
+7
+0
+2
+2
+:
+v
+i
+X
+r
+a
+
+Finding Deep-Learning Compilation Bugs with NNSmith
+
+Jiawei Liu∗
+University of Illinois
+at Urbana-Champaign
+Champaign, IL, USA
+jiawei6@illinois.edu
+
+Fabian Ruffy
+New York University
+New York, NY, USA
+fruffy@nyu.edu
+
+Aurojit Panda
+New York University
+New York, NY, USA
+apanda@cs.nyu.edu
+
+Jinkun Lin∗
+New York University
+New York, NY, USA
+jinkun.lin@nyu.edu
+
+Jinyang Li
+New York University
+New York, NY, USA
+jinyang@cs.nyu.edu
+
+Cheng Tan
+Northeastern University
+Boston, MA, USA
+c.tan@northeastern.edu
+
+Lingming Zhang
+University of Illinois
+at Urbana-Champaign
+Champaign, IL, USA
+lingming@illinois.edu
+
+Abstract
+
+Deep-learning (DL) compilers such as TVM and TensorRT are in-
+creasingly used to optimize deep neural network (DNN) models to
+meet performance, resource utilization and other requirements. Bugs
+in these compilers can produce optimized models whose semantics
+differ from the original models, and produce incorrect results impact-
+ing the correctness of down stream applications. However, finding
+bugs in these compilers is challenging due to their complexity. In
+this work, we propose a new fuzz testing approach for finding bugs
+in deep-learning compilers. Our core approach uses (i) light-weight
+operator specifications to generate diverse yet valid DNN models
+allowing us to exercise a large part of the compiler’s transformation
+logic; (ii) a gradient-based search process for finding model inputs
+that avoid any floating-point exceptional values during model ex-
+ecution, reducing the chance of missed bugs or false alarms; and (iii)
+differential testing to identify bugs. We implemented this approach
+in NNSmith which has found 65 new bugs in the last seven months
+for TVM, TensorRT, ONNXRuntime, and PyTorch. Of these 52 have
+been confirmed and 44 have been fixed by project maintainers.
+
+1 Introduction
+
+Deep learning (DL) compilers such as TVM [11], TensorRT [44],
+and TensorFlow XLA [1] are increasingly being used to deploy deep
+neural network (DNN) models in many different applications. These
+compilers optimize DL models to meet desired performance, en-
+ergy, and resource requirements, allowing their use by interactive
+or safety-critical applications deployed on a variety of devices. How-
+ever, as compiler implementations are complex, we must be vigilant
+about detecting bugs in these systems. Compiler bugs can result in
+crashes or generating an incorrect executable that produces different
+results than those intended by the user-specified input model1.
+
+∗Co-first authors.
+1As deep-learning models use floating-point operations, a correctly compiled executable
+model can have close but not identical results as those of the input model. We do not
+regard this case as a bug.
+
+In this paper, we develop techniques to automatically find bugs
+in deep-learning compilers. Similar to prior work [29, 33, 57], we
+adopt a fuzzing and differential testing based approach: we gener-
+ate random models, compile them using the compiler being tested,
+and then compare results obtained from the compiled model with
+those from a reference implementation. This basic approach faces
+two main challenges, which are not adequately addressed by prior
+work. First, how to generate structurally diverse and valid models?
+Deep-learning compilers express a model as a computation graph
+of tensor operators. For better test coverage, we must ensure model
+diversity, which requires us to generate graphs by combining oper-
+ators in different ways. However, it is often invalid to connect two
+arbitrary operators together; invalid models are rejected and will
+not be compiled. For example, a compiler will reject any computa-
+tion graph containing a MatMul (matrix multiplication) operator for
+which the number of rows in the first input differs from the columns
+for the second. Therefore, for test efficiency, our graph generation
+method must also ensure the validity of generated models. Second,
+given a compiled model, what weights/inputs should we use to run
+it for differential testing? Naively testing generated models with
+random or default weights/inputs can easily lead to floating point
+(FP) exceptional values, i.e., 𝑁 𝑎𝑁 s or infinities (𝐼𝑛𝑓 s). In such cases,
+we cannot compare the compiled model with its reference imple-
+mentation. Therefore, to enable equivalence checking, we must be
+able to generate computational inputs that can avoid FP exceptional
+values during model execution.
+
+We address these two challenges to build NNSmith, a tester for
+deep-learning compilers including TVM [11], ONNXRuntime [38],
+and TensorRT [44]. NNSmith adopts a three-step approach for find-
+ing bugs: (i) first, it automatically generates an arbitrary but valid
+computation graph expressing some model 𝑀𝐼 ; (ii) it then uses the
+compiler being tested to produce a compiled model 𝑀𝑂 from 𝑀𝐼 ,
+and a reference backend to produce an executable model 𝑀𝑅; and
+(iii) finally it generates random inputs which it passes to 𝑀𝑂 and
+𝑀𝑅, and compares their outputs.
+
+ 
+ 
+ 
+ 
+ 
+ 
+,
+
+Jiawei Liu, Jinkun Lin, Fabian Ruffy, Cheng Tan, Jinyang Li, Aurojit Panda, and Lingming Zhang
+
+NNSmith addresses the challenges of generating models and their
+
+inputs as follows.
+Generating diverse and valid computation graphs: The com-
+putation graph expressing a deep-learning model consists of tensor
+operators with attributes attached to both the operators and graph
+edges. Operator attributes specify parameters such as kernel sizes
+that impact the operator’s semantics, while edge attributes are used
+to specify input and output tensor types2. Before proceeding with the
+actual compilation steps, deep-learning compilers check the validity
+of the input computation graph, e.g., whether an operator’s output
+tensor type matches the expected input tensor type of its down-
+stream operators and whether an operator’s attributes are valid. In
+order to produce valid graphs, NNSmith aims to capture and ensure
+the type matching constraints of a computation graph during its
+generation. To do so, NNSmith requires that users provide operator
+specifications, which specify constraints that must be satisfied by an
+operator’s input tensors/attributes and guarantee about its output
+type, which it uses to check the validity of generated graphs. During
+NNSmith’s incremental graph generation, it inserts one candidate
+operator at a time by solving for the satisfiability of its type matching
+constraints given the existing graph. NNSmith uses an existing SMT
+solver [40] for constraint solving.
+Executing compiled models without FP exceptional values.
+In order to meaningfully compare the outputs of a compiled compu-
+tation graph with those from a reference implementation, NNSmith
+aims to select computation inputs (aka model weights and inputs)
+that do not result in 𝑁 𝑎𝑁 s or 𝐼𝑛𝑓 s during execution. Instead of ran-
+dom search, NNSmith uses gradient-guided search to efficiently find
+viable model inputs/weights for 98% of the generated models with
+negligible overhead.
+
+In addition to addressing the two main challenges above, we de-
+signed NNSmith so it can be easily extended to add support for new
+operators or to work with other deep-learning compilers. We do so by
+providing users with a framework for writing operator specifications
+that are needed to ensure graph validity, and by providing a library
+of common patterns. In our experience, using this framework and
+library, users can write new operator specifications in a few lines of
+code. We evaluated the efficacy of our approach by using NNSmith
+to identify bugs in TVM, ONNXRuntime, TensorRT, and PyTorch.
+Over the last seven months, NNSmith found 65 new bugs in these
+frameworks. Developers have confirmed 52 and fixed 44 of these
+bugs. Our coverage evaluation also shows that NNSmith outper-
+forms the state-of-the-art fuzzer by 1.8× for ONNXRuntime and
+1.08× for TVM in total branch coverage, as well as 32.7× and 10.8×
+respectively in unique branches.
+2 Background
+
+2.1 The DNN Computation Graph
+
+DL frameworks represent a model’s underlying computation as a
+directed graph of tensor operators. In this work, we focus on DNN
+inference, where the graph captures the forward NN computation
+that given inputs generates predicted labels or outputs. For example,
+the model in Figure 1 is invoked by specifying its inputs (i.e., input
+variables %x0 and %x1) and the model weights (i.e., input variable
+
+2A tensor’s type defines its shape and its elements’ data type.
+
+Figure 1: Sample DNN graph.
+
+Figure 2: Deep learning compiler workflow and bug finding.
+
+%w0), and the DNN runtime computes the output tensor (%v2) from
+these inputs.
+
+In what follows, we use the term tensor type to refer to the shape
+and element type of a tensor. In the DNN computation graph, each
+edge is marked with the tensor type that corresponds to the output
+of the edge’s upstream operator, as shown in Figure 1. When instanti-
+ating an operator, model developers must specify certain additional
+attributes that dictate its output tensor type. For example, on line
+4 in Figure 1, the Reshape operator takes %v1 as an input tensor and
+[62,62,2] as an attribute indicating the output shape. Because each
+operator expects its input tensors to be of certain types, it is often
+invalid to connect two arbitrary operators together by an edge: e.g.,
+the reshape operator on line 4 is valid if and only if its upstream
+operator’s output (%v1) has 7688 elements (62×62×2). This is akin to
+a “type checking error” in traditional programs. We say that a DNN
+computation graph is valid if and only if all operators in the graph
+are valid.
+2.2 DL Compilers
+
+State-of-the-art DL compilers turn a user-specified model, expressed
+as a DNN computation graph, into an executable implementation.
+As shown in Figure 2, DL compilers process an input DNN model
+in two stages during its compilation.
+
+First, DL compilers need to convert an input computation graph
+into their own internal formats. For interoperability, DL training
+frameworks typically export trained models to a standardized and
+commonly supported format such as ONNX [2]. DL compilers take
+ONNX models as input and convert them to a compiler-specific Inter-
+mediate Representation (IR) that makes it easier to perform compiler
+optimization.
+
+Second, DL compilers invoke various transformation passes which
+rewrite their input IR into a more efficient version. These passes
+include: graph-optimization passes that simplify the graph (e.g.,
+constant folding) or fuse operators (merge Add and Softmax into
+BiasSoftmax) [45]; low-level passes that optimize computation using
+arithmetic simplification and loop tiling/fusion, to reduce compu-
+tational overheads.
+
+Conv2dAddReshape[62,62,2]%w0%x0%x11defmain(%x0, %x1) {2%v0= Conv2d(%x0, %w0)3%v1 = Add(%v0, %x1)4%v2 = Reshape(%v1, [62,62,2])5return%v26}[3,3][1,3,64,64][1,3,64,64][1,2,62,62][62,62,2]weightoperatorinput[1,2,62,62]DLCompilerIRCompiledModelPassPassConversionBugsTransformationBugsCrashTrainingFrameworkImportInputSamplesReferenceOutputsOutputsofCompiledModelVerifyReferenceBackendsInconsistent ResultSymptomsCausesFinding Deep-Learning Compilation Bugs with NNSmith
+
+,
+
+def M0 () :
+
+Listing 1: DNN patterns that can expose compiler bugs.
+# M0 triggers a compiler crash bug !
+# shape : (1 ,2 ,1 ,48)
+1 ,1 ,48)
+# shape : (
+
+A = Conv2d (...)
+B = Ones (1 ,1 ,48)
+return A + B
+
+def M1 () :
+
+A = Conv2d (...)
+B = Ones (1 ,2 ,1 ,49) # different shape : (1 ,2 ,1 ,49)
+return A + B [: ,: ,: ,:48] # slice to match (1 ,2 ,1 ,48)
+
+# bug NOT triggered !
+# shape : (1 ,2 ,1 ,48)
+
+def M2 () :
+
+A = Conv2d (...)
+B = Ones (1,1,1)
+return A + B
+
+# bug NOT triggered !
+# shape : (1 ,2 ,1 ,48)
+
+# trivial shape : (1 ,1 ,1)
+
+def M3 () :
+
+# M3 can trigger a semantic bug
+
+Y = Conv2d ( Conv2d (...) , ...)
+Y = Pow(Y, BIG_NUM) # bug not exposed due to Infs
+return Y
+
+# bug lies here
+
+Bugs can exist during both conversion and transformation, with
+the latter ones likelier to be harder to identify and debug. To com-
+prehensively detect both kinds of bugs, we need to test using models
+with a diverse graph structure and tensor operators.
+2.3 Challenges in Finding DL Compiler Bugs
+
+Differential testing and fuzzing [37] presents a promising approach
+to finding DL compiler bugs. As shown in the right part of Figure 2,
+this approach requires synthesizing random models for compila-
+tion, then running the compiled models with random inputs, and
+finally comparing the generated results with those from a reference
+implementation.
+
+There are several challenges facing the basic approach of fuzzing
+and differential testing, which are not addressed by prior work [33,
+57, 59]. Next, we illustrate these challenges using concrete examples.
+Challenge #1: Generating graphs with diverse patterns. Find-
+ing DL compiler bugs requires generating input graphs that contain
+a variety of operators and connections. Some prior fuzzers [59] test
+only using single-operators and thus are too limiting. LEMON [57]
+and GraphFuzzer [33] generate multi-operator computation graphs,
+but they are restricted to certain types of operators and connec-
+tions in order to avoid “type check” errors on the generated graphs
+(detailed in §6.1). Such restrictions limit graph diversity, and com-
+promise test coverage.
+
+Listing 1 shows an example model (M0) generated by NNSmith
+which has triggered a layout analysis bug in TVM. LEMON cannot
+generate this model because M0 contains non-shape-preserving op-
+erators (e.g., Conv2d) and connections (e.g., broadcasting) which are
+not supported by LEMON for ensuring graph validity. GraphFuzzer
+uses a different strategy to guarantee graph validity. Specifically,
+GraphFuzzer tries to “fix” mismatched tensor shapes in generated
+graphs through slicing and padding, as illustrated by line 6 in model
+M1. Unfortunately, doing so biases the generated graphs to include
+many slicing/padding nodes. In our example, the slice operation in
+M1 would silence the layout bug found by M0.
+Challenge #2: Exploring diverse attributes for operators and
+edges. When generating graphs, it is tempting to ignore the need to
+explore the operator/edge attribute space and rely on some default
+values. For example, M2 of Listing 1 uses trivial attributes (e.g., always
+1) to initialize operator Ones(1,1,1) (line 13). Unfortunately, the
+bug found by M0 will not be triggered by M2. Since exploring different
+attribute values result in diverse output tensor types on edges, it fur-
+ther complicates the task to ensure the validity of generated graphs.
+
+Challenge #3: Running compiled models to produce numer-
+ically valid output. Using arbitrary inputs and model weights to
+test a compiled model can result in FP exceptional values (i.e., 𝑁 𝑎𝑁 s
+and 𝐼𝑛𝑓 s) during execution. Such cases occur when the given inputs
+to some operator are outside of its expected domain, e.g., feeding
+Sqrt negative values results in 𝑁 𝑎𝑁 s, and feeding Pow large base or
+exponents results in 𝐼𝑛𝑓 s. Larger graphs are particularly prone to
+encountering FP exceptional values. For example, we have found that
+𝑁 𝑎𝑁 /𝐼𝑛𝑓 occurs in 56.8% of 20-node models generated by NNSmith
+when using PyTorch’s default weight initializer. Previous testing
+frameworks did not consider these issues, and consequently up to 41%
+of their bug reports can be false-alarms because of the undefined/non-
+deterministic behaviors arising from the 𝑁 𝑎𝑁 /𝐼𝑛𝑓 [16].
+
+Clearly we should not compare the output of a compiled model
+to those of the reference implementation if the results themselves
+contain 𝑁 𝑎𝑁 /𝐼𝑛𝑓 . What about those scenarios with “normal” final
+results (aka without any 𝑁 𝑎𝑁 /𝐼𝑛𝑓 ) where some internal operator
+has produced FP exceptional values during graph execution? For
+example, operator ArgMax can output a normal FP value even though
+one of its upstream operators gives it 𝑁 𝑎𝑁 as input. It is a subtle
+requirement that we must also exclude these results from differential
+testing or risk incurring false positives in bug detection. This is be-
+cause when handling FP exceptional values, otherwise semantically
+equivalent operators could produce different results. Therefore, to be
+able to test effectively, we must generate model inputs/weights that
+avoid FP exceptional values for all operators in the graph. Only then
+we refer to the model’s output as numerically valid. Otherwise, we
+might miss detecting bugs. As an example, Listing 1’s model M3 can
+trigger a semantic bug. However, this bug is not exposed because the
+execution results in 𝐼𝑛𝑓 values which are not used for comparison.
+
+3 NNSmith’s Design
+
+Overview of the approach. Figure 3 shows an overview of NN-
+Smith’s workflow. NNSmith generates valid random models to be
+compiled and executed. To ensure graph validity, NNSmith captures
+the “type checking” constraints of a graph as operator specifications
+(§3.1), and uses an SMT solver to generate valid operator attributes
+during graph generation (§3.2). To run a compiled model, NNSmith
+uses a gradient guided search procedure to find benign weights/in-
+puts so that no FP exceptional values are produced at any step of the
+execution (§3.3). Finally, NNSmith compares the results obtained
+from multiple deep learning libraries and compilers to those from
+a reference implementation to identify bugs.
+
+3.1 Modeling DNN Operators
+
+NNSmith generates random DNN models expressed as computa-
+tional graphs by connecting together different operators. We aim to
+generate valid graphs that “type check”, i.e., graphs where each oper-
+ator’s attributes and input tensor type meet requirements imposed
+by the compiler.
+
+In order to generate valid graphs, we require users to provide oper-
+ator specifications that explicitly state the compiler’s requirements
+for each operator and guarantees about its output. An operator’s
+specification codifies rules for checking validity and depends on its
+inputs and attributes: For example, the 2-D convolution operator
+(Conv2d) has several attributes, including a kernel, and takes an
+
+,
+
+Jiawei Liu, Jinkun Lin, Fabian Ruffy, Cheng Tan, Jinyang Li, Aurojit Panda, and Lingming Zhang
+
+Figure 3: Overview of NNSmith.
+
+Listing 2: Sample specification for the 2D Pooling operator.
+class Pool2d ( AbsOpBase ) :
+
+input_type =
+
+# [( input 1 types ) , ...]
+
+output_type =
+
+[( AbsTensor ( float32 , 4) , AbsTensor ( float64 , 4) )]
+# [( output 1 types ) , ...]
+[( AbsTensor ( float32 , 4) , AbsTensor ( float64 , 4) )]
+
+def __init__ ( self , kh , kw , stride , pad ):
+
+self .kh , self . kw = kh , kw ...
+
+def requires ( self , inputs : List [ AbsTensor ]) :
+
+ih , iw = inputs [0]. shape [ -2:]
+return [ self . kw > 0, self . kh > 0,
+self . stride > 0, self . pad >= 0,
+self . kw <= 2 * self . pad + iw , ...]
+
+def type_transfer ( self , inputs : List [ AbsTensor ]) :
+
+ishape = inputs [0]. shape
+oshape = [ ishape [0] , ishape [1] ,
+
+( ishape [2] - self . kw + 2* self . pad ) // self . stride ,
+( ishape [3] - self . kh + 2* self . pad ) // self . stride ]
+return [ AbsTensor ( inputs [0]. dtype , 4, shape = oshape )]
+
+Constraints. The operator’s requires function (Line 10) returns
+constraints that its inputs and attributes must satisfy as a list of logical
+predicates. For example, among other constraints, the Pool2d oper-
+ator requires that the kernel size should be greater than 0 (Line 12).
+Type transfer function. The operator uses a type transfer func-
+tion (Line 16) to specify how its output tensor relates to its inputs.
+For example, on Line 21, Pool2d’s type transfer function relates the
+shape of the operator’s output tensor to its kernel size (self.kw
+and self.kh) and its input shapes. Observe that the constraints
+output by the type transfer function are the input constraints on
+a downstream operator. These constraints are used to to combine
+constraints from connected operators in a computation graph, and
+thus allow NNSmith to generate valid models.
+
+def infer_input_type ( self , outputs ):# §3.2
+return [ AbsTensor ( outputs [0]. dtype , 4) ]
+
+3.2 Model Generation
+
+image as input. A model that uses a Conv2d operator is valid if the
+input image is a rank-4 tensor that is larger than the kernel’s size.
+
+While our implementation includes specifications for common
+operators (detailed in §4), we designed NNSmith to make it easy for
+users to write specification for additional operators. NNSmith spec-
+ifications are written using symbolic integers and abstract tensors.
+An abstract tensor is specified with its data type, rank and shape. In
+our implementation we use concrete values to specify an abstract
+tensor’s data type and rank, and use symbolic integers to specify its
+shape. As we will see later in §3.2, NNSmith uses an SMT solver to
+assign concrete integers to each symbolic integer during graph gen-
+eration. NNSmith operator specifications provide input and output
+types (specified using abstract tensors), constraints on inputs and
+attributes, as well as transfer rules for each operator. Listing 2 shows
+the operator specification for a 2-D pooling operator (Pool2d), and
+we describe each of part below:
+Inputs and outputs. An operator’s attributes are inferred from the
+inputs to its __init__ function. The class variables input_type
+and output_type describe the input and output tensor types respec-
+tively (Lines 3 and 5). Programmers specify a list of tuples, each tuple
+says what data types can be used for an input (or provided as output).
+In the listing, the Pool2d operator accepts a single rank 4 tensor of
+32-bit or 64-bit floats.
+
+Given a set of operator specifications, NNSmith generates models
+that are topologically diverse and whose operators use diverse at-
+tributes. Below we first detail our approach for generating diverse
+model topologies and then present our binning based approach to
+assigning diverse attributes.
+Generating computation graphs. Our model generation algo-
+rithm is designed to ensure that the computation graphs it generates
+are fully connected, as is the case with most real-world models. Ad-
+ditionally, it is also designed so that it can generate a rich variety of
+models, including ones similar to existing multi-modal and multi-
+task models [3, 20, 42, 51] that can accept multiple inputs and/or
+produce multiple outputs.
+
+NNSmith generates connected computation graph by extend-
+ing an existing graph while maintaining connectivity. It does so by
+starting with a graph that contains a single placeholder node, and
+extending it by either (a) adding a new node whose input edges are
+connected to the output of an existing node (we refer to this as a
+forward insertion) or (b) replacing an existing placeholder node with
+an operator node whose input edges are connected to one or more
+placeholder nodes (we refer to this as backward insertion). In both
+cases, the node added by NNSmith is picked at random from the set
+of symbolic operator specification (op) it is provided. Placeholder
+nodes have one output, and at the end of the graph generation process
+they are replaced by input nodes or by weights (which are constant
+inputs). Algorithm 1 shows our graph generation algorithm. We
+
+OperatorSpec.(§3.1)RuntimeFailure?WrongResults?DifferentialTesting∇𝑓∇𝑔∇ℎNNSMITHONNXRuntimeApache TVMTensorRT𝑿;𝑾=𝒀check…ModelGeneration(§3.2)IncrementalGraphGenerationAttributeBinningGenerationValidityModelDiversityValueSearching(§3.3)Numerical ValidityNumeric Validity Loss FunctionsProxyDerivative?Reshapetype_transferrequiresResizetype_transferrequiresConv2dtype_transferrequiresFinding Deep-Learning Compilation Bugs with NNSmith
+
+,
+
+detail the steps taken when inserting a randomly selected operator
+(op) into an existing compute graph below:
+
+1. Type matching: To insert op, NNSmith must first find a feasible in-
+sertion point in the current graph. When using forward insertion,
+this means finding an output edge in the graph whose constraints
+(as provided by the operator that node represents) satisfy op’s
+input constraints. Similarly, when using backward insertion, this
+means finding a placeholder node whose output is connected
+to node(s) whose input constraints are satisfied by op’s output
+constraints. To do so we need to check constraint satisfaction, and
+we use a SMT solver for this. Rather than invoking an SMT solver
+for all possible insertion points, we use a simple type matching
+heuristic to filter out nodes that are obviously infeasible because
+of incompatible data types or ranks. For example, when using
+forward insertion for Where(cond, T, F), type matching (Lines 7)
+will filter out any output edges which are not boolean.
+
+2. Constraint solving: Next, NNSmith generates constraints for any
+feasible insertion points that have not been filtered out by its
+type matching heuristic, and uses an SMT solver to check their
+satisfiability. NNSmith caches constraints for the current model
+(in 𝑀.solver) to reduce constraint generation overheads, and
+uses incremental solving [5] to reduce time taken for checking
+constraints (Line 5).
+
+3. Node insertion: As we stated previously, we use one of two ap-
+proaches to insert nodes into the graph: forward insertion and
+backward insertion:
+• Forward insertion (Line 6) selects one group of plausible tensors
+(𝑣) as the inputs of op (Line 8) and inserts op as their consumer
+(Line 10) if the insertion constraints are satisfiable (Line 9).
+• Backward insertion (Line 11) replaces an existing placeholder
+node with op. To do so it first determines a placeholder candi-
+date (𝑣) by matching op’s output type and the candidate’s type
+(Line 12—13). Next, it infers op’s input type from 𝑣. If op’s input
+type constraints can be satisfied for the candidate, NNSmith re-
+places the candidate with op and creates new placeholder nodes
+(of the inferred types) to act as op’s inputs (Lines 18 and 19).
+Attribute binning. In addition to graph topological diversity, at-
+tribute diversity is also crucial as discussed in §2.3. We use the model
+generated by an SMT solver (Z3 [40] in our implementation) when
+checking satisfiability for the graph’s constraints to determine at-
+tributes. However, we found that when producing models for integer
+constraints, most SMT solvers pick boundary values, e.g., when given
+a constraint that requires tensor dimensions to be at least 1, all re-
+turned models have a dimension of 1. This limits attribute diversity
+and prevents us from finding bugs in practice. For example, we found
+that naively using the model returned by Z3 led to us usually us-
+ing a batch size of 1, and that prevented us from finding some bugs
+(§2.3). We address this problem by adding binning constraints that
+confine each symbolic integer to a randomly chosen range. Adding
+binning constraints to the graph’s constraints can produce an unsat-
+isfiable constraint system, leading to a situation where we can find
+no attributes for a valid graph. We avoid this situation by adding
+constraints only after a graph has been generated (§3.2) and only
+when doing so does not impact satisfiability.
+
+Specifically, we group all (positive) integers exponentially into
+𝑘 bins with the 𝑖-th bin representing integers ∈ [2𝑖−1, 2𝑖 ] for all
+
+Algorithm 1: Computation graph generation.
+Input :Graph 𝑀; operator to try op; global constraints 𝐶.
+
+1 Function Solve(𝑀, 𝐶, op, op’s inputs 𝑣):
+2 𝐶 ←𝐶 ∪𝑜𝑝.requires(𝑣)
+3
+
+for ∀𝑠 ∈𝑜𝑝.type_transfer(𝑣) do
+
+𝐶 ←𝐶 ∪ {𝑠.shape0 ≥ 1,···,𝑠.shape𝑠.𝑟𝑎𝑛𝑘−1 ≥ 1}
+return 𝑀.solver.try_add_constraints(𝐶)
+
+5
+6 Function ForwardInsert(𝑀, op):
+7
+
+𝑆 ← TypeMatch(𝑀 .intermediates(), op.input_type)
+𝑣 ← randomly choose one input combination from 𝑆
+if Solve(𝑀, ∅, op, 𝑣) then
+
+𝑀.insert_consumer(v, op)
+
+11 Function BackwardInsert(𝑀, op):
+12
+
+𝑆 ← TypeMatch(𝑀 .placeholders(), op.output_type)
+𝑣 ← randomly choose one set of placeholders from 𝑆
+// Also see infer_input_type in Line 23 of Listing 2
+𝑝 ← new placeholders w.r.t. op.infer_input_type(v)
+𝑜 ← op.type_transfer(𝑝)
+if Solve(𝑀, {∀𝑖 ∈ [0, |𝑣 |],𝑣𝑖 .shape =𝑜𝑖 .shape}, op, 𝑝) then
+
+𝑀.insert_consumer(p, op)
+𝑀.replace_placeholder(v, op)
+
+4
+
+8
+
+9
+
+10
+
+13
+
+14
+
+15
+
+16
+
+17
+
+18
+
+19
+
+𝑖 = 1,...,𝑘 −1, and the last bin [2𝑘−1,∞). To sample a range [𝑙,𝑟 ], we
+select a bin and sample two integers (𝑙 and 𝑟 ) from the selected bin.3
+We use bins with exponential ranges because, in practice, systems
+are more sensitive to changes in smaller values, e.g., changing a
+variable from 0 to 1 generally has larger effect on the output than
+changes from 30 to 31. Other fuzzers, including AFL [66], use a similar
+binning-based strategy.
+3.3 Improving Numeric Validity with Gradients
+
+Next, NNSmith generates inputs and weights that can be used to test
+the generated models. We initially considered using randomly se-
+lected numbers for this, however we found that the generated graphs
+produce FP exceptional values, including NaN (not a number) and
+Inf (infinite number). For example, when generating 20-operator
+graphs, FP exceptional values occur in 56.8% of generated graphs if
+we use random weight and inputs.
+
+This is because some operators, which we refer to as vulnerable
+√
+𝑥 returns 𝑁 𝑎𝑁 if 𝑥 < 0) or stable
+operators [63], produce real (e.g.,
+(e.g., 𝑥 𝑦 returns 𝐼𝑛𝑓 for large 𝑥 and 𝑦) results only for a subset of
+their input domain. If a vulnerable operator’s input lies outside of
+this domain, the operator outputs an FP exceptional value, which
+propagates through the model and impacts the model’s output, pre-
+venting us from comparing model outputs during differential testing.
+Table 1 lists examples of vulnerable operators we encountered in
+our evaluation.
+
+One way to address this problem is to use additional heuristics to
+extend and fix vulnerable operators. For example, changing Div(x, y)
+to Div(x, |y|+𝜖) renders the Div operator safe. However, this requires
+changing inputs to the operator, which limits graph diversity as
+discussed in §2.3. We thus propose an alternate approach, where
+we use a gradient-search algorithm to find inputs that ensure that
+the model’s output is numerically valid. Our approach is inspired
+
+3If the last bin is chosen we use 𝑙 = 2𝑘−1 and 𝑟 = ∞. For all other bins 𝑖, values are chosen
+by sampling 𝑥 ∼𝑈 (𝑖 −1,𝑖) and using ⌊2𝑥 ⌋.
+
+,
+
+Jiawei Liu, Jinkun Lin, Fabian Ruffy, Cheng Tan, Jinyang Li, Aurojit Panda, and Lingming Zhang
+
+Operator
+Asin(X)
+Div(X, Y)
+
+Pow(X, Y)
+
+Violation
+NaN
+NaN
+
+Domain
+|𝑋 | ≤ 1
+|𝑌 | > 0
+𝑋 > 0
+𝑌 log(𝑋 ) ≤ 40
+𝑋 > 0
+
+Loss functions
+L (|𝑋 |−1 ≤ 0)
+L (|𝑌 | > 0)
+L (𝑋 > 0)
+L (𝑌 log(𝑋 ) −40 ≤ 0)
+L (𝑋 > 0)
+Table 1: Representative vulnerable operators.
+
+NaN /Inf
+
+NaN
+
+(cid:26)
+
+(cid:26)
+
+Log2(X)
+
+Tensor Ineq.
+𝑓 (𝑋 ) ≤ 0
+𝑓 (𝑋 ) < 0
+
+Loss function L
+(cid:205)𝑥 ∈𝑋 max(𝑓 (𝑥),0)
+(cid:205)𝑥 ∈𝑋 max(𝑓 (𝑥) +𝜖,0)
+
+Table 2: Tensor inequality to loss function conversions.
+
+by GRIST [63], though that work has a totally opposite goal: it aims
+to find inputs that result in FP exceptional values.
+
+At a high-level, our approach first associates a loss function with
+each operator; then, starting with random inputs, it iteratively refines
+these inputs so that no operator in the graph produces an FP excep-
+tional value. In each iteration, NNSmith identifies the first operator
+in the model that produces an FP exceptional value. It then uses the
+loss function associated with the operators to compute new model
+inputs and uses these for the next iteration. The algorithm terminates
+when no FP exceptional values are found. We provide details below:
+Loss functions for avoiding FP exceptional values. NNSmith
+requires that each vulnerable operator is associated with a set of loss
+functions, and our input search algorithm (Algorithm 2) uses these
+loss functions to update the model’s inputs to avoid FP exceptional
+values. We allow users to specify the loss function for each opera-
+tor, and here we describe the approach we adopted to produce loss
+functions.
+
+As we noted above, vulnerable operators produce valid outputs
+(i.e., outputs that are not FP exceptional values) when inputs are
+drawn from a particular domain, and this domain can be expressed
+(or approximated) by the conjunction of a few (usually one or two)
+inequality predicates on the operator’s input. We refer to this con-
+junction of inequality predicates as the operator’s tensor inequalities.
+For example, the 𝑆𝑞𝑟𝑡 (𝑋 ) operator takes a tensor 𝑋 as input, and is
+numerically valid if and only if 𝑋 ≥ 0 (i.e., all elements of 𝑋 are pos-
+itive). Similarly, the 𝑃𝑜𝑤 (𝑋,𝑌 ) operator’s numerically valid domain
+can be under-approximated as 𝑋 ≥ 0∧𝑌 log(𝑋 ) ≤ 40, which requires
+that all elements of 𝑋 be positive to avoid 𝑁 𝑎𝑁 s (since 𝑌 might con-
+tain fractional elements) and bounds 𝑌 log(𝑋 ) to avoid outputs that
+are too large (and would be represented by infinity) 4. We associate a
+loss function with each predicate in an operator’s tensor inequality.
+We do so by first rewriting each predicate so that it is either of the
+form 𝑓 (𝑋 ) < 0 or 𝑓 (𝑋 ) ≤ 0, and then use the formulas in Table 2
+to convert this cannonical form to a scalar loss. We show examples
+of the loss functions produced in this manner in Table 1. When an
+operator produces invalid outputs, the search algorithm picks which
+loss function to use by finding a predicate that is violated by the
+operator’s current input and using the loss function associated with
+it. For simplicity, our design assumes that a loss function is positive
+if and only if its associated predicate is violated by the operator’s
+
+4We constrain the logarithm instead of directly using the power function to ensure that
+the loss function does not generate a FP exceptional value.
+
+input, allowing us to use any positive loss function associated with
+the operator (Line 8) without evaluating its associated predicate.
+Proxy derivative. Given a vulnerable operator’s loss, NNSmith
+uses gradient propagation to compute changes to the model inputs
+and weights. Doing so requires computing gradients (derivatives)
+for each operator in the graph (Line 9). However, some operators
+are either undifferentiable for some inputs (e.g., Floor, Ceil, and other
+operators cannot be differentiated at integers) or have zero gradient
+in some region (e.g., ReLU has gradient 0 for all negative inputs), and
+this prevents backward propagation. For these functions, we use
+Proxy Derivative Functions [4] instead of actual derivatives during
+gradient propagation.
+
+Given an operator 𝐹 whose gradient is 0 in region U we use
+𝑑𝐹 (𝑥)
+(𝑥 ∈ U) =𝛼 as the derivative. We set 𝛼’s sign based on the over-
+𝑑𝑥
+all trend of the function, e.g., we use a positive 𝛼 for ReLU because it is
+monotonic. Similar to LeakyReLU [62], we choose a small magnitude
+for 𝛼, thus avoiding large discrepancies between the proxy and the
+actual derivative. On the other hand, if the operator 𝐹 cannot be dif-
+ferentiated in the region 𝑈 , we use the closest left-derivative instead.
+
+Algorithm 2: Gradient-guided value search.
+1 Function GradSearch(DNN 𝑀, learning rate 𝜇):
+2
+
+⟨𝑋 ,𝑊 ⟩ ← randomly initialized inputs and weights
+OUTER:while time budget not exhausted do
+
+for operator 𝐹𝑖 in topologicalSort(𝑀) do
+
+𝐼𝑖 ← input to 𝐹𝑖
+𝑂𝑖 ← 𝐹𝑖 (𝐼𝑖 )
+if ∃ NaN/Inf ∈𝑂𝑖 then
+
+L ← first positive loss functions of 𝐹𝑖
+⟨𝑋 ,𝑊 ⟩ ← ⟨𝑋 ,𝑊 ⟩−𝜇 ∇⟨𝑋 ,𝑊 ⟩ L (𝐼𝑖 )
+if ⟨𝑋 ,𝑊 ⟩ not changed then // Zero gradients
+
+⟨𝑋 ,𝑊 ⟩ ← randomly initialized values
+
+else if ∃ NaN/Inf ∈ ⟨𝑋 ,𝑊 ⟩ then
+
+Replace NaN/Inf with random values
+
+continue OUTER // Go to Line 3
+
+return ⟨𝑋 ,𝑊 ⟩
+
+raise failed to find viable ⟨𝑋 ,𝑊 ⟩
+
+3
+
+4
+
+5
+
+6
+
+7
+
+8
+
+9
+
+10
+
+11
+
+12
+
+13
+
+14
+
+15
+
+16
+
+Search process. The overall input search algorithm (Algorithm 2)
+proceeds as follows: Given a model 𝑀 and time budget 𝑇 , we first
+randomly initialize inputs and weights ⟨𝑋,𝑊 ⟩ (Line 2) used by the
+first iteration of the search algorithm (Line 3). In each iteration, we
+find the first operator (in topological order, Line 4) that produces an
+FP exceptional value (Line 7). We use its loss function as an optimiza-
+tion objective (Line 8) to tune ⟨𝑋,𝑊 ⟩. If the gradient is neither zero
+nor a FP exceptional values then we move on to the next iteration
+(Line 14), otherwise we restart the search with a different initial
+value (Line 11 and 13). The algorithm throws an exception (Line 16)
+if it does not terminate within the time budget.
+
+Because loss functions can vary by orders-of-magnitude across
+operators, we use Adam [23], an adaptive learning rate schedul-
+ing algorithm, to set the learning rate. We also reset the learning
+rate whenever we switch the loss functions used for optimization
+(as would be the case when an iteration finds a different operator).
+While this design can lead to a scenario where optimizing for one
+operator leads to another producing invalid outputs and vice-versa,
+
+Finding Deep-Learning Compilation Bugs with NNSmith
+
+,
+
+we found that this to be rare in practice (it occurred less than 1% of
+the time). We found that the most common reason for the search
+algorithm failing was that the model has no valid inputs.
+4 Implementation
+
+NNSmith is implemented in 5157 lines of Python code. Consistent
+with Algorithm 1, NNSmith outputs a symbolic graph and its SMT
+solution for being valid with the help of the Z3 [40] solver. We
+then concretize the symbolic graph by invoking the materialized
+PyTorch functors in the topological order, and export the model to
+the deployment-friendly ONNX [2] format using PyTorch’s exporter.
+We also use PyTorch to implement our algorithm for finding model
+inputs/weights that result in numerically valid output (§3.3).
+
+Since DL compilers vary in operator and data type support, we
+infer the set of operators supported by the compiler being tested by
+trying to compile single-operator models with different data types.
+We use this information when generating graphs, so as to avoid
+“Not-Implemented” errors.
+
+Our implementation uses PyTorch as a reference backend, and
+we compare the optimized model’s output to PyTorch’s output. If
+they disagree, we further compare it with results from the model
+compiled in “O0” mode to narrow down the cause of the bug (i.e.,
+PyTorch or the compiler).
+
+We wrote operator specifications in NNSmith using information
+obtained from framework documentation [50] and source code [46].
+To simplify this task, we implemented several meta types including,
+unary/binary, reduce and broadcast that further reduce the amount
+of code needed to specify an operator. Using these, we found that
+we could implement 59 (out of 73) operator specification within 4
+lines of code. Furthermore, even for the most complex specification,
+which was for Conv2d, the requires function has 9 inequalities and
+the type_transfer function is only 7 lines of code (formatted by
+PEP8 [52]) that can be quickly implemented in a few minutes. Fur-
+thermore, these specifications can be written once and then shared
+by all compilers that can accept ONNX models as input.
+5 Evaluation
+
+5.1 Experimental Setup
+
+Metrics. We mainly target the following metrics for evaluation:
+
+• Code coverage: Following prior fuzzing work [7, 8, 59], we trace
+source-level branch coverage for both the entire systems and their
+pass-only components, measuring 1) total coverage counts all hit
+branches; and 2) unique coverage counts unique branches (“hard”
+branches) that other baselines cannot cover.
+
+• Bug counting: Following prior work [29, 59, 60], we use the number
+of independent patches as the number of detected bugs, except
+that we directly count the number of bug reports for closed-source
+systems (i.e., TensorRT) and unfixed ones.
+
+Baselines. We compare NNSmith with both the state-of-the-art
+general DNN model generators (LEMON and GraphFuzzer) and
+fuzzer specifically designed for TVM (i.e., Tzer).
+
+• LEMON [57] is a mutation-based model generator that mutates
+pre-trained Keras [17] models [58]. We convert Keras models into
+ONNX, to reuse the same differential testing and evaluation frame-
+work of NNSmith for fair comparison;
+
+• GraphFuzzer [33] generates models by randomly connecting nodes
+from a block corpus. While LEMON is limited to shape-preserving
+unary operators, GraphFuzzer also supports non-unary operators
+by aligning input tensor shapes with slicing/padding and uses spe-
+cific attributes to create shape-preserving instances for a few non-
+shape-preserving operators such as Conv2d. As its implementation
+is not open-sourced, for a fair comparison, we reimplemented its
+main design, e.g., stitching operators via padding/slicing, by re-
+placing NNSmith’s specification-based node insertion.
+
+• Tzer [29] is a coverage-guided and mutation-based fuzzer target-
+ing TVM’s low-level IR. As DNNs generated by NNSmith can also
+be lowered to low-level IR, we compare Tzer with NNSmith to
+see if NNSmith can well cover low-level optimizations as Tzer.
+
+Systems under test. NNSmith finds bugs in the following com-
+monly used compilers:
+
+• ONNXRuntime [45] (by Microsoft) is a graph-optimized DNN
+library for ONNX models, with over 130 source files on various
+graph optimizations. Like many runtime-based frameworks (e.g.,
+PyTorch), though ONNXRuntime enables optimizations, the opti-
+mized graph will still be directly mapped into pre-compiled kernel
+functions (i.e., no code generation). To evaluate pass-only coverage,
+we only instrument files under onnxruntime/core/optimizer;
+• TVM [11] is an end-to-end compiler for deploying DNNs on var-
+ious platforms. In addition to 61 graph-level passes, TVM also
+performs up to 58 low-level optimizations to generate highly opti-
+mized target code. As a front end, ONNX models will be converted
+into TVM’s graph-level IR to perform further optimization. TVM
+also has a much higher coverage upper limit (i.e., 116k) than ON-
+NXRuntime (i.e., 65k) given its higher capability/complexity. For
+pass-only instrumentation, we consider files in all transfroms
+folders.
+
+• TensorRT [43] is a compiler and runtime highly optimized for
+NVIDIA GPUs and has been used by more than 350k developers
+across 27.5k companies. Since TensorRT is closed-sourced, we
+exclude it for coverage evaluation.
+
+Experimental configuration. The testbed hardware configura-
+tions include: 1) Intel 10700k CPU (16 threads); 2) 64 GB memory
+(3200 Mhz); and 3) 2TB NVMe SSD. The operating system is Ubuntu
+20.04 and targeted DL systems are compiled by Clang 14 under re-
+lease mode. Except that we performed bug findings on various latest
+compiler versions over the last seven months, the default software
+versions used in evaluation are: ONNXRuntime v1.12 (c556f5), TVM
+v0.8 (9ab3a1), TensorRT v8.4 and PyTorch v1.13 (dev20220615).
+
+When evaluating NNSmith, for Algorithm 1 we choose between
+forward and backward at every insertion randomly with equal prob-
+ability. For the binning approach we use 𝑘 = 6 bins (§3.2) to ensure a
+decent amount of attribute diversity while keeping the models small
+for fuzzing efficiency. For the gradient search, the initial learning
+rate is set to be 0.5, 𝜖 in the tensor inequality loss function is set
+to 10−10. While LEMON does not explicitly control the graph sizes
+(since it mutates existing models), we set the default generated graph
+size of NNSmith and GraphFuzzer to be 10. For coverage evaluation,
+we run fuzzers for 4 hours by default (following Tzer [29]) as we
+observe that code coverage curves generally converge before that
+point (e.g., as shown in Figure 4).
+
+,
+
+Jiawei Liu, Jinkun Lin, Fabian Ruffy, Cheng Tan, Jinyang Li, Aurojit Panda, and Lingming Zhang
+
+(a) ONNXRuntime
+
+(b) TVM
+
+Figure 4: Total branch coverage over time (all files).
+
+(a) ONNXRuntime
+
+(b) TVM
+
+Figure 5: Total branch coverage over test cases (all files).
+
+(a) ONNXRuntime
+
+(b) TVM
+
+Figure 6: Total branch coverage over time (pass files).
+
+due to the overhead incurred by constraint solving), NNSmith can
+still achieve higher coverage than the 2nd-best baseline (i.e., Graph-
+Fuzzer), indicating that NNSmith can generate higher-quality test
+cases. It is also worth noting that LEMON is the slowest technique
+(e.g., up to 103× slower than NNSmith). The reason is that LEMON
+mutates real-world models which can be very costly to run. We also
+have similar observations on the pass-only coverage. For example,
+as shown in Figure 6, NNSmith outperforms GraphFuzzer by 1.85×
+on ONNXRuntime and 1.09× on TVM, showing its effectiveness for
+testing compiler transformation passes.
+
+Another interesting observation is that NNSmith’s coverage im-
+provement on TVM is relatively smaller than that on ONNXRun-
+time (1.08× v.s. 1.8×). This can be inferred by the difference in their
+fundamental designs. While ONNXRuntime implements over 130
+optimization files targeting various specific graph patterns, TVM’s
+graph-level optimization is more general. For example, TVM’s op-
+erator fusion does not check specific operator types, but high-level
+operator properties such as injective, reduce, etc. Therefore, TVM’s
+coverage is less sensitive to the diversity of generated graph patterns.
+To show the unique coverage for each studied technique, Figure 7
+further breaks down the coverage sets of different fuzzers through
+Venn diagrams [61]. It shows that NNSmith can achieve much higher
+unique coverage than the 2nd-best baseline (i.e., LEMON), e.g., 32.7×
+higher on ONNXRuntime and 10.8× higher on TVM. Despite that
+GraphFuzzer beats LEMON in total coverage, LEMON contrast-
+ingly outperforms GraphFuzzer in unique coverage. This is because
+LEMON has a different design from NNSmith and GraphFuzzer: it
+mutates existing real-world models rather than generating new mod-
+els from scratch, creating different model patterns. Please note that
+we omitted the unique coverage distribution analysis for pass-only
+files as it follows a similar pattern as Figure 7.
+
+(a) ONNXRuntime
+
+(b) TVM
+
+Figure 7: Venn diagram of overall coverage (total coverage
+shown in parenthesis).
+
+(a) All files.
+
+(b) Pass-only files.
+
+Figure 8: NNSmith vs. Tzer.
+
+5.2 End-to-end Coverage Efficiency
+
+We first compare NNSmith with our graph-level baselines (i.e.,
+GraphFuzzer and LEMON) in terms of code coverage on TVM and
+ONNXRuntime (since TensorRT is closed-sourced). Figure 4 shows
+the coverage growth (y axis) over four hours (x axis). As is shown in
+the Figure, NNSmith beats the 2nd-best baseline (i.e., GraphFuzzer)
+by 1.8× on ONNXRuntime and by 1.08× on TVM. NNSmith also
+achieves a decent percentage of total coverage, i.e., 17.9% on ON-
+NXRuntime and 18.6% on TVM 5. Figure 5 further shows the number
+of generated test cases (x axis) within 4 hours and their accumulated
+total coverage (y axis, consistent to Figure 4). We can observe that
+with fewer test cases generated within the same time limit (mainly
+
+5Note that it is unlikely for NNSmith to achieve perfect overall coverage as there are
+many other irrelevant components related to debugging, auto-tuning [12, 69], etc. For
+instance, existing Linux kernel fuzzers [22] can only achieve 0.8-10.5% coverage.
+
+Figure 8 also compares NNSmith against Tzer on TVM (as Tzer
+is specifically designed for TVM). On all TVM files, NNSmith as a
+general graph-level fuzzer, can outperform state-of-the-art IR-level
+TVM-specific fuzzer by 1.4× in total coverage and 13× in unique cov-
+erage. Interestingly, while other graph-level baselines can at most
+exclusively cover 117 branches (i.e., LEMON in Figure 7b), Tzer has
+an unique coverage of 461. This is because Tzer directly manipu-
+lates low-level IR and some low-level operations are not exposed
+at the graph level. Moreover, in terms of pass-only coverage, NN-
+Smith outperforms Tzer even more, e.g., by 123× in unique coverage,
+demonstrating the superiority of graph-level fuzzing.
+5.3 Ablation Study
+
+Attribute binning. Figure 9 evaluates the effectiveness of attribute
+binning from the perspective of redundancy. Note that for imple-
+mentation convenience we use the type system from TVM’s Relay IR
+
+050100150200250Time(Minute)6912#Coverage(1000branches)11579/64854=17.9%NNSmithGraphFuzzerLEMON050100150200250Time(Minute)161820#Coverage(1000branches)19161/102994=18.6%050000100000150000#Iteration6912#Coverage(1000branches)NNSmithGraphFuzzerLEMON0100002000030000#Iteration161820#Coverage(1000branches)050100150200250Time(Minute)10152025#Coverage(100branches)2210/7160=30.9%NNSmithGraphFuzzerLEMON050100150200250Time(Minute)22242628#Coverage(100branches)2646/10238=25.8%137368448574320964255LEMON(5203)GraphFuzzer(6422)NNSmith(11579)11768171265273161216011LEMON(16418)GraphFuzzer(17708)NNSmith(19161)461597813183Tzer(13644)NNSmith(19161)1113561290Tzer(1301)NNSmith(2646)Finding Deep-Learning Compilation Bugs with NNSmith
+
+,
+
+(parsed from ONNX models) to distinguish operators.It shows that
+within 4 hours, our binning approach achieves 2.07× unique oper-
+ator instances, which are distinguished by input types and operator
+attributes.
+
+Turning to system coverage, as shown in Figure 10, attribute bin-
+ning improves the unique branch coverage by 2.2× for ONNXRun-
+time (Figure 10a) and 1.8× for TVM (Figure 10b). The total coverage
+improvement is relatively subtle (up to 2.3%) as the binning approach
+aims at covering the hard-to-hit branches whose proportion is ex-
+pected to be minor. For example, simply importing TVM’s libraries
+with “import tvm” can hit 4015 branches but those branches are
+unlikely to have bugs.
+
+Figure 9: Normalized unique operator instances tested.
+
+(a) ONNXRuntime
+Figure 10: Impact of attribute binning on coverage.
+
+(b) TVM
+
+Gradient guidance. Figure 11 evaluates the effectiveness of three
+input/weight searching methods: 1) Sampling: randomly initializ-
+ing test case values; 2) Gradient (Proxy Deriv.): searching values
+via the full gradient-based approach; and 3) Gradient: method two
+without proxy derivatives. The experiment is conducted on three
+model groups, each of which contains 512 models of 10, 20 and 30
+nodes respectively. Every model has at least one vulnerable operator.
+The Sampling baseline randomly samples values from the range
+of [1,9] which is empirically obtained selecting the best one from
+various tested ranges. For fairness, all methods run on the same
+groups of models with the same initial weights/inputs generated
+by the Sampling baseline. We assign different per-model searching
+timeouts (i.e., 𝑖 ×8ms where 𝑖 ∈ [1,8]) to each method and observe
+the ratio of models with numeric-valid inputs/weights (y-axis) over
+group-wide average searching time (x-axis). Figure 11 shows that
+our full gradient search improves the numerical validity of Sampling
+by 1.16-1.34× as the node size/difficulty grows. Also, the proxy de-
+rivative mechanism consistently helps our gradient search achieve
+higher success rate within shorter amount of time.
+
+We also observe that searching time is negligible compared with
+model generation time, e.g., generating a 10-node model costs 83ms
+on average while our gradient-based searching only takes 3.5ms
+(4.2%) to achieve a success rate of 98%.
+
+Figure 11: Effectiveness of gradient-based search.
+
+5.4 Bug Study
+
+Transformation Conversion Unclassified
+
+ONNXRuntime
+TVM
+TensorRT
+PyTorch Exporter
+Total
+(Crash/Semantic)
+
+9
+23
+4
+–
+36
+(29/7)
+
+0
+11
+2
+10
+23
+(18/5)
+
+2
+0
+4
+–
+6
+(3/3)
+
+Table 3: Bug distribution.
+
+Total
+11
+34
+10
+10
+65
+(50/15)
+
+To date, NNSmith has uncovered 65 new bugs as shown in Table 3,
+where 52 have been confirmed and 44 have been fixed. Others are
+awaiting developer responses. Interestingly, in addition to compiler
+bugs, since NNSmith generates models through PyTorch ONNX
+exporter (§4), it also found 10 conversion bugs in PyTorch as a by-
+product. Among the bugs we found, 15 are semantic bugs (result
+inconsistencies with PyTorch) and 50 are crash bugs (segmentation
+faults or exceptions). In total, there are 36 transformation bugs in
+ONNXRuntime (9), TVM (23) and TensorRT (4), accounting for the
+majority of the detected bugs 6. We found that most of these were
+optimization bugs: of the 20 fixed transformation bugs we found, 19
+are optimization bugs (and the remaining one is an unclassified bug
+in TensorRT whose code is not available).
+
+Of the 65 bugs we found, 43 bugs cannot be triggered using the
+algorithms implemented by LEMON or GraphFuzzer. Of these 25
+are transformation bugs and 14 are conversion bugs. LEMON’s al-
+gorithms can trigger at most 16 of all bugs we found, while Graph-
+Fuzzer’s algorithms can trigger at most 22 of these. The core differ-
+ence is that these prior approaches limit how non-shape preserving
+operators are connected in the graph, thus limiting graph diversity.
+In addition to this theoretical analysis, we also evaluated all tools by
+running them for four hours under the same setting (e.g., all on the
+default compiler versions as shown in § 5.1), NNSmith triggers 38
+unique crashes (by error messages) for ONNXRuntime and 13 for
+TVM, while LEMON triggers none and GraphFuzzer only triggers
+1 crash for each of ONNXRuntime and TVM. For instance, the only
+ONNXRuntime bug detected by GraphFuzzer is the wrong fusion
+to a double-precision ReLU-Clip connection (element-wise and thus
+shape-preserving).
+
+We next describe transformation and conversion bugs we found
+by illustrating prominent bug patterns with examples. We use ⋆ to
+denote bugs exclusively found by NNSmith.
+
+6We classify bugs first based on code inspection (when possible); otherwise, we classify
+a bug as transformation bug if its individual operators cannot reproduce the issue
+separately.
+
+wherestridedsliceresize1dconcatenatetransposebroadcasttobin.elem.-wiseresize3dreshapemaxpool2dconv2davgpool2dpadreduceresize2dsoftmaxunaryelem.-wisebroadcasttolikeexpanddimsbatchnormdensebiasadd1.0×1.3×1.4×1.5×1.6×1.8×1.9×2.0×2.1×2.2×2.4×2.4×2.4×2.7×2.7×3.3×3.3×3.7×3.8×5.3×6.8×8.3×binning(total:136737)base(total:65550)21047111108nobinning(11318)w/binning(11579)9717118990nobinning(19087)w/binning(19161)051015202530Avg.SearchingTime(millisecond)0.60.70.80.91.0SuccessRateSearchingMethodGradient(ProxyDeriv.)GradientSamplingModelSize102030ModelSize102030,
+
+Jiawei Liu, Jinkun Lin, Fabian Ruffy, Cheng Tan, Jinyang Li, Aurojit Panda, and Lingming Zhang
+
+⋆
+
+Transformation bugs. Wrong expression simplification: We found 5
+such bugs in ONNXRuntime (4) and TVM (1). One bug
+happens in
+FuseMatMulScale when ONNXRuntime optimizes (𝑠𝑎 ·𝐴)@(𝑠𝑏 ·𝐵)
+to (𝑠𝑎 ·𝑠𝑏 ) · (𝐴@𝐵) for scalars𝑠𝑎,𝑠𝑏 and matrices𝐴,𝐵 where @ denotes
+MatMul. However, when 𝐵 is a 1×1 matrix, ONNXRuntime can mis-
+take matrix 𝐵 as a scalar and rewrite it into (𝑠𝑎 ·𝐵) · (𝐴@𝑠𝑏 ), which is
+illegal as MatMul does not accept scalar inputs, causing a compiler
+exception. Prior work cannot use the non-shape-preserving MatMul
+operator, thus missing such bugs. Wrong expression simplification
+can also lead to semantic bugs, which may lead to wrong decisions
+in downstream AI applications, introducing security threats in crit-
+ical scenarios (e.g., self-driving). For example, TVM has a buggy
+arithmetic optimization pass that switches the order of division and
+⌋ ×𝑖 mod𝑧, simplifying it to
+multiplication when rewriting ⌊
+(𝑥 mod𝑦) mod𝑧 incorrectly.
+
+𝑥 mod 𝑦
+𝑖
+
+⋆
+
+Wrong layout analysis: Memory layout optimizations in TVM
+first rewrite layouts of the most beneficial operators (e.g., Conv2d)
+to efficient ones and then let remaining operators adapt changed
+layouts. We found 7 layout transformation bugs
+in TVM, related
+to non-shape-preserving operators including broadcasting, reduce
+and slicing, which cannot be handled by prior work. For example,
+𝐶
+4 HW4c
+TVM can rewrite NCHW Conv2d to the SIMD-friendly N
+layout (NCHW4c for short), by packing every 4 elements on C to the
+new sub-dimension (4c). However, using this optimization when the
+Conv2d is followed by a Slice operator whose stride for C is greater
+than one causes TVM to crash. GraphFuzzer cannot find this bug
+because to ensure shape alignment it always uses a stride of 1.
+
+Integer type mismatch: Like traditional compilers (e.g., LLVM [24]),
+DL compilers leverage IRs to simplify optimization. IR type mismatch
+can happen if one pass makes wrong assumption for the IR being
+⋆
+transformed. This is especially a pain for TVM: we found 8 bugs
+stopping the compilation due to int32-int64 mismatch and one core
+TVM developer also admits that “TVM has a pretty fragile system of
+using i32 vs i64; I personally experienced it a few times before...”.int64
+is often introduced by shape-related operators (e.g., shape attributes
+of Reshape and BroadcastTo), which are not supported by prior work
+as they cannot handle those complicated shape constraints. Since
+our first bug report on such issues, there have been 12 fixes (7 from
+us and 5 from followers) within 5 months to resolve similar issues,
+one of which even blocked models in production. Interestingly, a
+bug we found also helped the developers find another bug that had
+previously been diagnosed as the outcome of a flaky test [32].
+Conversion bugs. Wrong scalar handling: We found 6 crash bugs
+triggered when TVM imports reduce-like operators with a scalar
+input. Since these operators are not shape-preserving, prior work
+cannot trigger such bugs. Similarly in PyTorch, when exporting Log2
+with a scalar input, the exporter mistakenly sets its output to a rank-1
+tensor instead of a scalar, causing a semantic issue. A few days after
+our report, developers identified 37 other similar bugs. Concurrently,
+NNSmith also identified a subset of these bugs, but in our evaluation
+we only treat the first bug (Log2) as one found by NNSmith.
+
+⋆
+
+Wrong broadcasting: Given a 3-way broadcasting Where(𝐶1×1,𝑇3×1,𝐹2),
+
+⋆
+
+causes the lower-ranked tensor 𝐹2 being ignored dur-
+a TVM bug
+ing shape inference, resulting in the wrongly inferred shape 3×1,
+which should be 3×2. This incurs a compiler failure in later phases.
+
+⋆
+
+Another TVM bug
+causes an import failure to MatMul with single-
+rank broadcasting (one input is a vector) and notably, one month
+after our bug report, real-world TVM users also encountered such
+issues and pushed for its fix, showing that NNSmith can synthesize
+real-world model patterns. Prior work cannot detect them since their
+design are incompatible with broadcasting operations.
+
+Data type mismatch: Operators’ data type supports vary by ONNX
+versions, which are often mishandled. For example, PyTorch can
+mistakenly (and silently) export Clip whose data type is int32 which
+is not supported by ONNX version 11. Such ill-formed models will
+be rejected by most compilers; however, it can also be mistakenly
+compiled by TensorRT, producing unexpected model outputs (i.e., se-
+mantic bugs in TensorRT), due to the wrongly interpreted attributes.
+False alarms. As we discussed in the introduction, floating point
+semantics [47, 49] mean that even correct optimizations can lead
+to scenarios where an optimized model’s output differs from the
+reference output. Consequently, we check output equivalence by
+checking that the distance between model outputs,when scaled by
+their overall magnitude is small. However, in some cases valid opti-
+mizations can lead to a large relative change in outputs and produce
+false alarms. For example, optimizing a model where a Sigmoid op-
+erator provides the input to a Floor operator, can result in a scenario
+where the optimized output differs from the reference output by 1,
+causing NNSmith to falsely report a bug.
+
+6 Related Work
+
+Since the first proposal of fuzzing [39], various techniques have been
+proposed for fuzzing systems of different application domains [6, 14,
+28, 30, 34, 35, 41, 55, 56, 70]. In this section, we mainly talk about the
+most closely related work in DL system fuzzing and compiler fuzzing.
+
+6.1 DL System Fuzzing
+
+In recent years, a number of techniques have been proposed to test
+DL libraries and compilers. As one of the first techniques in this direc-
+tion, CRADLE [36] directly runs existing DNN models on different
+DL libraries to detect potential inconsistencies via differential test-
+ing.Later on, AUDEE [19] and LEMON [57] further extend CRADLE
+by applying search-based mutation strategies on the DNN models
+and their inputs to cover more library code. While AUDEE mainly
+focuses on mutating layer parameters and weight/input tensors,
+LEMON further applies more advanced mutation rules, including
+layer deletions/additions. Meanwhile, to ensure correctness of gen-
+erated models, LEMON [57] only mutates type-preserving operators
+(or blocks of operators) from the real-world models, to avoid handling
+type constraints.However, there are many non-shape-preserving
+operator types, e.g., even the commonly used Conv2d cannot be
+completely handled by LEMON. More recently, GraphFuzzer [33] al-
+lows a slightly larger operator search space using padding/slicing to
+align unmatched tensor shapes and also specifically controls the at-
+tributes of shape-changing operator types to create shape-preserving
+instances (e.g., Conv2d with kernel size/stride of 1). However, this
+design still substantially limits model diversity (as demonstrated in
+§2.3). The very recent (and concurrent) Muffin work [18] shares a
+similar limitation as GraphFuzzer: it uses “reshaping” layers to align
+tensor shapes during model generation; in addition, Muffin focuses
+on finding gradient computation bugs in DL libraries rather than
+
+Finding Deep-Learning Compilation Bugs with NNSmith
+
+,
+
+DL compiler bugs. In this work, we aim to support more diverse/-
+valid model generation for DL compiler fuzzing via a fundamentally
+different design powered by symbolic constraint solving [10] and
+gradient-driven search.
+
+To complete DL system testing at the model/graph level, researchers
+have also proposed DL system fuzzing techniques focusing on di-
+rectly generating or manipulating the low-level model IRs [29, 48].
+TVMFuzz [48] aims to automatically generate arbitrary low-level
+IRs based on a set of predefined grammar rules for fuzzing the pop-
+ular TVM compiler [11]. The more recent Tzer work [29] leverages
+coverage feedback to perform joint mutation of both the low-level IR
+and optimization passes for TVM. While Tzer has shown promising
+results over TVMFuzz, the low-level IR mutation adopted by Tzer
+can hardly test the graph-level optimizations widely adopted by
+various DL compilers (as shown in §5.2).
+
+In recent years, researchers have also investigated techniques to
+fuzz each DL system API in isolation. Meanwhile, DL APIs are usually
+exposed in Python, a dynamically typed language, making it hard
+even to determine their argument types for test generation. There-
+fore, prior techniques, such as Predoo [68], require users to manually
+set up the function arguments, and can only be evaluated on a lim-
+ited number of APIs. More recently, FreeFuzz [59] aims to address
+this challenge via dynamically tracing API executions from various
+sources (including library documents, developer tests, and real-world
+models), and further mutates the traced inputs for each API to test
+DL libraries. While such API-level testing techniques are adequate
+for testing first-generation DL libraries (§2.1), they can hardly find
+bugs in graph-level optimizations (e.g., 86% of the transformation
+bugs detected by NNSmith require multiple operators to trigger).
+
+6.2 Compiler Fuzzing
+
+As one of the most widely studied compiler fuzzing approaches in
+the literature [36], grammar-based techniques (such as Csmith [64],
+jsfunfuzz [53], and LangFuzz [21]) aim to generate syntactically valid
+input programs acceptable by the underlying compilers. While effec-
+tive, it is hard for grammar-based techniques to ensure the semantic
+correctness of the generated programs to cover deep code paths,
+and highly specialized analyses have to be employed for specific
+languages. Therefore, various mutation-based techniques [15, 25,
+26, 54, 67] have also been proposed for fuzzing compilers via mutat-
+ing existing seed input programs.Moreover, given the advances in
+DL, researchers have also proposed learning-based techniques for
+compiler fuzzing. DeepSmith [13] and DeepFuzz [31] directly lever-
+age recurrent neural networks (RNNs) to generate test programs
+from scratch, while Montage [27] performs mutation-based fuzzing,
+and replaces code snippets of the seed programs with new code
+fragments generated by RNNs. More recently, researchers have also
+leveraged the advanced pre-trained language models (e.g., GPT [9])
+for more powerful test program generation for compiler fuzzing [65].
+Such existing compiler fuzzing techniques can be potentially applied
+to the low-level IRs (C-like) for fuzzing DL compilers [29]. How-
+ever, they can be hardly directly applied for graph-level DL compiler
+fuzzing, and our study has also shown the superiority of NNSmith
+over state-of-the-art IR-level DL compiler fuzzer.
+
+7 Conclusion
+
+NNSmith is a tool for generating diverse and valid test cases for deep
+learning compilers. It creates abstract operator models to ensure the
+validity of the generated models, and further utilizes incremental
+graph generation and attribute binning to ensure its diversity. To
+avoid false alarms and bug escapes, NNSmith leverages gradient
+search to find inputs that do not introduce NaN/Inf in the computa-
+tion. NNSmith is easily extensible to support new operators with few
+lines of code. Lastly, NNSmith is implemented to generate models in
+the popular format ONNX and is readily applicable to any systems
+with ONNX support. To date NNSmith has found 65 new bugs in
+TVM, TensorRT, ONNXRuntime, and PyTorch, 52 of which have
+been confirmed or fixed, demonstrating its effectiveness.
+References
+
+[1] Martín Abadi, Paul Barham, Jianmin Chen, Zhifeng Chen, Andy Davis, Jeffrey
+Dean, Matthieu Devin, Sanjay Ghemawat, Geoffrey Irving, Michael Isard, et al.
+Tensorflow: A system for large-scale machine learning. In 12th USENIX symposium
+on operating systems design and implementation (OSDI 16), pages 265–283, 2016.
+
+[2] Junjie Bai, Fang Lu, Ke Zhang, et al. Onnx: Open neural network exchange.
+
+https://github.com/onnx/onnx, 2019.
+
+[3] Tadas Baltrušaitis, Chaitanya Ahuja, and Louis-Philippe Morency. Multimodal
+machine learning: A survey and taxonomy. IEEE transactions on pattern analysis
+and machine intelligence, 41(2):423–443, 2018.
+
+[4] Yoshua Bengio, Nicholas Léonard, and Aaron C. Courville. Estimating or
+propagating gradients through stochastic neurons for conditional computation.
+ArXiv, abs/1308.3432, 2013.
+
+[5] Nikolaj Bjørner, Leonardo de Moura, Lev Nachmanson, and Christoph M
+Wintersteiger. Programming z3. In International Summer School on Engineering
+Trustworthy Software Systems, pages 148–201. Springer, 2018.
+
+[6] Marcel Boehme, Cristian Cadar, and Abhik Roychoudhury. Fuzzing: Challenges
+
+and reflections. IEEE Softw., 38(3):79–86, 2021.
+
+[7] Marcel Böhme, Van-Thuan Pham, Manh-Dung Nguyen, and Abhik Roychoudhury.
+Directed greybox fuzzing. In Proceedings of the 2017 ACM SIGSAC Conference on
+Computer and Communications Security, pages 2329–2344, 2017.
+
+[8] Marcel Böhme, László Szekeres, and Jonathan Metzman. On the reliability of
+coverage-based fuzzer benchmarking. In 44th IEEE/ACM International Conference
+on Software Engineering, ser. ICSE, volume 22, 2022.
+
+[9] Tom Brown, Benjamin Mann, Nick Ryder, Melanie Subbiah, Jared D Kaplan,
+Prafulla Dhariwal, Arvind Neelakantan, Pranav Shyam, Girish Sastry, Amanda
+Askell, et al. Language models are few-shot learners. Advances in neural
+information processing systems, 33:1877–1901, 2020.
+
+[10] Cristian Cadar and Koushik Sen. Symbolic execution for software testing: three
+
+decades later. Communications of the ACM, 56(2):82–90, 2013.
+
+[11] Tianqi Chen, Thierry Moreau, Ziheng Jiang, Lianmin Zheng, Eddie Yan, Haichen
+Shen, Meghan Cowan, Leyuan Wang, Yuwei Hu, Luis Ceze, et al. TVM: An
+automated end-to-end optimizing compiler for deep learning. In 13th USENIX
+Symposium on Operating Systems Design and Implementation (OSDI 18), pages
+578–594, 2018.
+
+[12] Tianqi Chen, Lianmin Zheng, Eddie Yan, Ziheng Jiang, Thierry Moreau, Luis
+Ceze, Carlos Guestrin, and Arvind Krishnamurthy. Learning to optimize tensor
+programs. Advances in Neural Information Processing Systems, 31, 2018.
+
+[13] Chris Cummins, Pavlos Petoumenos, Alastair Murray, and Hugh Leather.
+Compiler fuzzing through deep learning. In Proceedings of the 27th ACM SIGSOFT
+International Symposium on Software Testing and Analysis, pages 95–105, 2018.
+
+[14] Kyle Dewey, Jared Roesch, and Ben Hardekopf. Language fuzzing using constraint
+logic programming. In Proceedings of the 29th ACM/IEEE international conference
+on Automated software engineering, pages 725–730, 2014.
+
+[15] Alastair F Donaldson, Hugues Evrard, Andrei Lascu, and Paul Thomson.
+Automated testing of graphics shader compilers. Proceedings of the ACM on
+Programming Languages, 1(OOPSLA):1–29, 2017.
+
+[16] gbftdlie. Found result inconsistency in graph-based fuzz testing. https://github.
+com/gbftdlie/Graph-based-fuzz-testing/blob/master/BugDetails_DCF.md, 2020.
+
+[17] Google. Keras, 2015. https://keras.io.
+[18] Jiazhen Gu, Xuchuan Luo, Yangfan Zhou, and Xin Wang. Muffin: Testing deep learn-
+ing libraries via neural architecture fuzzing. arXiv preprint arXiv:2204.08734, 2022.
+[19] Qianyu Guo, Xiaofei Xie, Yi Li, Xiaoyu Zhang, Yang Liu, Xiaohong Li, and Chao
+Shen. Audee: Automated testing for deep learning frameworks. In 2020 35th
+IEEE/ACM International Conference on Automated Software Engineering (ASE),
+pages 486–498. IEEE, 2020.
+
+[20] Kaiming He, Georgia Gkioxari, Piotr Dollár, and Ross Girshick. Mask r-cnn.
+In Proceedings of the IEEE international conference on computer vision, pages
+
+,
+
+Jiawei Liu, Jinkun Lin, Fabian Ruffy, Cheng Tan, Jinyang Li, Aurojit Panda, and Lingming Zhang
+
+2961–2969, 2017.
+
+[21] Christian Holler, Kim Herzig, and Andreas Zeller. Fuzzing with code fragments.
+
+In 21st USENIX Security Symposium (USENIX Security 12), pages 445–458, 2012.
+
+[22] Kyungtae Kim, Dae R Jeong, Chung Hwan Kim, Yeongjin Jang, Insik Shin, and
+Byoungyoung Lee. Hfl: Hybrid fuzzing on the linux kernel. In NDSS, 2020.
+[23] Diederik P. Kingma and Jimmy Ba. Adam: A method for stochastic optimization,
+
+2014.
+
+[24] Chris Arthur Lattner. LLVM: An infrastructure for multi-stage optimization. PhD
+
+thesis, University of Illinois at Urbana-Champaign, 2002.
+
+[25] Vu Le, Mehrdad Afshari, and Zhendong Su. Compiler validation via equivalence
+
+modulo inputs. ACM Sigplan Notices, 49(6):216–226, 2014.
+
+[26] Vu Le, Chengnian Sun, and Zhendong Su. Finding deep compiler bugs via guided
+stochastic program mutation. ACM SIGPLAN Notices, 50(10):386–399, 2015.
+[27] Suyoung Lee, HyungSeok Han, Sang Kil Cha, and Sooel Son. Montage: A neural
+network language model-guided javascript engine fuzzer. In 29th USENIX Security
+Symposium (USENIX Security 20), pages 2613–2630, 2020.
+
+[28] Jun Li, Bodong Zhao, and Chao Zhang. Fuzzing: a survey. Cybersecurity, 1(1):1–13,
+
+2018.
+
+[29] Jiawei Liu, Yuxiang Wei, Sen Yang, Yinlin Deng, and Lingming Zhang. Coverage-
+guided tensor compiler fuzzing with joint ir-pass mutation. Proc. ACM Program.
+Lang., 6(OOPSLA1), apr 2022.
+
+[30] Sihang Liu, Suyash Mahar, Baishakhi Ray, and Samira Khan. Pmfuzz: Test case
+generation for persistent memory programs.
+In Proceedings of the 26th ACM
+International Conference on Architectural Support for Programming Languages
+and Operating Systems, ASPLOS 2021, page 487–502, New York, NY, USA, 2021.
+Association for Computing Machinery.
+
+[31] Xiao Liu, Xiaoting Li, Rupesh Prajapati, and Dinghao Wu. Deepfuzz: Automatic
+generation of syntax valid c programs for fuzz testing. In Proceedings of the AAAI
+Conference on Artificial Intelligence, volume 33, pages 1044–1051, 2019.
+
+[32] Qingzhou Luo, Farah Hariri, Lamyaa Eloussi, and Darko Marinov. An empirical
+analysis of flaky tests. In Proceedings of the 22nd ACM SIGSOFT international
+symposium on foundations of software engineering, pages 643–653, 2014.
+
+[33] Weisi Luo, Dong Chai, Xiaoyue Run, Jiang Wang, Chunrong Fang, and Zhenyu
+Chen. Graph-based fuzz testing for deep learning inference engines. In 2021
+IEEE/ACM 43rd International Conference on Software Engineering (ICSE), pages
+288–299. IEEE, 2021.
+
+[34] Weiyu Luo and Brian Demsky. C11tester: A fuzzer for c/c++ atomics. In Pro-
+ceedings of the International Conference on Architectural Support for Programming
+Languages and Operating Systems (ASPLOS 2021), April 2021.
+
+[35] Valentin Jean Marie Manès, HyungSeok Han, Choongwoo Han, Sang Kil Cha,
+Manuel Egele, Edward J Schwartz, and Maverick Woo. The art, science, and
+engineering of fuzzing: A survey. IEEE Transactions on Software Engineering, 2019.
+[36] Michaël Marcozzi, Qiyi Tang, Alastair F Donaldson, and Cristian Cadar. Compiler
+fuzzing: How much does it matter? Proceedings of the ACM on Programming
+Languages, 3(OOPSLA):1–29, 2019.
+
+[37] William M McKeeman. Differential testing for software. Digital Technical Journal,
+
+10(1):100–107, 1998.
+
+[38] Microsoft. Onnx runtime: cross-platform, high performance ml inferencing and
+
+training accelerator. https://onnxruntime.ai/, 2020.
+
+[39] Barton P Miller, Louis Fredriksen, and Bryan So. An empirical study of the
+reliability of unix utilities. Communications of the ACM, 33(12):32–44, 1990.
+[40] Leonardo de Moura and Nikolaj Bjørner. Z3: An efficient smt solver.
+
+In
+International conference on Tools and Algorithms for the Construction and Analysis
+of Systems, pages 337–340. Springer, 2008.
+
+[41] Ian Neal, Andrew Quinn, and Baris Kasikci. Hippocrates: Healing persistent
+memory bugs without doing any harm.
+In Proceedings of the 26th ACM
+International Conference on Architectural Support for Programming Languages and
+Operating Systems, pages 401–414, 2021.
+
+[42] Jiquan Ngiam, Aditya Khosla, Mingyu Kim, Juhan Nam, Honglak Lee, and
+
+Andrew Y Ng. Multimodal deep learning. In ICML, 2011.
+
+[43] NVIDIA. https://nvidianews.nvidia.com/news/nvidia-inference-breakthrough-
+
+makes-conversational-ai-smarter-more-interactive-from-cloud-to-edge, 2021.
+
+et al. Learning transferable visual models from natural language supervision. In
+International Conference on Machine Learning, pages 8748–8763. PMLR, 2021.
+[52] Guido Rossum, Barry Warsaw, and Nick Coghlan. Pep 8 – style guide for python
+
+code, 2013.
+
+[53] Mozilla Security. jsfunfuzz. https://github.com/MozillaSecurity/funfuzz, 2007.
+[54] Chengnian Sun, Vu Le, and Zhendong Su. Finding compiler bugs via live code mu-
+tation. In Proceedings of the 2016 ACM SIGPLAN International Conference on Object-
+Oriented Programming, Systems, Languages, and Applications, pages 849–863, 2016.
+[55] Theodoros Theodoridis, Manuel Rigger, and Zhendong Su. Finding missed
+optimizations through the lens of dead code elimination. In Proceedings of the
+27th ACM International Conference on Architectural Support for Programming
+Languages and Operating Systems, pages 697–709, 2022.
+
+[56] Timothy Trippel, Kang G Shin, Alex Chernyakhovsky, Garret Kelly, Dominic
+Rizzo, and Matthew Hicks. Fuzzing hardware like software. arXiv preprint
+arXiv:2102.02308, 2021.
+
+[57] Zan Wang, Ming Yan, Junjie Chen, Shuang Liu, and Dongdi Zhang. Deep learning
+library testing via effective model generation. In Proceedings of the 28th ACM
+Joint Meeting on European Software Engineering Conference and Symposium on
+the Foundations of Software Engineering, pages 788–799, 2020.
+
+[58] Zan Wang, Ming Yan, Junjie Chen, Shuang Liu, and Dongdi Zhang. The
+implementation repository of LEMON: Deep Learning Library Testing via
+Effective Model Generation, 2021. https://github.com/Jacob-yen/LEMON.
+[59] Anjiang Wei, Yinlin Deng, Chenyuan Yang, and Lingming Zhang. Free lunch
+for testing: Fuzzing deep-learning libraries from open source. arXiv preprint
+arXiv:2201.06589, 2022.
+
+[60] Westley Weimer. Patches as better bug reports.
+
+In Proceedings of the 5th
+international conference on Generative programming and component engineering,
+pages 181–190, 2006.
+
+[61] Wikipedia contributors. Venn diagram — Wikipedia, 2022. [Online; accessed
+
+3-July-2022].
+
+[62] Bing Xu, Naiyan Wang, Tianqi Chen, and Mu Li. Empirical evaluation of rectified
+activations in convolutional network. arXiv preprint arXiv:1505.00853, 2015.
+[63] Ming Yan, Junjie Chen, Xiangyu Zhang, Lin Tan, Gan Wang, and Zan Wang.
+Exposing numerical bugs in deep learning via gradient back-propagation.
+ESEC/FSE 2021, page 627–638. Association for Computing Machinery, 2021.
+[64] Xuejun Yang, Yang Chen, Eric Eide, and John Regehr. Finding and understanding
+In Proceedings of the 32nd ACM SIGPLAN conference on
+
+bugs in c compilers.
+Programming language design and implementation, pages 283–294, 2011.
+
+[65] Guixin Ye, Zhanyong Tang, Shin Hwei Tan, Songfang Huang, Dingyi Fang,
+Xiaoyang Sun, Lizhong Bian, Haibo Wang, and Zheng Wang. Automated
+conformance testing for javascript engines via deep compiler fuzzing.
+In
+Proceedings of the 42nd ACM SIGPLAN International Conference on Programming
+Language Design and Implementation, pages 435–450, 2021.
+
+[66] Michal Zalewski. American fuzzing lop (afl). https://lcamtuf.coredump.cx/afl/,
+
+2018.
+
+[67] Qirun Zhang, Chengnian Sun, and Zhendong Su. Skeletal program enumeration
+for rigorous compiler testing. In Proceedings of the 38th ACM SIGPLAN Conference
+on Programming Language Design and Implementation, pages 347–361, 2017.
+[68] Xufan Zhang, Ning Sun, Chunrong Fang, Jiawei Liu, Jia Liu, Dong Chai, Jiang
+Wang, and Zhenyu Chen. Predoo: precision testing of deep learning operators.
+In Proceedings of the 30th ACM SIGSOFT International Symposium on Software
+Testing and Analysis, pages 400–412, 2021.
+
+[69] Lianmin Zheng, Chengfan Jia, Minmin Sun, Zhao Wu, Cody Hao Yu, Ameer Haj-Ali,
+Yida Wang, Jun Yang, Danyang Zhuo, Koushik Sen, et al. Ansor: Generating {High-
+Performance} tensor programs for deep learning. In 14th USENIX Symposium on
+Operating Systems Design and Implementation (OSDI 20), pages 863–879, 2020.
+
+[70] Yong-Hao Zou, Jia-Ju Bai, Jielong Zhou, Jianfeng Tan, Chenggang Qin, and
+Shi-Min Hu. {TCP-Fuzz}: Detecting memory and semantic bugs in {TCP} stacks
+with fuzzing.
+In 2021 USENIX Annual Technical Conference (USENIX ATC 21),
+pages 489–502, 2021.
+
+[44] NVIDIA. Nvidia tensorrt, 2022.
+[45] ONNXRuntime.
+
+Graph optimizations
+//onnxruntime.ai/docs/performance/graph-optimizations.html, 2022.
+Symbolic shape inference in onnxruntime.
+
+in onnx runtime.
+
+[46] ONNXRuntime.
+
+https:
+
+https:
+
+//github.com/microsoft/onnxruntime/blob/master/onnxruntime/python/
+tools/symbolic_shape_infer.py, 2022.
+
+[47] Michael L Overton. Numerical computing with IEEE floating point arithmetic.
+
+SIAM, 2001.
+
+[48] David Pankratz. Tvmfuzz: Fuzzing tensor-level intermediate representation in
+
+tvm. https://github.com/dpankratz/TVMFuzz, 2020.
+
+[49] Douglas M. Priest. On properties of floating point arithmetics: Numerical stability
+and the cost of accurate computations. Technical report, UC Berkeley, 1992.
+
+[50] PyTorch.
+
+Conv2d — pytorch
+https://pytorch.org/docs/1.11/generated/torch.nn.Conv2d.html.
+
+1.11.0
+
+documentation,
+
+2021.
+
+[51] Alec Radford, Jong Wook Kim, Chris Hallacy, Aditya Ramesh, Gabriel Goh,
+Sandhini Agarwal, Girish Sastry, Amanda Askell, Pamela Mishkin, Jack Clark,
+
+

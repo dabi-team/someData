@@ -1,0 +1,1616 @@
+2
+2
+0
+2
+
+p
+e
+S
+5
+
+]
+S
+M
+
+.
+s
+c
+[
+
+1
+v
+5
+9
+8
+1
+0
+.
+9
+0
+2
+2
+:
+v
+i
+X
+r
+a
+
+Forward-Mode Automatic Diﬀerentiation
+of Compiled Programs
+
+Max Aehle, Johannes Blühdorn, Max Sagebaum,
+and Nicolas R. Gauger
+
+September 7, 2022
+
+Algorithmic diﬀerentiation (AD) is a set of techniques to obtain accu-
+rate derivatives of a computer-implemented function in an automatic fashion.
+State-of-the-art AD tools rely on the source code of the implementation or
+internal representations of compilers building it.
+
+We present the new AD tool Derivgrind, which augments the machine
+code of compiled programs with forward AD logic. Derivgrind leverages the
+Valgrind instrumentation framework for a structured access to the machine
+code, and a shadow memory tool to store dot values. Depending on the
+application scenario, no access to the source code is required at all, or the
+access is restricted to the parts deﬁning input and output variables.
+
+Derivgrind’s versatility comes at the price of scaling the running time by
+a factor between 60 and 140, measured on a benchmark based on a PDE
+solver. Results of our extensive test suite indicate that Derivgrind produces
+correct results on GCC- and Clang-compiled programs, including a Python
+interpreter, with a small number of exceptions. While we provide a list of
+scenarios that Derivgrind does not handle correctly, most of them are aca-
+demic examples or originate from highly optimized math libraries. We will
+therefore further study the potential of our tool in more complex software
+projects.
+
+1 Introduction
+
+In many areas of science and technology, processes of interest can be described by a
+function f : Rn → Rm, x (cid:55)→ y implemented in a computer program. In order to leverage
+such a simulation for, e. g., gradient-based optimization, knowledge of the derivatives
+∂yi
+is required. To this end, besides numerical and symbolic diﬀentiation, algorithmic
+∂xj
+diﬀerentiation (AD) 1 has found widespread use in various areas such as aerodynamic
+shape optimization 2 and machine learning 3. AD is a set of techniques to turn a computer
+program for f into a ﬂoating-point accurate computer program for ∂yi
+. Both the forward
+∂xj
+
+1
+
+ 
+ 
+ 
+ 
+ 
+ 
+and reverse mode of AD run the original program f , and perform additional AD logic
+before, alongside, and afterwards. This work is concerned with the forward mode in
+the case of a single (n = 1) input variable x: For each input, intermediate, and output
+variable a, the additional AD logic computes a dot or tangent variable ˙a = ∂a
+. The dot
+∂x
+variable ˙x of the input is initialized with 1, ˙a is initialized with 0 for every constant a, and
+each real arithmetic operation a0 = φ(a1, . . . , ak) originally performed by the program is
+matched by an update
+
+˙a0 =
+
+∂φ
+∂a1
+
+· ˙a1 + · · · +
+
+∂φ
+∂ak
+
+· ˙ak.
+
+(1)
+
+For instance, a multiplication a0 = a1 · a2 leads to an update ˙a0 = a2 · ˙a1 + a1 · ˙a2 of the
+dot values, and a0 = sin(a1) should be accompanied by ˙a0 = cos(a1) · ˙a1. Several ways
+for the augmentation of the program with additional AD logic such as (1) have been
+described in the literature.
+
+• Source transformation tools like TAPENADE 4 parse the source code, and insert
+
+the additional AD logic in the respective programming language.
+
+• Operator overloading tools like ADOL-C 5, CoDiPack 6 and autograd 7 rely on a
+language feature of many object-oriented languages like C++ and Python. They
+deﬁne a special type to be used instead of the regular ﬂoating-point types such
+as double and np.array. The new type stores both a and additional AD data
+such as ˙a, and overloads all elementary operations with their original action on a
+accompanied by the additional AD logic.
+
+• AD logic can also be added during compilation. The AD tool CLAD 8 is a plugin
+for the Clang front-end of the LLVM compiler infrastructure, operating on Clang’s
+internal representation of the C/C++ source code in the form of an abstract syntax
+tree (AST). Zygote 9 augments an internal representation of the Julia compiler.
+Enzyme 10 operates on the LLVM intermediate representation (IR), and provides
+reverse-mode derivatives for software projects written in any mix of languages for
+which LLVM front-ends exist.
+
+Except for Enzyme, a common weakness of these approaches is that they rely on those
+parts of the source code that contain the real arithmetic to be diﬀerentiated. Thus,
+they cannot be applied if these sources are not fully available, or written in an exotic
+programming language or a mix of languages for which no AD tool exists yet.
+
+Diﬀerent languages supported by LLVM front-ends are not a problem for Enzyme, as
+it relies only on the LLVM IR, instead of the source code. Enzyme even makes it possible
+to include functions from static libraries into AD without access to their source code, if
+these static libraries were shipped with embedded LLVM IR.
+
+In this work, we go one step further and propose a method to propagate dot variables
+through the machine code of a compiled “client” program, imposing only mild constraints
+on how the client program performs real arithmetic. Users of our tool Derivgrind only
+need access to small portions of the source code that are related to the input and output
+variables, in order to set and get their dot values. Derivgrind therefore enables the inte-
+gration of forward-mode AD into complex and heterogeneous software projects involving
+
+2
+
+closed-source dependencies, with minimal eﬀort. We target clients running under Linux
+on both the x86 (also referred to as i386 or IA-32) and amd64 (x86-64, Intel 64 or x64)
+instruction set architectures.
+
+Derivgrind has been implemented as a tool within the Valgrind 11,12 framework for
+
+building dynamic analysis tools. After invoking
+
+valgrind -- tool =(cid:104)tool (cid:105) (cid:104)tool options(cid:105) (cid:104)client executable(cid:105) (cid:104)arguments for client(cid:105)
+
+the Valgrind core gets control and starts to read portions of the machine code of the
+client program, which consists of the client executable as well as dynamically linked
+or loaded libraries. Valgrind translates these portions into the uniﬁed object-oriented
+VEX IR, which it presents to the selected Valgrind tool. After the tool has modiﬁed
+(“instrumented”) the VEX IR, the Valgrind core executes it on a “synthetic” CPU.
+
+As an example, Valgrind’s default tool Memcheck 13 adds code to keep track of so-called
+availability and validity bits and detect memory errors. A standard Valgrind distribution
+includes several other tools for thread error detection and proﬁling. Our tool Derivgrind
+augments the VEX IR with forward AD logic.
+
+Besides the instrumentation of machine code, tools can specify monitor commands
+and client requests to enable communication between the tool, the user, and the client
+program. Derivgrind uses this feature for setting and getting dot values. As tools can
+wrap library functions, Derivgrind provides analytical derivatives for functions from the
+C math library.
+
+The remainder of this paper is structured as follows.
+
+In Section 2, we recall how
+compiled programs usually handle ﬂoating-point data, and how this handling can be
+extended to propagate dot values alongside. Section 3 starts with a review of VEX IR, and
+describes the speciﬁc AD instrumentation added by Derivgrind. Sections 4 and 5 detail
+the monitor commands and client requests, and the function wrappers introduced by
+Derivgrind. We apply Derivgrind in multiple case studies for validation and performance
+analysis in Section 6, and close with a summary and outlook in Section 7.
+
+2 Instrumentation of Machine Code with Forward AD Logic
+
+2.1 Shadowing Approach
+
+Our approach to store dot values is to match every storage location, such as memory and
+registers, by a shadow storage location. Whenever a location stores a representation of
+a ﬂoating-point value a in any format, the AD instrumentation should make sure that
+the corresponding shadow location stores the dot value ˙a in the same format. This also
+applies to individual bytes of a ﬂoating-point representation in case the representation
+is split up into several parts, e. g. to copy them separately. When the data at a location
+does not originate from a binary representation of a ﬂoating-point value, the content of
+the shadow location is unspeciﬁed.
+
+3
+
+2.2 Floating-Point Formats and Instructions
+
+Among other representations of real numbers as digital data, the IEEE-754 standard 14,
+revised in 2008, speciﬁes the most commonly used binary ﬂoating-point interchange for-
+mats binary32 (formerly: single) and binary64 (formerly: double). In the 8-byte format
+binary64,
+
+• the most signiﬁcant bit stores the sign, 0 indicating a positive and 1 indicating a
+
+negative number,
+
+• the 11 next-most signiﬁcant bits store the integer exponent in a biased fashion,
+meaning that 0b00. . .01 and 0b11. . .10 represent the lowest and highest possible
+exponents −1022 and 1023, respectively, and
+
+• the remaining 52 lower-signiﬁcant bits store the signiﬁcand (also called mantissa),
+
+apart from its implicit leading digit 1,
+
+so 0bb63b62 . . . b1b0 represents the real number
+
+(−1)b63 · (cid:0)1 · 2E + b51 · 2E−1 + b50 · 2E−2 + · · · + b0 · 2E−52(cid:1)
+with E = b62 · 210 + b61 · 29 + · · · + b52 · 20 − 1023.
+
+(2)
+
+A diﬀerent formula applies if the exponent is 0b00. . .00, to represent numbers close to
+zero without an implicit leading digit 1. In particular, a 64-bit 0x00. . .00 is interpreted
+as +0.0. The exponent 0b11. . .11 is used to represent inﬁnite numbers and not-numbers
+(NaNs). The 4-byte format binary32 is deﬁned in an analogous fashion with 8 exponent
+and 23 signiﬁcand bits (apart from the leading 1), and exponents ranging from −126 to
+127.
+
+On x86 and amd64 CPUs, real arithmetic is provided by the ﬂoating-point instruction
+sets x87, SSE, and AVX. Most of these instructions expect real numbers to be represented
+as binary32 or binary64, or a sequence of those in a single-instruction-multiple-data
+(SIMD) vector 15. Compilers typically use binary32 to implement the C/C++ type float
+and the Fortran type real, and binary64 for double and double precision.
+
+Internally, the x87 ﬂoating-point registers use an 80-bit double-extended precision for-
+mat. While the x87 instructions flds/fstps and fldl/fstpl convert from/to binary32
+and binary64 when they move data between the ﬂoating-point registers and memory,
+the instructions fldt/fstpt expose the 80-bit format to memory. GCC and Clang use
+the 80-bit format to implement the C/C++ type long double.
+
+Our main assumption on the client program is that it performs real arithmetic only
+by the corresponding ﬂoating-point instructions (with the exceptions listed below). To
+apply forward-mode AD, these instructions have to be recognized and augmented with
+instructions acting on the operands and their dot values according to basic rules of
+diﬀerential calculus.
+
+The client program may, moreover, use type-agnostic instructions to move ﬂoating-
+point values, even in several portions like single bytes. In most cases, these instructions
+
+4
+
+are simply applied to the dot values as well. Compare-and-swap (CAS) instructions need
+special consideration in Section 2.3.
+
+During our work, we encountered a variety of tricky ways to perform real arithmetic
+using integer or bitwise logical instructions, or by a “misuse” of ﬂoating-point instructions.
+The most important of these, presented in Section 2.4, can be dealt with by a suitable
+instrumentation of bitwise logical instructions. Further scenarios listed in Section 2.5 are
+not covered by our current implementation.
+
+2.3 Compare-And-Swap Instructions
+
+A CAS instruction makes a copy of the present value at a memory location b, compares
+it with an “expected” value and only if they match, writes another given value to b. The
+copy of the previous value at b can be used to determine whether the write to b took
+place. CAS instructions are useful in setups with multiple threads accessing a shared
+state, because all the operations happen in a single “atomic” step. Threads can use CAS
+instructions to make sure in a thread-safe way that when they update the shared state
+at b, it has not changed while the update was computed. Otherwise, if a thread T1 used
+a non-atomic conditional write and another thread T2 wrote to b after the comparison
+but before the write of T1, the update by T2 would be discarded.
+
+For the correct AD handling of CAS instructions, it is important to realize that the
+shared state of the augmented program consists of both the value at b, and the dot value
+in the shadow location. Due to their AD augmentation, threads will always update both,
+but it can happen that an update leaves either the value or the dot value unchanged. To
+determine whether the shared state has changed, it is therefore mandatory to compare
+both the present value at b with the expected value, and the corresponding dot values.
+For this reason, we replace a CAS instruction by a construct that ﬁrst performs the two
+comparisons, and only if they both succeed, writes to memory and to shadow memory. It
+is not a problem for Derivgrind that this construct is non-atomic, because Valgrind runs
+only one thread at a time and prevents context switches in the middle of an instrumented
+instruction.
+
+2.4 Bitwise Logical Instructions
+
+A bitwise logical “and” operation between a binary32/binary64 and 0b01. . .11 sets
+the sign bit to zero, and thus computes the absolute value. Listing 1 demonstrates
+that GCC routinely uses this “trick”. The assembly code on the right is a part of what
+GCC 11.2.0 with ﬂags -S -O3 produces for the C code on the left. It was stripped from
+irrelevant labels and directives, and is explained in the following. By the System V
+ABI 16, the ﬂoating-point argument of the function f is passed in the lower half of the
+128-bit register %xmm0. The four four-byte constants 0b11. . .11, 0b01. . .11, 0b00. . .00
+and 0b00. . .00, inserted by the .long directives, compose the other 128-bit operand to
+andpd. Note that the most signiﬁcant byte 0b01111111 of the second four-byte block is
+stored at the highest memory address within that block, as x86 and amd64 stick to the
+little-endian storage order. Therefore, its zero bit aligns with the sign bit of the binary64
+
+5
+
+Listing 1: GCC 11.2.0 may use a 128-bit logical “and” to set the sign bit of a binary64
+to zero, in order to compute the absolute value.
+
+# include < math .h >
+double f ( double x ) {
+return fabs ( x );
+
+}
+
+f :
+
+endbr64
+andpd .LC0 (% rip ) , % xmm0
+ret
+; ...
+.LC0 :
+
+; 0 b11..11
+.long -1
+.long 2147483647 ; 0 b01..11
+; 0 b00..00
+.long 0
+; 0 b00..00
+.long 0
+
+in the lower half of %xmm0.
+
+As a consequence, the AD instrumentation of an “and” instruction has to inspect
+If x is equal to 0b01. . .11, y might represent a real number
+both operands x and y.
+whose absolute value is taken by this instruction, and the AD instrumentation must
+act according to the respective diﬀerentiation rule. Analogous considerations apply for
+y. In case both operands of an “and” instruction are 0b01. . .11, no diﬀerentiable real
+arithmetic can be “hidden” because 0b01. . .11, as a binary32 or binary64, represents
+not-a-number.
+
+To handle SIMD operations correctly, the search for 0b01. . .11 must be performed on
+
+all 32-bit and 64-bit blocks of the operands.
+
+A similar procedure has to be applied for the bitwise logical “or” and “exclusive-or”
+instructions when one operand is 0b10. . .00, as these operations can compute the neg-
+ative absolute value and negative of a real number represented by the other operand,
+respectively. As an additional complication, 0b10. . .00 represents the real number −0.0.
+Therefore, taking the negative of −0.0 can lead to an “exclusive-or” instruction whose
+operands are both 0b10. . .00, making it ambiguous which operand represents the real
+number, and which dot value the diﬀerentiation rule of negation should thus be applied
+to. To resolve this issue, we interpret a logical “or” or “exclusive-or” as an arithmetic
+operation only if the dot value of the operand 0b10. . .00 is 0x00. . .00.
+
+A second important way in which ﬂoating-point arguments pass through bitwise logical
+
+instructions is given by the masking pattern
+
+( m and x ) or (( not m ) and y ).
+
+The result of this expression is assembled in a bitwise fashion from x and y depending on
+whether the respective bit in the mask m is 1 or 0. We observed this pattern being used by
+Clang 14.0.0 for the code in Listing 2. In this example, the mask is created by the cmpltsd
+instruction, which sets %xmm2 to either 0xff. . .ff if a < 0, or 0x00. . .00 otherwise. The
+subsequent “and”, “and-not” and “or” instructions then place in %xmm2 either the constant
+2.0 copied from .LCPI0_0, or the value a copied from %xmm0, respectively. In both cases,
+ﬁnally %xmm2 is added to the register %xmm0, which holds the input a in the beginning,
+and the return value at the end (realizing 2 · a as a + a in the “else” branch).
+
+6
+
+Listing 2: Clang 14.0.0 may use logical operations in a masking pattern to select one of
+two ﬂoating-point numbers.
+
+double f ( double a ){
+
+.LCPI0_0 :
+
+if (a <0){
+
+return 2+ a ;
+
+} else {
+
+return 2* a ;
+
+}
+
+}
+
+.quad 0 x40 00000000000000
+
+f :
+
+xorpd % xmm1 , % xmm1
+movapd
+% xmm0 , % xmm2
+cmpltsd % xmm1 , % xmm2
+movsd .LCPI0_0 (% rip ) , % xmm1
+andpd % xmm2 , % xmm1
+andnpd
+orpd
+% xmm1 , % xmm2
+addsd % xmm2 , % xmm0
+retq
+
+% xmm0 , % xmm2
+
+We support masking patterns as long as entire binary32s or binary64s are picked in
+
+the style of an if-then-else operation, as in the previous example. To this end,
+
+• if one operand of a bitwise logical “and” is 0xff. . .ff, or
+
+• if one operand of a bitwise logical “or” is 0x00. . .00 and has the dot value 0x00. . .00,
+
+we copy the dot value of the other operand.
+
+2.5 Unhandled Hidden Floating-Point Arithmetics
+
+Unfortunately, we are not aware of any comprehensive approach to systematically detect
+all the real arithmetic “hidden” in a portion of machine code. This subsection lists
+scenarios in which our current implementation fails to produce the correct dot values,
+and indicates patterns that programmers and compilers should avoid to make the machine
+code “AD-friendly”.
+
+Masking of incomplete ﬂoating-point representations. The approach of Section 2.4 to
+handle masking patterns breaks down if a binary32 or binary64 is not entirely selected,
+e. g. in order to exchange the exponent bits.
+
+Integer additions to the exponent. Multiplications with powers of two can be im-
+plemented by integer additions to the exponent bits, possibly in conjunction with bit-
+shifts. We observed this pattern in the implementation of the exponential function for a
+binary32 SIMD vector in NumPy, where initially a multiple k · ln 2 is subtracted from
+the argument to map it into [0, ln 2], and the result is scaled by 2k to account for this
+range reductiona.
+It is diﬃcult to decide which of the two summands represents the
+ﬂoating-point number.
+
+aNumPy 17 version 1.19.5, https://github.com/numpy/numpy/blob/8f4b73a0d04f7bebb06a154b43e5
+
+ef5b5980052f/numpy/core/src/umath/simd.inc.src#L1558
+
+7
+
+Emulation of ﬂoating-point instructions. As a generalization of the previous items,
+ﬂoating-point libraries like GNU MPFR 18 emulate arithmetic operations of standardized
+or proprietary ﬂoating-point formats by integer and bitwise logical instructions. The
+decimal ﬂoating-point arithmetic upcoming with the C23 and C++23 standards must, as
+long as there is no hardware support for the IEEE-754 formats decimal32, decimal64,
+decimal128, also be implemented in softwareb.
+
+Instruction sequences composing a binary identity. When a client program passes
+around real numbers as decimal strings or in an otherwise encoded or encrypted form,
+this obviously erases the dot values. GCC’s implementation of an OpenMP atomic
+addition to a double on the x86 Pentium CPU initially copies the original value on
+the stack using the instructions fildq, fistpq, i. e. reinterprets the value as an integer,
+converts it to a 80-bit ﬂoating-point number, and then converts it backc.
+
+Rational arithmetic. As integer operations are ignored by our approach, any calcula-
+tions with integer fractions are not recognized as performing real arithmetic.
+
+In order to represent a real number
+Exploiting ﬂoating-point imprecision for rounding.
+x with 252 ≤ |x| < 253 in the binary64 format according to formula (2), the exponent E
+has to be chosen as 52, so the least-signiﬁcant bit of the signiﬁcand controls the binary
+digit 2E−52 = 1. Therefore within the above range for x, the real numbers representable
+by binary64 are precisely the integral numbers. The following procedure exploits this fact
+to round a binary64 y with |y| < 251 to an integral number. In a ﬁrst step, T = 1.5 · 252
+is added to y. As 252 < |T + y| < 253, storing the sum as a binary64 rounds it to
+an integral number, obeying the ﬂoating-point addition’s rounding mode. Immediately
+subtracting T again does not introduce any more ﬂoating-point errors, so we end up with
+the value of y rounded to an integral number. The GLIBC math library uses tricks of
+this kind, e. g. for range reduction (shifting the argument to sin into [− π
+4 ] by adding
+)d or to compute an index into a lookup tablee. While the correct dot
+a multiple of π
+2
+value of the result of a rounding operation is zero, the instrumented code, according to
+the above analytical diﬀerentiation rules, adds and immediately subtracts ˙T = 0 from
+˙y, leaving it unchanged because there are no ﬂoating-point errors. Note that dangerous
+constructs in the C math library are not problematic for Derivgrind if math function
+wrappers (Section 5) are used.
+
+4 , π
+
+Summary and comment. As real arithmetic can be hidden in machine code in various
+ways, it would be unrealistic to aim for a universal “AD tool for machine code” supporting
+
+bGCC 11.2 does it like this: https://github.com/gcc-mirror/gcc/blob/b454c40956947938c9e274d
+
+75cef8a43171f3efa/libgcc/config/libbid/bid64_add.c
+
+cGCC 11.2 with -m32 -march=pentium -O3, https://godbolt.org/z/hc8ehfG88
+dGLIBC version 2.35, https://sourceware.org/git/?p=glibc.git;a=blob;f=sysdeps/ieee754/db
+
+l-64/s_sin.c;h=8e65f7cc00faf64f4ca85a2a1e937280bcd06d3a;hb=HEAD#l156
+
+eGLIBC version 2.35, https://sourceware.org/git/?p=glibc.git;a=blob;f=sysdeps/ieee754/db
+
+l-64/s_sin.c;h=8e65f7cc00faf64f4ca85a2a1e937280bcd06d3a;hb=HEAD#l136
+
+8
+
+each and every possible client program.
+Instead, we require that the authors of the
+client program and the applied compilers stick to the binary32, binary64, and x87 80-
+bit format to represent real numbers. Furthermore, we assume that they perform real
+arithmetic only by the respective ﬂoating-point instructions, calls to functions from the
+C math library, and the tricks listed in Section 2.4. From our collection of unit tests
+described in Section 6, only a small number violate this assumption and fail. Therefore,
+we believe that our assumption is only a mild limitation regarding a productive use of
+AD for compiled programs.
+
+3 Implementation of AD Instrumentation in Derivgrind
+
+Instead of directly working with the machine code of the client program, we have im-
+plemented the forward-mode AD instrumentation of Section 2 using the Valgrind 11,12
+framework. Therefore, our tool Derivgrind operates on Valgrind’s object-oriented inter-
+nal representation of machine code, VEX IR, in portions called superblocks.
+
+In Section 3.1, we revisit the necessary details of VEX. More extensive documentation
+can be found in the source code of Valgrindf. Section 3.2 describes how shadow locations
+for dot values are obtained, and Sections 3.3 and 3.4 detail how Derivgrind instruments
+the two main building blocks of VEX to process the dot values. Finally, we remark on
+system calls in Section 3.5 and on limitations of Valgrind in Section 3.6.
+
+3.1 Basic Structure of VEX IR
+
+Synthetic CPU. As VEX IR strives to be independent from hardware and instruction
+set architectures, its execution model is built around a synthetic CPU. The synthetic CPU
+has access to memory using the same virtual addresses as the client program. Registers
+of the synthetic CPU are speciﬁed by a byte oﬀset into a separate block of memory called
+the guest state. In addition, VEX IR provides temporaries to store intermediate values
+for the scope of the current superblock. Temporaries are speciﬁed by an index and can
+be assigned only once.
+
+Statements and expressions. Each superblock contains a list of statements, which
+represent actions with side eﬀects, such as those listed in the left column of Table 1.
+Depending on the type of action, a statement involves further parameters and expres-
+sions. A parameter is a value deﬁned during instrumentation, and is denoted by angle
+brackets (cid:104)·(cid:105) in Tables 1 and 2. An expression represents a value to be computed when
+the containing statement is executed on the synthetic CPU, without side eﬀects. We
+denote expressions by italic text in Tables 1 to 3. The left column of Table 2 lists types
+of expressions along with the parameters and sub-expressions that they involve. A very
+important type of expressions acquire their value on the synthetic CPU by an (integer,
+
+fhttps://sourceware.org/git/?p=valgrind.git;a=blob;f=VEX/pub/libvex_ir.h;h=85805bb69b8b
+
+447d0d5cd362b1fd3e5b9b181c28;hb=8b2cf214afb2590ecef5ff7cabeb6ceec3862ade
+
+9
+
+Listing 3: Example of the textual representation of a VEX IR superblock, from the
+documentation of Valgrind. Every line represents a statement. We have emphasized
+parameters with red text and expressions with a blue frame.
+
+------ IMark(0x24F275, 7, 0) ------
+t3 = GET:I32(0)
+t2 = GET:I32(12)
+t1 = Add32(t3,t2)
+PUT(0) = t1
+
+# get %eax, a 32-bit integer
+# get %ebx, a 32-bit integer
+# addl
+# put %eax
+
+ﬂoating-point, bitwise logical, . . . ) operation applied to one to four sub-expressions. We
+provide more examples of those in the left column of Table 3.
+
+Listing 3 reproduces an example of a VEX IR superblock’s textual representation from
+the documentation of Valgrind, corresponding to the 4-byte integer addition of %eax to
+%ebx on x86. Each of the ﬁve lines represents one statement. The ﬁrst statement is meta
+information, the next three statements are writes to temporaries and the last statement
+writes to the guest state. Expressions (indicated by a blue frame) specify which data is
+written. For the ﬁrst two writes, the “get” expression represents reads from the registers
+with byte oﬀsets 0 and 12. The expression on the right hand side of the fourth line
+applies an operation. Its operands are expressions themselves, which acquire their value
+by reading from the temporaries with indices 3 and 2. The right hand side of the ﬁfth
+line reads from temporary 1.
+
+Dirty calls and CCalls. VEX achieves its full generality through dirty call statements
+and CCall expressions. Both store a name, a function pointer and a tuple of expressions
+(among other things), and when execution on the synthetic CPU reaches the dirty call or
+CCall, the stored function is called with arguments taken from the evaluated expressions.
+The Valgrind core represents certain x86 and amd64 instructions by dirty calls when there
+is no architecture-independent equivalent in VEX.
+
+For example, the x87 instruction fldt loads 10 bytes of memory into an x87 ﬂoating-
+point register, which internally uses 80 bits to represent a ﬂoating-point number. The
+other way round, fstpt stores an 80-bit ﬂoating-point representation in memory. Note
+that VEX IR does not support 80-bit arithmetic. Instead, Valgrind represents the x87
+ﬂoating-point registers by binary64s in the guest state of the synthetic CPU, and re-
+places 80-bit by 64-bit arithmetic. Therefore, dirty calls replacing the fldt and fstpt
+instructions have to convert between the binary64 format in the guest state and the
+80-bit format in memory.
+
+Additionally, Derivgrind emits dirty calls to access the shadow memory from within
+VEX, and CCalls for the rather complicated AD augmentation of bitwise logical instruc-
+tions (Section 2.4).
+
+10
+
+3.2 Shadow Temporaries, Registers and Memory
+
+As described in Section 2.1, Derivgrind provides a shadow location to every storage
+location.
+
+Temporaries Within each superblock, Derivgrind shadows every temporary i with the
+temporary (i + mtmp), using a shift mtmp larger than the maximal index of a temporary
+before instrumentation. When Derivgrind needs additional temporaries to compute dot
+values, it allocates indices greater than or equal to 2 · mtmp.
+
+Registers Before instrumentation, the VEX code uses a known, architecture-dependent
+number mgs of bytes of the guest state. Valgrind’s synthetic CPU provides 3 · mgs bytes
+of guest state to the instrumented code. For each register with byte oﬀset j, Derivgrind
+can therefore use the “shadow register” with byte oﬀset j + mgs to store the dot value.
+
+Memory The address shifting approach used to shadow temporaries and registers is
+not feasible for memory, as the client program can use addresses throughout the whole
+virtual address space, and the tool has limited control about which parts of the virtual
+address space it might itself make allocations in. Like Memcheck, Derivgrind therefore
+uses a shadow memory tool 19,20. It can be thought of as a big hashmap assigning the
+content of shadow memory to memory addresses, although the actual implementation is
+more complex. As the default value of an uninitialized byte in the shadow memory is
+0x00, binary32s and binary64s in the data and bss section of the client program (such
+as C/C++ ﬂoating-point variables with static storage duration) have the correct initial
+dot value +0.0.
+
+3.3 Wrapping Statements
+
+For all statements with relevance to AD and except for CAS statements, Derivgrind
+inserts “diﬀerentiated statements” in front of the original statements. Examples of such
+diﬀerentiated statements are shown in Table 1. Most of them involve “diﬀerentiated
+expressions” marked with a dot, which have to be formed as described in Section 3.4.
+
+Derivgrind replaces a CAS statement by an entirely new sequence of statements, in
+order to perform the additional check whether the dot value has changed, as discussed
+in Section 2.3.
+
+Dirty call statements can be identiﬁed by their name. Derivgrind matches dirty calls
+emitted for fldt and fstpt (see Section 3.1) by dirty calls performing the same operation
+on the shadow guest state and shadow memory, to comply with our convention to store
+the dot value of every ﬂoating-point variable in the same format as its value (Section 2.1).
+As far as we observed it, all the other dirty calls emitted by the Valgrind core from
+x86 and amd64 machine code can hardly be part of a ﬂoating-point calculation. For
+example, they perform actions such as obtaining information about the CPU hardware
+(the VEX IR equivalent of the x86 instruction cpuid), reading a time-stamp counter
+(rdtsc), SSE 4.2 string operations (pcmp(cid:104)X(cid:105)str(cid:104)Y (cid:105)), or (re)storing some SSE status
+
+11
+
+Table 1: VEX IR statements, and their augmentation with forward-mode AD logic.
+
+VEX statement
+
+Additional VEX statements for AD
+
+Write data to a temporary with index i. Write diﬀerentiated data to the shadow
+
+t(cid:104)i(cid:105) = x
+
+Write data to the register with byte oﬀset
+j in the guest state.
+PUT((cid:104)j(cid:105)) = x
+
+Write data to memory.
+STle(address) = x
+
+Write data to memory, if a condition is sat-
+isﬁed.
+if (guard) STle(address) = x
+Compare-and-swap, loading addr into tem-
+porary t(cid:104)old(cid:105), and replacing data at addr
+by new if it matches expd.
+t(cid:104)old(cid:105) = CASle(addr :: expd -> new)
+
+temporary.
+t(cid:104)i + mtmp(cid:105) = ˙x
+Write diﬀerentiated data to the shadow
+register.
+PUT((cid:104)j + mgs(cid:105)) = ˙x
+Write diﬀerentiated data to shadow mem-
+ory. Implemented as a dirty call to access
+the shadow memory from VEX.
+
+Write diﬀerentiated data to shadow mem-
+ory, subject to the same condition. Imple-
+mented as a dirty call.
+
+CAS statements are replaced as discussed
+in Section 2.3.
+
+Dirty call,
+with side eﬀects.
+
+invoking a Valgrind function
+
+The augmentation depends on the dirty
+call, see details in Section 3.3.
+
+Meta information.
+------ IMark(. . .) ------
+
+Not relevant for AD.
+
+Conditional jump.
+if (guard) goto {(cid:104)jump kind(cid:105)} (cid:104)target(cid:105)
+
+Not relevant for AD.
+
+12
+
+Table 2: VEX IR expressions, and their forward-mode algorithmic derivatives.
+
+Expression
+
+Diﬀerentiated expression
+
+Read from a temporary with index i.
+t(cid:104)i(cid:105)
+
+Read data of speciﬁed type from the regis-
+ter with byte oﬀset j in the guest state.
+GET:(cid:104)type(cid:105)((cid:104)j(cid:105))
+
+Read from memory.
+LDle:(cid:104)type(cid:105)(address)
+
+Operation with one to four arguments, see
+Table 3 for examples.
+(cid:104)op(cid:105)(a, b, . . . )
+
+Constant value.
+(cid:104)literal(cid:105):(cid:104)type(cid:105) or (cid:104)type(cid:105){(cid:104)literal(cid:105)}
+If-then-else construct, selecting either a or
+b depending on condition.
+ITE(condition, a, b)
+
+CCall to Valgrind function without side ef-
+fects.
+
+Read from the shadow temporary.
+t(cid:104)i + mtmp(cid:105)
+Read data of the same type from the
+shadow register.
+GET:(cid:104)type(cid:105)((cid:104)j + mgs(cid:105))
+Read from shadow memory, expecting data
+of the same type. Implemented as a dirty
+call.
+
+See Table 3.
+
+Constant value zero of the same type.
+0x0:(cid:104)type(cid:105) or (cid:104)type(cid:105){0x0}
+If-then-else construct with same condition
+on diﬀerentiated operands.
+ITE(condition, ˙a, ˙b)
+Until now, we only encountered cases with-
+out relevance to AD.
+
+bits. These dirty calls do not require any additional AD logic, except that shadows of
+output temporaries should be assigned some value so they are initialized in case they are
+later read from.
+
+3.4 Wrapping Expressions
+
+Many of the diﬀerentiated statements (Section 3.3 and Table 1) involve a diﬀerentiated
+expression ˙x computing the dot value of the expression x. Derivgrind forms diﬀerentiated
+expressions according to Table 2. Table 3 gives more details for the important subclass of
+expressions that perform an operation. From the large number of operations available in
+VEX, we only handle those that we consider necessary. For instance, the VEX operation
+SinF64 corresponding to the x87 instruction fsin does not need AD handling because
+modern compilers and libraries do not use this instruction. For unhandled operations,
+Derivgrind by default assumes a zero derivative, and optionally outputs the containing
+statement for debugging purposes.
+
+13
+
+Table 3: VEX IR expressions performing an operation, and their forward-mode algorith-
+mic derivatives. The placeholder rm represents an expression for the rounding
+mode.
+
+Expression
+
+Diﬀerentiated expression
+
+Application of the diﬀerentiation rule.
+
+AddF64(rm, ˙a,˙b)
+
+AddF32(rm,MulF32(rm, ˙a,b),
+MulF32(rm,a,˙b))
+Component-wise application of the diﬀer-
+entiation rule.
+Add32Fx8(rm,Mul32Fx8(rm, ˙a,b),
+Mul32Fx8(rm,a,˙b))
+
+Formal application of the diﬀerentiation
+rule with lowest-lane-only operations, tak-
+ing care to be correct outside the lowest
+lane also. E. g. for ( ˙a0b0 + a0 ˙b0, ˙a1, ˙a2, ˙a3),
+Add32F0x4(Mul32F0x4( ˙a,b),
+Mul32F0x4(a,˙b))
+Analogous application to the dot values.
+F64toF32(rm, ˙a)
+
+Analogous application to the dot values.
+
+ReinterpI64asF64( ˙a)
+
+Analogous application to the dot values.
+64x4toV256( ˙a3, ˙a2, ˙a1, ˙a0)
+Handling according to Section 2.4.
+(Represented by a CCall.)
+
+Not relevant for AD.
+0x0:I64
+
+Not relevant for AD.
+0x0:I32
+
+Scalar ﬂoating-point arithmetic, e. g. addi-
+tion of binary64s,
+AddF64(rm,a,b)
+or multiplication of binary32s,
+MulF32(rm,a,b)
+
+SIMD ﬂoating-point arithmetic, e. g. mul-
+tiplication of eight binary32s.
+Mul32Fx8(rm,a,b)
+
+Lowest-lane-only
+SIMD ﬂoating-point
+arithmetic, e. g. mapping the operands
+to
+(a0, a1, a2, a3)
+(a0 · b0, a1, a2, a3).
+Mul32F0x4(a,b)
+
+(b0, b1, b2, b3)
+
+and
+
+Floating-point conversions, e. g.
+F64toF32(rm,a)
+
+Binary reinterpretation of ﬂoating-point
+representations as integers and vice versa,
+e. g.
+ReinterpI64asF64(a)
+
+SIMD (un)packing, e. g.
+64x4toV256(a3,a2,a1,a0)
+Bitwise logical operations, e. g.
+And64(a,b)
+
+Integer arithmetic, e. g.
+Add64(a,b)
+
+Comparisons, e. g.
+CmpF64(a,b)
+
+14
+
+3.5 System Calls
+
+Under POSIX-compliant operating systems, userspace programs accomplish (most of)
+their interaction with the outside by invoking functionality of the kernel. Such system
+calls are usually raised through software interrupts or speciﬁc instructions. Valgrind does
+not instrument kernel code, but enables tools to wrap system calls.
+
+For now, Derivgrind does not use this feature. Therefore, writing data to standard, ﬁle
+or network streams does not export the dot values. Data read from streams into memory
+is endowed with the dot values previously residing in the corresponding parts of the
+shadow memory. In particular, Derivgrind currently cannot handle MPI multiprocessing.
+
+3.6 Limitations of Valgrind
+
+From the limitations listed in the Valgrind documentation 12, the following have a par-
+ticular relation to AD.
+
+• Valgrind does not support 3DNow! instructions (which are anyway rarely supported
+by CPUs). When Valgrind encounters an unknown instruction, it sends SIGILL to
+the client program, triggering its termination if it did not deﬁne a signal handler.
+
+• Valgrind replaces 80-bit by 64-bit ﬂoating-point arithmetic (as mentioned above),
+and performs these with partial observance of rounding modes, no support for nu-
+meric exceptions, and ignoring some SSE2 control bits. If the client program is very
+sensitive to ﬂoating-point errors, it might therefore behave diﬀerently when exe-
+cuted under Valgrind. We do not expect this to become a problem since algorithmic
+derivatives of very sensitive programs are usually not meaningful.
+
+4 Accessing Dot Values in Derivgrind
+
+Derivgrind’s instrumentation of the machine code propagates dot values alongside the
+execution of the compiled client program. This part of the tool, as described in Sections 2
+and 3, does not rely on the source of the client program.
+
+However, the user needs some knowledge on the internal structure of the client program
+in order to identify input and output variables. In order to seed dot values of inputs before
+the propagation, and retrieve dot values of outputs afterwards, these variables must be
+matched to memory addresses.
+It is therefore natural that Derivgrind’s interfaces for
+setting and getting dot variables rely on the source code of the client program to some
+extent. We describe two interfaces in this section.
+
+4.1 Monitor Commands Interface
+
+Valgrind’s monitor commands mechanism enables the user to interact with Valgrind dur-
+ing the execution of the client program. When Valgrind is started with the command-line
+argument --vgdb-error=0, it activates its built-in gdbserver and waits for a connection,
+instead of executing the instrumented client program right away. The user has to connect
+
+15
+
+to the gdbserver from a GDB session with GDB’s target remote command. In addi-
+tion to regular debugger commands like setting breakpoints, stepping, and inspecting
+memory, the user can then send monitor commands over this connection. Derivgrind
+provides monitor commands to access the shadow memory, and hence the dot value of
+any variable. Therefore, this mechanism allows for an interactive exploration of auto-
+matic derivatives of any variable at any point of time, and with respect to any variable
+at any (earlier) point of time, during the execution of a client programm—as long as the
+debugger can stop the client at these points of time, and the user can obtain memory
+addresses of the variables.
+
+This condition implies that the source ﬁles which either deﬁne variables of interest, or
+contain lines where a breakpoint should be set, can be read by the user, and recompiled
+with debugging symbols (e. g. -g ﬂag of GCC and Clang) and most optimizations turned
+oﬀ (e. g. -O0).
+
+4.2 Valgrind Client Request Interface
+
+Valgrind’s client request mechanism enables the client program to interact with the Val-
+grind core and tool. In contrast to the monitor commands interface (Section 4.1) where
+the user selects and accesses input and output variables interactively in a debugger, the
+client request interface enables the user to deﬁne the AD input/output by code inserted
+into the client program.
+
+To perform a request, the client program has to assemble a data structure specifying
+the request, load its address into a speciﬁc register, and then execute a speciﬁc sequence
+of machine code instructions. On a normal CPU, this instruction sequence amounts to
+a no-operation. When the client is running under Valgrind however, Valgrind recognizes
+the pattern and passes the data structure to client request handlers in the Valgrind core
+and tool. It is easy to make a client request from an editable C/C++ source, because
+Valgrind provides header ﬁles with preprocessor macros that set up the data structure
+and add the speciﬁc instruction sequence using the __asm__ syntax.
+
+Derivgrind deﬁnes and implements client requests to copy data from memory to shadow
+memory and vice versa. Listing 4 demonstrates the usage of the corresponding macros,
+which are called with a memory address, a shadow memory address, and the number of
+bytes to be copied. Note that when function arguments are passed by value, the AD
+instrumentation makes sure that their dot values are copied as well. The dot value of
+dotvalue is irrelevant for the setter, and unspeciﬁed for the getter.
+
+A user of the client request interface has to insert calls to the C functions set_derivative
+
+(typically proceeded by an initialization of the dot value) and get_derivative (typically
+followed by an output statement) near the lines of the client’s source code where the in-
+put and output variables are deﬁned. It is therefore necessary that the respective parts
+of the source code can be edited and recompiled, and that the respective programming
+In the special case of diﬀerentiating
+languages and compilers provide a “C interface”.
+a Python interpreter in Section 6.3, we are able to make client requests without any
+modiﬁcations of the interpreter’s source code.
+
+16
+
+Listing 4: Usage of Derivgrind’s client request macros to access the shadow memory from
+within the client program.
+
+# include < valgrind / derivgrind .h >
+double set_derivative ( double value , double dotvalue ){
+// Copy 8 bytes from the memory address & dotvalue
+// to the shadow memory address & value .
+VALGRIND_SET_DERIVATIVE (& value , & dotvalue , sizeof ( double ));
+return value ;
+
+}
+double get_derivative ( double value ){
+
+double dotvalue = 0.; // Return 0. if run outside Valgrind .
+// Copy 8 bytes from the shadow memory address & value
+// to the memory address & dotvalue .
+VALGRIND_GET_DERIVATIVE (& value , & dotvalue , sizeof ( double ));
+return dotvalue ;
+
+}
+
+5 Wrapping the C Math Library
+
+The C standard library provides basic maths functions such as power and square root, the
+trigonometric and hyperbolic functions and their inverses, exponentiation and logarithm.
+While some of them could be realized by hardware instructions like fsin and fcos,
+implementations of the standard library are free to perform an approximation algorithm
+entirely in software.
+
+Figure 1 shows the derivatives of the GLIBC math library’s implementation of sin and
+log, using the components of Derivgrind presented so far. The algorithmic derivatives
+match the analytic derivatives cos(x) and 1/x only inside the intervals [−0.126, 0.126]
+and [0.9375, 1.0646972656 . . . ], respectively, and are zero outside. We further analyzed
+the case of sin with the following ﬁndings:
+
+• For |x| < 2−26 and 2−26 ≤ |x| < 0.126, sin(x) is computed using the Taylor poly-
+nomials of degree 1 or 11, respectively. Derivgrind thus computes the derivatives
+of these polynomials, which equal the Taylor polynomials of degree 0 or 10 to the
+cosine function, and are therefore good approximations for the analytical derivative
+in the respective intervals.
+
+• For 0.126 ≤ |x| < 0.855 . . . , the algorithm in GLIBC is based on a trigonometric
+
+formula
+
+sin(xtab + xrem) = sin(xtab) cos(xrem) + cos(xtab) sin(xrem)
+
+after writing x as xtab + xrem with a multiple xtab of 2−7 and a small remainder
+xrem. The purpose of this decomposition is to read the sine and cosine of xtab from a
+lookup table, and to use a Taylor series for xrem. While the correct decomposition of
+˙x would be ˙xtab = 0 and ˙xrem = ˙x, Derivgrind erroneously computes ˙xtab = ˙x and
+
+17
+
+1.5
+
+1
+
+0.5
+
+0
+
+d
+dx sin(x)
+cos(x)
+
+1.5
+
+1
+
+0.5
+
+0
+
+d
+dx log(x)
+1/x
+
+−1 −0.5
+
+0.5
+
+1
+
+0
+x
+
+0.8
+
+1
+
+x
+
+1.2
+
+1.4
+
+Figure 1: The black-box algorithmic derivative of GLIBC’s implementation of sin and
+log agrees with the analytic derivatives only within some intervals.
+
+˙xrem = 0 because GLIBC performs the decomposition by adding and subtracting a
+big constant, relying on ﬂoating-point errors as described in Section 2.5.
+
+• For 0.855 . . . ≤ |x| < 2.426 . . . , the implementation of cos is invoked with a modi-
+
+ﬁed value, basically using the same lookup-table based approach.
+
+• For 2.426 . . . < |x| < 1.054 . . . · 108, the previously mentioned methods are used for
+a shifted argument y = x − k · π
+4 ]. As GLIBC again computes the integral
+4 , π
+factor k by a tricky exploitation of ﬂoating-point errors as described in Section 2.5,
+Derivgrind erroneously ﬁnds ˙k = ˙x · 2
+π
+
+and ˙y = 0.
+
+2 ∈ [− π
+
+Fortunately, the Valgrind function wrapping feature allows Valgrind tools to specify
+functions by their names (and, if desired, the “soname” ﬁeld of the containing shared
+object) and reroute the respective calls to wrapper functions supplied by the tool. De-
+rivgrind wraps all C95 math functions using this mechanism. The wrappers obtain their
+arguments’ dot values by the client request mechanism (Section 4.2), compute the return
+value and its analytical derivative using the original math functions, and overwrite the
+return value’s dot value accordingly using the client request mechanism.
+
+Our approach is not universal. If a client program implements numerical approxima-
+tions of mathematical functions on its own and uses diﬀerent function names or inlining,
+AD tools based on machine code can hardly recognize these, and thus fall back to black-
+box diﬀerentiation. For instance, Derivgrind computes wrong derivatives in several test-
+cases involving NumPy’s 32-bit ﬂoating-point type, because NumPy reimplements some
+math functions for binary32 on amd64. And the other way round, if a client program
+reuses math.h function names for functions with a diﬀerent meaning or signature, under
+Derivgrind it might produce wrong results or crash, respectively.
+
+18
+
+6 Results
+
+Our collection of unit tests, described in Section 6.1, checks Derivgrind’s results for a large
+number of small pieces of code. We apply Derivgrind to larger programs in Sections 6.2
+and 6.3 for further validation, and to measure the average increase in time and memory
+complexity. In Section 6.2, the diﬀerentiated program is a numerical solver for Burgers’
+PDE. In Section 6.3, we diﬀerentiate a Python interpreter, as an example for a large
+pre-compiled program whose source code is not available to Derivgrind.
+
+6.1 Unit Tests
+
+Our test suite veriﬁes the values and derivatives computed by Derivgrind for many com-
+binations of
+
+• a language and compiler: C and C++ programs are compiled by GCC and Clang,
+Fortran programs are compiled by GCC; Python scripts are interpreted by CPython
+(see more details in Section 6.3),
+
+• a simple “algorithm” to be diﬀerentiated: elementary operations, calls to math.h
+functions, control structures, loops suitable for auto-vectorization and OpenMP
+constructs;
+
+• a ﬂoating-point type: binary32, binary64, and the 80-bit x87 double-extended
+
+precision type; and
+
+• an architecure: x86 or amd64.
+
+Derivgrind passes almost all of these tests, demonstrating its versatility in general. The
+small number of failing tests were either related to applying NumPy math functions on
+binary32 arguments in CPython on amd64, or to using OpenMP constructs with GCC.
+The underlying issues are discussed in Sections 2.5 and 5 in more detail.
+
+6.2 Performance Study
+
+We apply Derivgrind to a PDE solver for the two-dimensional Burgers’ equations on a
+unit square, in order to diﬀerentiate a norm of the solution after the last timestep with
+respect to a simultaneous shift of all components of the initial state. Arithmetically, the
+C++ code merely involves addition, subtraction, multiplication, division, and the square
+root function. A related benchmark has been used in previous studies of AD perfor-
+mance 6,21,22,23. For all the conﬁgurations considered in the following, the derivatives
+computed by Derivgrind match those of CoDiPack’s forward mode.
+
+Figure 2 displays the eﬀect of Derivgrind on the running time. We considered 23 = 8
+setups, using the GCC 10.2.1 (g++) and Clang 11.0.1 (clang++) compilers, for amd64
+(no ﬂag) and x86 (-m32), with full (-O3) and without (-O0) optimization. Our time
+measurements refer to the diﬀerence in the system time retrieved by the client pro-
+gram right before and after solving the PDE. This eliminates Derivgrind’s startup and
+
+19
+
+-O3
+
+-O0
+
+80
+
+60
+
+40
+
+20
+
+,
+s
+
+n
+i
+
+e
+m
+
+i
+t
+
+d
+n
+i
+r
+g
+v
+i
+r
+e
+D
+r
+e
+d
+n
+u
+
+0
+
+0
+
+× 130
+
+0
+
+× 6
+
+0.4
+
+0.8
+0.2
+time in s, direct execution
+
+0.6
+
+400
+
+300
+
+200
+
+100
+
+,
+s
+
+n
+i
+
+e
+m
+
+i
+t
+
+d
+n
+i
+r
+g
+v
+i
+r
+e
+D
+r
+e
+d
+n
+u
+
+× 130
+
+0
+
+× 6
+
+1
+
+0
+
+0
+
+2
+
+4
+
+time in s, direct execution
+
+GCC on amd64.
+
+GCC on x86.
+
+Clang on amd64.
+
+Clang on x86.
+
+Figure 2: Derivgrind’s eﬀect on the running time of the Burgers benchmark.
+
+ﬁnalization time, which amounts to about 2.3 s on amd64, where it is mainly spent on
+the initialization of the shadow memory tool, and 0.5 s on x86. Averages were taken
+over 100 (-O3) or 10 (-O0) measurements. The client was compiled and executed on an
+exclusive 64-bit Intel Xeon Gold 6126 processor at 2.6 GHz in the Elwetritsch cluster at
+TU Kaiserslautern.
+
+Each dot in Figure 2 represents a problem instance with an nx × nx grid and nt
+time steps, for nx = 100, 120, . . . , 500 and nt = 100, 200, . . . , 500. The plots show that
+Derivgrind slows down the PDE solver by a factor that is essentially independent from
+nx and nt, and varies between 60 and 130. Regarding optimized builds (-O3), the factor
+is smaller for GCC than for Clang and smaller on amd64 than on x86. For unoptimized
+builds (-O0), Derivgrind has the same slow-down factors for GCC and Clang, with the
+factor for x86 being smaller than the factor for amd64. As Derivgrind’s instrumentations
+of the various VEX constructs diﬀer in complexity, and probably oﬀer diﬀerent potential
+for the Valgrind core to optimize them before they are run on the synthetic CPU, it is
+natural that the slow-down factor depends on the “mixture” of instructions produced by
+the compiler. For comparison, when running the benchmark with the forward mode of
+the AD tool CoDiPack, the largest slow-down factor measured by us on the setups with
+-O3 is approximately 3.3.
+
+With a similar setup, Figure 3 displays the eﬀect of Derivgrind on the required memory.
+Our memory measurements refer to the maximum resident set size (RSS) reported by the
+GNU time command. We consider problem instances on an nx × nx grid and nt = 4 time
+steps, for nx = 200, 400, . . . , 5000, as the memory consumption hardly depends on nt. As
+Figure 3 shows, Derivgrind doubles the memory consumption, in addition to a constant
+reservation of about 4.1 GB on amd64 and 20 MB on x86. On amd64, the shadow memory
+tool needs much more memory for its internal data structures. Compiling the program
+with Clang instead of GCC, and/or disabling optimizations (-O0), had no signiﬁcant
+eﬀect on the required memory.
+
+20
+
+6,000
+
+4,000
+
+2,000
+
+,
+
+B
+M
+n
+i
+
+S
+S
+R
+
+.
+x
+a
+m
+
+d
+n
+i
+r
+g
+v
+i
+r
+e
+D
+r
+e
+d
+n
+u
+
+0
+
+0
+
++4100 MB
+
+×2
+
+100
+
+200
+
+300
+
+400
+
+500
+
+600
+
+700
+
+800
+
+900 1,000 1,100 1,200
+
+maximum resident set size in MB, direct execution
+
+GCC on amd64.
+
+GCC on x86.
+
+Figure 3: Derivgrind’s eﬀect on the maximum resident set size of the Burgers benchmark.
+
+6.3 Diﬀerentiating a Python Interpreter
+
+On many Linux systems, the default interpreter python3 for the Python programming
+language is CPythong. Core components of CPython are written in C. When the Python
+type float is used in a Python statement, CPython represents its value internally by a
+C doubleh. Basic arithmetic operations in Python are performed by CPython via the
+corresponding C operationsi, and mathematical functions from the Python modules math
+and numpy are usually (but now always) dispatched to the C math library.
+
+Derivgrind can thus be used to diﬀerentiate a Python script, by applying it to CPython
+
+interpreting the Python script, i. e.,
+
+valgrind -- tool = derivgrind python3 (cid:104)Python script(cid:105) (cid:104)arguments for Python script(cid:105).
+
+In our test system based on Debian 11.3 on amd64, we obtain python3 as a pre-built
+package of CPython 3.9.2 from a software repository, so the source code of CPython
+is not available on the system.
+In order to access dot values of Python variables, we
+use pybind11 24 to create a Python extension module derivgrind, i. e., a shared object
+compliant with the Python/C API. When CPython reads the Python statement import
+derivgrind at runtime, it loads derivgrind.so, and establishes links between functions
+of the shared object and function names on the Python side. Our module contains the
+two functions in Listing 4, which can be used as shown in Listing 5. In short, insertions
+into the source code of CPython are not necessary because CPython exposes Python
+variables to user-supplied C code at runtime.
+
+Our reimplementation of the Burgers benchmark as a Python script utilizes standard
+Python lists instead of C arrays, math.sqrt to compute the square root, and our extension
+module instead of direct client request macros. We use the setup of Section 6.2 with a
+
+ghttps://github.com/python/cpython
+hhttps://github.com/python/cpython/blob/787498cbbb7d1c7115a7af4435efb7f607b10ed1/Includ
+
+e/cpython/floatobject.h#L7
+
+ihttps://github.com/python/cpython/blob/787498cbbb7d1c7115a7af4435efb7f607b10ed1/Object
+
+s/floatobject.c#L597
+
+21
+
+Listing 5: Usage of the Python extension module derivgrind to access the shadow
+memory from within a Python script, assuming the interpreter is running under Valgrind.
+
+import derivgrind
+x = derivgrind . set_derivative (4 ,1)
+y = x * x * x
+print ( derivgrind . get_derivative ( y ))
+
+200 × 200 grid and 200 time steps. The computed values and derivatives match those of
+the C++ program. Time measurements, taken via clock reads from the Python program,
+result in 9.31 s for CPython running directly and 1232 s for CPython running under
+Valgrind, corresponding to a slow-down factor of 132.
+
+7 Summary
+
+With the new AD tool Derivgrind, we have demonstrated a methodology to augment
+compiled programs with forward-mode AD logic, independent of their source code. De-
+rivgrind handles x86 and amd64 machine code through the VEX intermediate representa-
+tion of the Valgrind framework. Every temporary, register and memory byte is shadowed
+to keep track of the respective dot values. For statements with ﬂoating-point expres-
+sions or copy operations, Derivgrind updates the shadows according to the respective
+analytical rules of diﬀerentiation.
+
+Real arithmetic can also be performed by integer or logic operations, in manifold ways.
+Our current lack of a systematic approach to detect all the real arithmetic “hidden”
+in a portion of machine code would be a fundamental obstacle if we sought a truly
+universal AD tool, that could even handle hand-written assembly code of a determined
+counterexample-maker. However, we take a more practical perspective. To this end,
+we have set up an extensive test suite, which checks various simple programs produced
+by the GCC and Clang compilers, as well as the precompiled CPython interpreter as
+it runs various Python scripts. The results indicate that unless explicitly instructed
+otherwise by the programmer, actual compilers only very rarely realize some of the more
+“dangerous” constructs. We will therefore further study and develop machine-code-based
+AD for larger software packages.
+
+In order to identify the input and output variables of the diﬀerentiation task, and to set
+or get the respective dot values, generally the parts of the client’s source code containing
+their deﬁnitions must be accessible, in one of the following two ways. For the monitor
+commands interface, these parts of the source must be compiled with debugging symbols
+and optimization turned oﬀ. For the client request interface, they must be augmented
+by calls to C functions, and recompiled. If the client program exposes the variables of
+interest via a suitable API, this oﬀers another way to access their dot values without
+any modiﬁcations of the client’s source code. We used this approach to demonstrate AD
+for Python programs, by applying Derivgrind to the Python interpreter and injecting
+
+22
+
+additional C code via Python extension modules.
+
+Time measurements on various client executables found that Derivgrind scales their
+running time by a factor between 60 and 140, in addition to a start-up time of a few
+seconds. While this is much slower than existing tools, Derivgrind is applicable for a
+much wider range of software, with less integration eﬀorts. The real arithmetic between
+input and output variables is provided to Derivgrind as machine code only, so it does
+not matter whether it has been compiled from a variety of programming languages, uses
+pre-compiled libraries, or comes in the shape of an interpreter running a script. Seeding
+inputs and retrieving output derivatives can be as easy as stopping the client in the
+debugger and issuing monitor commands there.
+
+For now, Derivgrind only supports the forward mode of AD. By replacing the forward-
+mode AD logic with a recording of all the performed real arithmetic, we hope to add
+capabilities for reverse-mode AD in the future.
+
+Acknowledgements
+
+Max Aehle gratefully acknowledges funding from the research training group SIVERT
+by the German federal state of Rhineland-Palatinate.
+
+We are grateful to the authors of Valgrind for creating such a highly versatile frame-
+
+work, and to Karl Cronburg for sharing his shadow memory library.
+
+References
+
+[1] Andreas Griewank and Andrea Walther. Evaluating Derivatives. Other Titles in
+Applied Mathematics. Society for Industrial and Applied Mathematics, 2008.
+
+[2] Mathias Luers, Max Sagebaum, Sebastian Mann, Jan Backhaus, David Grossmann,
+and Nicolas R. Gauger. Adjoint-based Volumetric Shape Optimization of Turbine
+Blades. In 2018 Multidisciplinary Analysis and Optimization Conference. American
+Institute of Aeronautics and Astronautics, 2018.
+
+[3] Atılım Günes Baydin, Barak A. Pearlmutter, Alexey Andreyevich Radul, and Jef-
+frey Mark Siskind. Automatic Diﬀerentiation in Machine Learning: A Survey. J.
+Mach. Learn. Res., 18(1):5595–5637, 2017.
+
+[4] Laurent Hascoet and Valérie Pascual. The Tapenade automatic diﬀerentiation tool:
+Principles, model, and speciﬁcation. ACM Trans. Math. Softw., 39(3):1–43, 2013.
+
+[5] Andrea Walther and Andreas Griewank. Getting started with ADOL-C. In Uwe
+Naumann and Olaf Schenk, editors, Combinatorial Scientiﬁc Computing, chapter 7,
+pages 181–202. Chapman-Hall CRC Computational Science, 2012.
+
+[6] Max Sagebaum, Tim Albring, and Nicolas R. Gauger. High-Performance Deriva-
+tive Computations using CoDiPack. ACM Transactions on Mathematical Software
+(TOMS), 45(4), 2019.
+
+23
+
+[7] Dougal Maclaurin, David Duvenaud, and Ryan P Adams. Autograd: Eﬀortless
+Gradients in Numpy. In ICML 2015 AutoML Workshop, volume 238, page 5, 2015.
+
+[8] V. Vassilev, M. Vassilev, A. Penev, L. Moneta, and V. Ilieva. Clad — Automatic
+Diﬀerentiation Using Clang and LLVM. Journal of Physics: Conference Series,
+608:012055, 2015.
+
+[9] Michael Innes. Don’t Unroll Adjoint: Diﬀerentiating SSA-Form Programs. Technical
+
+Report arXiv:1810.07951, arXiv, March 2019.
+
+[10] William Moses and Valentin Churavy. Instead of Rewriting Foreign Code for Ma-
+chine Learning, Automatically Synthesize Fast Gradients. In H. Larochelle, M. Ran-
+zato, R. Hadsell, M. F. Balcan, and H. Lin, editors, Advances in Neural Information
+Processing Systems, volume 33, pages 12472–12485. Curran Associates, Inc., 2020.
+
+[11] Nicholas Nethercote and Julian Seward. Valgrind: A Framework for Heavyweight
+
+Dynamic Binary Instrumentation. SIGPLAN Not., 42(6):89–100, jun 2007.
+
+[12] Julian Seward, Nicholas Nethercote, Tom Hughes, Jeremy Fitzhardinge, Josef Wei-
+dendorfer, et al. Valgrind Documentation, Release 3.19.0, 11 Apr 2022, 2022.
+
+[13] Julian Seward and Nicholas Nethercote. Using Valgrind to Detect Undeﬁned Value
+Errors with Bit-Precision.
+In Proceedings of the Annual Conference on USENIX
+Annual Technical Conference, ATEC ’05, page 2, USA, 2005. USENIX Association.
+
+[14] IEEE 754. IEEE Standard for Floating-Point Arithmetic. Technical report, IEEE,
+
+2008.
+
+[15] AMD64 Architecture Programmer’s Manual, Volumes 1–5. Technical report,
+
+AMD64 Technology, October 2021. Revision 4.04.
+
+[16] Michael Matz, Jan Hubička, Andreas Jaeger, and Mark Mitchell. System V Appli-
+cation Binary Interface, AMD64 Architecture Processor Supplement, Draft Version
+0.99.6. Technical report, 2012.
+
+[17] Charles R. Harris, K. Jarrod Millman, Stéfan J. van der Walt, Ralf Gommers,
+Pauli Virtanen, David Cournapeau, Eric Wieser, Julian Taylor, Sebastian Berg,
+Nathaniel J. Smith, Robert Kern, Matti Picus, Stephan Hoyer, Marten H. van
+Kerkwijk, Matthew Brett, Allan Haldane, Jaime Fernández del Río, Mark Wiebe,
+Pearu Peterson, Pierre Gérard-Marchant, Kevin Sheppard, Tyler Reddy, Warren
+Weckesser, Hameer Abbasi, Christoph Gohlke, and Travis E. Oliphant. Array pro-
+gramming with NumPy. Nature, 585(7825):357–362, September 2020.
+
+[18] Laurent Fousse, Guillaume Hanrot, Vincent Lefèvre, Patrick Pélissier, and Paul
+Zimmermann. MPFR: A Multiple-Precision Binary Floating-Point Library with
+Correct Rounding. ACM Trans. Math. Softw., 33(2):13–es, jun 2007.
+
+[19] Karl Cronburg. GitHub repository shadow-memory, 2022. https://github.com/c
+
+ronburg/shadow-memory.
+
+24
+
+[20] Nicholas Nethercote and Julian Seward. How to Shadow Every Byte of Memory
+Used by a Program.
+In Proceedings of the 3rd International Conference on Vir-
+tual Execution Environments, VEE ’07, page 65–74, New York, NY, USA, 2007.
+Association for Computing Machinery.
+
+[21] Max Sagebaum, Tim Albring, and Nicolas R. Gauger. Expression templates for
+primal value taping in the reverse mode of algorithmic diﬀerentiation. Optimization
+Methods and Software, 33(4):1207–1231, 2018.
+
+[22] Max Sagebaum, Johannes Blühdorn, and Nicolas R. Gauger. Index handling and
+assign optimization for Algorithmic Diﬀerentiation reuse index managers. arXiv
+cs.MS 2006.12992, 2021.
+
+[23] Johannes Blühdorn, Max Sagebaum, and Nicolas R. Gauger. Event-Based Auto-
+matic Diﬀerentiation of OpenMP with OpDiLib. Preprint, arXiv:2102.11572, 2021.
+
+[24] Wenzel Jakob, Jason Rhinelander, and Dean Moldovan. pybind11 – Seamless oper-
+ability between C++11 and Python, 2017. https://github.com/pybind/pybind11.
+
+25
+
+

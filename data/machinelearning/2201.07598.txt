@@ -1,0 +1,1717 @@
+2
+2
+0
+2
+
+y
+a
+M
+6
+2
+
+]
+
+C
+D
+.
+s
+c
+[
+
+2
+v
+8
+9
+5
+7
+0
+.
+1
+0
+2
+2
+:
+v
+i
+X
+r
+a
+
+Near-Optimal Sparse Allreduce for Distributed Deep
+Learning
+
+Shigang Li
+shigang.li@inf.ethz.ch
+Department of Computer Science, ETH Zurich
+Switzerland
+
+Torsten Hoefler
+htor@inf.ethz.ch
+Department of Computer Science, ETH Zurich
+Switzerland
+
+Abstract
+Communication overhead is one of the major obstacles to
+train large deep learning models at scale. Gradient sparsifica-
+tion is a promising technique to reduce the communication
+volume. However, it is very challenging to obtain real perfor-
+mance improvement because of (1) the difficulty of achieving
+an scalable and efficient sparse allreduce algorithm and (2)
+the sparsification overhead. This paper proposes O𝑘-Top𝑘, a
+scheme for distributed training with sparse gradients. O𝑘-
+Top𝑘 integrates a novel sparse allreduce algorithm (less than
+6𝑘 communication volume which is asymptotically optimal)
+with the decentralized parallel Stochastic Gradient Descent
+(SGD) optimizer, and its convergence is proved. To reduce
+the sparsification overhead, O𝑘-Top𝑘 efficiently selects the
+top-𝑘 gradient values according to an estimated threshold.
+Evaluations are conducted on the Piz Daint supercomputer
+with neural network models from different deep learning
+domains. Empirical results show that O𝑘-Top𝑘 achieves sim-
+ilar model accuracy to dense allreduce. Compared with the
+optimized dense and the state-of-the-art sparse allreduces,
+O𝑘-Top𝑘 is more scalable and significantly improves training
+throughput (e.g., 3.29x-12.95x improvement for BERT on 256
+GPUs).
+
+CCS Concepts: • Theory of computation → Parallel al-
+gorithms; • Computing methodologies → Neural net-
+works.
+
+Keywords: distributed deep learning, allreduce, gradient
+sparsification, data parallelism
+
+1 Introduction
+Training deep learning models is a major workload on large-
+scale computing systems. While such training may be paral-
+lelized in many ways [7], the dominant and simplest form
+is data parallelism. In data-parallel training, the model is
+replicated across different compute nodes. After the com-
+putation of local gradient on each process is finished, the
+distributed gradients are accumulated across all processes,
+usually using an allreduce [12] operation. However, not all
+dimensions are equally important and the communication
+of the distributed gradients can be sparsified significantly,
+
+PPoPP ’22, April 2–6, 2022, Seoul, Republic of Korea
+2022. ACM ISBN 978-x-xxxx-xxxx-x/YY/MM. . . $15.00
+https://doi.org/10.1145/nnnnnnn.nnnnnnn
+
+1
+
+introducing up to 99.9% zero values without significant loss
+of accuracy. Only the nonzero values of the distributed gra-
+dients are accumulated across all processes. See [22] for an
+overview of gradient and other sparsification approaches in
+deep learning.
+
+However, sparse reductions suffer from scalability issues.
+Specifically, the communication volume of the existing sparse
+reduction algorithms grows with the number of processes
+𝑃. Taking the allgather-based sparse reduction [36, 41, 47]
+as an example, its communication volume is proportional
+to 𝑃, which eventually surpasses the dense allreduce as 𝑃
+increases. Other more complex algorithms [36] suffer from
+significant fill-in during the reduction, which also leads to a
+quick increase of the data volume as 𝑃 grows, and may de-
+grade to dense representations on the fly. For example, let us
+assume the model has 1 million weights and it is 99% sparse
+at each node—thus, each node contributes its 10,000 largest
+gradient values and their indexes to the calculation. Let us
+now assume that the computation is distributed across 128
+data-parallel nodes and the reduction uses a dissemination
+algorithm [20, 28] with 7 stages. In stage one, each process
+communicates its 10,000 values to be summed up. Each pro-
+cess now enters the next stage with up to 20,000 values.
+Those again are summed up leading to up to 40,000 values
+in stage 3 (if the value indexes do not overlap). The number
+of values grows exponentially until the algorithm converges
+after 7 stages with 640,000 values (nearly dense!). Even with
+overlapping indexes, the fill-in will quickly diminish the ben-
+efits of gradient sparsity in practice and lead to large and
+suboptimal communication volumes [36].
+
+We show how to solve or significantly alleviate the scal-
+ability issues for large allreduce operations, leading to an
+asymptotically optimal O(𝑘) sparse reduction algorithm. Our
+intuitive and effective scheme, called O𝑘-Top𝑘 is easy to
+implement and can be extended with several features to im-
+prove its performance: (1) explicit sparsity load balancing can
+distribute the communication and computation more evenly,
+leading to higher performance; (2) a shifted schedule and
+bucketing during the reduction phase avoids local hot-spots;
+and (3) an efficient selection scheme for top-𝑘 values avoids
+costly sorting of values leading to a significant speedup.
+
+We implement O𝑘-Top𝑘 in PyTorch [33] and compare it to
+four other sparse allreduce approaches. Specifically, O𝑘-Top𝑘
+enables:
+
+ 
+ 
+ 
+ 
+ 
+ 
+PPoPP ’22, April 2–6, 2022, Seoul, Republic of Korea
+
+Shigang Li and Torsten Hoefler
+
+• a novel sparse allreduce incurring less than 6𝑘 (asymp-
+totically optimal) communication volume which is
+more scalable than the existing algorithms,
+
+• a parallel SGD optimizer using the proposed sparse
+allreduce with high training speed and convergence
+guarantee,
+
+• an efficient and accurate top-𝑘 values prediction by re-
+garding the gradient values (along the time dimension)
+as a slowly changing stochastic process.
+
+We study the parallel scalability and the convergence
+of different neural networks, including image classification
+(VGG-16 [44] on Cifar-10), speech recognition (LSTM [21]
+on AN4), and natural language processing (BERT [13] on
+Wikipedia), on the Piz Daint supercomputer with a Cray
+Aries HPC network. Compared with the state-of-the-art ap-
+proaches, O𝑘-Top𝑘 achieves the fastest time-to-solution (i.e.,
+reaching the target accuracy/score using the shortest time for
+full training), and significantly improves training throughput
+(e.g., 3.29x-12.95x improvement for BERT on 256 GPUs). We
+expect speedups to be even bigger in cloud environments
+with commodity networks. The code of O𝑘-Top𝑘 is available:
+https://github.com/Shigangli/Ok-Topk
+
+2 Background and Related Work
+Mini-batch stochastic gradient descent (SGD) [9] is the main-
+stream method to train deep neural networks. Let 𝑏 be the
+mini-batch size, 𝑤𝑡 the neural network weights at iteration
+𝑡, (𝑥𝑖, 𝑦𝑖 ) a sample in a mini-batch, and ℓ a loss function.
+During training, it computes the loss in the forward pass for
+each sample as ℓ (𝑤𝑡, 𝑥𝑖, 𝑦𝑖 ), and then a stochastic gradient
+in the backward pass as
+
+𝐺𝑡 (𝑤𝑡 ) =
+
+1
+𝑏
+
+𝑏
+∑︁
+
+𝑖=0
+
+∇ℓ (𝑤𝑡, 𝑥𝑖, 𝑦𝑖 ).
+
+The model is trained in iterations such that 𝑤𝑡 +1 = 𝑤𝑡 −
+𝛼𝐺𝑡 (𝑤𝑡 ), where 𝛼 is the learning rate.
+
+To scale up the training process to parallel machines, data
+parallelism [18, 25, 26, 38, 52, 53] is the common method, in
+which the mini-batch is partitioned among 𝑃 workers and
+each worker maintains a copy of the entire model. Gradi-
+ent accumulation across 𝑃 workers is often implemented
+using a standard dense allreduce [12], leading to about 2𝑛
+communication volume where 𝑛 is the number of gradient
+components (equal to the number of model parameters).
+However, recent deep learning models [10, 13, 34, 35] scale
+rapidly from millions to billions of parameters, and the pro-
+portionally increasing overhead of dense allreduce becomes
+the main bottleneck in data-parallel training.
+
+Gradient sparsification [2, 4, 11, 16, 19, 36, 41–43, 50] is a
+key approach to lower the communication volume. By top-𝑘
+selection, i.e., only selecting the largest (in terms of the ab-
+solute value) 𝑘 of 𝑛 components, the gradient becomes very
+
+2
+
+sparse (commonly around 99%). Sparse gradients are accu-
+mulated across 𝑃 workers using a sparse allreduce. Then, the
+accumulated sparse gradient is used in the Stochastic Gradi-
+ent Descent (SGD) optimizer to update the model parameters,
+which is called Top𝑘 SGD. The convergence of Top𝑘 SGD
+has been theoretically and empirically proved [4, 36, 41].
+However, the parallel scalablity of the existing sparse allre-
+duce algorithms is limited, which makes it very difficult
+to obtain real performance improvement, especially on the
+machines (e.g., supercomputers) with high-performance in-
+terconnected networks [5, 17, 37, 40].
+
+Table 1. Communication overhead of dense and sparse allre-
+duces (𝑛 is the number of gradient components and 𝑛 ≫ 𝑘)
+
+Algorithms
+
+Dense [12]
+Top𝑘A [36, 47]
+Top𝑘DSA [36]
+gTop𝑘 [42]
+Gaussian𝑘 [41]
+O𝑘-Top𝑘
+
+1 Intervals.
+
+Bandwidth
+2𝑛 𝑃 −1
+𝑃 𝛽
+2𝑘(𝑃-1)𝛽
+[4𝑘 𝑃 −1
+4𝑘 (log 𝑃)𝛽
+2𝑘(𝑃-1)𝛽
+[2𝑘 𝑃 −1
+
+𝑃 𝛽, (2𝑘 + 𝑛) 𝑃 −1
+
+𝑃 𝛽, 6𝑘 𝑃 −1
+
+𝑃 𝛽]1
+
+Latency
+
+2(log 𝑃)𝛼
+(log 𝑃)𝛼
+𝑃 𝛽]1 (𝑃 + 2 log 𝑃)𝛼
+
+2(log 𝑃)𝛼
+2(log 𝑃)𝛼
+(2𝑃 + 2 log 𝑃)𝛼
+
+Table 1 summarizes the existing dense and sparse allre-
+duce approaches. We assume all sparse approaches use the
+coordinate (COO) format to store the sparse gradient, which
+consumes 2𝑘 storage, i.e., 𝑘 values plus 𝑘 indexes. There are
+other sparse formats (see [22] for an overview), but format
+selection for a given sparsity is not the topic of this work.
+To model the communication overhead, we assume bidirec-
+tional and direct point-to-point communication between the
+compute nodes, and use the classic latency-bandwidth cost
+model. The cost of sending a message of size 𝐿 is 𝛼 + 𝛽𝐿,
+where 𝛼 is the latency and 𝛽 is the transfer time per word.
+For dense allreduce, Rabenseifner’s algorithm [12] reaches
+the lower bound [45] on the bandwidth term (i.e., about 2𝑛).
+Top𝑘A represents the Allgather based approach [36, 42],
+in which each worker gathers the sparse gradients across
+𝑃 workers, and then the sparse reduction is conducted lo-
+cally. Although Top𝑘A is easy to realize and does not suf-
+fer from the fill-in problem, the bandwidth overhead of all-
+gather is proportional to 𝑃 [12, 45] and thus not scalable.
+Top𝑘DSA represents the Dynamic Sparse Allreduce used in
+SparCML [36], which consists of reduce-scatter and allgather
+(motivated by Rabenseifner’s algorithm) on the sparse gra-
+dients. In the best case of that the indexes of top-𝑘 values
+are fully overlapped across 𝑃 workers and the top-𝑘 values
+are uniformly distributed in the gradient space, Top𝑘DSA
+only incurs about 4𝑘 communication volume. However, the
+best case is almost never encountered in the real world of
+distributed training, and Top𝑘DSA usually suffers from the
+
+Near-Optimal Sparse Allreduce for Distributed Deep Learning
+
+PPoPP ’22, April 2–6, 2022, Seoul, Republic of Korea
+
+fill-in problem and switches to a dense allgather before spar-
+sity cannot bring benefit, which incurs about 2𝑘+𝑛 commu-
+nication volume. gTop𝑘 [42] implements the sparse allre-
+duce using a reduction tree followed by a broadcast tree. To
+solve the fill-in problem, gTop𝑘 hierarchically selects top-𝑘
+values in each level of the reduction tree, which results in
+4𝑘 log 𝑃 communication volume. Gaussian𝑘 [41] uses the
+same sparse allreduce algorithm as Top𝑘A with a further
+optimization for top-𝑘 selection. For our O𝑘-Top𝑘, the com-
+munication volume is bounded by 6𝑘. Although O𝑘-Top𝑘
+has a little higher latency term than the others, we target
+large-scale models and thus the bandwidth term dominates.
+Since the bandwidth term of O𝑘-Top𝑘 is only related to 𝑘,
+our algorithm is more efficient and scalable than all others.
+See Section 5.4 for experimental results.
+
+Gradient quantization [3, 8, 14, 23, 30, 48], which reduces
+the precision and uses a smaller number of bits to represent
+gradient values, is another technique to reduce the com-
+munication volume. Note that this method is orthogonal to
+gradient sparsification. A combination of sparsification and
+quantization is studied in SparCML [36].
+
+Another issue is the sparsification overhead. Although
+gradient sparsification significantly reduces the local mes-
+sage size, top-𝑘 selection on many-core architectures, such as
+GPU, is not efficient. A native method is to sort all values and
+then select the top-𝑘 components. Asymptotically optimal
+comparison-based sorting algorithms, such as merge sort
+and heap sort, have O(𝑛 log 𝑛) complexity, but not friendly to
+GPU. Bitonic sort is friendly to GPU but requires O(𝑛 log2 𝑛)
+comparisons. The quickselect [29] based top-𝑘 selection has
+an average complexity of O(𝑛) but again not GPU-friendly.
+Bitonic top-𝑘 [39] is a GPU-friendly algorithm with complex-
+ity O(𝑛 log2 𝑘), but still not good enough for large 𝑘. To lower
+the overhead of sparsification, Gaussian𝑘 [41] approximates
+the gradient values distribution to a Gaussian distribution
+with the same mean and standard deviation, and then es-
+timates a threshold using the percent-point function and
+selects the values above the threshold. The top-𝑘 selection
+in Gaussian𝑘 is GPU-friendly with complexity O(𝑛), but it
+usually underestimates the value of 𝑘 because of the dif-
+ference between Gaussian and the real distributions (see
+Section 3.1.3). Adjusting the threshold adaptively (e.g., lower
+the threshold for an underestimated 𝑘) [41] is difficult to be
+accurate. In O𝑘-Top𝑘, we use a different method for the top-𝑘
+selection. We observe that the distribution of gradient values
+changes slowly during training. Therefore, we periodically
+calculate the accurate threshold and reuse it in the following
+iterations within a period. Empirical results show that this
+threshold reuse strategy achieves both accuracy (see Sec-
+tion 5.2) and efficiency (see Section 5.4) when selecting local
+and global top-𝑘 values in O𝑘-Top𝑘.
+
+Figure 1. Gradient space split with balanced top-𝑘 values
+and reduction on subspace.
+
+3 O(𝑘) Sparse Allreduce
+In this section, we will present the sparse allreduce algo-
+rithm of O𝑘-Top𝑘, analyze the complexity using the afore-
+mentioned latency (𝛼) - bandwidth (𝛽) cost model, and prove
+its optimality. We use COO format to store the sparse gradi-
+ent. Since the algorithm incurs less than 6𝑘 communication
+volume, we call it O(𝑘) sparse allreduce.
+
+3
+
+P0P1P2P3P0P1P2P3P0P1P2P3reductionon P0reductionon P1reductionon P2reductionon P3reductionon P0reductionon P1reductionon P2reductionon P3local top-k valuesreduced top-k values(b) Split and reduce(c) Balanced split and reduce(a) Local top-k values selectionreduced top-k valuesregion 0region 1region 2region 3region 0region 1region 2region 3 PPoPP ’22, April 2–6, 2022, Seoul, Republic of Korea
+
+Shigang Li and Torsten Hoefler
+
+3.1 Sparse allreduce algorithm
+O(𝑘) sparse allreduce mainly includes two phases: (1) split
+and reduce, and (2) balance and allgatherv. During the two
+phases, we propose to use an efficient top-𝑘 selection strategy
+to select (what we call) local top-𝑘 values and global top-𝑘
+values, respectively. Specifically, the semantic of O(𝑘) sparse
+allreduce is defined by Top𝑘 ((cid:205)𝑃 −1
+𝑡 is
+the sparse gradient on worker 𝑖 at training iteration 𝑡, the
+inner Top𝑘 operator is the local top-𝑘 selection, and the outer
+Top𝑘 operator is the global top-𝑘 selection.
+
+𝑖=0 Top𝑘 (𝐺𝑖
+
+𝑡 )), where 𝐺𝑖
+
+3.1.1 Split and reduce. Figure 1 presents the split and re-
+duce phase. Suppose we have 4 workers and each worker
+has a 2D gradient of size 16x4. In Figure 1(a), each worker
+selects the local top-𝑘 values to sparsify the gradient. How
+to efficiently select the top-𝑘 values will be discussed in Sec-
+tion 3.1.3. Then, a straightforward split and reduce for the
+sparse gradients is presented in Figure 1(b), in which the
+2D space of the sparse gradient is evenly partitioned into 𝑃
+regions and worker 𝑖 is responsible for the reduction on re-
+gion 𝑖. Each worker 𝑖 receives sparse regions from the other
+workers and then conducts the reduction locally. However,
+this simple partitioning method may lead to severe load im-
+balance, since the top-𝑘 values may not be evenly distributed
+among the regions. In an extreme case, all local top-𝑘 values
+will be in region 0 of each worker, then worker 0 has to
+receive a total of 2(𝑃 − 1)𝑘 elements (i.e., values and indexes)
+while the other workers receive zero elements.
+
+Without loss of generality, we can make a more balanced
+partition (as shown in Figure 1(c)) based on our observations
+for deep learning tasks: the coordinates distribution of the
+local top-𝑘 values of the gradient is approximately consistent
+among the workers at the coarse-grained (e.g., region-wise)
+level, and changes slowly during training. To achieve a bal-
+anced partition, each worker calculates the local boundaries
+of the 𝑃 regions by balancing the local top-𝑘 values. Then,
+a consensus is made among 𝑃 workers by globally averag-
+ing the 𝑃-dimensional boundary vectors, which requires an
+allreduce with message size of 𝑃 elements. The boundaries
+are recalculated after every 𝜏 iterations. We empirically set
+𝜏 = 64 to get a performance benefit from periodic space
+repartition as shown in Section 5.3. Note that the small over-
+head of allreduce (i.e., (log 𝑃)𝛼) is amortized by the reuse
+in the following 𝜏-1 iterations, resulting in only (log 𝑃)𝛼/𝜏
+overhead per iteration. Therefore, the overhead of boundary
+recalculation can be ignored. After making a balanced split,
+each worker approximately receives 2𝑘/𝑃 elements from any
+of the other 𝑃 − 1 workers. Therefore, the overhead is
+
+𝐶𝑠𝑝𝑙𝑖𝑡 _𝑎𝑛𝑑_𝑟𝑒𝑑𝑢𝑐𝑒 = (𝑃 − 1)𝛼 + 2𝑘
+
+𝑃 − 1
+𝑃
+
+𝛽
+
+(1)
+
+We further make two optimizations for split and reduce,
+including destination rotation and bucketing. As shown in
+
+4
+
+Figure 2(a), a native communication pattern is that all work-
+ers send data to worker 𝑖 at step 𝑖, which may lead to endpoint
+congestion [49]. To avoid these hot-spots, we rotate the desti-
+nations of each worker as shown in Figure 2(b). Furthermore,
+to utilize the network parallelism, we bucketize the com-
+munications. The messages with in a bucket are sent out
+simultaneously using non-blocking point-to-point communi-
+cation functions. Communications in the current bucket can
+be overlapped with the computation (i.e., local reduction) of
+the previous bucket.
+
+Figure 2. Top-𝑘 values reduction with endpoint congestion
+avoidance and network parallelism exploitation.
+
+3.1.2 Balance and allgatherv. Figure 3 presents the phase
+of balance and allgatherv. First, each worker selects the global
+top-𝑘 values from the reduced top-𝑘 values in the region
+that the worker is in charge of. Note that the global top-𝑘
+selection only happens locally according to an estimated
+threshold (will be discussed in detail in Section 3.1.3). Next,
+each worker packages the selected global top-𝑘 values (and
+the corresponding indexes) into a consecutive buffer. Similar
+to the local top-𝑘 values, the global top-𝑘 values may also
+not be evenly distributed among the workers, causing load
+imbalance. In an extreme case, all global top-𝑘 values will
+be in one worker. The classic recursive doubling based all-
+gatherv [45] would incur 2𝑘 log 𝑃 communication volume,
+namely, total log 𝑃 steps with each step causing 2𝑘 traffic.
+To bound the communication volume by 4𝑘, we conduct
+a data balancing step after packaging. Before balancing, an
+allgather is required to collect the consecutive buffer sizes
+from 𝑃 workers, which only incurs (log 𝑃)𝛼 overhead (the
+bandwidth term can be ignored). Then, each worker uses the
+collected buffer sizes to generate the communication scheme
+(i.e., which data chunk should be sent to which worker) for
+data balancing. We use point-to-point communication (blue
+arrows in the step of data balancing) to realize the scheme.
+The overhead of data balancing is bounded by the extreme
+case of all global top-𝑘 values locate in one worker, where
+data balancing costs 𝑃𝛼 + 2𝑘 𝑃 −1
+𝑃 𝛽. Data balancing in any
+
+   P0P1P2P3P0P0P1P2P3P1P0P1P2P3P2P0P1P2P3P3P0P1P2P3P0P1P2P3P0P1P2P3P0P1P2P3P0P1P2P3P0P1P2P3P0P1P2P3P0P1P2P3P0P1P2P3P0P1P2P3bucket0bucket1(a) Naive communication pattern(b) Destination rotation(c) Destination rotation and bucketing Near-Optimal Sparse Allreduce for Distributed Deep Learning
+
+PPoPP ’22, April 2–6, 2022, Seoul, Republic of Korea
+
+Figure 3. Data balancing and allgatherv for global top-𝑘
+values.
+
+other case has less cost than the extreme case. At last, an
+allgatherv using recursive doubling on the balanced data has
+the overhead of (log 𝑃)𝛼 + 2𝑘 𝑃 −1
+𝑃 𝛽. Therefore, the overhead
+of balance and allgatherv is
+
+𝐶𝑏𝑎𝑙𝑎𝑛𝑐𝑒_𝑎𝑛𝑑_𝑎𝑙𝑙𝑔𝑎𝑡ℎ𝑒𝑟 𝑣 ≤ (𝑃 + 2 log 𝑃)𝛼 + 4𝑘
+
+𝑃 − 1
+𝑃
+
+𝛽.
+
+(2)
+
+By adding the costs of the two phases, the total overhead
+
+of O(𝑘) sparse allreduce is
+
+𝐶𝑂𝑘_𝑠𝑝𝑎𝑟𝑠𝑒_𝑎𝑙𝑙𝑟𝑒𝑑𝑢𝑐𝑒 ≤ (2𝑃 + 2 log 𝑃)𝛼 + 6𝑘
+
+𝑃 − 1
+𝑃
+
+𝛽
+
+(3)
+
+3.1.3 Efficient selection for top-𝑘 values. O𝑘-Top𝑘 re-
+lies on estimated thresholds to approximately select the local
+and global top-𝑘 values. The key idea is to regard the gradi-
+ent values (along the time dimension) as a slowly changing
+stochastic process 𝐺 (𝑡). Specifically, the statistics (such as
+top-𝑘 thresholds) of 𝐺 (𝑡), 𝐺 (𝑡 +1), ...𝐺 (𝑡 +𝜏 ′ −1) change very
+slowly. Therefore, we only calculate the accurate thresholds
+for local and global top-𝑘 values after every 𝜏 ′ iterations, and
+then reuse the thresholds in the following 𝜏 ′-1 iterations. The
+accurate threshold can be obtained by sorting the gradient
+values and returning the 𝑘-th largest value. Top-𝑘 selection
+according to a threshold only requires 𝑛 comparisons and is
+quite efficient on GPU. The overhead of accurate threshold
+calculation is amortized by the reuse.
+
+We validate our claim by the empirical results from differ-
+ent deep learning tasks presented in Figure 4. The gradient
+value distribution shown in Figure 4 is for a selected itera-
+tion where O𝑘-Top𝑘 uses a threshold calculated more than
+25 iterations ago. We can see the threshold of O𝑘-Top𝑘 is
+still very close to the accurate threshold (see Section 5.2 for
+
+(a) VGG-16 [44] on Cifar-10 with density = 1.0%.
+
+(b) LSTM [21] on AN4 [1] with density = 2.0%.
+
+(c) BERT [13] on Wikipedia [13] with density = 1.0%.
+
+Figure 4. Gradient value distribution and local top-𝑘 thresh-
+old predictions. Density is defined as 𝑘/𝑛.
+
+the accuracy verification for top-𝑘 selections of O𝑘-Top𝑘 in
+the scenario of full training). On the contrary, Gaussian𝑘
+severely underestimates the value of 𝑘 by predicting a larger
+threshold, especially after the first few training epochs. This
+is because as the training progresses, the gradient values are
+getting closer to zero. Gaussian distribution, with the same
+mean and standard deviation as the real distribution, usually
+has a longer tail than the real distribution (see Figure 4).
+
+3.1.4 Pseudocode of O(𝑘) sparse allreduce. We present
+the pseudocode of O(𝑘) sparse allreduce in Algorithm 1. In
+Lines 2-4, the local top-𝑘 threshold is re-evaluated after ev-
+ery 𝜏 ′ iterations. In Lines 5-7, the region boundaries are
+re-evaluated after every 𝜏 iterations. Split and reduce is con-
+ducted in Line 8, which returns the reduced local top-𝑘 values
+in region 𝑖 and the indexes of local top-𝑘 values. In Lines
+9-12, the global top-𝑘 threshold is re-evaluated after every
+
+5
+
+  P0P1P2P3P1P2P3P0P1P2P3P0P1P2P3P0P1P2P3P0       global top-k values selection        data packaging       Allgatherv using recursive doublingreduced top-k values1global top-k values2        data balancing34   0.020.040.060.00-0.02-0.04-0.0605.0E+41.0E+51.5E+52.0E+5CountGaussianRealdistributiondistributionAccurateGaussiankthresholdthresholdOk-TopkthresholdGradient value0.030.0439684032Accurate threshold curveTraining iterationGaussianRealdistributiondistributionAccurateGaussiankthresholdthresholdOk-Topkthreshold1.01.52.00.50.0-0.5-1.0Gradient value-1.5-2.001.0E+52.0E+53.0E+54.0E+5Count0.81.012801312Accurate threshold curveTraining iterationGaussianRealdistributiondistributionOk-TopkthresholdAccuratethresholdGaussiankthreshold0.040.020.00-0.02-0.04Gradient value01.0E+62.0E+63.0E+6Count0.0280.0364992050048Training iterationAccurate threshold curvePPoPP ’22, April 2–6, 2022, Seoul, Republic of Korea
+
+Shigang Li and Torsten Hoefler
+
+Algorithm 1 O(𝑘) sparse allreduce
+1: Inputs: stochastic gradient 𝐺𝑖
+
+𝑡 at worker 𝑖, iteration 𝑡
+(𝑡>0), value 𝑘, space repartition period 𝜏, thresholds re-
+evaluation period 𝜏 ′.
+
+𝑡 , 𝑘)
+
+𝑙𝑜𝑐𝑎𝑙_𝑡ℎ = 𝑡ℎ_𝑟𝑒_𝑒𝑣𝑎𝑙𝑢𝑎𝑡𝑒(𝐺𝑖
+
+2: if (𝑡-1) mod 𝜏 ′ == 0 then
+3:
+4: end if
+5: if (𝑡-1) mod 𝜏 == 0 then
+6:
+7: end if
+8: 𝑟𝑒𝑑𝑢𝑐𝑒𝑑_𝑡𝑜𝑝𝑘𝑖 , 𝑙𝑜𝑐𝑎𝑙_𝑡𝑜𝑝𝑘_𝑖𝑛𝑑𝑒𝑥𝑒𝑠 =
+
+𝑏𝑜𝑢𝑛𝑑𝑎𝑟𝑖𝑒𝑠 = 𝑠𝑝𝑎𝑐𝑒_𝑟𝑒𝑝𝑎𝑟𝑡𝑖𝑡𝑖𝑜𝑛(𝐺𝑖
+
+𝑡 , 𝑙𝑜𝑐𝑎𝑙_𝑡ℎ)
+
+𝑡 , 𝑙𝑜𝑐𝑎𝑙_𝑡ℎ, 𝑏𝑜𝑢𝑛𝑑𝑎𝑟𝑖𝑒𝑠)
+
+𝒔𝒑𝒍 𝒊𝒕_𝒂𝒏𝒅_𝒓 𝒆𝒅𝒖𝒄𝒆(𝐺𝑖
+9: if (𝑡-1) mod 𝜏 ′ == 0 then
+10:
+11:
+12: end if
+13: 𝑢𝑡 , 𝑔𝑙𝑜𝑏𝑎𝑙_𝑡𝑜𝑝𝑘_𝑖𝑛𝑑𝑒𝑥𝑒𝑠 =
+
+𝑎𝑙𝑙_𝑟𝑒𝑑𝑢𝑐𝑒𝑑_𝑡𝑜𝑝𝑘 = 𝑎𝑙𝑙𝑔𝑎𝑡ℎ𝑒𝑟𝑣(𝑟𝑒𝑑𝑢𝑐𝑒𝑑_𝑡𝑜𝑝𝑘𝑖 )
+𝑔𝑙𝑜𝑏𝑎𝑙_𝑡ℎ = 𝑡ℎ_𝑟𝑒_𝑒𝑣𝑎𝑙𝑢𝑎𝑡𝑒(𝑎𝑙𝑙_𝑟𝑒𝑑𝑢𝑐𝑒𝑑_𝑡𝑜𝑝𝑘, 𝑘)
+
+𝒃𝒂𝒍𝒂𝒏𝒄𝒆_𝒂𝒏𝒅_𝒂𝒍𝒍𝒈𝒂𝒕𝒉𝒆𝒓𝒗(𝑟𝑒𝑑𝑢𝑐𝑒𝑑_𝑡𝑜𝑝𝑘𝑖 , 𝑔𝑙𝑜𝑏𝑎𝑙_𝑡ℎ)
+14: 𝑖𝑛𝑑𝑒𝑥𝑒𝑠 = 𝑙𝑜𝑐𝑎𝑙_𝑡𝑜𝑝𝑘_𝑖𝑛𝑑𝑒𝑥𝑒𝑠 ∩ 𝑔𝑙𝑜𝑏𝑎𝑙_𝑡𝑜𝑝𝑘_𝑖𝑛𝑑𝑒𝑥𝑒𝑠
+15: return 𝑢𝑡 , 𝑖𝑛𝑑𝑒𝑥𝑒𝑠
+
+𝜏 ′ iterations. Balance and allgatherv is conducted in Line 13,
+which returns a sparse tensor 𝑢𝑡 with global top-𝑘 values
+and the indexes of global top-𝑘 values. Line 14 calculates the
+intersection of the indexes of local top-𝑘 values and the in-
+dexes of global top-𝑘 values. This intersection (will be used in
+O𝑘-Top𝑘 SGD in Section 4) covers the indexes of local values
+which eventually contribute to the global top-𝑘 values.
+
+3.2 Lower bound for communication volume
+Theorem 3.1. For sparse gradients stored in COO format,
+O(𝑘) sparse allreduce incurs at least 2𝑘 𝑃 −1
+communication
+𝑃
+volume.
+
+Proof. For O(𝑘) sparse allreduce, each worker eventually ob-
+tains the global top-𝑘 values. Assume that all workers receive
+less than 𝑘 𝑃 −1
+𝑃 values from the others, which means that each
+worker already has more than 𝑘
+𝑃 of the global top-𝑘 values
+locally. By adding up the number of global top-𝑘 values in
+each worker, we obtain more than 𝑘 global top-𝑘 values,
+which is impossible. Therefore, each worker has to receive at
+least 𝑘 𝑃 −1
+𝑃 values. Considering the corresponding 𝑘 indexes,
+the lower bound is 2𝑘 𝑃 −1
+𝑃 .
+
+□
+
+The lower bound in Theorem 3.1 is achieved by O(𝑘) sparse
+allreduce in the following special case: All local top-𝑘 values
+of worker 𝑖 are in region 𝑖 that worker 𝑖 is in charge of, so that
+the reduction across 𝑃 workers is no longer required. Fur-
+thermore, the global top-𝑘 values are uniformly distributed
+among 𝑃 workers, namely each worker has exactly 𝑘
+𝑃 of the
+global top-𝑘 values. Then, an allgather to obtain the global
+top-𝑘 values (plus 𝑘 indexes) incurs 2𝑘 𝑃 −1
+𝑃 communication
+
+volume. Therefore, the lower bound is tight. Since O(𝑘) sparse
+allreduce incurs at most 6𝑘 𝑃 −1
+𝑃 communication volume (see
+Equation 3), it is asymptotically optimal.
+
+Algorithm 2 O𝑘-Top𝑘 SGD
+
+1: Inputs: stochastic gradient 𝐺𝑖 (·) at worker 𝑖, value 𝑘,
+
+learning rate 𝛼.
+
+2: Initialize 𝜖𝑖
+0 = 0, 𝐺𝑖
+3: for 𝑡 = 1 to 𝑇 do
+4:
+
+0 = 0
+
+𝑡 = 𝜖𝑖
+
+𝑡 −1 + 𝛼𝐺𝑖
+
+𝑎𝑐𝑐𝑖
+𝑡 −1(𝑤𝑡 −1)
+𝑢𝑡 , 𝑖𝑛𝑑𝑒𝑥𝑒𝑠 = 𝑶𝒌_𝒔𝒑𝒂𝒓𝒔𝒆_𝒂𝒍𝒍𝒓 𝒆𝒅𝒖𝒄𝒆(𝑎𝑐𝑐𝑖
+𝑡 − 𝑎𝑐𝑐𝑖
+𝜖𝑖
+𝑡 = 𝑎𝑐𝑐𝑖
+𝑡 (𝑖𝑛𝑑𝑒𝑥𝑒𝑠)
+𝑃 𝑢𝑡
+𝑤𝑡 = 𝑤𝑡 −1 − 1
+
+𝑡 , 𝑡, 𝑘)
+⊲ Update residuals
+⊲ Apply the model update
+
+⊲ Accumulate residuals
+
+5:
+
+6:
+
+7:
+8: end for
+
+4 O𝑘-Top𝑘 SGD Algorithm
+We discuss how O(𝑘) sparse allreduce works with the SGD
+optimizer for distributed training in this section. An algorith-
+mic description of O𝑘-Top𝑘 SGD in presented in Algorithm 2.
+The key point of the algorithm is to accumulate the residuals
+(i.e., the gradient values not contributing to the global top-𝑘
+values) locally, which may be chosen by the top-𝑘 selection
+in the future training iterations to make contribution. Em-
+pirical results of existing work [4, 36, 42] show that residual
+accumulation benefits the convergence. We use 𝜖𝑖
+𝑡 to repre-
+sent the residuals maintained by worker 𝑖 at iteration 𝑡. In
+Line 4 of Algorithm 2, residuals are accumulated with the
+newly generated gradient to obtain the accumulator 𝑎𝑐𝑐𝑖
+𝑡 .
+Then, in Line 5, 𝑎𝑐𝑐𝑖
+𝑡 is passed to O(𝑘) sparse allreduce (pre-
+sented in Algorithm 1), which returns the sparse tensor 𝑢𝑡
+containing global top-𝑘 values and the 𝑖𝑛𝑑𝑒𝑥𝑒𝑠 marking the
+values in 𝑎𝑐𝑐𝑖
+𝑡 which contribute to 𝑢𝑡 . In Line 6, residuals are
+updated by setting the values in 𝑎𝑐𝑐𝑖
+𝑡 marked by 𝑖𝑛𝑑𝑒𝑥𝑒𝑠 to
+zero. In Line 7, 𝑢𝑡 is applied to update the model parameters.
+
+4.1 Convergence proof
+Unless otherwise stated, ∥ · ∥ denotes the 2-norm.
+Theorem 4.1. Consider the O𝑘-Top𝑘 SGD algorithm when
+minimizing a smooth, non-convex objective function 𝑓 . Then
+there exists a learning rate schedule (𝛼𝑡 )𝑡 =1,𝑇 such that the
+following holds:
+
+E[∥∇𝑓 (𝑤𝑡 )∥2]
+
+𝑇 →∞
+→ 0
+
+min
+𝑡 ∈ {1,...,𝑇 }
+
+(4)
+
+Proof. The update to 𝑤𝑡 +1 in O𝑘-Top𝑘 SGD is
+𝑃 −1
+(cid:19)(cid:19)
+∑︁
+
+(cid:18)
+𝛼𝐺𝑖
+
+Top𝑘
+
+𝑡 (𝑤𝑡 ) + 𝜖𝑖
+𝑡
+
+,
+
+Top𝑘
+
+(cid:18) 1
+𝑃
+
+𝑖=0
+
+while top-𝑘 components of the sum of updates across all
+𝑃 workers, i.e., the true global top-𝑘 values intended to be
+applied, is
+
+6
+
+Near-Optimal Sparse Allreduce for Distributed Deep Learning
+
+PPoPP ’22, April 2–6, 2022, Seoul, Republic of Korea
+
+Top𝑘
+
+(cid:18) 1
+𝑃
+
+𝑃 −1
+∑︁
+
+𝑖=0
+
+(cid:18)
+𝛼𝐺𝑖
+
+𝑡 (𝑤𝑡 ) + 𝜖𝑖
+𝑡
+
+(cid:19)(cid:19)
+
+.
+
+We assume the difference between the update calculated
+by O𝑘-Top𝑘 SGD and the true global top-𝑘 values is bounded
+by the norm of the true gradient 𝐺𝑡 (𝑤𝑡 ) = 1
+𝑡 (𝑤𝑡 ).
+𝑃
+Then, we make the following assumption:
+
+(cid:205)𝑃 −1
+𝑖=0
+
+𝐺𝑖
+
+Assumption 1. There exists a (small) constant 𝜉 such that,
+for every iteration 𝑡 ≥ 0, we have:
+
+(cid:13)
+(cid:13)
+(cid:13)
+(cid:13)
+(cid:13)
+
+Top𝑘
+
+(cid:18) 1
+𝑃
+
+𝑃 −1
+∑︁
+
+𝑖=0
+
+(cid:18)
+𝛼𝐺𝑖
+
+𝑡 (𝑤𝑡 ) + 𝜖𝑖
+𝑡
+
+(cid:19)(cid:19)
+
+− Top𝑘
+
+(cid:18) 1
+𝑃
+
+𝑃 −1
+∑︁
+
+𝑖=0
+
+(cid:18)
+𝛼𝐺𝑖
+
+𝑡 (𝑤𝑡 ) + 𝜖𝑖
+𝑡
+
+Top𝑘
+
+(cid:19)(cid:19)(cid:13)
+(cid:13)
+(cid:13)
+(cid:13)
+(cid:13)
+
+(5)
+
+≤ 𝜉 ∥𝛼𝐺𝑡 (𝑤𝑡 )∥
+
+We validate Assumption 1 by the empirical results on dif-
+ferent deep learning tasks in Section 5.1. Then, we utilize the
+convergence proof process for Top𝑘 SGD in the non-convex
+case, presented in the work of [4], to prove Theorem 4.1.
+
+□
+
+Regarding Theorem 4.1, we have the following discussion.
+First, since we analyze non-convex objectives, a weaker no-
+tion of convergence than in the convex case (where we can
+prove convergence to a global minimum) is settled. Specifi-
+cally, for a given sequence of learning rates, we prove that
+the algorithm will converge to a stationary point of negli-
+gible gradient. Second, like most theoretical results, it does
+not provide a precise set for the hyperparameters, except the
+indication of diminishing learning rates.
+
+5 Evaluations
+We conduct our experiments on the CSCS Piz Daint super-
+computer. Each Cray XC50 compute node contains an Intel
+Xeon E5-2690 CPU, and one NVIDIA P100 GPU with 16
+GB global memory. We utilize the GPU for acceleration in
+all following experiments. The compute nodes of Piz Daint
+are connected by a Cray Aries interconnect network in a
+Dragonfly topology.
+
+Table 2. Neural networks used for evaluation.
+
+Tasks
+
+Models
+
+Parameters Dataset
+
+VGG-16 [44]
+Image classification
+Speech recognition
+LSTM [21]
+Language processing BERT [13]
+
+14,728,266 Cifar-10
+27,569,568 AN4 [1]
+133,547,324 Wikipedia [13]
+
+We use three neural networks from different deep learning
+domains summarized in Table 2 for evaluation. For VGG-16,
+we use SGD optimizer with initial learning rate of 0.1; for
+
+7
+
+LSTM, we use SGD optimizer with initial learning rate of 1e-
+3; for BERT, we use Adam [24] optimizer with initial learning
+rate of 2e-4, 𝛽1 =0.9, 𝛽2 =0.999, weight decay of 0.01, and lin-
+ear decay of the learning rate. For BERT, sparse allreduce is
+conducted on the gradients and Adam optimizer is applied af-
+terwards. We compare the performance of O𝑘-Top𝑘 with the
+parallel SGD schemes using the dense and sparse allreduce
+algorithms listed in Table 1, which covers the state-of-the-art.
+For a fair comparison, all schemes are implemented in Py-
+Torch [33] with mpi4py as the communication library, which
+is built against Cray-MPICH 7.7.16. Commonly, the gradients
+of network layers locate in non-contiguous buffers. We use
+Dense to denote a single dense allreduce on a long message
+aggregated from the gradients of all neural network layers.
+Furthermore, we use DenseOvlp to denote dense allreduce
+with the optimization of communication and computation
+overlap. For DenseOvlp, the gradients are grouped into buck-
+ets and the message aggregation is conducted within each
+bucket; once the aggregated message in a bucket is ready, a
+dense allreduce is fired. The sparse allreduce counterparts
+(i.e., Top𝑘A, Top𝑘DSA, gTop𝑘, and Gaussian𝑘) are already
+discussed in Section 2. In all following experiments, we de-
+fine 𝑑𝑒𝑛𝑠𝑖𝑡𝑦 as 𝑘/𝑛, where 𝑛 is the number of components
+in the gradient.
+
+We utilize the 𝑡𝑜𝑝𝑘 function provided by PyTorch [33],
+which is accelerated on GPU, to realize the top-𝑘 selection in
+Top𝑘A, Top𝑘DSA, and gTop𝑘, as well as the periodic thresh-
+old re-evaluation in O𝑘-Top𝑘.
+
+5.1 Evaluate the empirical value of 𝜉
+To validate Assumption 1, we present the empirical values of
+𝜉 when training two models until convergence with different
+densities in Figure 5. For VGG-16 and BERT, the value of 𝜉
+increases quickly in the first few epochs or training itera-
+tions, and then turns to be stable. For LSTM, the value of 𝜉
+gradually increases at the beginning and tends to plateau
+in the second half of the training. For all three models, the
+value of 𝜉 with a higher density is generally smaller than
+that with a lower density, especially in the stable intervals.
+This can be explained trivially by the reason that, the higher
+the density the higher probability that the results of sparse
+and dense allreduces get closer.
+
+As shown in Equation 14 of [4], the effect of 𝜉 is damp-
+ened by both 𝑃 and small (i.e., less than 1) learning rates.
+If 𝜉<𝑃 (satisfied by all three models in Figure 5) or not too
+larger than 𝑃, we consider it has no significant effect on the
+convergence. Although 𝜉 slightly grows in Figure 5b, which
+is caused by the decreasing of the true gradient norm as
+the model converges, a small learning rate (e.g., 0.001) can
+restrain its effect. Overall, Assumption 1 empirically holds
+with relatively low, stable or slowly growing values of 𝜉.
+
+PPoPP ’22, April 2–6, 2022, Seoul, Republic of Korea
+
+Shigang Li and Torsten Hoefler
+
+(a) VGG-16 on Cifar-10 running on 16 GPU nodes.
+
+(a) VGG-16 on Cifar-10 on 16 GPUs (density=1.0%, 𝜏 ′=32).
+
+(b) LSTM on AN4 running on 32 GPU nodes.
+
+(b) LSTM on AN4 on 32 GPUs (density=2.0%, 𝜏 ′=32).
+
+(c) BERT on Wikipedia on 32 GPU nodes.
+
+Figure 5. The empirical value of 𝜉.
+
+(c) BERT on Wikipedia on 32 GPUs (density=1.0%, 𝜏 ′=128).
+
+Figure 6. Selections for local and global top-𝑘 values
+
+5.2 Top-𝑘 values selection
+We will verify the accuracy of the top-𝑘 selection strategy
+used by O𝑘-Top𝑘 on different neural network models. For
+VGG-16 and LSTM, the models are trained for 160 epochs
+until convergence with 𝜏 ′=32. Recall that 𝜏 ′ is the period of
+thresholds re-evaluation. For BERT, the model is trained for
+200,000 iterations (more than 20 hours on 32 GPU nodes)
+with 𝜏 ′=128. The numbers of local and global top-𝑘 values
+selected by O𝑘-Top𝑘 during training are monitored. We also
+record the values of 𝑘 predicted by Gaussian𝑘 for compari-
+son. The results are reported in Figure 6. We can see that the
+numbers of both local and global top-𝑘 values selected by
+O𝑘-Top𝑘 are very close to the accurate number for a given
+density, except that O𝑘-Top𝑘 overestimates the value of 𝑘 in
+the early epochs of VGG-16 and LSTM. For both local top-
+𝑘 and global top-𝑘 on three models, the average deviation
+from the accurate number is below 11%. For example, the
+average deviation for local top-𝑘 selection on BERT is only
+1.4%. These results demonstrate the accuracy of the thresh-
+old reuse strategy adopted by O𝑘-Top𝑘. On the contrary,
+
+8
+
+Gaussian𝑘 overestimates the value of 𝑘 in the first few epochs
+and then severely underestimate 𝑘 (an order of magnitude
+lower than the accurate number) in the following epochs.
+This can be explained by the difference between Gaussian
+and the real distributions, as discussed in Section 3.1.3.
+
+As a comparison, we also count the density of the output
+buffer (i.e., the accumulated gradient) for Top𝑘DSA (Top𝑘A
+has the same density), which expands to 13.2% and 34.5% on
+average for VGG-16 (local density = 1.0%, on 16 GPUs) and
+LSTM (local density = 2.0%, on 32 GPUs), respectively. These
+statistics show the effect of the fill-in issue for Top𝑘DSA.
+
+5.3 Optimizations for load balancing in O𝑘-Top𝑘
+To evaluate the effectiveness of the load balancing optimiza-
+tions of O(𝑘) sparse allreduce, we train BERT for 8,192 itera-
+tions and report the average values.
+
+First, we evaluate the periodic space repartition strategy
+(discussed in Section 3.1.1) for load balancing in the phase of
+split and reduce. The results are presented in Figure 7(a). Re-
+call that we set the period 𝜏 to 64. The repartition overhead is
+
+051015050100150EpochValue of𝜉 Ok−Topk (density=1.0%,Ok−Topk (density=2.0%,=32)τ ' =32)τ ' 0102030050100150EpochOk−Topk (density=1.0%,Ok−Topk (density=2.0%,Value of𝜉 =32)τ ' =32)τ ' 0246025005000750010000Training iterationOk−Topk (density=1.0%,Ok−Topk (density=2.0%,=128)τ ' =128)τ ' Value of𝜉 0e+001e+052e+053e+05050100150EpochNumber of selected valuesAccurateGaussiankOk−Topk (local)Ok−Topk (global)050100150EpochAccurateGaussiankOk−Topk (local)Ok−Topk (global)Numberof selected values2.5e+55.0e+57.5e+51.0e+60e+001e+062e+063e+06050000100000150000200000Training iterationNumber of selected valuesAccurateGaussiankOk−Topk (local)Ok−Topk (global)Near-Optimal Sparse Allreduce for Distributed Deep Learning
+
+PPoPP ’22, April 2–6, 2022, Seoul, Republic of Korea
+
+Figure 7. Evaluation for communication balancing in O𝑘-
+Top𝑘 using BERT with density = 1.0%.
+
+counted and averaged in the runtime of the balanced reduce.
+In the naive reduce, the gradient space is partitioned into
+equal-sized regions, regardless of the coordinate distribution
+of the local top-𝑘 values. The balanced reduce achieves 1.13x
+to 1.75x speedup over the naive one, with a trend of more sig-
+nificant speedup on more GPUs. This trend can be explained
+by that the load imbalance in the naive reduce incurs up to
+2(𝑃 − 1)𝑘 communication volume (proportional to 𝑃). While
+the balanced reduce incurs less than 2𝑘 communication vol-
+ume, which is more scalable.
+
+Next, we evaluate the data balancing strategy (discussed
+in Section 3.1.2) in the phase of balance and allgatherv. Al-
+though data balancing helps to bound the bandwidth over-
+head of allgatherv, there is no need to conduct it if the data is
+roughly balanced already. Empirically, we choose to conduct
+data balancing before allgatherv if the max data size among 𝑃
+workers is more than four times larger than the average data
+size, and otherwise use an allgatherv directly. Figure 7(b)
+presents the results for the iterations where data balancing
+is triggered. Data balancing and allgatherv achieve 1.12x to
+1.43x speedup over the direct allgatherv. For similar reasons
+as split and reduce, more speedup is achieved on more GPUs.
+
+5.4 Case studies on training time and model
+
+convergence
+
+We study the training time and model convergence using
+real-world applications listed in Table 2. For training time
+per iteration, we report the average value of full training. To
+better understand the results, we make a further breakdown
+of the training time, including sparsification (i.e., top-𝑘 selec-
+tion from the gradient), communication (i.e., dense or sparse
+allreduces), and computation (i.e., forward and backward
+passes) plus I/O (i.e., sampling from dataset).
+
+As discussed in Section 5.2, Gaussian𝑘 usually under-
+estimates the value of 𝑘, which makes the actual density
+far below the setting. Both empirical and theoretical re-
+sults [4, 36, 42] show that a very low density would jeopar-
+dize the convergence. To make a fair comparison between
+the counterparts for both training time and model accuracy,
+
+(a) Running on 16 GPU nodes with global batch size = 256.
+
+(b) Running on 32 GPU nodes with global batch size = 512.
+
+Figure 8. Weak scaling of training VGG-16 on Cifar-10 with
+density = 2.0%.
+
+we gradually scale the predicted threshold of Gaussian𝑘 un-
+til the number of selected values is more than 3𝑘/4. The
+threshold adjustment is also suggested by [41], although it
+is difficult to be accurate. The threshold adjustment may
+slightly increase the sparsification overhead of Gaussian𝑘,
+but compared with the other overheads it can be ignored
+(see the following results).
+
+5.4.1 Image classification. Figure 8 presents the results
+of weak scaling for training VGG-16 on Cifar-10. DenseOvlp
+outperforms Dense by enabling communication and compu-
+tation overlap. Although Top𝑘A and Top𝑘DSA have lower
+communication overhead than DenseOvlp, they have a high
+overhead for sparsification, which makes the benefit of lower
+communication disappear. Note that the communication
+overhead of gTop𝑘 seems much higher than the others; this is
+because the overhead of hierarchical top-𝑘 selections in the
+reduction-tree (with log 𝑃 steps) is also counted in the com-
+munication overhead. Among all sparse allreduce schemes,
+Gaussian𝑘 has the lowest sparsification overhead. O𝑘-Top𝑘
+has the lowest communication overhead; by using the thresh-
+old reuse strategy, O𝑘-Top𝑘 only has a slightly higher spar-
+sification overhead than Gaussian𝑘. When scaling from 16
+GPUs to 32 GPUs, the communication overhead of Top𝑘A
+and Gaussian𝑘 almost doubles. This is because allgather-
+based sparse allreduce is not scalable (see the performance
+
+9
+
+0.00.51.01.516 GPUs32 GPUs64 GPUsSpeedup normalized to native0.00.51.01.5Balance and allgatherv16 GPUs32 GPUs64 GPUs(a) Reduce(b) AllgathervDirect allgathervBalanced reduceNaive reduceSpeedup normalized to native0.00.20.40.60.8DenseDenseOvlpTopkATopkDSAgTopkGaussiankOk−Topksparsificationcommunicationcomputation + ioRuntime per iteration (s)0.00.20.40.60.8DenseDenseOvlpTopkATopkDSAgTopkGaussiankOk−Topksparsificationcommunicationcomputation + ioRuntime per iteration (s)PPoPP ’22, April 2–6, 2022, Seoul, Republic of Korea
+
+Shigang Li and Torsten Hoefler
+
+(a) Running on 16 GPU nodes with global batch size = 256.
+
+(a) Running on 32 GPU nodes with global batch size = 64.
+
+(b) Running on 32 GPU nodes with global batch size = 512.
+
+Figure 9. Top-1 test accuracy for VGG-16 on Cifar-10 with
+density = 2.0% training for 160 epochs.
+
+model in Table 1). On 32 GPU nodes, O𝑘-Top𝑘 outperforms
+the other schemes by 1.51x-8.83x for the total training time.
+Figure 9 presents the Top-1 test accuracy as a function of
+runtime by training VGG-16 on Cifar-10 for 160 epochs. On
+both 16 and 32 GPUs, the accuracy achieved by O𝑘-Top𝑘 is
+very close to dense allreduce. We did not do any hyperpa-
+rameter optimization except simply diminishing the learning
+rate. The accuracy results are consistent with these reported
+in machine learning community [6, 41]. On both 16 and 32
+GPUs, O𝑘-Top𝑘 achieves the fastest time-to-solution.
+
+5.4.2 Speech recognition. Figure 10 presents the results
+of weak scaling for training LSTM on AN4. Similar to the
+results on VGG-16, O𝑘-Top𝑘 has a better scalability than the
+counterparts. On 64 GPUs, O𝑘-Top𝑘 outperforms the other
+schemes by 1.34x-7.71x for the total training time.
+
+Figure 11 presents the test Word Error Rate (WER, the
+smaller the better) as a function of runtime by training for 160
+epochs. On 32 GPUs, O𝑘-Top𝑘 is 1.39x faster than DenseOvlp,
+and achieves 0.309 WER, which is very close to DenseOvlp
+(0.308). On 64 GPUs, all schemes achieve higher WERs than
+these on 32 GPUs. This is because the model accuracy is
+compromised by using a larger global batch size, which is
+also observed in many other deep learning tasks [7, 51, 53].
+How to tune hyperparameters for better accuracy with large
+batches is not the topic of this work. Surprisingly, on 64
+GPUs, O𝑘-Top𝑘, Gaussian𝑘, Top𝑘A and Top𝑘DSA achieve
+
+10
+
+(b) Running on 64 GPU nodes with global batch size = 128.
+
+Figure 10. Weak scaling of training LSTM on AN4 with
+density = 2.0%.
+
+(a) Running on 32 GPU nodes with global batch size = 64.
+
+(b) Running on 64 GPU nodes with global batch size = 128.
+
+Figure 11. WER for LSTM on AN4 with density = 2.0% train-
+ing for 160 epochs.
+
+7080900100200300Top-1 test accuracy %Acc: 93.1%Runtime: 356.2Acc: 93.3%Runtime: 166.1Acc: 93.4%Runtime: 72.9Acc: 93.3%Runtime: 46.5DenseOvlpTopkATopkDSAgTopkGaussiankOk-TopkTraining time (minutes)708090050100150200Acc: 93.1%Runtime: 84.1Acc: 93.1%Runtime: 36.5Acc: 93.0%Runtime: 25.3Acc: 92.9%Runtime: 202.6DenseOvlpTopkATopkDSAgTopkGaussiankOk-TopkTraining time (minutes)Top-1 test accuracy %0.00.51.01.52.0DenseDenseOvlpTopkATopkDSAgTopkGaussiankOk−TopkRuntime per iteration (s)sparsificationcommunicationcomputation + io0.00.51.01.52.0DenseDenseOvlpTopkATopkDSAgTopkGaussiankOk−Topksparsificationcommunicationcomputation + ioRuntime per iteration (s)0.20.40.60.81.00204060WER: 0.309Runtime: 8.8WER: 0.312Runtime: 60.7WER: 0.308Runtime: 12.2DenseOvlpTopkATopkDSAgTopkGaussiankOk-TopkTraining time (minutes)Word Error Rate (WER)0.30.50.70.90102030Training time (minutes)Word Error Rate (WER)DenseOvlpTopkATopkDSAgTopkGaussiankOk-TopkWER: 0.368Runtime: 4.8WER: 0.363Runtime: 6.7WER: 0.377Runtime: 14.6WER: 0.392Runtime: 34.0Near-Optimal Sparse Allreduce for Distributed Deep Learning
+
+PPoPP ’22, April 2–6, 2022, Seoul, Republic of Korea
+
+Figure 12. Weak scaling (from 32 to 256 GPU nodes) of training BERT on Wikipedia with density = 1.0%.
+
+the dense allreduce for BERT pre-training. Compared with
+DenseOvlp, O𝑘-Top𝑘 reduces the total training time on 32
+GPUs from 150 hours to 47 hours (more than 3x speedup),
+and also outperforms Gaussian𝑘 by 1.30x. Since pre-training
+BERT is very costly (energy- and time-consuming), in Fig-
+ure 13 we only present the results for two important baselines
+(i.e., Gaussian𝑘, with the highest training throughput among
+all baselines, and DenseOvlp, a lossless approach). Since the
+other baselines are inferior to Gaussian𝑘 and DenseOvlp in
+terms of training throughput and not better than DenseOvlp
+in terms of convergence rate, it is sufficient to show the
+advantage of O𝑘-Top𝑘 by comparing it with these two im-
+portant baselines in Figure 13.
+
+6 Conclusion
+O𝑘-Top𝑘 is a novel scheme for distributed deep learning
+training with sparse gradients. The sparse allreduce of O𝑘-
+Top𝑘 incurs less than 6𝑘 communication volume, which is
+asymptotically optimal and more scalable than the coun-
+terparts. O𝑘-Top𝑘 enables an efficient and accurate top-𝑘
+values prediction by utilizing the temporal locality of gradi-
+ent value statistics. Empirical results for data-parallel train-
+ing of real-world deep learning models on the Piz Daint
+supercomputer show that O𝑘-Top𝑘 significantly improves
+the training throughput while guaranteeing the model accu-
+racy. The throughput improvement would be more signifi-
+cant on commodity clusters with low-bandwidth network.
+We foresee that our scheme will play an important role in
+scalable distributed training for large-scale models with low
+communication overhead. In future work, we aim to further
+utilize O𝑘-Top𝑘 to reduce the communication overhead in
+distributed training with a hybrid data and pipeline paral-
+lelism [15, 27, 31, 32].
+
+Acknowledgments
+This project has received funding from the European Re-
+search Council (ERC) under the European Union’s Hori-
+zon 2020 programme (grant agreement DAPP, No. 678880,
+EPiGRAM-HS, No. 801039, and MAELSTROM, No. 955513).
+
+11
+
+Figure 13. BERT pre-training on 32 GPU nodes for 400,000
+iterations with global batch size = 256 and density = 1.0%.
+
+lower WERs than DenseOvlp, which may be caused by the
+noise introduced by the sparsification. Overall, on both 32
+and 64 GPUs, O𝑘-Top𝑘 achieves the fastest time-to-solution.
+
+5.4.3 Natural language processing. BERT [13] is a pop-
+ular language model based on Transformer [46]. The model is
+usually pre-trained on a large dataset and then fine-tuned for
+various downstream tasks. Pre-training is commonly much
+more expensive (years on a single GPU) than fine-tuning.
+Therefore, we focus on pre-training in the evaluation.
+
+Figure 12 presents the results of weak scaling for pre-
+training BERT. When scaling to 256 GPUs, the communi-
+cation overhead of Top𝑘A and Gaussian𝑘 is even higher
+than the dense allreduce, which again demonstrates that the
+allgather-based sparse allreduce is not scalable. Top𝑘DSA
+exhibits better scalablity than the allgather-based sparse
+allreduce, but its communication overhead also significantly
+increases, since the more workers, the more severe the fill-
+in problem [36]. On 256 GPUs, O𝑘-Top𝑘 outperforms all
+counterparts by 3.29x-12.95x. Using 32 nodes as the base-
+line, O𝑘-Top𝑘 achieves 76.3% parallel efficiency on 256 GPUs
+in weak scaling, which demonstrates a strong scalalibity of
+O𝑘-Top𝑘.
+
+In Figure 13, we report the training loss by pre-training
+BERT from scratch on the Wikipedia dataset (containing
+114.5 million sequences with a max length of 128) for 400,000
+iterations. Eventually, the training loss of O𝑘-Top𝑘 decreases
+to 2.43, which is very close to DenseOvlp (2.33). These re-
+sults show that O𝑘-Top𝑘 has a similar convergence rate as
+
+0246DenseDenseOvlpTopkATopkDSAgTopkGaussiankOk−TopkRuntime per iteration (s)sparsificationcommunicationcomputation + iosparsificationcommunicationcomputation + iosparsificationcommunicationcomputation + ioDenseDenseOvlpTopkATopkDSAgTopkGaussiankOk−TopkDenseDenseOvlpTopkATopkDSAgTopkGaussiankOk−TopkRuning on 32 GPU nodes with global batch size = 256Runing on 64 GPU nodes with global batch size = 512Runing on 256 GPU nodes with local batch size = 2,048DenseOvlpGaussiankOk-Topk050100150Training time (hours)2468Training lossPPoPP ’22, April 2–6, 2022, Seoul, Republic of Korea
+
+Shigang Li and Torsten Hoefler
+
+We also thank the Swiss National Supercomputing Center for
+providing the computing resources and technical support.
+
+References
+[1] Alejandro Acero and Richard M Stern. 1990. Environmental robust-
+ness in automatic speech recognition. In International Conference on
+Acoustics, Speech, and Signal Processing. IEEE, 849–852.
+
+[2] Alham Fikri Aji and Kenneth Heafield. 2017. Sparse communication for
+
+distributed gradient descent. arXiv preprint arXiv:1704.05021 (2017).
+[3] Dan Alistarh, Demjan Grubic, Jerry Li, Ryota Tomioka, and Milan
+Vojnovic. 2017. QSGD: Communication-efficient SGD via gradient
+quantization and encoding. Advances in Neural Information Processing
+Systems 30 (2017), 1709–1720.
+
+[4] Dan Alistarh, Torsten Hoefler, Mikael Johansson, Sarit Khirirat, Nikola
+Konstantinov, and Cédric Renggli. 2018. The convergence of sparsified
+gradient methods. arXiv preprint arXiv:1809.10505 (2018).
+
+[5] Bob Alverson, Edwin Froese, Larry Kaplan, and Duncan Roweth. 2012.
+Cray XC series network. Cray Inc., White Paper WP-Aries01-1112
+(2012).
+
+[6] Babajide O Ayinde and Jacek M Zurada. 2018. Building efficient con-
+vnets using redundant feature pruning. arXiv preprint arXiv:1802.07653
+(2018).
+
+[7] Tal Ben-Nun and Torsten Hoefler. 2019. Demystifying parallel and
+distributed deep learning: An in-depth concurrency analysis. ACM
+Computing Surveys (CSUR) 52, 4 (2019), 1–43.
+
+[8] Jeremy Bernstein, Yu-Xiang Wang, Kamyar Azizzadenesheli, and Ani-
+mashree Anandkumar. 2018. signSGD: Compressed optimisation for
+non-convex problems. In International Conference on Machine Learning.
+PMLR, 560–569.
+
+[9] Léon Bottou, Frank E Curtis, and Jorge Nocedal. 2018. Optimization
+methods for large-scale machine learning. SIAM Rev. 60, 2 (2018).
+[10] Tom B Brown, Benjamin Mann, Nick Ryder, Melanie Subbiah, Jared
+Kaplan, Prafulla Dhariwal, Arvind Neelakantan, Pranav Shyam, Girish
+Sastry, Amanda Askell, et al. 2020. Language models are few-shot
+learners. arXiv preprint arXiv:2005.14165 (2020).
+
+[11] Yi Cai, Yujun Lin, Lixue Xia, Xiaoming Chen, Song Han, Yu Wang,
+and Huazhong Yang. 2018. Long live time: improving lifetime for
+training-in-memory engines by structured gradient sparsification. In
+Proceedings of the 55th Annual Design Automation Conference. 1–6.
+
+[12] Ernie Chan, Marcel Heimlich, Avi Purkayastha, and Robert Van
+De Geijn. 2007. Collective communication: theory, practice, and expe-
+rience. Concurrency and Computation: Practice and Experience 19, 13
+(2007), 1749–1783.
+
+[13] Jacob Devlin, Ming-Wei Chang, Kenton Lee, and Kristina Toutanova.
+2018. Bert: Pre-training of deep bidirectional transformers for language
+understanding. arXiv preprint arXiv:1810.04805 (2018).
+
+[14] Nikoli Dryden, Tim Moon, Sam Ade Jacobs, and Brian Van Essen.
+2016. Communication quantization for data-parallel training of deep
+neural networks. In 2016 2nd Workshop on Machine Learning in HPC
+Environments (MLHPC). IEEE, 1–8.
+
+[15] Shiqing Fan, Yi Rong, Chen Meng, Zongyan Cao, Siyu Wang, Zhen
+Zheng, Chuan Wu, Guoping Long, Jun Yang, Lixue Xia, et al. 2021.
+DAPPLE: a pipelined data parallel approach for training large models.
+In Proceedings of the 26th ACM SIGPLAN Symposium on Principles and
+Practice of Parallel Programming. 431–445.
+
+[16] Jiawei Fei, Chen-Yu Ho, Atal N Sahu, Marco Canini, and Amedeo Sapio.
+2021. Efficient sparse collective communication and its application to
+accelerate distributed deep learning. In Proceedings of the 2021 ACM
+SIGCOMM 2021 Conference. 676–691.
+
+[17] Denis Foley and John Danskin. 2017. Ultra-performance Pascal GPU
+
+and NVLink Interconnect. IEEE Micro 37, 2 (2017), 7–17.
+
+[18] Priya Goyal, Piotr Dollár, Ross Girshick, Pieter Noordhuis, Lukasz
+Wesolowski, Aapo Kyrola, Andrew Tulloch, Yangqing Jia, and Kaiming
+
+12
+
+He. 2017. Accurate, large minibatch sgd: Training imagenet in 1 hour.
+arXiv preprint arXiv:1706.02677 (2017).
+
+[19] Pengchao Han, Shiqiang Wang, and Kin K Leung. 2020. Adaptive gra-
+dient sparsification for efficient federated learning: An online learning
+approach. In 2020 IEEE 40th International Conference on Distributed
+Computing Systems (ICDCS). IEEE, 300–310.
+
+[20] Debra Hensgen, Raphael Finkel, and Udi Manber. 1988. Two algo-
+rithms for barrier synchronization. International Journal of Parallel
+Programming 17, 1 (1988), 1–17.
+
+[21] Sepp Hochreiter and Jürgen Schmidhuber. 1997. Long short-term
+
+memory. Neural computation 9, 8 (1997), 1735–1780.
+
+[22] Torsten Hoefler, Dan Alistarh, Tal Ben-Nun, Nikoli Dryden, and
+Alexandra Peste. 2021. Sparsity in Deep Learning: Pruning and growth
+for efficient inference and training in neural networks. arXiv preprint
+arXiv:2102.00554 (2021).
+
+[23] Samuel Horváth, Dmitry Kovalev, Konstantin Mishchenko, Sebas-
+tian Stich, and Peter Richtárik. 2019. Stochastic distributed learning
+with gradient quantization and variance reduction. arXiv preprint
+arXiv:1904.05115 (2019).
+
+[24] Diederik P Kingma and Jimmy Ba. 2014. Adam: A method for stochastic
+
+optimization. arXiv preprint arXiv:1412.6980 (2014).
+
+[25] Shigang Li, Tal Ben-Nun, Salvatore Di Girolamo, Dan Alistarh, and
+Torsten Hoefler. 2020. Taming unbalanced training workloads in
+deep learning with partial collective operations. In Proceedings of the
+25th ACM SIGPLAN Symposium on Principles and Practice of Parallel
+Programming.
+
+[26] Shigang Li, Tal Ben-Nun, Giorgi Nadiradze, Salvatore Di Girolamo,
+Nikoli Dryden, Dan Alistarh, and Torsten Hoefler. 2020. Breaking
+(global) barriers in parallel stochastic optimization with wait-avoiding
+group averaging. IEEE Transactions on Parallel and Distributed Systems
+32, 7 (2020), 1725–1739.
+
+[27] Shigang Li and Torsten Hoefler. 2021. Chimera: Efficiently Train-
+ing Large-Scale Neural Networks with Bidirectional Pipelines. arXiv
+preprint arXiv:2107.06925 (2021).
+
+[28] Shigang Li, Torsten Hoefler, and Marc Snir. 2013. NUMA-aware shared-
+memory collective communication for MPI. In Proceedings of the 22nd
+international symposium on High-performance parallel and distributed
+computing. 85–96.
+
+[29] Hosam M Mahmoud, Reza Modarres, and Robert T Smythe. 1995. Anal-
+ysis of quickselect: An algorithm for order statistics. RAIRO-Theoretical
+Informatics and Applications-Informatique Théorique et Applications 29,
+4 (1995), 255–276.
+
+[30] Giorgi Nadiradze, Amirmojtaba Sabour, Peter Davies, Shigang Li, and
+Dan Alistarh. 2021. Asynchronous decentralized SGD with quantized
+and local updates. Advances in Neural Information Processing Systems
+34 (2021).
+
+[31] Deepak Narayanan, Aaron Harlap, Amar Phanishayee, Vivek Seshadri,
+Nikhil R Devanur, Gregory R Ganger, Phillip B Gibbons, and Matei
+Zaharia. 2019. PipeDream: generalized pipeline parallelism for DNN
+training. In Proceedings of the 27th ACM Symposium on Operating
+Systems Principles. 1–15.
+
+[32] Deepak Narayanan, Amar Phanishayee, Kaiyu Shi, Xie Chen, and
+Matei Zaharia. 2021. Memory-efficient pipeline-parallel dnn training.
+In International Conference on Machine Learning. PMLR, 7937–7947.
+
+[33] Adam Paszke, Sam Gross, Francisco Massa, Adam Lerer, James
+Bradbury, Gregory Chanan, Trevor Killeen, Zeming Lin, Natalia
+Gimelshein, Luca Antiga, et al. 2019. Pytorch: An imperative style,
+high-performance deep learning library. In Advances in neural infor-
+mation processing systems. 8026–8037.
+
+[34] Alec Radford, Jeffrey Wu, Rewon Child, David Luan, Dario Amodei,
+and Ilya Sutskever. 2019. Language models are unsupervised multitask
+learners. OpenAI blog 1, 8 (2019), 9.
+
+Near-Optimal Sparse Allreduce for Distributed Deep Learning
+
+PPoPP ’22, April 2–6, 2022, Seoul, Republic of Korea
+
+[51] Yang You, Jonathan Hseu, Chris Ying, James Demmel, Kurt Keutzer,
+and Cho-Jui Hsieh. 2019. Large-batch training for LSTM and beyond.
+In Proceedings of the International Conference for High Performance
+Computing, Networking, Storage and Analysis. 1–16.
+
+[52] Yang You, Jing Li, Sashank Reddi, Jonathan Hseu, Sanjiv Kumar, Sri-
+nadh Bhojanapalli, Xiaodan Song, James Demmel, Kurt Keutzer, and
+Cho-Jui Hsieh. 2019. Large batch optimization for deep learning:
+Training bert in 76 minutes. arXiv preprint arXiv:1904.00962 (2019).
+
+[53] Yang You, Zhao Zhang, Cho-Jui Hsieh, James Demmel, and Kurt
+Imagenet training in minutes. In Proceedings of the
+
+Keutzer. 2018.
+47th International Conference on Parallel Processing. 1–10.
+
+[35] Esteban Real, Alok Aggarwal, Yanping Huang, and Quoc V Le. 2019.
+Regularized evolution for image classifier architecture search. In Pro-
+ceedings of the aaai conference on artificial intelligence, Vol. 33. 4780–
+4789.
+
+[36] Cèdric Renggli, Saleh Ashkboos, Mehdi Aghagolzadeh, Dan Alistarh,
+and Torsten Hoefler. 2019. SparCML: High-performance sparse com-
+munication for machine learning. In Proceedings of the International
+Conference for High Performance Computing, Networking, Storage and
+Analysis. 1–15.
+
+[37] Daniele De Sensi, Salvatore Di Girolamo, Kim H. McMahon, Duncan
+Roweth, and Torsten Hoefler. 2020. An In-Depth Analysis of the
+Slingshot Interconnect. In Proceedings of the International Conference
+for High Performance Computing, Networking, Storage and Analysis
+(SC20).
+
+[38] Alexander Sergeev and Mike Del Balso. 2018. Horovod: fast
+and easy distributed deep learning in TensorFlow. arXiv preprint
+arXiv:1802.05799 (2018).
+
+[39] Anil Shanbhag, Holger Pirk, and Samuel Madden. 2018. Efficient top-k
+query processing on massively parallel hardware. In Proceedings of the
+2018 International Conference on Management of Data. 1557–1570.
+[40] Tom Shanley. 2003. InfiniBand network architecture. Addison-Wesley
+
+Professional.
+
+[41] Shaohuai Shi, Xiaowen Chu, Ka Chun Cheung, and Simon See. 2019.
+Understanding top-k sparsification in distributed deep learning. arXiv
+preprint arXiv:1911.08772 (2019).
+
+[42] Shaohuai Shi, Qiang Wang, Kaiyong Zhao, Zhenheng Tang, Yuxin
+Wang, Xiang Huang, and Xiaowen Chu. 2019. A distributed synchro-
+nous SGD algorithm with global top-k sparsification for low bandwidth
+networks. In 2019 IEEE 39th International Conference on Distributed
+Computing Systems (ICDCS). IEEE, 2238–2247.
+
+[43] Shaohuai Shi, Kaiyong Zhao, Qiang Wang, Zhenheng Tang, and Xi-
+aowen Chu. 2019. A Convergence Analysis of Distributed SGD with
+Communication-Efficient Gradient Sparsification.. In IJCAI. 3411–
+3417.
+
+[44] Karen Simonyan and Andrew Zisserman. 2014. Very deep convo-
+lutional networks for large-scale image recognition. arXiv preprint
+arXiv:1409.1556 (2014).
+
+[45] Rajeev Thakur, Rolf Rabenseifner, and William Gropp. 2005. Opti-
+mization of collective communication operations in MPICH. The
+International Journal of High Performance Computing Applications 19,
+1 (2005), 49–66.
+
+[46] Ashish Vaswani, Noam Shazeer, Niki Parmar, Jakob Uszkoreit, Llion
+Jones, Aidan N Gomez, Lukasz Kaiser, and Illia Polosukhin. 2017. At-
+tention is all you need. arXiv preprint arXiv:1706.03762 (2017).
+[47] Linnan Wang, Wei Wu, Junyu Zhang, Hang Liu, George Bosilca, Mau-
+rice Herlihy, and Rodrigo Fonseca. 2020. FFT-based Gradient Spar-
+sification for the Distributed Training of Deep Neural Networks. In
+Proceedings of the 29th International Symposium on High-Performance
+Parallel and Distributed Computing. 113–124.
+
+[48] Wei Wen, Cong Xu, Feng Yan, Chunpeng Wu, Yandan Wang, Yiran
+Chen, and Hai Li. 2017. TernGrad: Ternary Gradients to Reduce Com-
+munication in Distributed Deep Learning. In Proceedings of the 31st In-
+ternational Conference on Neural Information Processing Systems (Long
+Beach, California, USA) (NIPS’17). Curran Associates Inc., Red Hook,
+NY, USA, 1508–1518.
+
+[49] Ke Wu, Dezun Dong, Cunlu Li, Shan Huang, and Yi Dai. 2019. Net-
+work congestion avoidance through packet-chaining reservation. In
+Proceedings of the 48th International Conference on Parallel Processing.
+1–10.
+
+[50] Hang Xu, Kelly Kostopoulou, Aritra Dutta, Xin Li, Alexandros Ntoulas,
+and Panos Kalnis. 2021. DeepReduce: A Sparse-tensor Communica-
+tion Framework for Federated Deep Learning. Advances in Neural
+Information Processing Systems 34 (2021).
+
+13
+
+PPoPP ’22, April 2–6, 2022, Seoul, Republic of Korea
+
+Shigang Li and Torsten Hoefler
+
+A Artifact Appendix
+A.1 Abstract
+
+The artifact contains the source code for our Ok-Topk and
+the benchmarks used in the evaluation. It supports the re-
+sults in Section 5. To validate or reproduce the results, build
+this artifact and check the results returned by running bench-
+marks.
+
+> git clone https://github.com/NVIDIA/apex
+> cd apex
+> pip install -v –disable-pip-version-check –no-cache-dir
+
+–global-option="–cpp_ext" –global-option="–cuda_ext" ./
+
+3. Download and preprocess data sets.
+
+a) Cifar-10
+> cd $WORK/Ok-Topk/VGG/vgg_data
+> wget https://www.cs.toronto.edu/∼kriz/
+
+A.2 Artifact check-list (meta-information)
+
+cifar-10-python.tar.gz
+
+• Algorithm: Ok-Topk
+• Compilation: Python 3.8
+• Model: VGG, LSTM, BERT
+• Data set: Cifar-10, AN4, Wikipedia
+• Run-time environment: torch, mpi4py, apex
+• Hardware: GPU clusters
+• Execution: srun or mpirun
+• Metrics: execution time, top-1 test accuracy, WER, training
+
+loss
+
+• Output: txt files
+• How much disk space required (approximately)?:
+
+100 GB
+
+• How much time is needed to prepare workflow (ap-
+proximately)?: Except for preparing the Wikipedia dataset,
+it takes about 30 minutes. Preprocessing the Wikipedia dataset
+takes several hours.
+
+• How much time is needed to complete experiments
+
+(approximately)?: It takes about 5 hours without pre-training
+BERT. BERT pre-training takes more than 100 hours.
+• Archived?: Yes. https://doi.org/10.5281/zenodo.5808267
+
+A.3 Description
+
+A.3.1 How to access. The artifact can be downloaded from
+https://github.com/Shigangli/Ok-Topk
+
+The artifact can also be downloaded using the DOI link
+
+https://doi.org/10.5281/zenodo.5808267
+
+A.3.2 Hardware dependencies. GPU clusters
+
+A.3.3 Software dependencies. To run the experiments, Python
+3.8 is required. Python packages, including torch, mpi4py, apex,
+simplejson, tensorboard, tensorboardX, ujson, tqdm, h5py,
+coloredlogs, psutil, torchaudio, torchvision, numba,
+librosa, python-Levenshtein, and warpctc-pytorch, are re-
+quired.
+
+A.4 Installation
+1. Download the artifact and extract it in your personal $WORK di-
+rectory.
+
+2. Setup Python environment and install the dependent packages.
+
+> conda create –name py38_oktopk python=3.8
+> conda activate py38_oktopk
+
+> pip3 install pip==20.2.4
+> pip install -r requirements.txt
+> MPICC="cc -shared" pip install –no-binary=mpi4py
+
+mpi4py
+
+> tar -zxvf cifar-10-python.tar.gz
+b) AN4
+> cd $WORK/Ok-Topk/LSTM/audio_data
+> wget www.dropbox.com/s/l5w4up20u5pfjxf/an4.zip
+> unzip an4.zip
+c) Wikipedia
+> cd $WORK/Ok-Topk/BERT/bert/bert_data
+Prepare the dataset according to the README file in this directory.
+
+A.5 Experiment workflow
+We run experiments on GPU clusters with SLURM job scheduler. In
+the job scripts of the artifact, we use srun to launch multiple pro-
+cesses among the computation nodes. But one can also use mpirun
+to launch multiple processes if there is no SLURM job scheduler on
+your machine. Once the jobs are finished, the results of training
+speed, test accuracy and training loss values for each algorithm
+will be output into txt files.
+
+A.6 Evaluation and expected result
+
+1. To run VGG jobs
+
+> cd $WORK/Ok-Topk/VGG
+> ./sbatch_vgg_jobs.sh
+
+2. To run LSTM jobs
+
+> cd $WORK/Ok-Topk/LSTM
+> ./sbatch_lstm_jobs.sh
+
+3. To run BERT jobs
+
+> cd $WORK/Ok-Topk/BERT/bert
+> ./sbatch_bert_jobs.sh
+
+4. Check the output results
+
+It takes about 5 hours for all jobs to be finished, which depends
+on the busyness of the job queue. To make sure all jobs have been
+finished, checking the status by:
+> squeue -u username
+If you see no job is running, then all jobs are finished.
+> cd $WORK/Ok-Topk/VGG
+Check the 6 output txt files for the 6 algorithms (i.e., dense,
+gaussiank, gtopk, oktopk, topkA, and topkDSA), respectively,
+which contain the training speed and top-1 test accuracy for VGG.
+
+> cd $WORK/Ok-Topk/LSTM
+Check the 6 output txt files for the 6 algorithms, respectively,
+
+which contain the training speed and WER values for LSTM.
+
+> cd $WORK/Ok-Topk/BERT/bert
+Check the 6 output txt files for the 6 algorithms, respectively,
+which contain the training speed and training loss values for BERT.
+
+14
+
+Near-Optimal Sparse Allreduce for Distributed Deep Learning
+
+PPoPP ’22, April 2–6, 2022, Seoul, Republic of Korea
+
+Users are expected to reproduce the results in this paper. Dif-
+ferent software or hardware versions may lead to slightly variant
+results compared with the numbers reported in the paper, but it
+should not affect the general trends claimed in the paper, namely
+Ok-Topk achieves higher training throughput and faster time-to-
+solution, and is more scalable than the other algorithms.
+
+the gradient; modify max-epochs to change the number of train-
+ing epochs; modify nworkers and nodes to change the number of
+processes used for training.
+
+A.8 Notes
+
+None.
+
+A.7 Experiment customization
+
+A.9 Methodology
+
+Users can modify the variables in the job scripts to customize the
+experiments. For example, modify density to change the density of
+
+Submission, reviewing and badging methodology:
+https://www.acm.org/publications/policies/artifactreview-badging
+http://cTuning.org/ae/submission-20201122.html
+http://cTuning.org/ae/reviewing-20201122.html
+
+15
+
+

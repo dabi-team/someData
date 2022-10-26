@@ -1,0 +1,2193 @@
+Confidential Machine Learning within Graphcore IPUs
+
+Kapil Vaswani,1 Stavros Volos,1 Cédric Fournet,1 Antonio Nino Diaz,1 Ken Gordon,1 Balaji Vembu,0 Sam Webster,1 David Chisnall,1
+Saurabh Kulkarni,2 Graham Cunningham,2 Richard Osborne,2 Dan Wilkinson2
+
+1Microsoft Research
+
+2Graphcore
+
+2
+2
+0
+2
+
+y
+a
+M
+0
+2
+
+]
+
+R
+C
+.
+s
+c
+[
+
+2
+v
+5
+0
+0
+9
+0
+.
+5
+0
+2
+2
+:
+v
+i
+X
+r
+a
+
+ABSTRACT
+We present IPU Trusted Extensions (ITX), a set of experimental
+hardware extensions that enable trusted execution environments
+in Graphcore’s AI accelerators.
+
+ITX enables the execution of AI workloads with strong confiden-
+tiality and integrity guarantees at low performance overheads. ITX
+isolates workloads from untrusted hosts, and ensures their data and
+models remain encrypted at all times except within the IPU. ITX
+includes a hardware root-of-trust that provides attestation capabili-
+ties and orchestrates trusted execution, and on-chip programmable
+cryptographic engines for authenticated encryption of code and
+data at PCIe bandwidth. We also present software for ITX in the
+form of compiler and runtime extensions that support multi-party
+training without requiring a CPU-based TEE.
+
+Experimental support for ITX is included in Graphcore’s GC200
+IPU taped out at TSMC’s 7nm technology node. Its evaluation
+on a development board using standard DNN training workloads
+suggests that ITX adds less than 5% performance overhead, and
+delivers up to 17x better performance compared to CPU-based
+confidential computing systems relying on AMD SEV-SNP.
+
+1 INTRODUCTION
+Machine learning (ML) is transforming many tasks such as med-
+ical diagnostics, video analytics, and financial forecasting. Their
+progress is largely driven by the computational capabilities and
+large memory bandwidth of AI accelerators such as NVIDIA GPUs,
+Alibaba’s NPU [2], Google’s TPU [19], and Amazon’s Inferentia [3].
+Their security and privacy is a serious concern: due to the nature
+and volume of data required to train sophisticated models, the
+sharing of accelerators in public clouds to reduce cost, and the
+increasing frequency and severity of data breaches, there is a real-
+ization that machine learning systems needs stronger end-to-end
+security mechanisms that protect their sensitive models and data.
+Confidential computing [1, 4, 10, 32] relies on custom hardware
+support for trusted execution environments (TEE), also known as
+enclaves, that can provide such security guarantees. Abstractly,
+a TEE is capable of hosting code and data while protecting them
+from privileged attackers. The hardware can also measure this code
+and data to issue an attestation report, which can be verified by
+any remote party to establish trust in the TEE. In principle, con-
+fidential computing enables multiple organizations to collaborate
+and train models using sensitive data, and to serve these models
+with assurance that their data and models remain protected. How-
+ever, existing TEEs such as Intel SGX [24], AMD SEV-SNP [5], and
+ARM Trustzone [6] are restricted to CPUs and cannot be used for
+applications that offload computation to accelerators.
+
+Adding native support for confidential computing into AI ac-
+celerators can greatly increase their security, but also involves
+
+0Work done while Balaji Vembu was affiliated with Microsoft.
+
+Figure 1: GC200 IPU development board with the ITX extensions
+for confidential ML showing the two IPUs on the front side con-
+nected to the CCU via the ICU (on the back).
+
+many challenges. Security features such as isolation, attestation,
+and side-channel resilience must be fitted in their highly optimized
+architecture, with minimal design changes, and without degrading
+their functionality, performance, or usability. An additional require-
+ment is the flexibility to operate with different hosts, including
+CPUs with no TEE support, CPUs with process-based TEEs such as
+Intel SGX, and CPUs with VM-based TEEs such as AMD SEV-SNP.
+Finally, the manufacturing and assembly process and protocols
+must be hardened against supply chain attacks.
+
+This paper describes our effort to support TEEs in a state-of-the-
+art AI accelerator, Graphcore’s Intelligence Processing Unit (IPU).
+We introduce IPU Trusted Extensions (ITX), a set of experimental
+hardware capabilities in the IPU. We show that, using ITX in con-
+junction with appropriate compiler and runtime support, we can
+delegate ML tasks to the IPU with strong confidentiality and in-
+tegrity guarantees while delivering accelerator-grade performance.
+In particular, ITX can guarantee isolation of an ML application from
+an untrusted host: application code and data appears in cleartext
+only within the IPU, and remains encrypted otherwise, including
+when transferred over the PCIe link between the host and the IPU.
+Once an application is deployed within an ITX TEE, the host can
+no longer tamper with the application state or the IPU configura-
+tion. ITX can also issue remotely verifiable attestations, rooted in a
+Graphcore PKI, enabling a relying party to establish trust in a given
+ML task before releasing secrets such as data decryption keys.
+
+The main components of ITX are a new execution mode in the
+IPU for isolating all security sensitive state from the host and se-
+curely handling security exceptions, programmable cryptographic
+engines capable of encrypting and decrypting PCIe traffic between
+
+1
+
+IPU0IPU1CCUICU 
+ 
+ 
+ 
+ 
+ 
+the host CPU and the IPU at line rate (32 GB/s bidirectional through-
+put for supporting PCIe Gen4), and a novel authenticated encryp-
+tion protocol for ensuring confidentiality and integrity of code and
+data transfers without requiring trust in the host.
+
+Trust in ITX is rooted in the Confidential Compute Unit (CCU),
+a new hardware Root-of-Trust on the Graphcore board. The CCU
+provides each device with a unique identity based on a hardware
+secret sampled within the CCU at the end of manufacturing. The
+CCU firmware is responsible for managing the entire lifecycle of
+TEEs on the IPU, including creation, issuing attestation reports
+that capture IPU and task specific attributes, key exchange, launch,
+and termination of TEEs. Our design also features protocols for
+securely provisioning firmware to the IPU in a potentially hostile
+manufacturing environment, for issuing certificates that capture
+the identity of all updatable firmware, and for supporting firmware
+updates without requiring device re-certification.
+
+Several distinguishing aspects of ITX and the IPU programming
+model result in stronger security than one may expect from CPU-
+based TEEs, notably as regards side channels:
+
+• An ITX TEE spans the entire IPU, and has exclusive access
+to all IPU resources until it terminates. Therefore, it is
+not possible for an adversary to run concurrently on the
+same resources and exploit the resulting side channels. This
+execution model is feasible since most AI workloads require
+at least one accelerator, with larger workloads requiring
+thousands of accelerators for many hours.
+
+• The IPU’s memory system consists of large amounts of
+on-chip SRAM attached to its cores, which is loaded with
+data from untrusted external memory during explicit syn-
+chronization phases. Thus, during computational phases,
+code and data accesses to IPU memory have a fixed latency.
+This has two security implications: (1) traffic between the
+IPU cores and memory need not be encrypted, since it
+stays within the chip; (2) this avoids the need for optimiza-
+tions such as caching or speculation to hide memory access
+latency, and the resulting side channels.
+
+• The IPU supports a programming model where allocation
+and scheduling of all resources on the IPU (cores, memory,
+and communication channels) are statically managed by
+the compiler. Hence, the IPU application binary defines its
+entire data and control flow, including data transfers within
+the IPU, and between IPU and host memory. This is unlike
+GPUs where the host software stack (runtime and driver)
+remain in full control of the execution, and therefore must
+be trusted to some extent to guarantee integrity.
+
+There are many ways for software to utilize ITX to provide
+end-to-end guarantees for ML workloads, depending on the threat
+model and capabilities of the host. This paper focuses on configu-
+rations where a multi-party ML training workload is deployed to
+the IPU without trusting the host CPU. This mode has the strongest
+security properties and can be used with any CPU. We describe a
+prototype software stack and protocols for it, and present its end-to-
+end evaluation using standard DNN training workloads. Software
+to support other configurations, e.g., where the IPU is coupled with
+a hardware-protected CPU TEE, are left for future work.
+
+2
+
+We have fully implemented ITX in the GC200 IPU, manufactured
+in TSMC’s 7nm technology. Our extensions use less than 1% of this
+large ASIC, and do not require any change to its compute core or
+memory subsystem. Its evaluation on a development board using
+confidential ML training workloads suggests a performance over-
+head of less than 5% compared to non-confidential IPU workloads.
+While our prototype demonstrates promising results, significant
+work remains to turn our work into production.
+
+Due to implementation constraints, our prototype uses a dis-
+crete hardware root-of-trust (instead of an on-die core) and it does
+not encrypt traffic over IPU-IPU links. It is therefore vulnerable
+to physical attacks, e.g., on the link between the CCU and IPU, or
+between multiple IPUs. These vulnerabilities are not limitations of
+our design and can be addressed in future IPU generations by inte-
+grating the root-of-trust on the IPU chip, and introducing additional
+encryption engines on IPU-IPU links.
+
+In summary, this paper makes the following contributions:
+
+(1) A set of experimental hardware extensions to the IPU, Graph-
+core’s AI accelerator, that enable high-performance confidential
+multi-party machine learning.
+
+(2) Support for remote attestation and secure key exchange based
+
+on a discrete hardware root-of-trust.
+
+(3) A pipelined application-level protocol for authenticated encryp-
+
+tion & decryption of code and data over PCIe.
+
+(4) Protocols for securely provisioning secrets, firmware and cer-
+
+tificates to a device during manufacturing.
+
+(5) Prototype software support for enabling confidential multi-
+party training of ML models expressed in TensorFlow on the
+IPUs without requiring trust in the CPU.
+
+(6) Implementation of ITX in the IPU ASIC manufactured by TSMC
+in 7nm technology, and its initial evaluation on a development
+board, which suggests low overheads and orders of magnitude
+improvements over CPU TEEs. This makes our prototype the
+first AI accelerator to support confidential computing.
+
+While some aspects of our design are specific to Graphcore IPUs,
+we hope it can serve as a blueprint for adding TEE support in other
+specialized devices and accelerators.
+
+2 BACKGROUND
+This section outlines the Graphcore IPU architecture and its pro-
+gramming model, with an emphasis on aspects relevant to secu-
+rity. A more detailed description of IPUs and a comparison with
+GPUs are out of scope—see, e.g., [11, 12]. The section also reviews
+hardware-based confidential computing.
+
+2.1 IPU Hardware Architecture
+
+Tiles. Each IPU consists of a set of tiles, each with a multi-threaded
+core and a small amount of private on-chip SRAM. The GC200 IPU
+features 1472 tiles, totalling roughly 900 MB of on-chip SRAM. The
+cores support an instruction set tuned for AI, including special-
+ized vector instructions and low-precision arithmetic. Each core
+can execute up to six statically scheduled threads. Since on-chip
+memory can be accessed at fixed latency, most instructions can be
+exactly scheduled by the compiler. (Other IPU configurations may
+provide connectivity between tiles and additional on-board DRAM,
+
+Host-IPU Synchronization. The IPU execution model is based
+on the Bulk Synchronous Parallel (BSP) paradigm, with barriers and
+supersteps. A superstep involves a global synchronization barrier
+between all tiles on one or more IPUs, followed by an exchange
+phase that transfers data between tiles, followed by a compute
+phase which ends at another barrier. This process repeats until some
+application specific criteria is met—e.g., loss is under a threshold.
+Using the Host Sync Proxy registers, the host can configure
+the frequency of synchronization barriers and indicate barriers at
+which it expects to be notified—e.g., when one or more batch of
+data has been processed, at epoch boundaries. Once configured,
+the IPUs can execute multiple supersteps independently without
+requiring involvement from the host.
+
+IPU Control Unit (ICU). The ICU is a microcontroller integrated
+on the board and connected with the IPUs via JTAG, and with PCB
+peripherals for power supply and environmental monitoring. It is
+responsible for initialization and power management of the IPUs.
+
+Resets. The main means of resetting the IPU from the host is a
+secondary bus reset (SBR) that resets the entire device including the
+IPUs, the ICU, and the host link; the ICU must re-enable the host
+link once it comes out of reset. Alternatively, a Newmanry Reset
+can be triggered by writing the IPU control register; it resets the
+device logic including the host and IPU links, but does not reset the
+physical links. In both of these resets, tile memory is not scrubbed.
+
+2.2 IPU Software Stack
+Graphcore provides a software stack, known as Poplar, for com-
+piling and executing applications written in ML frameworks such
+as TensorFlow and PyTorch. Poplar consists of a compiler, a host
+runtime, and a set of libraries supported by the IPU device driver.
+
+Compilation. The Poplar compiler is responsible for compiling
+a computation graph representing a task (e.g., a TensorFlow XLA
+graph) into IPU binaries. Compilation involves statically partition-
+ing each layer in the computation graph between tiles, with each
+tile holding a part of the model state (weights and activations for
+some layers) and a part of the input data. The compiler assigns
+resources (threads, memory) to each node of the graph, schedules
+its computation, and emits specialized code for each tile.
+
+The resulting IPU binary captures the different phases of execu-
+tion, including I/O for reading batches of data, code for running the
+training loop, and I/O for writing the weights of the trained model.
+I/O phases also include synchronization and internal exchange code
+for exchanging data among tiles.
+
+The Poplar compiler maps all data transfers between the host
+and IPUs to an abstraction called streams supported by the runtime.
+Data transfers from the host to an IPU (and IPU to the host) are
+mapped to input (output) streams and compiled to sequences of
+read (write) instructions to the Tile PCI address space. The compiler
+also uses streams to implement checkpoints; checkpoint creation
+maps all model weights to a single output stream, and checkpoint
+restoration reads them back from a single input stream.
+
+The compiler supports an offline mode, which decouples com-
+pilation from execution. In this mode, the compiler generates self-
+contained IPU binaries, which can be persisted and loaded into one
+or more IPUs at a later point in time.
+
+Figure 2: System stack (left) and IPU floorplan (right).
+
+which would be accessed in a similar way as host DRAM; these
+configurations are out of scope in this paper.)
+
+Interconnects. The tiles are connected over a high-bandwidth
+internal exchange, an all-to-all, stateless, synchronous and non-
+blocking interconnect whose operation is similarly orchestrated
+by software. The internal exchange is connected to an external
+exchange interconnect via a set of exchange blocks. Each exchange
+block manages a subset of the tiles and mediates traffic between the
+two interconnects. Each IPU has a pair of PCIe links that connect to
+a host server, and additional IPU-Links that connect to other IPUs.
+The external interconnect is a packet-switched Network-on-
+Chip. Tiles use the external interconnect to dispatch packets to the
+host via PCIe links and unicast/multi-cast packets to tiles on other
+IPUs via IPU-links. Tiles read data from the host by issuing a read
+request packet and waiting for all associated read completion packets.
+Tiles write data to the host by issuing one or more write request
+packets. Packets are routed based on tile identifiers. For requests,
+packets from exchange blocks are placed onto lanes based on the
+source tile identifier of the exchange packet. For read completions,
+the exchange lane is chosen based on the destination tile identifier,
+which is recorded in a lookup table in the PCI complex for each
+outstanding read request.
+
+IPU Address Spaces. The IPU exposes three address spaces, col-
+lectively known as the IPU exchange address space, to facilitate
+communication between the host and the IPU and between IPUs.
+The Tile address space is used by tiles to address one another. The
+Host PCI space is used by the host to address tile memory and on-
+chip page tables in the Host Exchange block. The Tile PCI space
+is used by tiles to address read requests to host memory over PCI.
+The IPU can be configured to re-map read requests from tiles to
+the PCI domain using on-chip page tables.
+
+Host-IPU Interface. The IPU exposes a set of configuration reg-
+isters to the host via a PCI BAR space. These registers are hosted
+in a component known as the PCI Complex. The PCI complex con-
+sists of a Host Sync Proxy (HSP) that is responsible for external
+synchronization between the host and the IPU, a host exchange that
+translates packets between PCI format and a proprietary external-
+exchange packet format, on-chip page tables for address translation
+of read/write requests from tiles to the PCI domain, on-chip lookup
+tables for keeping metadata for outstanding PCI read requests, and
+a control port that provides access to configuration registers of all
+other internal components.
+
+The host exchange subsystem also includes a component known
+as the autoloader, which enables efficient scrubbing and initializa-
+tion of tile memory. To initialize a binary in tile memory, the host
+can load small programs (e.g., a bootloader) into the autoloader,
+which can then broadcast it to all tiles.
+
+3
+
+PCI ControllerPCI ComplexInternal InterconnectExternal Exchange InterconnectIPU-IPU Link ControllerExchange Blocks (XB)TilesControl PortRegistersHost ExchangeHSPIPU-IPU Link ControllerTilesICUIPUIPUUser ApplicationIPU BinaryFWPCIML FrameworkPoplar SDKGuest OSDeviceDriversHypervisor and Host OSCPUHost Runtime. The runtime provides abstractions for loading IPU
+binaries, and for streaming data in and out of the IPUs.
+
+For loading IPU binaries, the runtime deploys a small bootloader
+into a reserved section of each tile memory. The bootloader in turn
+reads tile-specific application binary from the host into tile memory.
+The runtime implements input streams by repeatedly copying
+data into a ring buffer in host memory and mapping the pages of
+the ring buffer into Tile PCI space in the on-chip page table. Once
+the ring buffer is ready and the mapping is defined, code on tiles
+can issue read requests. Similarly, output streams are implemented
+by copying data from the ring buffer to application memory.
+
+2.3 Confidential Computing
+Confidential computing is a paradigm where code and data remains
+protected from priviledged attackers throughout their lifecycle,
+including when it is at rest, in transit and during use. Central to
+confidential computing is the notion of a trusted execution environ-
+ment (TEE). TEEs offer two key capabilities: the capability to host
+an application in a hardware-isolated secure environment, which
+protects the application from all external access including access
+from privileged attackers; and the capability to issue remotely veri-
+fiable attestations, which capture various security claims about the
+application hosted in the TEE and the platform supporting the TEE.
+These attestations can be used by any relying party to establish trust
+in an application and opening secure channels for communication.
+TEEs are supported by recent processors from Intel and AMD.
+ARM has recently defined a specification for supporting TEEs. There
+are broadly two classes of CPU TEEs: process-based and VM-based.
+Process-based TEEs (e.g., Intel SGX) are designed to isolate a user-
+space application from an untrusted operating system (both guest
+and host) and the hypervisor. VM-based TEEs (e.g., AMD SEV-
+SNP, Intel TDX) are designed to protect an entire guest VM from
+the host operating system and the hypervisor. TEEs offer varying
+degrees of protection from attackers with physical access to the
+CPU. Most TEE implementations assume that attackers can snoop
+on interconnects between the CPU package and external compo-
+nents (e.g., off-chip DRAM) and protect data by encrypting and
+integrity-protecting memory traffic. Information leakage through
+side-channels is still often considered out of scope, although CPU
+vendors are offering defense-in-depth protection against specific
+side-channels, such as those based on speculation.
+
+Support for remote attestation is typically rooted in an on-die
+hardware root of trust (HRoT), which has exclusive access to a
+unique device secret provisioned into one-time programmable fuses
+during manufacturing. During boot, the HRoT uses the secret to
+derive a device-specific identity key. The corresponding public
+key is endorsed by the hardware manufacturer. This key typically
+endorses keys used for signing attestation reports for a TEE.
+
+3 THREAT MODEL
+TEE hardware is subject to a variety of attacks throughout its life-
+cycle, from chip design and manufacturing up until the hardware
+is decommissioned.
+
+Trust in TEEs is rooted in hardware, and consequently in the chip
+designers and their OEMs involved in designing and manufacturing
+the chips. Additional trust is also required in the infrastructure
+
+4
+
+for issuing certificates to each chip, and for publishing the last
+known good version of firmware TCB. While this is also the case
+with the IPU, we wish to minimize trust in the rest of the supply
+chain. Hence, we conservatively assume that attackers control the
+manufacturing and assembly process after tapeout, including the
+process of provisioning firmware and/or secrets to each device and
+harvesting their Certificate Signing Requests (CSR).
+
+After deployment, we assume a strong adversary that controls
+the entire system software stack, including the hypervisor and the
+host operating system, and also has physical access to the host. The
+adversary can access or tamper with any code and data transferred
+between the host CPU and the IPU, either in operating system
+buffers or over PCIe. The adversary can also tamper with device
+memory directly via the PCI BAR, or map the victim application’s
+tile PCI address space to host-side memory controlled by the at-
+tacker. Information leakage through side channels such as traffic
+analysis, power consumption, timing, and physical probes on the
+IPU are generally out of scope. However, we do wish to offer pro-
+tection from side channels based on memory access patterns, and
+from low level integrity attacks such as glitching.
+
+We trust the IPU and the HRoT packages, and we assume that
+the adversary cannot extract secrets or corrupt state within the
+packages. In particular, the IPU package includes trusted SRAM
+within the IPU tiles accessed only via on-chip private channels.
+
+The ML source script and high-level configuration are trusted.
+The ML framework and the Poplar compiler are trusted for integrity
+of the computation—i.e., to compile the model defined in the ML
+script correctly into a manifest and binaries that run on the IPU.
+
+In multi-party configurations (involving parties that do not trust
+one another), these assumptions can be addressed by having all
+parties review the script and configuration for the workload, then
+confirm that they all locally compile to the same manifest and
+binaries. Each party is trusted with the integrity and confidentiality
+of the data streams they provide for the computation; in particular,
+honest parties are trusted to correctly encrypt their data streams
+with a fresh data encryption key, and to release this key to IPUs
+only after verifying their attestation report.
+
+In configurations that couple the IPU with a host CPU TEE
+(e.g., Intel SGX and TDX, AMD SEV-SNP), the CPU package is
+also trusted, along with any software hosted in the TEE; we omit
+the details of their platform-specific threat models. With process-
+based TEEs, such as Intel SGX, the CPU-based software TCB may
+include the ML training or inferencing script, ML framework (e.g.,
+TensorFlow, PyTorch), the Poplar compiler and runtime. With VM-
+based TEEs, such as AMD SEV-SNP, the TCB may additionally
+include the Poplar kernel-mode driver and a guest operating system.
+The Poplar runtime is then trusted for confidentiality—i.e., to setup
+a secure, attested channel between the CPU TEE and IPU, and to
+transfer code/data over this secure channel.
+
+With the current generation of IPUs, we make additional trust
+assumptions in the ICU, which provides connectivity between the
+hardware RoT and the IPUs, and in links between IPUs. We trust
+the ICU firmware and the physical links that connect the HRoT,
+the ICU and the IPU. These trust assumptions can be removed in
+subsequent generations of the IPU by placing the HRoT on the IPU
+die, and encrypting communication over IPU-IPU links.
+
+Under this threat model, we wish to provide confidentiality and
+integrity guarantees for model code and data, including initial
+weights, input data, checkpoints and outputs. For training, integrity
+implies that the final outcome (i.e., the trained model) is bitwise
+equivalent to the model obtained in the absence of the attacker. For
+inferencing, integrity implies that requests yield the same results as
+those obtained in the absence of the attacker. Conversely, liveness
+properties (e.g., progress or availability) are out of scope.
+
+We wish to also provide remote attestation, which refers to the
+ability of the platform to make remotely verifiable claims that a
+relying party can use to reason about the TEE’s security properties
+and thereby establish trust in the application hosted within the TEE
+even in the presence of an attacker. Specifically, we wish to ensure
+that the attestation can deliver temporally fresh evidence that con-
+tains all security-sensitive parts of the platform and application
+state, and that the underlying attestation mechanism is trustworthy
+and robust to advanced attacks such as chosen-firmware attacks.
+
+4 OVERVIEW
+Trusted execution in IPUs enables model developers to securely
+offload an ML job (training or inferencing) while protecting both
+model and data from the hosting platform. In turn, model developers
+can prove to data providers that their data remains protected from
+both the hosting platform and the model developers themselves.
+
+The workflow for securely offloading an ML job involves mul-
+tiple steps, starting with the creation of a TEE, generation of an
+attestation report, its verification by remote parties (e.g., the model
+developer or data providers), encryption of code and data, secure
+exchange of encryption keys with the IPU, job execution, and de-
+cryption of the outcome: a trained model or inference results.
+
+4.1 Hardware extensions (ITX)
+The IPU hardware contains several components (shown in Figure 4)
+to support this workflow.
+
+First, a new hardware root-of-trust integrated on the IPU board,
+called the Confidential Computing Unit (CCU). The CCU gives each
+board a unique identity based on a hardware secret generated by
+the CCU during manufacturing. The CCU firmware supports an
+API which an untrusted host can use to manage the entire TEE
+lifecycle on the IPU, including creation, attestation, key exchange,
+application launching, and termination. Section 5.1 describes the
+architecture of the HRoT and its role in trusted execution.
+
+Second, a new mode, called the trusted mode, in which all security
+sensitive state is isolated from a potentially malicious host. This
+mode is entered by writing to a configuration register. (For remote
+verifiability, this register is measured by the CCU and included in the
+attestation report.) Once the IPU enters this mode, its configuration
+registers and tile memory can be accessed only by the CCU and
+ICU. The only way to exit this mode is via a chip reset, which is
+extended to scrub all key registers and tile memory.
+
+Third, programmable AES-GCM engines for authenticated en-
+cryption and decryption of code and data transferred between the
+host and the IPU at PCIe line rate. These engines are hosted in
+new components, called Secure Exchange Pipes (SXP), located on
+the interconnect between the PCIe block and the exchange blocks.
+The SXP and its use are described in Section 6.1.
+
+Figure 3: Multi-party training in trusted offline mode. Before train-
+ing, the remote parties upload their encrypted code, data and cer-
+tificates (1–4) Once training starts (5–6), they verify the attestation
+report (7) then release their encryption keys to the CCU (8-9); they
+can be offline for the rest of the computation. The IPUs train the
+model in a TEE (10) and releases an encrypted trained model (11),
+whose key can be shared with model receiver(s).
+
+4.2 Software Support
+There are many ways for software to utilize ITX. For this paper,
+we illustrate a particular mode, which we refer to as the offline
+mode (Figure 3). In this mode, a multiparty ML training workload
+can be deployed in an IPU-based TEE without requiring a CPU-
+based TEE. This mode has strong security properties (e.g., small
+TCB) and minimal dependencies on the host server hardware. We
+discuss limitations of this mode, and extensions for scenarios such
+as aggregation and pre-processing, and inferencing in Section 7.4.
+
+Job Preparation. In offline mode, a model developer uses an ex-
+tended Poplar compiler to statically compile a model training job
+expressed in an ML framework such as TensorFlow or PyTorch to
+standalone IPU binaries in a trusted, offline clean room environment
+(1). In addition to the binary, the compiler generates a job mani-
+fest, which contains auxiliary information required at runtime to
+execute the job. Next, the model developer encrypts binaries and
+parameters such as initial weights and learning rate using encryp-
+tion keys that remain in the clean room environment. The model
+developer also generates a fresh public key share for key exchange,
+and a signature over the key share using their certificate. These
+artifacts, along with the model developer’s certificate are packaged
+together to create an application package. Separately, data providers
+pre-process and encrypt their input data and labels in their own
+clean room environments, and create data packages which include
+their key shares and certificates (2). The resulting packages are
+uploaded to a server with IPUs attached (3, 4).
+
+Job Initialization. Any entity (including the model developer)
+can initiate execution of the training job using the Poplar run-
+time, which we extend to load encrypted code and data into the
+IPUs. For confidential computing jobs, the Poplar runtime provides
+user-mode APIs for operations such as creating TEEs (5) for a job,
+requesting for attestation reports and additional collateral such as
+device-specific certificates (6), and relaying key-exchange messages
+from relying parties to the CCU (8). This runtime is not trusted.
+
+5
+
+Remote Attestation. In trusted mode, the CCU can issue remotely
+verifiable attestations, which are relayed to relying parties (7) as
+proof of TEE configuration for their workload. The attestation is a
+certificate chain from the Graphcore root CA to an end-certificate
+signed by the CCU with custom extensions that embed initialization
+attributes (e.g., measurement of all security-sensitive IPU registers)
+and job-specific attributes, such as the measurement of the job
+manifest, and the hash digest of other runtime attributes, including
+certificate fingerprints of all parties and the CCU’s fresh public
+keyshare. The model developer and data providers verify this report,
+the model, and identities of other participants. If they decide to
+make their data available for this job, they derive shared encryption
+keys using the CCU’s public key share and securely exchange their
+secrets with the CCU (see Appendix A.6).
+Job Execution. After the model developer and data providers have
+relayed their keys to the CCU, the CCU deploys the keys into the
+SXPs and starts the job (9) by installing a bootloader into the IPU
+tiles using the autoloader. The bootloader is designed to fetch the
+application binary from host memory to each tile in 1KB blocks.
+In trusted mode, the blocks are decrypted and integrity checked
+by the SXPs before being written to tile memory (see Section 7.3).
+Once the application binary has been transferred, the Poplar run-
+time initiates execution of the job. During execution, tiles generate
+read requests for data, also in blocks of 1KB. In trusted mode, the
+blocks are fetched from host memory over PCIe, and decrypted and
+integrity checked by the SXPs before being written to tile memory.
+Similarly, all write requests (e.g., checkpoints and trained model)
+are encrypted and extended with authentication tags before being
+written to host memory. The encryption/decryption protocol is
+mostly transparent to the compiler, which can compile any training
+algorithm into binary relying on the data being in tile memory
+in cleartext and utilizing all compute resources available on the
+IPU. Finally, the IPU encrypts the trained model with a key made
+available only to the model receivers listed, such as one or more of
+the parties involved, or another CPU/IPU TEE, e.g., for inference.
+
+5 TRUSTED EXECUTION ON IPUS
+5.1 Confidential Compute Unit (CCU)
+The CCU is responsible for associating each Graphcore device with
+a unique cryptographic identity and managing trusted execution in
+its IPUs. The CCU is a discrete chip based on STMicro’s STM32H753
+microcontroller [26]. This chip was selected as the root of trust
+based on several security features required to implement measured
+boot and offer protection from a variety of attacks throughout the
+IPU lifecycle, such as the abilities to provision a custom bootloader
+during manufacturing in a region of one-time programmable flash
+memory, and to switch the microcontroller into a mode that pre-
+vents external access via interfaces such as JTAG.
+
+As shown in Figure 4, the CCU is connected to the IPU via the
+ICU. A dedicated pin receives all exceptions generated by the IPU in
+trusted mode, giving the CCU firmware full control over exception
+handling. The CCU reset pin is coupled in hardware with the ICU
+reset pin and IPU reset, so they cannot be independently reset.
+Firmware Architecture and Attestation. The CCU implements
+a measured boot protocol based on the Device Identity Composition
+Engine (DICE) architecture [14, 36]. The protocol is designed to
+
+Figure 4: IPU hardware extensions to support trusted execution.
+
+Figure 5: CCU firmware architecture and key hierarchy
+
+ensure that each device is assigned a unique identity while min-
+imizing exposure of hardware secrets. The protocol also ensures
+that, except for the stable device identity, all derived secrets and
+keys automatically change when firmware (and its measurement)
+changes, which ensures that low level firmware attacks such as
+boot-kits do not compromise secrets used with other firmware.
+
+The CCU firmware (Figure 5) consists of three layers: an im-
+mutable primary bootloader provisioned in one-time programmable
+flash memory at manufacturing; a mutable secondary bootloader
+responsible for device identity and attestation certificates; and a
+confidential compute engine (CCE) that manages the TEE lifecycle.
+During manufacturing, the CCU would be provisioned with the
+primary bootloader firmware. When the device is brought out of
+reset for the first time, this primary bootloader receives control
+from ROM firmware, samples a unique device secret (UDS) using
+a hardware-based TRNG, stores it in a region of flash memory,
+that is permanently and permanently blocks access from any other
+firmware layers. The UDS is the root of the IPU’s key hierarchy,
+and this protocol ensures that it is never exposed outside the CCU,
+not even to the manufacturer.
+
+On every subsequent boot, the CCU follows a variant of the DICE
+measured boot protocol [13][37]: the primary bootloader receives
+control out of reset, loads and authenticates the secondary boot-
+loader from flash using Graphcore firmware signing key deployed
+
+6
+
+ICUCCUSEC. EXCEPTIONEXCEPTION BOARD RESETSXPsExchangePCIComplexTilesAutoloaderFlashIPUHOSTCorewithin the primary bootloader. Next, it derives two intermediate
+secrets: a Hardware Device Identifier (HDI) from UDS, and a Com-
+posite Device Identifier (CDI) from UDS and the measurement of
+the secondary bootloader. The HDI is unique to each card, whereas
+the CDI is unique to each card and secondary bootloader. It then
+scrubs any copies of UDS from memory, and transfers control to
+the secondary bootloader, handing over both HDI and CDI.
+
+The secondary bootloader further derives two public-private key
+pairs: a Card Identity Key (CIK) from HDI, and a Platform Identity
+Key (PIK) from CDI. The CIK gives each card a stable identity
+whereas the PIK is unique to each card and secondary bootloader.
+The bootloader also generates a self-signed CSR for the CIK, a
+PIK CSR, and a PIK certificate signed by CIK. The PIK CSR and
+certificate contain a custom extension that records measurements
+of the secondary bootloader and the ICU firmware along with
+additional device-specific information. The CSRs would be securely
+harvested during manufacturing and processed by a Graphcore CA,
+which would issue CIK and PIK certificates.
+
+The secondary bootloader derives another key pair: the Attesta-
+tion Key (AK) from CDI and the CEE measurement. Hence, AK is
+unique to each device, secondary bootloader and CCE. The boot-
+loader issues an AK certificate signed by PIK; this certificate logs the
+CCE measurement in a custom extension. Finally, the bootloader
+scrubs all secrets and transfers control to CCE, handing over AK.
+The CCE uses AK to sign attestation reports that contains IPU-
+specific information and job-specific information (Section 5.2). A
+relying party can validate attestation reports using the AK certifi-
+cate issued by the device, and CIK and PIK certificates that would be
+issued by Graphcore. Graphcore would also issue certificates con-
+taining the measurements of the latest known good CCU firmware
+and IPU configuration, which a relying party can use to verify
+contents of the PIK and AK certificates.
+
+Firmware Update. As intended with DICE, a secondary bootloader
+update invalidates PIK certificates issued by the manufacturer and,
+as UDS is provisioned within each device, it is not possible for
+Graphcore to independently derive and certify the updated PIK.
+Instead, we rely on CIK, acting as a local CA, to sign the updated
+PIK certificate. Additionally, Graphcore would issue TCB update
+certificates containing measurements of old and new versions of
+firmware. A relying party can validate attestation reports using
+PIK certificates obtained from the device, the original PIK and CIK
+certificates, and TCB update certificates (see Appendix A.3.)
+
+Note that the protocol above is still susceptible to advanced
+chosen-firmware attacks: a malicious secondary bootloader could
+impersonate another version of the firmware by using CIK to en-
+dorse a PIK certificate for the corresponding firmware measure-
+ment. Firmware authorization provides a strong defense against
+such attacks—the malicious firmware would need to be correctly
+signed by Graphcore to run as secondary bootloader. We can harden
+the protocol further by moving CIK and PIK generation into the
+primary bootloader, at the cost of increased complexity in one-time
+programmable firmware. Appendix A.4 discusses this variant.
+
+5.2 TEE Management
+The CCU exposes an API for creating and managing TEEs on the
+IPU, outlined below.
+
+7
+
+TEE Initialization. The first step in securely offloading a job to an
+IPU is to create a fresh TEE for this job. TEE initialization requires
+a job manifest, public key shares, signatures over the key shares
+and certificates for each relying party and a checkpoint counter
+indicating whether job is starting or resuming from a checkpoint.
+During TEE initialization, the CCU first quiesces the IPU, ensuring
+that there are no in-flight read and write requests between the
+host and IPU. It then switches the IPU into trusted mode, scrubs
+all tile memory using the autoloader, and measures the state of
+the configuration registers. It then checks the signatures over the
+key shares using the certificates. and generates its own fresh EC
+share, which is used to establish a ECDH shared secret between
+each relying party and the CCU (device).
+
+The CCU generates an attestation report signed by the attestation
+key containing various IPU-specific attributes, such as configura-
+tion register measurements, and job-specific attributes, such as the
+job manifest, certificate fingerprints for all parties, and the epoch
+counter and checkpoint identifier (see Appendix A.6 for the details.)
+Each relying party (model or data provider) can review the at-
+testation report, along with the supporting certificate chains, to
+validate the device and the initial state of the CCU and IPU, then
+it can compute the ECDH shared secret to wrap a key package
+that contains the party’s encryption keys for data it contributes
+to the job and nonces (see Table 3 and Secure Key Exchange in
+Appendix A.6 for the details.)
+
+TEE Launch. After gathering wrapped encryption keys from all
+relying parties, the host launches the execution of a job, which
+proceeds in several steps.
+
+First, the CCU computes the ECDH shared secret for each party
+and uses them to unwrap the key package(s) received from each
+party. It then combines the nonces to derive a checkpoint key and a
+final-model encryption key for this run of the job (and, if resuming
+from another run, the checkpoint key from that previous run to re-
+store its state). This key derivation ensures both that the checkpoint
+key for this run is fresh (as long as one relying party’s nonce is
+fresh) and that the checkpoint key of a prior run can be recomputed
+once all relying parties agree to resume from a checkpoint. Table 3
+and Appendix A.6 provide details about the key derivations.
+
+Next, the CCU deploys a pre-defined bootloader on the IPU tiles
+using the autoloader, and it deploys a first set of encryption keys
+to the SXP (including the code encryption key) as specified in the
+job manifest. It then activates the bootloader (whose measurement
+is included in the attestation report) on every tile, which issues re-
+quests to read their encrypted application binary from host memory.
+Responses to these read requests are authenticated and decrypted
+by the SXPs before being copied into private tile memory.
+
+Finally, The CCU deploys the next set of encryption keys (in-
+cluding data keys, and possibly the checkpoint key for resumption),
+as specified in the job manifest, and trigger the main execution
+loop on the IPU tiles. The CCU may be similarly involved at some
+synchronization points later in the job, to deploy different sets of
+encryption keys.
+
+TEE Termination. At any point after initialization of a TEE, the
+host runtime can also request that the TEE be terminated. The
+CCU may also trigger TEE termination in the event of a security
+exception raised from the IPU e.g., failure to authenticate a response
+
+Figure 6: Authenticated encryption with explicit IVs. Data is stat-
+ically partitioned into frames with unique IVs. Hardware decryp-
+tion ensures their integrity based on their authentication tag; the
+receiver must verify that received IVs match the expected IVs be-
+fore accepting the decrypted payloads.
+
+of a read request. During TEE termination, the CCU quiesces the
+IPUs and scrubs tile memory using the autoloader and disables all
+keys in the SXPs. Finally, the CCU issues a Newmanry reset, which
+switches the IPU back into normal mode.
+
+A TEE may be abnormally terminated due to a hard reset of the
+device.In such a scenario, the IPU reverts to normal mode and all
+CCU state is cleared. When the IPU comes out of reset, prior to re-
+enabling the host links, the ICU is programmed to scrub tile memory
+to ensure that any secrets left over from a previous execution are
+erased before the host re-gains access to the device.
+
+6 ENCRYPTED DIRECT MEMORY ACCESS
+Next, we describe the ITX protocol for encrypted code and data
+transfers to and from IPU tiles. The protocol is designed to ensure
+confidentiality and integrity even in the presence of privileged at-
+tackers that control the host software stack and can observe/tamper
+with PCIe traffic. The protocol is application-level as opposed to
+transport-level (discussed in Section 9). While it is transparent to
+ML frameworks, it relies on application software (e.g., the Poplar
+compiler) to assign IVs for authenticated encryption and for pro-
+gramming the tiles to securely load code, initial weights, training
+data, and save/reload checkpoints and results. The protocol is sup-
+ported in IPU hardware by fully pipelined AES256-GCM engines
+for authenticated encryption at PCIe line rate. This design choice re-
+sults in simpler hardware (at the cost of some software complexity),
+allows the IPU to be coupled with untrusted CPUs or CPUs with
+varying TEE support, and retains the compiler’s ability to maximize
+PCIe utilization by parallelizing data transfers across multiple tiles.
+
+6.1 Data Format
+In the encryption protocol (illustrated in Figure 6), application
+software partitions each code and data stream into equally-sized
+encrypted frames. Each frame consists of a 128-bit IV, followed by
+a series of cipher blocks that carry the encrypted contents of the
+frame, and by a 128-bit authentication tag. Application software
+is free to use different frame sizes for different streams, as long
+as the total frame size (including IV and authentication tag) is a
+multiple of 128 bytes with a maximum of the 1kB, which is the
+largest supported PCIe read. Application software can use different
+keys to encrypt different streams. This is critical for multi-party
+
+Figure 7: IPU External Exchange Interconnect, with an SXP on
+each exchange lane. Traffic is forwarded from and to exchange
+blocks to exchange lanes based on the exchange block identifier.
+
+scenarios where streams are provided and accessed by different
+parties. Crucially, application software must ensure that IVs are
+never reused across frames encrypted with the same key (which
+would be catastrophic with AES-GCM). In our implementation,
+this invariant is ensured by the compiler, which constructs the IV
+by combining stream-specific identifiers and frame indexes, and
+the fact that in Poplar, both code and data streams are write-once
+abstractions. Together, this guarantees that unless the associated
+key has been compromised, authenticated decryption with the
+correct IV yields the correct payload.
+
+6.2 Hardware Support
+Multiple components in the IPU support ITX encryption. The IPU
+includes blocks, called Secure Exchange Pipes, extensions to packet
+formats for carrying encryption-related information, and exten-
+sions to exchange blocks and the PCIe complex for supporting the
+task of mapping frames to keys.
+Secure Exchange Pipe (SXP). The SXP is a programmable hard-
+ware block that supports AES256-GCM authenticated encryption
+and decryption of frames. Each SXP achieves 16 GBps unidirectional
+throughput with negligible impact on latency. As shown in Figure 7,
+there are four SXPs placed on the exchange interconnect (two per
+direction) to support encryption/decryption at PCIe Gen4 line rate
+(32GBps bidirectional). In trusted mode, each SXP is configured to
+intercept read/write requests from four exchange blocks.
+AES-GCM Engine. The SXP’s core is a fully pipelined AES-GCM
+engine that supports 16 physical key contexts to enable concurrent
+requests. Each context can be programmed by loading a 256-bit key
+into control registers exposed to the CCU via an internal control
+bus. While frames may be interleaved, for functional correctness
+we require that each context processes a single frame at a time. This
+invariant is enforced by the compiler, as detailed in Section 7.1.
+
+The core implements the standardized AES256-GCM algorithm
+with two restrictions: the additional authenticated data is always
+empty; and the plaintext is block-aligned and not empty. For con-
+venience, we also treat the IV as a full 16-byte block, including the
+32 bits of internal block counter. For each context, the SXP stores
+an AES key, the Galois-hash authentication key (AK) computed by
+encrypting 0128 when loading the AES key, the encryption of the
+
+8
+
+1Image (1/4)2Image (2/4)3Image (3/4)4Image (4/4)5Model (1/3)6Model (2/3)7Model (3/3)Authentication TagIVPCI ComplexExchange LanesExchange BlocksSXPsinitial IV (EK), the current IV including the block counter, and a
+partial Galois hash (H). In each cycle, the core performs one of the
+following operations on its context:
+
+• The context is idle (i.e., no frame is being encrypted or
+decrypted) and the core receives the IV for the frame. It
+combines IV with the initial block counter (0), encrypts it
+and stores the result in EK; outputs IV; increments IV; and
+marks the context as active.
+
+• The context is active and the core receives a block of data.
+It encrypts IV and XORs it with the data; accumulates this
+cipherblock into the partial hash H using AK; outputs the
+cipherblock; and increments IV.
+
+• The context is active and the core receives a MAC. It com-
+putes the authentication tag for the frame using AK, EK, IV,
+and H; compares it with the received MAC (if performing
+a decryption); outputs the authentication tag; and marks
+the context as idle.
+
+The core detects context switches by comparing key context
+identifiers between consecutive cycles (as discussed below), so that
+it can fetch the next context before the next operation.
+
+Frame encryption/decryption. The SXP receives three types of
+external exchange packets: read requests (egress), read completions
+requiring decryption (ingress), write requests requiring encryption
+(egress). Their headers are extended to carry additional information
+to help the SXP determine how the packets should be handled: an
+AES bit indicates that the read completion or the write request
+is encrypted; a 4-bit KEY_INDEX field identifies the physical key
+context to use; and a CC bit indicates the last packet of the frame
+and triggers the computation of its authentication tag.
+
+In write request packets (outbound to the host PCIe domain), the
+AES bit and the CC bit are set by the tile, whereas the KEY_INDEX
+is set by the SXP (as described below). In read completions packets,
+the information is set by the PCIe complex based on trusted state it
+maintains about pending read requests (as described below).
+
+Read request packets and packets with the AES bit unset do not
+require encryption/decryption; they are passed unchanged. For all
+other packets, the header bypasses the AES core, then
+
+• If the packet is the start of a new frame, the first block (16
+bytes) of payload is passed to the AES core as AES_IV,
+and the subsequent blocks are passed as AES_DATA.
+• If the packet is the continuation of a frame, its blocks of
+
+payload are passed as AES_DATA.
+
+• If the packet is the end of a frame (flagged by the header
+CC bit), all but the last block of payload are passed as
+AES_DATA, and the last block is passed as AES_MAC.
+(This block carries the authentication tag when decrypting,
+and a padding block otherwise.)
+
+Packets that both start and end a frame are similarly handled.
+
+Key Selection. As described earlier, each SXP supports multiple
+physical key contexts to enable encryption/decryption of concur-
+rent I/Os. The SXP provides a set of registers that can be pro-
+grammed by the CCU to define a mapping between packets and
+the physical key context to use for encrypting/decrypting their
+payload. The registers, known as the exchange block context map
+(KXBCTXMAP), define a mapping from exchange block contexts to
+
+9
+
+physical key contexts. The compiler can define this mapping by
+assigning a set of tiles associated with an exchange block context
+to read/write from/to a single stream. When the SXP receives a
+packet, it computes the index of the exchange block context from
+the source tile identifier in the header, and uses it to look up the
+physical key context in KXBCTXMAP.
+
+As additional defense-in-depth against misconfiguration or cor-
+ruption of these registers, the SXP defines two additional sets of
+registers. The first set of registers, known as the key region definition
+registers (KSELLIMIT), can be used to define up to 17 disjoint tile
+PCI address regions, with the expectation that the compiler will allo-
+cate streams encrypted with different keys in different key regions.
+The first region is always interpreted as the cleartext region, and is
+used to map public data; reads from or writes to this region bypass
+the SXPs. A second set of registers, known as physical context map
+(KPHYSMAP) registers, define a 1:1 mapping between physical key
+contexts and key region identifiers. After inferring the physical key
+context using KXBCTXMAP, the SXP looks up KPHYSMAP using
+the physical key context to obtain a logical key region identifier.
+Then, it looks up the key region definition registers to obtain the
+key region. Finally, it checks if the tile PCI address of the request
+belongs to the region. A failure of this check indicates a misconfig-
+uration of either one of these sets of registers, and causes the SXP
+to generate a security exception.
+
+Once the SXP infers the physical key context, it updates the
+KEY_INDEX field in the request packet header. For write requests,
+the field is then used by the SXP to switch the AES core to the
+inferred physical context for encrypting its payload. However, for
+read requests, the situation is more involved, as the read requests
+bypass the AES core, and the inferred physical key context must
+be used to decrypt the read completions that will be returned by
+the host after the read request has been processed. When the PCI
+complex receives the read request, it caches the KEY_INDEX and
+AES fields in an on-chip lookup table along with other metadata,
+such as the source tile identifier. When the corresponding read com-
+pletions arrive from the host, the PCI complex retrieves these fields
+from this lookup tables and inserts them into the read completion
+packets. The SXP can then use these values to identify the physical
+key context to use for decrypting the payload. The PCI complex
+also tracks the number of pending read completion packets for each
+read request, and sets the CC bit on the last read completion packet.
+
+7 SOFTWARE EXTENSIONS
+We now describe a set of extensions to the IPU software stack—the
+XLA backend in Tensorflow, the Poplar compiler and the Poplar
+runtime—to compile and execute confidential ML tasks using ITX
+in offline mode. This mode is triggered by a configuration option
+we have introduced in TensorFlow. When this option is enabled,
+
+• The XLA backend transforms the computation graph to use
+
+a new abstraction called confidential data streams(Section 7.1)
+for all data transfers; this includes initial weights, training
+data, checkpoints and the trained model.
+
+• The Poplar compiler usually compiles the computation
+graph into a set of IPU application binaries (one for each
+IPU), where each binary is a concatenation of tile-specific
+binaries. In confidential mode, the compiler encrypts each
+
+tile binary into a set of encrypted frames using a freshly
+sampled model key. Each frame is assigned a unique IV by
+composing the code type, IPU ID, tile ID and frame index.
+• The Poplar runtime is extended to securely bootstrap the
+task, then transfer its encrypted application binaries and
+data between the host and the IPU (Appendix A.7 illustrates
+this process for a sample training scenario.)
+
+7.1 Confidential Data Streams
+Confidential data streams are our compiler and runtime abstrac-
+tion for transferring data to/from the IPU with confidentiality and
+integrity guarantees, leveraging SXPs. Each stream is a sequence of
+data instances encrypted with the same symmetric encryption key.
+Each data instance is partitioned into a sequence of frames, and each
+frame is encrypted using a unique IV composed of a stream type
+(data), a stream identifier (one for each stream in the application),
+and the index of the frame within the stream.
+
+IVs do not depend on application-specific attributes, such as
+batch sizes, positions in the IPU address space associated with the
+stream, or the tiles that will issue read or write requests to the
+stream. Thus, a data stream can be encrypted and stored once, and
+then used for training multiple models.
+
+The compiler and the runtime implement reads and writes to
+confidential data streams as follows. As discussed in Section 6.1,
+the compiler first assigns a region in tile PCI space to each stream,
+subject to the constraint that it never exceeds the total capacity of
+the IPU ring buffer (e.g., 256 MB).
+
+Next, the compiler assigns sets of tiles to read from or write
+to each stream, reserves SRAM on each tile to hold a part of the
+stream, and generates SXP mappings, subject to the constraints
+that (a) the exchange block context associated with these tiles map
+to physical key contexts assigned to the stream, and (b) the number
+of physical key contexts in use at any point in the program does
+not exceed 16 for any SXP. To maximize performance under these
+constraints, the compiler may introduce synchronization points in
+the application where existing keys are invalidated and new keys
+are loaded. The compiler includes these synchronization points in
+the manifest, along with their key identifiers; and the (untrusted)
+Popar runtime uses this part of the manifest to ask the CCU to load
+the next decryption keys into the SXPs at these points.
+
+In multi-party scenarios, where tiles process encrypted data from
+multiple parties, the compiler may assign different sets of tiles to
+each party’s stream and introduce additional internal exchanges
+to distribute the data to tiles that process the data altogether. This
+is due to the constraint that a tile is assigned only one physical
+key context at a time, and thus cannot interleave accesses to data
+encrypted with different keys.
+
+The key changes apply only to input streams. Keys for output
+streams are derived and loaded by the CCU at the start of the TEE,
+and do not change throughput its lifetime. Therefore, a malicious
+runtime that does not follow the key schedule of the manifest can
+only cause decryption failures, resulting in denial-of-service.
+
+Next, the compiler schedules read/write operations on each tile.
+The schedule is required to satisfy a hardware constraint that, at any
+point, the tiles that generate requests targeting any given physical
+key context be associated with a single exchange block context. This
+
+is because, while the exchange block can dynamically synchronize
+and regulate requests within each exchange block context (so that
+its physical key context is used by one tile at a time) there is no
+such synchronization across exchange block contexts.
+
+Finally, the compiler generates code on each tile that implements
+the schedule, to issue read/write requests for the accessed frames.
+For reads, the tile code (i) determines the size and expected IV of
+the next frame; (ii) issues read request and wait for data to arrive
+in local memory; (iii) checks that the IV contained in the frame
+matches the expected IV, and generates security exception if not;
+(iv) strips IV and authentication tag; (v) strips any application-level
+padding. This sequence of steps is repeated for a pre-determined
+number of frames before the communication phase ends and the
+computation phase begins.
+
+For writes, the tile code repeats the following steps for as many
+frames as needed to write the data: (i) determines the size and IV of
+the next frame; (ii) writes the IV to the first 16 bytes of the current
+frame; (iii) splits the frame into multiple packets, sets the AES bit
+in the header of all packets and the CC bit in the header of the last
+packet, and adds padding to the last packet according to padding
+requirements; and (iv) issues the write requests for the frame.
+
+7.2 Secure Checkpointing
+Each IPU periodically checkpoints its state to enable recovery from
+failures. A checkpoint is created by writing the weights of the model
+to an output stream. The checkpoint also includes metadata, such as
+the current offset for all confidential data streams. These offsets are
+also written in plaintext, so that the Poplar runtime can restart the
+job and resume loading of confidential data streams at the correct
+offset. Conversely, a checkpoint is restored by reading the weights
+using an input stream and resuming confidential streams from the
+checkpointed offsets. A checkpoint along with the job manifest
+and binaries suffice to resume an application from the checkpoint
+instead of restarting from the beginning.
+
+In trusted mode, checkpoints are encrypted and integrity pro-
+tected. In particular, tiles enforce the integrity of the process of
+restoring state from a previously created checkpoint. This includes
+protecting against attacks, such as tampering a checkpoint or load-
+ing a wrong checkpoint onto an IPU. (Guaranteeing freshness, e.g.,
+resumption from the latest checkpoint, would involve some form
+of trusted persistent storage and is out of scope in this paper.)
+
+Checkpoints are implemented using confidential streams. The
+IV for each frame uniquely encodes the checkpoint type, the epoch
+counter (incremented at each resumption), the checkpoint identifier
+(incremented at each saved checkpoint), the IPU and tile IDs, and
+the frame index. The CCU uses a separate key for each epoch; it
+installs the key of the epoch of the checkpoint it is resuming from, if
+any, and the key of the current epoch for writing all its checkpoints.
+
+The tiles read and write checkpoints as follows:
+
+(1) Tiles obtain initial values of the epoch counter and checkpoint
+identifier from pre-determined locations in their tile memory;
+the CCU assigns them along with the bootloader code.
+
+(2) If the epoch counter is not null, tiles use it to compute their ex-
+pected IVs and read their part of the corresponding checkpoint.
+(3) Each tile increments their local epoch counter and start (or
+
+resume) the application.
+
+10
+
+(4) At regular intervals, the tiles checkpoint their part of the state,
+using IVs computed from their current values, and then incre-
+ment their local checkpoint identifier.
+
+7.3 Secure Bootstrapping
+Secure bootstrapping is the process of securely loading encrypted
+application binaries into the IPU, either at the start of a job, or while
+resuming a job from a checkpoint.
+
+Bootstrapping involves the following steps. First, the Poplar
+runtime loads the encrypted IPU binary in host memory and creates
+a TEE using the CCU APIs; this switches the IPU into trusted mode.
+Next, the CCU installs a bootloader (shown in Appendix A.5) onto
+every IPU tile using the autoloader described in Section 2.1, and
+also configures the SXPs with the model key and key regions in the
+tile PCI address space where the binary is loaded. The bootloader
+on each tile fetches the tile’s binary from host memory by issuing
+a sequence of read requests. Each frame received from the host is
+intercepted by the SXPs, authenticated and decrypted, and copied
+into tile memory. The bootloader then checks that the received
+IV matches the expected IV built into the bootloader logic; this
+check is performed in software because the SXPs only guarantee
+authenticity of each frame, not the integrity of the entire code or
+data stream. The failure of this check indicates an attempt by the
+host to tamper with the code stream (e.g., by replaying or reordering
+frames). In such an event, the tile raises a security exception, which
+is handled by the CCU. If all checks pass, the bootloader finally
+reconstruct the original cleartext binary by stripping the IVs and
+authentication tags from all frames.
+
+Finally, the bootloader computes a hash of the tile binary; the tiles
+accumulate a hash of the whole application binary; and the CCU
+checks that it matches the measurement in the job manifest and
+generates a security exception otherwise. This protocol, together
+with the integrity of the bootloader whose measurement is included
+in the attestation report, guarantees application integrity.
+
+7.4 Discussion: Online Mode and Inferencing
+The software extensions described above can also be used in a
+configuration where IPUs are coupled with a CPU TEE such as an
+Intel SGX enclave or AMD SEV-SNP protected VM. For example,
+an Intel SGX enclave can host TensorFlow, the Poplar compiler and
+runtime, with an untrusted IPU driver running in the guest OS. In
+this configuration, the enclave would receive an encrypted model
+script from the model developer, and the Poplar runtime would
+encrypt the compiled IPU binary with fresh keys. Similarly, the
+enclave would receive encrypted training data from data providers
+on the basis of an Intel SGX and IPU attestation. The data can be
+decrypted, pre-processed and aggregated within the CPU enclave
+(in parallel with job execution) and re-encrypted by the Poplar
+runtime with fresh keys. Encrypted code/data still then need to be
+copied to a run buffer allocated outside the enclave (in the host
+process) accessible to the IPU. Inferencing can be supported in a
+similar way. We leave support for such scenarios as future work.
+
+8 EVALUATION
+Our evaluation focuses on the overhead of TEEs for ML training,
+using either CPUs or IPUs. TEEs for GPUs are discussed in the next
+
+11
+
+section; it would be hard to perform a precise comparison with
+their prototypes—we report on a first complete hardware imple-
+mentation, whereas their experiments relied on simulations with
+benchmarks that are now outdated—but they exhibit 15–30% over-
+heads due to software encryption/decryption on GPUs, which our
+design eliminates using hardware encryption. A general perfor-
+mance comparison with GPUs is out scope; see [12].
+
+Implementation. We have implemented ITX on a Graphcore
+GC200 IPU on a non-production development board. The IPU chip
+has been fabricated in TSMC’s 7nm technology node, including the
+on-chip security extensions, which account for less than 1% of the
+chip size. The CCU has been integrated on the development board
+and implements the firmware architecture described in Section 5,
+including the protocols for measured boot and TEE management.
+As part of post-fabrication validation, the on-chip IPU security
+extensions have been tested to verify they conform to their spec-
+ified behavior. We leave in-depth hardware security analysis and
+procedures that seek to defeat an IPU TEE for future work.
+
+We have implemented a software prototype for confidential
+training tasks where the host CPU server is untrusted, as discussed
+in Sections 4 and 7. Our current prototype includes experimental
+support in the ML framework, Poplar compiler and runtime. There
+are a few gaps in our prototype. (1) Our implementation currently
+supports only one IPU on the board; (2) For simplicity, the compiler
+makes use of only one logical key region onto which code, data,
+label, checkpoints, and outputs are mapped; Nevertheless, every
+encrypted frame is statically assigned a unique IV, preserving the
+invariant that each IV is used only once; (3) Secure resumption is
+not yet implemented; (4) The bootloader deployed on IPU tiles does
+not measure the application binary after authenticated decryption.
+
+Experimental Results. Table 1 summarizes the hardware and
+software configuration of our test beds. We evaluate the perfor-
+mance of confidential training on ResNet models of various sizes
+(20, 56, and 110) on the Cifar-10 dataset. The dataset consists of
+60,000 32x32 images spanning 10 classes; 50,000 of these images
+are used for training the dataset and the remaining are used for
+testing the resulting model. We ran the same training code and data
+configurations in clear and confidential mode, and confirmed that
+they both yield models with the same prediction accuracy.
+
+We compare IPU TEEs against CPU TEEs based on the largest
+AMD SEV-SNP server we could find. Since these are early devel-
+opment boards, we operate them at a reduced frequency of 900
+MHz; we expect better performance at higher frequencies. The
+AMD CPU testbed utilizes 48 single-threaded AMD CPU cores (out
+of 64); Hyperthreading does not improve performance due to high
+vector unit utilization leaving little room for another hyperthread.
+Moving from 32 to 48 cores improved performance by 10%.
+
+Figure 8 shows the training throughput that we achieve in clear
+and confidential modes. IPU-based training even with a single IPU
+operating at reduced frequency is 12-20x and 13-17x faster than
+CPU-based training in clear and confidential modes respectively.
+Enabling SEV-SNP introduces modest overheads, ranging from 8%
+(small model) to 14% (large model) while the overheads of enabling
+ITX range from 3% (large model) to 58% (small model). Virtually
+all the overheads of ITX can be attributed to the time spent in of
+programming SXPs; the cost of encrypted I/O accounts for only
+
+Testbed
+AMD SEV-SNP
+48-core VM on 64-core
+EPYC 7763 @ 2.4GHz
+Graphcore GC200 ITX
+IPU @ 900 MHz, 2x24-
+core Intel Xeon 8168
+
+Training configuration
+ResNet-20. Batch size: 1534; 32 epochs.
+ResNet-56. Batch size: 768; 32 epochs.
+ResNet-110. Batch size: 384; 64 epochs.
+ResNet-20. Batch size: 64; 32 epochs.
+ResNet-56. Batch size: 32; 32 epochs.
+ResNet-110. Batch size: 16; 64 epochs.
+
+Table 1: Testbed configuration for TensorFlow training of ResNet
+models on Cifar-10 dataset. In each configuration, batch sizes are
+optimized to to yield maximum performance. (Smaller batches do
+not affect correctness, but may improve convergence or accuracy.)
+
+Figure 8: Training throughput of ResNet models on cifar-10.
+
+1.3% of the overheads. This is a temporary artifact of our prototype
+firmware, and can be easily optimized. More generally, we expect
+the startup cost (TEE initialization, remote attestation, SXP setup)
+to be negligible with state-of-the-art models, which take weeks
+or days to train. With ResNet-110 model, the overall overhead is
+just 3% (1123 vs 1089 seconds for running 64 epochs). We also
+expect that utilizing both IPUs at full frequency would deliver an
+additional performance improvement (of up to 3.5x) over CPUs.
+In summary, the preliminary evaluation shows that using ITX, AI
+workloads can continue to benefit from the use of accelerators
+without compromising on performance or security.
+
+9 RELATED WORK
+
+ML Privacy. Machine learning involves many security and privacy
+issues, which often need to be addressed both in their application al-
+gorithms (applying, e.g., differential privacy and federated learning)
+and in their system implementations.
+
+Several interesting lines of work develop novel cryptographic
+schemes for inference and training, relying on homomorphic en-
+cryption or secure multi-party computation instead of trusted hard-
+ware. These approaches can be implemented in software on ex-
+isting CPUs, and even benefit form GPU acceleration—see e.g.
+[34, 35]. They offer strong confidentiality, notably against side-
+channels. However, they remain order-of-magnitude slower and
+more resource-intensive than TEE-based approaches—see [17] for
+a comparison. They also require significant algorithmic changes (to
+reduce the cost of fully implementing floating-point operations and
+non-linear layers) and separate mechanisms to protect the integrity
+of their computation.
+Trusted hardware. There is a history of work [7–9, 15, 22, 22, 23,
+29, 33, 39] on trusted hardware that isolates code/ data from the rest
+of the system. Intel SGX [24] and AMD SEV-SNP [5] are the latest
+
+12
+
+in this line of work. Our work effectively extends this approach
+from general-purpose CPUs to custom devices and accelerators.
+Trusted execution on accelerators. To the best of our knowl-
+edge, our work is the first to demonstrate an ASIC with confidential
+computing capabilities. NVIDIA recently announced confidential
+computing support in upcoming Hopper GPUs [27]. NVIDIA’s de-
+sign shares the same core principles as ITX on IPUs. The GPUs are
+equipped with an on-package hardware root of trust responsible
+for attestation and enforcing course-grained GPU isolation under
+the assumption that on-package GPU memory is trusted.
+
+There are some notable differences. For example, in the NVIDIA
+design, a CPU-based TEE capable of hosting a full OS is necessary
+because the responsibility of attesting and establishing a secure
+channel with the GPU lies with the GPU kernel-mode driver. Also,
+the performance characteristics of NVIDIA’s approach are not yet
+known. Nevertheless, we believe that support for confidential com-
+puting in multiple accelerators will greatly benefit the ecosystem.
+Prior work has attempted to reduce trust on privileged host [41]
+via hardware support on the GPU [38] or on the CPU [18]. Gravi-
+ton [38] extends the GPU with support for secure resource manage-
+ment, and relies on a trusted GPU runtime hosted in a process-based
+CPU TEE to manage the TEE lifecycle. HIX [18] provides extensions
+to process-based CPU TEEs, including the PCI interconnect and
+the CPU’s MMU, to prevent system software from changing the
+PCI interconnect configuration and accessing GPU resources.
+
+A number of researchers have identified the need for mechanisms
+that allow an application hosted in a TEE to securely communicate
+with I/O devices, such as in-storage processors [20], GPUs [18, 38,
+41], FPGAs [21, 28, 31, 42], and AI accelerators [16, 40].
+
+GuardNN removes the CPU from the TCB of AI systems [16]. It
+introduces instructions for establishing a secure channel between a
+remote user and the accelerator, and for decrypting/ encrypting in-
+puts/outputs. Integrity is not guaranteed as an attacker controlling
+the CPU can tamper with the instruction schedule.
+
+HETEE [43] enables confidential rack-scale AI computing using
+a tamper-resistant chassis that consists of computing nodes, com-
+modity accelerators, a PCI switch, and a security controller. The
+security controller enables remote attestation and remote users to
+establish a secure channel with the chassis.
+PCIe-level encryption. The deployment of devices that support
+standardized PCIe-level encryption [30] is expected to start in a few
+years. Compared to application-level encryption (Section 6) it may
+enable a more transparent and more efficient CPU–IPU protocol
+(removing the need for explicit IVs in ML applications.) However,
+it would involve a larger TCB with an auxiliary host CPU TEE.
+
+10 CONCLUSION
+We presented ITX, a set of experimental hardware extensions for
+the Graphcore IPU, a state-of-the-art AI accelerator. Our design
+provides application-level confidentiality and integrity for ML tasks
+offloaded to an untrusted cloud provider. We also presented a soft-
+ware architecture that avoids the need to trust host CPUs, thereby
+minimizing the trusted computing base and removing dependen-
+cies on CPU-based TEEs. We implemented them in the Graphcore
+GC200 IPU, and experimentally confirmed small performance over-
+heads for training large models with strong security and privacy.
+
+1.E+001.E+011.E+021.E+031.E+041.E+05SEV-SNPITXSEV-SNPITXSEV-SNPITXresnet-20resnet-56resnet-110Throughput (cifar-10  images/sec)ClearConfidential1276274301734248244688467734239212293928491403REFERENCES
+[1] 2022. Confidential Computing Consortium. https://confidentialcomputing.io/.
+
+(2022).
+
+[2] Alibaba.
+
+2022.
+
+Alibaba
+
+computing
+alibaba-unveils-ai-chip-to-enhance-cloud-computing-power_595409. (2022).
+
+power.
+
+unveils AI
+
+cloud
+https://www.alibabacloud.com/blog/
+
+enhance
+
+chip
+
+to
+
+[3] Amazon. 2021. AWS Inferentia: High performance machine learning inference
+chip, custom designed by AWS. https://aws.amazon.com/machine-learning/
+inferentia. (2021).
+
+[4] Amazon. 2022. Confidential Computing.
+
+https://aws.amazon.com/blogs/
+
+compute/tag/confidential-computing/g. (2022).
+
+[5] AMD. 2021. AMD SEV-SNP: Strengthening VM isolation with integrity
+https://www.amd.com/system/files/TechDocs/
+
+protection and more.
+SEV-SNP-strengthening-vm-isolation-with-integrity-protection-and-more.
+pdf. (2021).
+
+[6] ARM. 2018. Security on ARM Trustzone. https://www.arm.com/products/
+
+security-on-arm/trustzone. (2018).
+
+[7] Rick Boivie. 2011. SecureBlue++: CPU Support for Secure Execution.
+[8] Victor Costan, Ilia A. Lebedev, and Srinivas Devadas. 2016. Sanctum: Mini-
+mal Hardware Extensions for Strong Software Isolation. In USENIX Security
+Symposium.
+
+[9] Dmitry Evtyushkin, Jesse Elwell, Meltem Ozsoy, Dmitry V. Ponomarev, Nael B.
+Abu-Ghazaleh, and Ryan Riley. 2014. Iso-X: A Flexible Architecture for Hardware-
+Managed Isolated Execution. In International Symposium on Microarchitecture
+(MICRO).
+[10] Google. 2022.
+
+Confidential Computing.
+
+https://cloud.google.com/
+
+confidential-computing. (2022).
+
+[11] Graphcore. 2022. Graphcore IPU overview. https://www.graphcore.ai/products/
+
+ipu. (2022).
+[12] Graphcore.
+
+2022.
+
+Performance
+
+at
+lat-
+scale. Graphcore’s
+https://www.graphcore.ai/posts/
+
+results.
+
+training
+
+est mlperf
+performance-at-scale-graphcores-latest-mlperf-training-results. (2022).
+[13] Trusted Computing Group. January 7, 2020. Symmetric Identity Based De-
+vice Attestation. Version 1.0, Revision 0.95. https://trustedcomputinggroup.org/
+resource/symmetric-identity-based-device-attestation/. (January 7, 2020).
+
+[14] Trusted Computing Group. March 22, 2018.
+
+Hardware Requirements
+for a Device Identifier Composition Engine Family 2.0, Level 00, Re-
+vision
+https://trustedcomputinggroup.org/wp-content/uploads/
+Hardware-Requirements-for-Device-Identifier-Composition-Engine-r78_
+For-Publication.pdf. (March 22, 2018).
+
+78.
+
+[15] Owen S. Hofmann, Sangman M Kim, Alan M. Dunn, Michael Z. Lee, and Emmett
+Witchel. 2013. InkTag: Secure applications on an untrusted operating system.
+In International Conference on Architectural Support for Programming Languages
+and Operating Systems (ASPLOS).
+
+[16] Weizhe Hua, Muhammad Umar, Zhiru Zhang, and G. Edward Suh. 2020.
+GuardNN: Secure DNN accelerator for privacy-preserving deep learning. In
+ArXiv.
+
+[18]
+
+[17] Tyler Hunt, Congzheng Song, Reza Shokri, Vitaly Shmatikov, and Emmet Witchel.
+2018. Chiron: Privacy-preserving machine learning as a service. In ArXiv.
+Insu Jang, Adrian Tang, Taehoon Kim, Simha Sethumadhavan, and Jaehyuk Huh.
+2019. Heterogeneous isolated execution for commodity GPUs.. In International
+Conference on Architectural Support for Programming Languages and Operating
+Systems (ASPLOS).
+
+[19] Norman P. Jouppi, Cliff Young, Nishant Patil, David Patterson, Gaurav Agrawal,
+Raminder Bajwa, Sarah Bates, Suresh Bhatia, Nan Boden, and et. al. 2017. In-
+datacenter performance analysis of a Tensor Processing Unit. In International
+Symposium on Computer Architecture (ISCA).
+
+[20] Luyi Kang, Yuqi Xue, Weiwei Jia, Xiaohao Wang, Jongryool Kim, Changhwan
+Youn, Myeong Joon Kang, Hyung Jin Lim, Bruce Jacob, and Jian Huang. 2021. Ice-
+Clave: A trusted execution envrionment for in-storage computing. In IEEE/ACM
+International Symposium on Microarchitecture (MICRO).
+
+[21] A. Khawaja, Landgraf. J, R. Prakash, M. Wei, E. Schkufza, and C. J. Rossbach. 2018.
+Sharing, protection, and compatibility for reconfigurable fabric with AmorphOS.
+In USENIX Symposium on Operating System Design and Implementation (OSDI).
+[22] David Lie, Chandramohan A. Thekkath, Mark Mitchell, Patrick Lincoln, Dan
+Boneh, John C. Mitchell, and Mark Horowitz. 2000. Architectural Support for
+Copy and Tamper Resistant Software. In International Conference on Architectural
+Support for Programming Languages and Operating Systems (ASPLOS).
+Jonathan M. McCune, Ning Qu, Yanlin Li, Anupam Datta, Virgil D. Gligor, and
+Adrian Perrig. 2009. Efficient TCB reduction and attestation.
+
+[23]
+
+[24] Frank McKeen, Ilya Alexandrovich, Alex Berenzon, Carlos V. Rozas, Hisham
+Shafi, Vedvyas Shanbhogue, and Uday R. Savagaonkar. 2013. Innovative Instruc-
+tions and Software Model for Isolated Execution. In International Workshop on
+Hardware and Architectural Support for Security and Privacy (HASP).
+
+[25] ST Microelectronics.
+
+in-
+stall
+https://www.st.com/resource/en/application_note/
+an4992-stm32-mcus-secure-firmware-install-sfi-overview-stmicroelectronics.
+
+secure firmware
+
+STM32 MCUs
+
+overview.
+
+2022.
+
+pdf. (2022).
+
+[26] ST Microelectronics. 2022. STM32H573 microcontroller with crypto accelera-
+tors. https://www.st.com/en/microcontrollers-microprocessors/stm32h743-753.
+html#documentation. (2022).
+
+[27] NVIDIA. 2022. NVIDIA Confidential Computing. https://www.nvidia.com/en-in/
+
+data-center/solutions/confidential-computing/. (2022).
+
+[28] Hyunyoung Oh, Kevin Nam, Seongil Jeon, Yeongpil Cho, and Yuneheung Paek.
+2021. MeetGo: A trusted execution environment for remote applications on
+FPGA. IEEEAccess 9 (2021), 51313–51324.
+
+[29] Emmanuel Owusu, Jorge Guajardo, Jonathan M. McCune, James Newsome,
+Adrian Perrig, and Amit Vasudevan. 2013. OASIS: On achieving a sanctuary for
+integrity and secrecy on untrusted platforms. In ACM Conference on Computer
+and Communications Security (CCS).
+
+[30] PCI-SIG. 2022. Integrity and Data Encryption (IDE). https://members.pcisig.
+
+com/wg/PCI-SIG/document/15149. (2022).
+
+[31] S. Pereira, D. Cerdeira, C. Rordigues, and S. Pinto. 2021. Towards a trusted
+
+execution environment via reconfigurable FPGA. In ArXiv.
+
+[32] Mark Russinovich, Manuel Costa, Cedric Fournet, David Chisnall, Antoine
+Delignat-Lavaud, Sylvan Clebsch, Kapil Vaswani, and Vikas Bhatia. 2021. Toward
+confidential cloud computing. Communications of ACM 64 (2021), 54–61. Issue 6.
+[33] Richard Ta-Min, Lionel Litty, and David Lie. 2006. Splitting Interfaces: Mak-
+ing trust between applications and operating systems configurable. In USENIX
+Symposium on Operating System Design and Implementation (OSDI).
+
+[34] Sijun Tan, Brian Knott, Yuan Tian, and David J. Wu. 2021. CryptGPU: Fast
+Privacy-Preserving Machine Learning on the GPU. In 2021 IEEE Symposium on
+Security and Privacy (SP). 1021–1038.
+
+[35] Florien Tramer and Dan Boneh. 2019. Slalom: Fast, verifiable and private exe-
+cution of neural networks in trusted hardware. In International Conference on
+Learning Representations (ICLR).
+
+[36] Trusted Computing Group. 2022. DICE. https://trustedcomputinggroup.org/
+
+work-groups/dice-architectures/. (2022).
+[37] Trusted Computing Group. March 5,
+Implicit
+0.93.
+
+ing Group:
+1.0,
+implicit-identity-based-device-attestation/. (March 5, 2018).
+
+Trusted Comput-
+Identity Based Device Attestation. Version
+https://trustedcomputinggroup.org/resource/
+
+Revision
+
+2018.
+
+[38] Stavros Volos, Kapil Vaswani, and Rordrigo Bruno. 2018. Graviton: Trusted
+execution environments on GPUs. In USENIX Symposium on Operating System
+Design and Implementation (OSDI).
+
+[39] Samuel Weiser and Mario Werner. 2017. SGXIO: Generic trusted I/O Path for
+Intel SGX. In ACM Conference on Data and Application Security and Privacy
+(CODAPSY).
+
+[40] Peichen Xie, Xuanle Ren, and Guangyu Sun. 2020. Customizing trusted AI
+accelerators for efficient privacy-preserving machine learning. In ArXiv.
+[41] Miao Yu, Virgil D. Gligor, and Zongwei Zhou. 2015. Trusted Display on Untrusted
+Commodity Platforms. In ACM Conference on Computer and Communications
+Security (CCS).
+
+[42] Mark Zhao, Mingyu Gao, and Christos Kozyrakis. 2021. ShEF: Shielded enclaves
+
+[43]
+
+for cloud FPGAs. In ArXiv.
+Jianping Zhu, Rui Hou, XiaoFeng Wang, Wenhao Wang, Jiangfeng Cao, Boyan
+Zhao, Zhongpu Wang, Yuhui Zhang, Lixin Zhang, and Dan Meng. 2020. En-
+abling rack-scale confidential computing using heterogeneous trusted execution
+environment. In IEEE Symposium on Security and Privacy (SP).
+
+A APPENDIX
+A.1 Attack Vectors and Security Analysis
+Table 2 summarizes the attack vectors discussed in Section 3 and,
+for those covered by our threat model, how ITX mitigates each of
+these attacks.
+
+A.2 Firmware Provisioning and Device
+
+Certification
+
+In this section, we describe an example process for firmware provi-
+sioning and device certificates that would be followed if ITX were
+to be used in a production Graphcore IPU products in a produc-
+tion environment. During board manufacturing, the CCU would
+be provisioned with firmware followed by a board reset to harvest
+certificate signing requests (CSRs) generated by the execution of
+the primary and secondary bootloaders. The CSRs would then be
+used by Graphcore to issue device certificates.
+
+13
+
+Threat
+Host (Software, Physical)
+IPU Memory Access, e.g., host soft-
+ware uses MMIO and PCI BARs,
+physical attacker tampers with
+on-chip memory
+
+Host CPU, Memory, and PCIe bus,
+e.g., read, write, replay, or re-
+ordering of code and data in host
+memory or in transit, including
+DMA buffers and PCIe bus
+
+IPU Binary Malleability, e.g., host
+replaces model encryption key or
+encrypted code
+
+IPU Connectivity,
+ICU-CCU or
+ICU-IPU Tampering on the devel-
+opment board
+
+IPU-IPU Tampering
+
+Supply Chain and Firmware
+Primary Bootloader Provisioning
+Tampering
+
+Using non-genuine, known vul-
+nerable TCB components
+
+Side-channels
+IPU Memory
+
+Host Memory and PCIe bus
+
+Power- and timing-level
+
+Mitigation
+
+MMIO blacklist prevents CPU from
+accessing code and data in IPU; ac-
+cess via interfaces like JTAG is pro-
+hibited; IPU memory cannot be phys-
+ically accessed without breaking into
+the package.
+
+Code and data are encrypted with
+AES-GCM using explicit IVs, and
+keys not shared with the host;
+uniqueness and integrity of IVs are
+ensured by trusted code executed on
+tiles.
+
+Bootloader computes hash of the
+tile binary; hash accumulated and
+checked against expected measure-
+ment in the job manifest. (Not imple-
+mented in the evaluated prototype.)
+
+no; attacker can mount a physical
+attack to (1) retrieve the key(s) sent
+to IPU, and (2) tamper with ICU
+firmware measurement sent to CCU
+
+no; attacker can mount physical at-
+tacks against multi-IPU tasks by tam-
+pering with data sent between IPUs.
+
+Graphcore checks whether
+the
+signed bootloader manifest includes
+the expected nonce provisioned into
+the CCU primary bootloader.
+
+Firmware authorization; hardened
+measurement protocol outlined in
+Appendix A.4.
+
+IPU memory access patterns cannot
+be observed by co-located attacker
+as the IPU is entirely assigned to one
+job at a time.
+
+no: attacker can observe access pat-
+terns to host memory and on PCIe
+bus. However, these patterns do not
+leak much information in the BSP
+model, e.g., the size and number of
+minibatches, but not their contents.
+
+no: attacker can measure power con-
+sumption and/or execution time of
+a superstep. Similarly, this does not
+leak much information for typical
+ML tasks.
+
+Table 2: Potential threats and how ITX mitigates them. Physical
+access attacks on the CCU-ICU-IPU and the IPU-IPU channels can
+be mitigitated once the CCU is integrated on the IPU and AES-GCM
+is utilized to protect the IPU-IPU channels.
+
+Firmware Provisioning. The CCU is provisioned with firmware
+using the SoC’s Secure Firmware Install (SFI) feature [25]. The
+
+14
+
+firmware package consists of all firmware layers discussed in Sec-
+tion 5.1 and the configuration bytes (called OPTION), whose secure
+user memory registers are configured so that secure user memory
+includes only the regions onto which the secure bootloader is de-
+ployed. The firmware package is encrypted with a symmetric key,
+which is provisioned to a hardware security module (HSM).
+
+The encrypted firmware package and the HSM are used by the
+board manufacturer to deploy CCU firmware during the manufac-
+turing and testing of the Graphcore products. The chip tester imple-
+ments a multi-stage protocol between the CCU secure bootloader
+and the HSM, during which the HSM authenticates the certificate
+issued by the CCU and wraps its firmware encryption key using
+the certified public key. This enables the CCU secure bootloader
+to decrypt the firmware package, to install the firmware, and to
+configure the OPTION bytes based on the requested configuration.
+While this SFI process guarantees confidentiality of the firmware,
+it does not directly protect its integrity: the provisioning process
+may be subject to supply-chain attacks that would replace CCU
+parts provisioned using SFI with CCU parts containing malicious
+firmware. We extend SFI with protection against such attacks by
+injecting a secret known only to Graphcore into the primary boot-
+loader. Once the CCU has been integrated onto a Graphcore board,
+a challenger can ask the primary bootloader to prove possession of
+the secret.
+
+This process entails the following three steps. First, Graphcore
+generates a fresh secret for every batch of CCUs. The secret is
+injected to the primary bootloader of the CCU firmware. Second,
+Graphcore derives from the secret an asymmetric batch-specific
+bootloader manifest signing key. After deriving this key, Graphcore
+keeps only the public part. Third, Graphcore issues a certificate
+for the public bootloader manifest signing key. The certificate is
+signed by the Graphcore Firmware certificate authority (CA). This
+certificate contains a batch number, and is valid till the production
+date of the batch of CCUs.
+
+Device Certification. In order to certify its device identity keys,
+the board tester resets the board and harvests the CIK and PIK CSRs
+generated for the board and platform identity keys, as well as the
+bootloader manifest. The command to harvest the bootloader man-
+ifest includes a fresh nonce, to be echoed in the signed bootloader
+manifest.
+
+In response, Graphcore verifies the CSRs received by the card
+manufacturer and issues CIK and PIK certificates that are signed by
+the Graphcore CIK and PIK CAs. In addition, Graphcore validates
+the bootloader manifest against the bootloader manifest signing
+key certificate expected specific to the batch to which the CCU
+belongs, and ensures that the nonce matches the expected nonce.
+
+A.3 Firmware Updates
+The CCU firmware consists of mutable secondary bootloader and
+CCE, both authenticated by the primary bootloader and possibly
+updated after the Graphcore card has been deployed in production.
+
+Updates to Secondary Bootloader. The secondary bootloader
+involves relatively complex cryptographic opertions, and may need
+to be updated in the field. As discussed in Section 5.1, the platform
+identity key (PIK) is derived from UDS depending on the hash of
+the secondary bootloader. Therefore, any updates to the secondary
+
+bootloader changes the platform identity, and PIK certificates issued
+by the manufacturer are no longer valid, requiring re-certification
+of the device by the manufacturer.
+
+Unfortunately, re-certification of a remote device by the man-
+ufacturer can be a complex and lengthy operation as the manu-
+facturer (by design) does not retain unique device keys. Thus, it
+requires collection of CSRs from the device, and more importantly
+an authentication mechanism to ensure that the manufacturer signs
+only PIK certificates exported from devices in the cloud provider’s
+datacenters.
+
+We overcome this challenge via a protocol that enables updates
+to the secondary bootloader without invalidating manufacturer-
+issued certificates.
+
+Prior to updating the secondary bootloader (say to version Y),
+the cloud provider’s Graphcore Firmware CA issues a TCB update
+certificate capturing the measurement of the new version of the
+secondary bootloader and revokes previous certificates for versions
+of the secondary bootloader that should no longer be deployed.
+
+After a firmware update has been deployed, the primary boot-
+loader generates a new CDI (𝐶𝐷𝐼𝑌 ). The secondary bootloader
+generates platform identity and attestation keys specific to this
+version of firmware (𝑃𝐼𝐾𝑌 and 𝐴𝐾𝑌 ). However, the card identity
+key (CIK) stays the same as it does not depend on the measurement
+of the secondary bootloader. The 𝑃𝐼𝐾𝑌 certificate, hence, is signed
+by the original CIK, which has been certified by the manufacturer.
+Subsequently, a remote challenger can combine the TCB update
+certificate with the CIK certificate originally issued by the manu-
+facturer to verify the 𝑃𝐼𝐾𝑌 certificate is issued by the device using
+the original CIK, and that the measurement of the new secondary
+bootloader in the 𝑃𝐼𝐾𝑌 certificate matches the measurement of the
+secondary bootloader in the TCB update certificate.
+
+Updates to CCE. They can be applied at any point without the
+need for any additional certification from the manufacturer. When
+a device boots with a new version of CCE, it generates a new attes-
+tation key with a signature over the public AK along with a hash of
+the CCE using the PIK. Quotes generated by the updated version
+of CCE firmware can be validated using a valid PIK certificate.
+
+A.4 Measured Boot Protocol
+As discussed in Section 5.1, the measured boot protocol is sus-
+ceptible to advanced impersonation attacks. We can harden the
+boot protocol further by moving CIK and PIK generation into the
+primary bootloader (as shown in Figure 9) without revealing the
+private CIK to the secondary bootloader.
+
+In this protocol, the primary bootloader generates CIK from UDS,
+and generates PIK using CDI and the measurement of the secondary
+bootloader. To allow a relying party (such as the Graphcore CA)
+to attest that the PIK was indeed generated by the primary boot-
+loader, the primary bootloader creates a custom structure known
+as PIK endorsement containing the PIK public key along with a
+measurement of the secondary bootloader, and a signature over
+these two attributes using the CIK. The bootloader then scrubs the
+CIK private key and passes public CIK and PIK keys along with
+the private PIK and the PIK endorsement to secondary bootloader.
+During manufacturing, the Graphcore PKI issues a PIK certificate
+only after validating the PIK endorsement structure.
+
+Figure 9: Hardened boot protocol that protects against bootloader
+impersonation attacks.
+
+Our prototype CCU does not implement this protocol to keep
+the primary bootloader simple, but this is easy to address in the
+future.
+
+A.5 Compiled Manifests and Bootloader
+
+Job Manifest. The Poplar compiler generates a job manifest, which
+includes all the information required by the Poplar runtime and
+CCU to create and launch a new TEE, which will host the ML task.
+The manifest contains the hash digest of the application binary
+loaded into each IPU. Finally, it lists the synchronization barriers
+(or points) at which the IPU needs to synchronize with the host, and
+for each synchronization point, it keeps the following information:
+• the key region identifier assigned to each stream that will
+be read or written following the end of synchronization
+(i.e., the mapping between a stream identifier 𝑗 to a key
+region identifier);
+
+• the ring buffer region (i.e., Tile PCI space in the ring buffer)
+assigned to each key region (key region definition regis-
+ters);
+
+• the part of each stream that has been mapped to the ring
+
+buffer region (stream offset);
+
+• the set of physical key contexts to which the stream key
+
+needs to be loaded;
+
+• the physical key context assigned to each exchange block
+
+context (exchange block context map registers); and
+
+15
+
+• the key region to which each physical key context is as-
+
+signed (physical key map registers).
+
+Secure Code Bootstrapping. The code snippet below illustrates
+the bootloader code that fetches the frames of an application binary
+and confirms the integrity of the IV of each frame.
+
+def bootloader():
+
+ipu_id = get_current_ipu_id()
+tile_id = get_current_tile_id()
+num_frames = TOTAL_TILE_MEMORY / (MAX_FRAME_SIZE -
+
+IV_SIZE -TAG_SIZE)
+
+for index in range(1, num_frames):
+
+expected_iv = StreamType::CODE | ipu_id | tile_id |
+
+index
+
+frame = read_next_frame_from_host()
+if expected_iv != get_iv(frame):
+
+raise_security_exception()
+
+strip_iv_and_tag(frame)
+
+compute_hash()
+
+A.6 Attestation
+
+Cryptographic Operations. Table 3 details the keys sampled, de-
+rived, and exchanged at the start of a run in trusted mode. We rely
+on standard algorithms: Elliptic Curve Diffie-Hellman for estab-
+lishing shared secrets, a KDF for deriving keys, and an AES-based
+authenticated key-wrapping scheme. These operations rely on the
+attestation of the manifest and runtime parameters (including all
+public keyshares). Each party provides its own random nonce, and
+the CCU combines them to deterministically derive keys for check-
+points and the final model; these keys are fresh secrets as long as
+one party is honest. In order to resume from a checkpoint saved
+in a previous run, the attested runtime parameters ensures that
+all parties agree on the epoch and checkpoint identifiers, and the
+parties provide their nonces both for the previous run and for the
+new run.
+
+Remote Attestation. During TEE creation, the CCU generates an
+attestation report that captures security-critical attributes about
+the IPU and runtime configuration, including
+
+• the measurement of configuration registers;
+• the measurement of the IPU bootloader used for loading
+
+application binaries onto IPUs;
+
+• the measurement of the job manifest;
+• the hash digest of the attributes for this run, including:
+– the public keyshare of the CCU for this run (𝑌 );
+– the epoch 𝑒 and checkpoint counter 𝑐 from which the
+
+job is restarted (if any).
+
+– the certificate fingerprints of all parties ( (cid:174)𝑋𝑝 );
+– a stream assignment, specifying a party for each input,
+and parties (model receivers) that receive the model
+key;
+
+The host collects the attestation report, along with a CCU-issued
+certificate chain, which includes the AK, PIK and CIK certificates,
+and is rooted at the self-signed CIK certificate. These are presented
+to relying parties along with: the original CIK and PIK certificates,
+the TCB update certificates for the secondary bootloader and ICU
+firmware, and any intermediate CA certificates.
+
+A relying party can verify the attestation report as follows:
+
+𝑘 𝑗
+
+𝑌 , 𝑦
+
+𝑋𝑝, 𝑥𝑝
+
+fresh key
+
+𝑠𝑝,𝑌
+𝑤𝑝
+
+receive 𝑌
+
+unwrapped
+
+fresh EC share
+
+CCU
+receive 𝑋𝑝
+
+Provider
+fresh EC share
+
+fresh secret
+KDF[𝑥𝑝 · 𝑌 ] (𝑎)
+
+unwrapped
+KDF[𝑦 · 𝑋𝑝 ] (𝑎)
+
+Key or secret
+public/private keyshare
+for each relying party 𝑝
+encryption key
+for each input stream 𝑗
+public/private keyshare
+for the CCU in this run
+nonce for 𝑝 in this run
+wrapping key
+for 𝑝, 𝑌 with salt
+𝑎 = 𝑋 𝑝 | |𝑌 | |𝑀
+key to load checkpoints
+saved by prior run 𝑍
+KDF[(cid:174)𝑠𝑝,𝑌 ] (’ck’)
+key to save checkpoints
+KDF[(cid:174)𝑠𝑝,𝑌 ] (’m’)
+key to save final model
+Table 3: Keying for a workload with manifest 𝑀 between relying
+parties identified by their public keyshares (cid:174)𝑋𝑝 and a CCU identi-
+fied by its fresh CCU public keyshare 𝑌 for this run. After attesta-
+tion, an ECDH shared secret 𝑤𝑝 is used for wrapping 𝑘 𝑗 , 𝑠𝑝,𝑌 , and
+𝑠𝑝,𝑍 when resuming from 𝑍 from 𝑝 to the CCU, and optionally for
+wrapping 𝑘m from CCU to any party 𝑝 designated as a receiver of
+the final model. The keys used for encrypting checkpoints and the
+final model are derived from nonces from all relying parties, ensur-
+ing these keys are fresh (as soon as one party is honest) and require
+agreement from all parties to be released.
+
+N/A
+unwrapped
+
+KDF[(cid:174)𝑠𝑝,𝑍 ] (’ck’)
+
+𝑘save
+𝑘m
+
+𝑘load
+
+N/A
+
+(1) Validate the CCU-generated certificate chain and auxiliary cer-
+tificates. This includes checking for certificate revocation.
+(2) Confirm that public key of the CIK certificate issued by Graph-
+core matches the public key in the CIK certificate obtained from
+the CCU.
+
+(3) Confirm that any updates to the secondary bootloader and ICU
+firmware are rooted to a valid certificate chain, In doing so, two
+checks are required: (i) if there exists a TCB update certificate
+issued for the secondary bootloader with a hash digest matching
+the hash digest in the CCU- issued PIK certificate; (ii) if there
+exists a TCB update certificate issued for ICU firmware with a
+hash digest matching the hash digest in the CCU- issued PIK
+certificate.
+
+(4) Review the attested manifest and attributes for this run.
+
+Secure Key Exchange. For each run, each party 𝑝 derives a fresh
+wrapping key 𝑤𝑝 using its private keyshare 𝑥𝑝 and the public
+keyshare of the attested CCU 𝑌 . This key is used to wrap a key
+package containing the streams identifiers assigned to the party
+and the party’s key for these streams 𝑘 𝑗 , and the nonce(s) 𝑠𝑝,𝑌
+for the current run (and 𝑠𝑝,𝑍 for the previous run if the current
+run is resuming from a checkpoint saved in run 𝑍 .) The CCU can
+derive the wrapping key for party 𝑝 using its private keyshare 𝑦 and
+the party’s public keyshare 𝑋𝑝 . In possession of (cid:174)𝑤𝑝 , the attested
+CCU can unwrap the key packages of all parties, which are made
+available during the TEE launch stage.
+
+The parameters of the model are encrypted using the final-model
+key 𝑘𝑚 that has been derived by the CCU using the nonces obtained
+from all parties. The parties engage in a protocol for exchanging
+their nonces so they can derive the key once they possess all nonces.
+The CCU can additionally release the final-model key to model
+
+16
+
+receivers listed in the attestation report using the wrapping key
+shared between itself and each model receiver.
+
+A.7 Sample Training Scenario
+Figure 10 illustrates a sample training scenario with three parties.
+Given the job manifest generated by the Poplar compiler, Poplar
+runtime, CCU, and IPU synchronize at various points where the
+Poplar runtime populate the ring buffer with the data expected by
+the IPU, and the CCU loads enryption keys to the IPU SXPs.
+
+Figure 10: Sample training scenario with 3 parties: one providing
+model code (using key0) and the others (using key1 and key2) each
+providing their own streams of training images and labels; this task
+saves checkpoints (using key3) and a final model (using key4). The
+compiler emits a job manifest that indicates, for each synchroniza-
+tion point of the task, which part of each stream is mapped to the
+ring buffer (1..6) and which keys the CCU should load for ingress.
+The keys for egress streams are programmed in the start of the job
+(0).
+
+17
+
+SyncPointTile PCI Spacein Ring BufferDescription0EgressSXPsloadkey3&key4forcheckpoint&outputstreams;Thekeyswillbeusedinsubsequentsteps.1Theringbufferholdsencryptedcode;IngressSXPsloadkey0,enablingalltilestoloadtheircode.2IngressSXPsloadkey1&key2toreadfrombothproviders;RBissplitbetween4streamsofencryptedimagesandlabels,andfilledwiththefirstbatch.3RBisfilledwiththesecondbatchfrombothproviders.4Alltilessavetheirpartofthecheckpoint,encryptedtoRB(key3).5RBisfilledwiththefinalbatchfrombothproviders.6Alltilessavetheirpartofthemodel,encryptedtoRB(key4).Training Image StreamLabel StreamCheckpoint StreamCodeIVImage (1/2)TagIVImage (2/2)TagTraining Image StreamLabel Streamkey0key1key2key3Output Streamkey4

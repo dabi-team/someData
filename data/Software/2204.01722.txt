@@ -1,0 +1,2089 @@
+2
+2
+0
+2
+
+y
+a
+M
+4
+2
+
+]
+S
+M
+
+.
+s
+c
+[
+
+3
+v
+2
+2
+7
+1
+0
+.
+4
+0
+2
+2
+:
+v
+i
+X
+r
+a
+
+Performance-Portable Solid Mechanics via
+Matrix-Free p-Multigrid
+
+Jed Brown
+University of Colorado, Boulder
+jed@jedbrown.org
+
+Valeria Barra
+California Institute of Technology
+valeria@caltech.edu
+
+Natalie Beams
+University of Tennessee
+nbeams@icl.utk.edu
+
+Leila Ghaffari
+University of Colorado, Boulder
+leila.ghaffari@colorado.edu
+
+Matthew Knepley
+University of Buffalo
+knepley@gmail.com
+
+William Moses
+Massachusetts Institute of Technology
+wmoses@mit.edu
+
+Rezgar Shakeri
+University of Colorado, Boulder
+rezgar.shakeri@colorado.edu
+
+Karen Stengel
+University of Colorado, Boulder
+karen.stengel@colorado.edu
+
+Jeremy L. Thompson
+University of Colorado, Boulder
+jeremy.thompson@colorado.edu
+
+Junchao Zhang
+Argonne National Laboratory
+jczhang@mcs.anl.gov
+
+Abstract—Finite element analysis of solid mechanics is a
+foundational tool of modern engineering, with low-order ﬁnite
+element methods and assembled sparse matrices representing
+the industry standard for implicit analysis. We use performance
+models and numerical experiments to demonstrate that high-
+order methods greatly reduce the costs to reach engineering
+tolerances while enabling effective use of GPUs; these data
+structures also offer up to 2x beneﬁt for linear elements. We
+demonstrate the reliability, efﬁciency, and scalability of matrix-
+free p-multigrid methods with algebraic multigrid coarse solvers
+through large deformation hyperelastic simulations of multiscale
+structures. We investigate accuracy, cost, and execution time
+on multi-node CPU and GPU systems for moderate to large
+models (millions to billions of degrees of freedom) using AMD
+MI250X (OLCF Crusher), NVIDIA A100 (NERSC Perlmutter),
+and V100 (LLNL Lassen and OLCF Summit), resulting in order
+of magnitude efﬁciency improvements over a broad range of
+model properties and scales. We discuss efﬁcient matrix-free
+representation of Jacobians and demonstrate how automatic
+differentiation enables rapid development of nonlinear material
+models without impacting debuggability and workﬂows targeting
+GPUs. The methods are broadly applicable and amenable to
+common workﬂows, presented here via open source libraries
+that encapsulate all GPU-speciﬁc aspects and are accessible
+to both new and legacy code, allowing application code to be
+GPU-oblivious without compromising end-to-end performance on
+GPUs.
+
+Index Terms—portable, scalable, implicit solvers, matrix-free,
+
+solid mechanics, HPC
+
+I. INTRODUCTION
+
+Solid mechanics simulations provide vital information for
+many engineering applications, using a large amount of
+computational resources from workstation to supercomputing
+scales. The industry standard for implicit analysis uses as-
+sembled sparse matrices with low-order elements, typically
+Q1 hexahedral and P2 tetrahedral elements [1], [2], with the
+linear systems solved using sparse direct solvers, algebraic
+multigrid, or multilevel domain decomposition. This approach
+has two fundamental inefﬁciencies: poor approximation accu-
+
+racy per Degree of Freedom (DoF) and high computational
+and memory cost per DoF due to choice of data structures
+and algorithms. High-order ﬁnite elements implemented in a
+matrix-free fashion with appropriate preconditioning strategies
+can overcome these inefﬁciencies.
+
+Solid mechanics models invariably have many stress sin-
+gularities due to boundary conditions and possible reentrant
+corners; therefore, h-reﬁnement with any ﬁnite element basis
+order p will converge at the same low-order of accuracy. Typi-
+cally, hp-adaptive methods [3] are used to resolve these singu-
+larities and enable geometric convergence. Such methods are
+available in niche commercial products such as StressCheck
+[4] as well as open source ﬁnite element libraries [5], [6],
+but are rarely used in production computational engineering.
+This is attributed to accuracy requirements and constant fac-
+tors: a low-order discretization can usually reach engineering
+tolerances with a coarse enough mesh that the modeling and
+implementation complexity of hp-adaptive methods are not
+justiﬁable, despite their clear asymptotic beneﬁt.
+
+Non-adaptive high order ﬁnite elements reduce complexity
+by being drop-in substitutes for low order elements if one can
+mesh the geometry more coarsely. Quadratic [7] and higher
+order [8] elements are often shown to be more accurate per
+DoF for large deformation analysis despite the presence of
+singularities preventing any asymptotic beneﬁt. However, such
+methods are rarely used due to high computation and memory
+costs for assembly and solution of the linear systems. Sparse
+matrices for high-order elements have more nonzero entries
+per DoF: a Q1 hexahedral element contributes 27 nodes per
+row while Q2 elements have an average of 64 nodes per
+row, so every sparse matrix-vector product is more than twice
+as expensive per DoF. Note that vertex separator size stays
+constant in h versus p reﬁnement to the same number of DoFs,
+so sparse direct solvers have the same size supernodes and thus
+asymptotic complexity [9], although the memory use and leaf
+cost increases. Meanwhile, algebraic multigrid (AMG) setup
+
+ 
+ 
+ 
+ 
+ 
+ 
+costs increase due to sparse matrix-matrix products, and the re-
+sulting solvers are observed to converge more slowly for high-
+order discretizations [10]–[12], even when using specialized
+methods [13]. A practical alternative to algebraic multigrid
+is p-multigrid [14], which is observed to be robust for ﬁnite
+element discretizations on unstructured meshes [11], [12] and
+pairs naturally with efﬁcient matrix-free data structures [15].
+Krylov solvers and preconditioners rely on matrix-vector
+operations that perform two ﬂoating point operations (FLOPs)
+per stored nonzero. For sparse matrix representations, each
+nonzero requires 12 bytes (or 16 if using 8-byte integers) to
+store double precision real values and their indices, yielding an
+arithmetic intensity [16] of 1 FLOP/6 bytes. Modern CPU and
+GPU hardware [17] provides upwards of 10 FLOPs per byte of
+memory streamed from DRAM or GPU device memory, and
+thus iterative sparse linear solvers saturate memory bandwidth
+at less than 2% of the device’s ﬂoating point peak. Fortunately,
+matrix-free methods [18]–[20] enable greatly reduced memory
+bandwidth requirements, often in exchange for modestly more
+FLOPs. In this new performance model, equipped with matrix-
+free p-multigrid methods and AMG coarse solvers, high-order
+methods become cheaper per DoF than low-order methods
+(assembled or not), enabling signiﬁcantly faster and cheaper
+simulations at engineering tolerances.
+
+In this paper, we demonstrate that high order methods
+improve accuracy per DoF for hyperelastic simulations of
+multiscale structures, even at coarse tolerances in the presence
+of singularities. We also demonstrate that such models can be
+solved robustly on a range of modern architectures at a fraction
+of the cost of per DoF of linear elements, using abstractions
+amenable to encapsulation and productive development. These
+beneﬁts are multiplicative, reducing the cost of implicit ﬁnite
+element analysis by up to an order of magnitude in terms appli-
+cable to existing analysis pipelines. This paper is organized as
+follows: section II introduces the hyperelastic formulation and
+ﬁnite element representation, section III describes the solver
+design and implementation, section IV investigates accuracy
+in terms of mesh resolution and number of DoFs, section V
+investigates efﬁciency per DoF and solver robustness, and
+section VI discusses implications and opportunities for further
+work.
+
+II. MATHEMATICAL MODEL
+
+A. Variational Form for Hyperelasticity
+
+In hyperelasticity, one seeks the displacement ﬁeld u(X)
+expressing the current (deformed) conﬁguration x = X + u
+in terms of the initial conﬁguration X. An isotropic Neo-
+Hookean material is deﬁned by its strain energy density
+
+ψ (e) =
+
+=
+
+λ
+2
+λ
+2
+
+(log J)2 − µ log J +
+
+µ
+2
+
+(trace b − 3)
+
+(log J)2 − µ log J + µ trace e,
+
+(1)
+
+where b = (∇X x)(∇X x)T is the left Cauchy-Green tensor,
+J = det (∇X x), µ and λ are the Lam´e parameters, and e is
+the Green-Euler strain tensor,
+
+(cid:16)
+
+1
+2
+
+1
+2
+
+e ≡
+
+(b − I) =
+
+∇X u + (∇X u)T + (∇X u) (∇X u)T (cid:17)
+For a domain Ω0 ⊂ R3 with boundary ∂Ω0 and the ﬁnite
+element space V ⊂ H 1 (Ω0), the variational problem ﬁnds a
+solution u ∈ V such that [10], [21]
+
+.
+
+(cid:90)
+
+Ω0
+
+(cid:124)
+
+∇xv : τ dV
+
+=
+
+(cid:123)(cid:122)
+a(v,u)
+
+(cid:125)
+
+(cid:90)
+
+Ω0
+
+v · ρ0g dV +
+
+(cid:90)
+
+∂Ω0
+
+v · ¯t dS ∀v ∈ V,
+
+(2)
+where ρ0 is the initial mass density, g is the body force per
+unit mass, ¯t is the prescribed traction, ∇x denotes spatial
+derivative with respect to the current conﬁguration, and τ is
+the Kirchhoff stress given by [22]
+
+τ =
+
+∂ψ
+∂e
+
+b = µ (b − I) + λ log J I
+
+= 2µ e + λ log J I.
+
+(3)
+
+In order to solve (2) using a Newton iteration algorithm, we
+
+need the Jacobian form of a (u, v) as [21]
+(cid:90)
+
+da (v, du; u) =
+
+∇xv :
+
+dτ − τ (∇x du)T (cid:17)
+(cid:16)
+
+dV,
+
+(4)
+
+where
+
+Ω0
+
+dτ − τ (∇x du)T = ∇x du τ + λ trace d(cid:15) I
+
++ 2 (µ − λ log J) d(cid:15),
+
+(5)
+
+with
+
+1
+2
+B. Matrix-free Finite Element Formulation
+
+∇x du + (∇x du)T (cid:17)
+
+d(cid:15) =
+
+(cid:16)
+
+.
+
+(6)
+
+The residual (2) and Jacobian (4) forms require derivatives
+with respect to (solution dependent) current conﬁguration x.
+For efﬁcient matrix-free discretization [23], [24], we pull these
+forms back to reference coordinates ξ by way of the chain
+(cid:1)(cid:105)
+rule ∇x(·) = ∂(·)
+, where the part in brackets
+∂ξ
+will move into the variational forms evaluated at quadrature
+points and ∇ξ = ∂
+∂ξ is applied by batched element algebra.
+We explain this approach for a general Dirichlet problem: ﬁnd
+u ∈ V0 such that
+(cid:90)
+
+(cid:104)(cid:0) ∂ξ
+∂X
+
+(cid:1)(cid:0) ∂X
+∂x
+
+(cid:104)v, f (u)(cid:105) =
+
+[v · f0 (u, ∇xu)
+
+Ω0
+
++ ∇xv : f1 (u, ∇xu)] dV = 0,
+
+∀v ∈ V0
+
+(7)
+
+(cf. (2) without traction, where f0 = −ρ0g and f1 = τ ). The
+discrete form of (7) is given by
+
+F (u) =
+
+(cid:88)
+
+(E e)T
+
+e
+
+(cid:34)(cid:12)
+(cid:12)
+(cid:12)
+(cid:12)
+(cid:12)
+
+(Be
+
+I )T W eΛ (f0 (ue, ∇xue))
+
++
+
+dim
+(cid:88)
+
+i=1
+
+(cid:0)Be
+
+x,i
+
+(cid:1)T
+
+W eΛ (f1 (ue, ∇xue))
+
+,
+
+(8)
+
+(cid:35)
+
+where Ee is the element e restriction operator that separates
+DoFs based on the elements they belong to, and Λ repre-
+sents pointwise function evaluation. The diagonal weighting
+(cid:16) ˆW ⊗ ˆW ⊗ ˆW
+W e = det (∇ξX) Λ
+are quadrature weights
+mapped to the physical element. Both f0 and f1 come from
+I E eu and
+the constitutive law and its tangent where ue = Be
+
+(cid:17)
+
+∇xue = (cid:2)Be
+
+x,i (E eu)(cid:3)dim
+
+i=1
+
+dim
+(cid:88)
+
+(cid:20)
+Bξ,j (E eu)
+
+=
+
+j=1
+
+(cid:21)
+
+,
+
+∂ξj
+∂x
+
+where u is the assembled solution vector, dim the dimension-
+ality of the problem (for our use cases dim = 3), and
+
+BI = BI ⊗ BI ⊗ BI , Bξ,1 = Bξ ⊗ BI ⊗ BI ,
+Bξ,2 = BI ⊗ Bξ ⊗ BI , Bξ,3 = BI ⊗ BI ⊗ Bξ,
+
+(9)
+
+are evaluations on reference elements written in terms of their
+one dimensional tabulations BI and Bξ of shape functions
+and their derivatives at quadrature points. The representation
+(9) implies nine tensor contractions to compute a gradient, but
+this can be reduced to six by ﬁrst applying BI (3 contractions)
+and then applying ˆBξ,1 =
+⊗ I ⊗ I, and similarly
+for the other directional derivatives, where B†
+I is the pseudo-
+inverse satisfying B†
+I BI = I because BI has full column
+rank. Asymptotically fast structure can also be exploited for
+simplicial elements [25], [26], but
+the constants are large
+enough that direct assembly of the reference element gradient
+Bξ is preferred for the modest basis order considered here.
+
+BξB†
+I
+
+(cid:17)
+
+(cid:16)
+
+Pulling (8) back to reference coordinates, we have
+
+F (u) =
+
+(cid:88)
+
+(E e)T
+
+e
+
+(cid:21)T
+
+(cid:20)BI
+Bξ
+
+W eΛ
+
+(cid:16) ˆf0
+
+
+(cid:16) ˆf1
+
+(cid:16)
+
+(cid:16)
+
+ue, (cid:100)∇ξu
+ue, (cid:100)∇ξu
+
+e(cid:17)(cid:17)
+
+
+
+e(cid:17)(cid:17)
+
+ ,
+
+(10)
+
+where ˆf0
+
+(cid:16)
+
+ue,(cid:92)∇ξue
+
+(cid:17)
+
+= f0
+
+(cid:16)
+
+ue, (cid:100)∇ξu
+
+(cid:17)
+
+e
+
+∇xξ
+
+and
+
+(cid:16)
+
+ˆf1
+
+ue,(cid:92)∇ξue
+
+(cid:17)
+
+= (∇xξ)T f1
+
+(cid:16)
+
+ue, (cid:100)∇ξu
+
+e
+
+∇xξ
+
+(cid:17)
+
+.
+
+= BξE eu,
+
+While this interface brings the isoparametric mapping into
+quadrature functions, the work outside these quadrature rou-
+tines shares the same data and can be batched over elements
+e
+(cid:100)∇ξu
+leading to improved vectorization and
+data reuse. Moreover, this abstraction provides ready access
+to element
+in stabilized methods
+for transport-dominated processes [27]) and allows optimized
+data representations, such as bypassing initial conﬁguration
+because (5) can be evaluated strictly in current conﬁguration,
+a technique equivalent to that of [10].
+
+length measures (useful
+
+The Jacobian action can be computed [23] similar to the
+
+residual (10),
+
+J du =
+
+(cid:88)
+
+(E e)T
+
+e
+
+(cid:21)T
+
+(cid:20)BI
+Bξ
+
+W eΛ
+
+(cid:20) ˆf0,0
+ˆf1,0
+
+(cid:21)
+
+ˆf0,1
+ˆf1,1
+
+(cid:21) (cid:20)BI
+Bξ
+
+E e du
+
+(11)
+
+libCEED composes local (L-vector to L-vector) operations from
+Fig. 1.
+element restriction E, basis B, and quadrature-point functions D. A T-
+vector represents the non-overlapping parallel partition of DoFs, as needed
+by nonlinear and linear algebraic solvers. The L-vector is localized per
+device (e.g., MPI rank or GPU context) with any ghost values replicated into
+each part. The E-vector (restricted to elements) and Q-vector (evaluated to
+quadrature points) exist only conceptually in our optimized implementation,
+since restriction E, basis B, and user-provided quadrature function D are
+fused into one kernel.
+
+where
+
+ˆfi,0 =
+
+(cid:16)
+
+∂ ˆfi
+
+ue,(cid:92)∇ξue
+∂ue
+
+(cid:17)
+
+,
+
+ˆfi,1 =
+
+∂ ˆfi
+
+(cid:17)
+
+(cid:16)
+
+ue,(cid:92)∇ξue
+∂(cid:92)∇ξue
+
+.
+
+Since functional derivatives commute with pull backs, one
+could equivalently differentiate fi in physical space to produce
+fi,j, then pull back to ˆfi,j.
+
+C. libCEED Abstraction
+
+Systems of equations with the form (10) and (11) admit a
+natural implementation via libCEED [15], which provides fast
+algebra for element-based discretizations on CPUs and GPUs.
+Figure 1 illustrates the action of an arbitrary ﬁnite element
+operator,
+
+A = P T E T BT DBEP,
+
+(12)
+
+where P represents the parallel communication portion of the
+element restriction operator, E represents the local portion of
+the element restriction operator, B represents the basis action
+kernels that provide solution values and derivatives at the
+quadrature points given by BI and Bξ, and D (which may be
+linear or nonlinear) represents the pointwise representation of
+the weak form, given by ˆfi and ˆfi,j as well as the element
+quadrature weights W and geometric factors ∇ξX.
+
+III. SOLVER DESIGN
+
+A. Nonlinear and Iterative Solvers
+
+Large deformation solid mechanics exhibits both geometric
+and material nonlinearities, leading to path dependence by
+which there can be multiple static solutions for a speciﬁed
+set of boundary conditions. To disambiguate the multiple
+solutions, we solve (8) as a non-autonomous differential alge-
+braic equation of index 1, with boundary conditions/loading a
+function of time t ∈ [0, 1]. The examples in the present study
+use applied load (rather than displacement) and use backward
+Euler from the Portable, Extensible Toolkit for Scientiﬁc
+Computation (PETSc) [28], [29], with extrapolation-based hot
+
+1: Compute uk
+2: uk ← uk + ˆM −1 (b − Af uk)
+3: r = P T
+ctof (b − Af uk)
+4: Ace = r
+5: uk ← uk + Pctofe
+6: uk ← uk + ˆM −1 (b − Af uk)
+
+(cid:46) pre-smooth
+(cid:46) restrict the residual
+(cid:46) Solve on coarse grid
+(cid:46) prolong error correction
+(cid:46) post-smooth
+
+Fig. 2. The multigrid algorithm is applied recursively, with Galerkin coarse
+operator Ac = P T
+ctofAf Pctof constructed matrix-free until coarsening to
+linear elements, then via algebraic multigrid.
+
+starts disabled for simplicity. Each pseudo time step requires a
+nonlinear solve, which is implemented using PETSc’s Scalable
+Nonlinear Equations Solver (SNES). We consider Newton-CG
+and L-BFGS methods in which a multigrid V-cycle is used
+either as a preconditioner for conjugate gradients or as the
+“initial inverse Hessian” scaling for L-BFGS [30]. In both
+cases, we use a “critical point” line search, which supposes
+that the residual is the functional gradient of a latent objective
+function, F (u) = ∇uΨ(u) and uses one step of a secant
+method to ﬁnd α for which F (u + α du)T du = 0, where
+du is the search direction found by Newton or L-BFGS.
+This line search is inspired by the strong Wolfe conditions
+in optimization [31], but without explicit evaluation of the
+objective Ψ, which may not be available or may not exist
+(e.g., for non-conservative models).
+
+The linear solve and multigrid preconditioner uses PETSc’s
+Krylov Subspace (KSP) and Preconditioning (PC) tools. When
+using Newton-CG, each Newton step J du = −F (u) is
+solved to a relative tolerance of 10−3 in the natural norm. To
+clarify preconditioner robustness, we report condition number
+estimates for the preconditioned operator obtained from the
+tridiagonal matrix implied by the CG/Lanczos recurrence, with
+similar estimates of the maximum eigenvalue used in the
+Chebyshev smoothers.
+
+B. Matrix-free p-multigrid
+
+Multigrid methods provide an efﬁcient preconditioning
+framework for obtaining uniform convergence rates with re-
+spect to resolution and model extent. p-type multigrid, devel-
+oped by Ronquist and Patera [14], is sensibly independent of
+the number of elements and polynomial order of the element
+bases. In p-multigrid, the discretization is coarsened by re-
+ducing the polynomial order of the basis functions, in contrast
+to h-multigrid, where the mesh is coarsened by aggregating
+elements. p-multigrid is a natural ﬁt for high-order ﬁnite
+elements on unstructured meshes and can be implemented with
+operators represented in libCEED’s computationally efﬁcient
+form in (12).
+
+Figure 2 describes a standard V-cycle [32]. In this algorithm,
+Af is the operator on the ﬁne grid, Pctof is the coarse to ﬁne
+grid prolongation operator, and ˆM a separate preconditioner
+used for smoothing. We use the transpose of the prolongation
+operator as the ﬁne to coarse grid restriction operator to pre-
+serve symmetry and prevent aliasing. We deﬁne the smoother
+
+(and implicitly, ˆM ) as the 2nd order Chebyshev/Jacobi iter-
+ation targeting the range [0.1λmax, 1.1λmax], where λmax is
+the eigenvalue estimate computed by 10 Lanczos iterations
+applied to a “rough” seed vector during preconditioner setup.
+Prolongation is expressed within the libCEED abstraction of
+Figure 1 via
+
+P p
+
+f =
+
+(cid:88)
+
+(cid:1)T
+
+(cid:0)E e
+
+f
+
+Λ
+
+(cid:17)
+
+(cid:16)
+
+m−1
+f
+
+Be
+
+ctofE e
+c ,
+
+(13)
+
+e
+
+where Be
+ctof is the interpolation kernel from the lower order
+to the higher order ﬁnite element, deﬁned by (9), and mf =
+Ef E T
+f Ef is a pointwise scaling factor for the multiplicity of
+nodes shared between elements on the ﬁne grid.
+
+The Jacobian on each level is represented by the 17 scalar
+values per quadrature point, ∇xξ, τ , log J, and the quadrature
+weight, as used in (5) and (11); cf. Table IV. Coarse level
+discretizations are deﬁned using the same quadrature points
+and Jacobian representation with coarser basis functions,
+which is an exact Galerkin method. An alternative needing
+somewhat more memory, but less memory bandwidth to apply
+coarse operators, would be to rediscretize by re-evaluating the
+nonlinearity on a smaller set of quadrature points (sufﬁcient
+for the lower order polynomials of the coarse space). Note
+that coarsening from Q2 to Q1 elements reduces the number
+of DoFs by a factor of 8 and reduces the number of nonzeros
+per row (asymptotically on 3D models) by a factor of 64/27.
+When using direct solvers in 3D,
+this reduces the vertex
+separator by a factor of 4 and thus supernode factorization
+(the asymptotically dominant cost) by a factor of 64. When
+using algebraic multigrid, this reduces the number of nonzeros
+in an assembled matrix by nearly 20 times (thereby reducing
+AMG setup and smoothing cost) as well as typically improving
+convergence rates.
+
+C. Portability and productivity
+
+PDE-based models contain symmetry/conservation struc-
+to change by a limited subset of
+ture, which is subject
+stakeholders, and material models (extending (3)) requiring
+frequent extensions by scientists and engineers who are not
+sophisticated numerical analysts or software developers. It is
+thus important that materials developers have a simple, debug-
+gable environment for development and testing. libCEED [15]
+provides fast algebra for element-based computation on CPUs
+and GPUs, meant for easy embedding in existing applications
+and enabling high performance on multiple architectures (Fig-
+ure 3) from a single source code, with run-time selection of
+the backend.
+
+The CPU backends call conventionally compiled functions
+to apply residuals (10) and Jacobians (11) at quadrature
+points, thereby enabling a rich debugging experience. CPU
+backends implement the element action B using tensor con-
+tractions with architecture-speciﬁc vectorization (e.g., AVX
+intrinsics, LIBXSMM [33]). The GPU backends used in
+these experiments create a fused kernel containing the entire
+E T BT DBEu of (12). The source code for the application of
+the weak form at the quadrature points, D, is transformed
+
+length,
+
+to multiple ﬁnite elements summing into the same nonzero
+entries. PETSc’s new COO-based assembly avoids data races
+or atomics completely with new algorithms, and handles MPI
+parallelism. The classic COO format consists of three arrays,
+row[], col[], val[], of equal
+in which the
+assembled matrix A is deﬁned as the sum of each contribution
+val[k] to entry arow[k],col[k]. It is common in nonlinear
+and transient PDE solves that one needs to assemble a matrix
+with the same nonzero pattern but different numeric values.
+PETSc’s interfaces splits COO assembly into a symbolic
+MatSetPreallocationCOO in which the row[], col[]
+parts are provided, followed by one or more calls to MatSet-
+ValuesCOO in which the numeric array val[] is provided
+on-device.
+
+In MatSetPreallocationCOO, which is done on-host, we
+analyze the coordinates, exchange information about remote
+entries, ﬁnalize the sparsity pattern of diagonal and off-
+diagonal blocks, and preallocate memory for them on-device.
+This phase prepares to ignore negative indices (convenient
+for boundary conditions) and sum duplicate entries, as well
+as planning how to send remote entries to their destination,
+including which entries in val[] should be packed into
+send buffers. In both PETSc’s native and GPU formats as
+well as hypre’s ParCSR, matrices are distributed row-wise
+across processes with diagonal (intra-process coupling) and
+off-diagonal (inter-process coupling) blocks stored separately
+in CSR format. The arrays row[], col[] can be freed after
+the planning stage.
+
+The val[] array is populated on-device using a libCEED
+kernel that performs the BT DB portion of the operator (12)
+(cf. [41]) as a triple matrix product, formulated such that
+each thread accumulates contributions for a particular element-
+based non-zero without forming an intermediate matrix. When
+the number of basis nodes per element is low (up to and
+including Q2 hexahedra), a two-dimensional
+thread block
+processes the row and column combinations in an element’s
+output matrix; when this design would exceed the allowed
+number of threads per block, the assembly switches to a one-
+dimensional thread block with an additional loop in the kernel.
+Runtime compilation through NVRTC/hipRTC ensures that all
+loop bounds are compile-time constants. Each accumulated
+value is then assigned to the val[] array at a speciﬁed
+index determined by element and component ordering, and
+the ﬁnal array is provided to MatSetValuesCOO. Each entry
+(with nonnegative indices) is destined for the owned diagonal,
+owned off-diagonal block, or send buffer. The implementation
+ﬁrst calls a kernel to ﬁll the send buffer and initiate the
+MPI communication, two asynchronous kernels for nonze-
+ros in the diagonal and off-diagonal blocks, in which each
+thread accumulates into a single nonzero, and after completing
+communication, two similar kernels unpack entries from the
+receive buffer.
+
+Fig. 3.
+
+libCEED Backends
+
+into an appropriate CUDA or HIP device function to be
+called as part of the fused operator. The resulting kernel is
+compiled at runtime via NVRTC/hipRTC, inlining the above
+call and making loop bounds and memory access offsets
+compilation constants, thereby improving register allocation
+and performance. In this implementation, there is no difference
+in user code to run on the different architectures. Indeed,
+the target CPU or (AMD or NVIDIA) GPU may be selected
+at run-time and need not be uniform across an application.
+All architecture-speciﬁc code is contained within libCEED
+backends and within PETSc and hypre [34] numerical kernels
+that are entirely independent from the application.
+
+D. Parallelism and GPUs
+
+While libCEED provides fast algebra on individual CPUs
+and GPUs, it is important that all problem-sized data stay
+resident on GPUs thoughout the parallel solve. PETSc pro-
+vides matrix and vector operations on the GPU, including the
+Galerkin product P T
+ctofAf Pctof in algebraic multigrid setup,
+with ability to use external libraries like Kokkos [35] and hypre
+[34] as well as CUDA and ROCm vendor libraries. Com-
+munication and computation are overlapped where possible,
+with message packing taking place on the GPU along with
+persistent nonblocking sends and receives using GPU-aware
+MPI, all via the “star forest” [36] abstraction.
+
+Compressed sparse row (CSR) type matrices are desirable
+for algebraic multigrid setup and solves, and have historically
+been created by preallocating and adding values to logically
+dense blocks using PETSc’s MatSetValues,
+typically one
+block per element
+in a ﬁnite element computation. This
+interface keeps memory utilization low, but is too ﬁne-grained
+for efﬁcient computing on GPUs and requires a binary search
+to ﬁnd the insertion location in the CSR matrix.
+
+We have developed a new interface in PETSc, based on
+a split-phase COO speciﬁcation that enables efﬁcient GPU
+assembly with strong encapsulation. Previous literature [37]–
+[40] on GPU-based sparse matrix assembly, including those
+using COO format [40], used coloring, atomics, or avoid
+assembling the global matrix to get around data races related
+
+ApplicationPETScNek5000MFEMLibrarylibCEEDBackendsPureCAVXLIBXSMMOCCAPureCUDAPureHIPMAGMAHardwareCPUNVIDIAGPUAMDGPUFig. 4. Visualization of the deformed state and strain energy singularities
+on mesh A of Figure 5, reﬁned 3 times by splitting each hexahedron in 8
+without snapping to geometry, and solved using Q2 ﬁnite elements. There
+are physical singularities on the back surface (e.g., top-right corner) and non-
+physical singularities at the weak reentrant corners of the hole (which do not
+exist in the smooth model with exact cylinder).
+
+IV. ACCURACY
+
+A. Pareto optimality at engineering tolerances
+
+Real-world structural mechanics problems have numerous
+reentrant corners and Dirichlet (ﬁxed/clamped) to Neumann
+(free or applied traction) boundary condition transitions, each
+of which result in stress singularities. Geometric convergence
+can be attained for such problems using hp-adaptive ﬁnite
+element methods [3], but such methods are rare in indus-
+trial practice because adequate tolerances can be achieved
+on coarser meshes. This can be because the quantity of
+interest is not so sensitive or because unresolved features
+(beveling or bolts/washers) or physical yielding will alleviate
+the singularity in quantities of interest such as the von Mises
+stress. Using high order ﬁnite elements on coarse meshes with
+singularities exposes some nuance, which we explore by way
+of a representative example. Consider a unit cube with radius
+0.3 cylindrical hole, ﬁxed to a rigid boundary on one end
+and with applied tangential traction on the other. Figure 4
+shows the deformed state and strain energy function for a Neo-
+Hookean material with Young’s modulus 2.4 and Poisson ratio
+0.4, and applied traction of 0.2.
+
+We perform a convergence study using linear and high-
+order geometry meshes produced by Gmsh [42], which can
+generate arbitrary order curved meshes. Figure 5 shows the
+relative error in predicted total strain energy Ψ (reference value
+computed on a highly-resolved mesh) versus DoFs for h and
+p reﬁnement of the 36-element (3 layers deep) mesh evident
+in Figure 4 (mesh A) as well as a more resolved mesh B. We
+observe that p reﬁnement of very coarse meshes is the most
+efﬁcient path to accuracy. Our experience is consistent with
+
+Fig. 5. Accuracy study showing relative error in total strain energy Ψ versus
+DoFs for the bending experiment Figure 4 under both h reﬁnement (same
+shape) and p reﬁnement (same color) with low and high order geometry.
+The Pareto front is toward the lower left and we observe that h reﬁnement
+always moves away from optimality. The slope of h reﬁnement is the same
+for all meshes and solution orders. p reﬁnement is very efﬁcient so long as the
+geometry is at least quadratic, but causes errors to increase when p reﬁning
+on linear geometry due to resolution of the non-physical singularities.
+
+prior empirical studies [43] that a quadratic solution space can
+be paired with linear geometry, but we also ﬁnd that further
+p reﬁnement is actively harmful as non-physical singularities
+are resolved.
+
+When high order elements are used on the coarsest possible
+meshes (one element thick), the number of DoFs is often
+an order of magnitude less than would be required of linear
+elements to achieve the same accuracy. Therefore, high order
+methods have better accuracy constants (thus favoring p reﬁne-
+ment), and yet they are rarely used in practice, mainly because
+the assembly and linear algebra are so much more expensive
+(no improvement in asymptotics). Speciﬁcally, the FLOPs per
+DoF of naive matrix assembly for order p polynomial basis
+functions in d dimensions scales as (p + 1)2d (this can be
+reduced by specialized methods [44]) and the number of
+nonzeros per DoF in the assembled matrix scales with pd.
+The former was a historical bottleneck while the latter is
+fundamental given the high relative expense of data motion
+on modern hardware. In contrast, when applying operators
+matrix-free with quadrature-point data, the storage per DoF
+declines (and is asymptotically constant) with increasing order
+p. In the following sections, we show that solve costs decrease
+with increasing p using matrix-free p-multigrid and thus
+Figure 5 is in fact generous to the low-order methods.
+
+B. Schwarz Primitive extrusions under load
+
+Volumetric extrusions of triply periodic minimal surfaces
+have garnered interest during the additive manufacturing rev-
+olution for a range of applications from tissue membranes
+[45] to metallurgy [46]. We consider the Schwarz Primitive
+surface, which exhibits interesting geometric and material
+nonlinearities. Prior ﬁnite element analysis of such models
+[47] using voxelized meshes [48] found that about 30k low
+order (Abaqus C3D8R) elements were needed to achieve an
+engineering tolerance of 1%. We consider conformal meshes
+
+TABLE I
+RELATIVE ERRORS IN MAXIMUM X AND Y DISPLACEMENT AND STRAIN
+ENERGY FOR A THICKNESS 0.2 PRIMITIVE EXTRUSION WITH EXTENT
+(4, 3, 3). PERCENT ERRORS ARE CALCULATED WITH RESPECT TO A
+REFERENCE (ORDER 2, REFINEMENT 4, LAYERS 5). ERRORS UNDER 5%
+FOR ALL 3 METRICS ARE ITALICIZED. CONFIGURATIONS USED IN LATER
+STUDIES ARE BOLDED. MDOFS ARE PROVIDED FOR COMPARISON.
+
+Order
+
+Reﬁnement
+
+Layers
+
+Disp. X
+
+Disp. Y
+
+Strain MDoF
+
+% Error
+
+3
+3
+3
+2
+2
+2
+2
+1
+1
+1
+1
+
+3
+2
+1
+3
+3
+2
+2
+4
+3
+3
+2
+
+1
+1
+1
+5
+2
+2
+1
+5
+5
+2
+2
+
+0.42
+1.60
+1.31
+0.42
+0.60
+2.54
+3.85
+2.15
+6.67
+8.88
+22.62
+
+0.47
+1.09
+2.63
+0.33
+0.77
+2.64
+4.34
+2.94
+8.66
+11.52
+27.80
+
+0.90
+3.96
+10.90
+0.92
+1.07
+4.82
+6.15
+2.23
+7.36
+9.70
+25.22
+
+6.0
+1.5
+0.38
+7.3
+3.3
+0.84
+0.50
+4.0
+1.0
+0.50
+0.12
+
+Fig. 6. Extruded Schwarz Primitive surface under 12% compressive strain,
+colored by von Mises stress. The left wall is ﬁxed and a compressive force is
+applied to the facing surfaces on the right. The simulation used 2 reﬁnements,
+2 layers, thickness 0.2, and Q2 elements.
+
+that attain comparable accuracy with fewer DoF and much
+fewer elements. To generate such meshes, start with a 24-
+element 2D manifold mesh of a single unit cell embedded
+in 3D, replicated to the prescribed extent in each embedding
+dimension. This mesh is partitioned and distributed using
+ParMETIS,
+then reﬁned with new nodes projected to the
+closest point on the implicit surface
+
+cos 2πx + cos 2πy + cos 2πz = 0.
+
+The resulting manifold mesh is extruded normal to this
+surface to the prescribed thickness and number of layers.
+Figure 6 shows such a model loaded to about 12% strain
+on an extent (8, 8, 8) model with about 11.8 million DoF
+(MDoF). Larger and smaller models are created by changing
+the extent, keeping the applied surface traction constant so
+the deformation is similar. These models, which are available
+in PETSc-3.17, provide excellent tests for solvers since they
+exhibit all compressive and bending modes, nonlinearities are
+activated at local and global scale, coarsening is inherently
+unstructured, and scaling is done by making the domain larger
+while achieving the same accuracy tolerances, in contrast to
+the common practice of reﬁning a simpler domain to achieve
+unrealistically tight accuracy tolerances.
+
+Table I quantiﬁes the effect of mesh reﬁnement and number
+of layers on the accuracy of a solve with linear, Q2, and Q3
+elements, all with linear geometry. We see that the Q2 and
+Q3 solutions are more accurate per DoF than those with linear
+elements. Increasing the number of layers in the mesh helps
+decrease the relative error of the simulation; however, 1 or
+2 layers is sufﬁcient for both Q2 and Q3 elements to give
+solutions within typical engineering accuracy tolerances.
+
+V. PERFORMANCE
+
+A. Compute environments
+
+We present GPU-based results on LLNL’s Lassen, OLCF’s
+Summit and Crusher, and NERSC’s Perlmutter. Lassen and
+Summit are both IBM POWER9 machines with 4 and 6
+NVIDIA V100-SXM2 16 GiB GPUs per node, respectively.
+Crusher is an early-access machine with the same node archi-
+tecture as the upcoming Frontier. Each node has one 64-core
+AMD EPYC 7A53 CPU and connected via Inﬁnity fabric to
+4 AMD MI250X GPUs, each of which consists of two GCDs
+that appear as logically separate GPUs with 64 GiB each. The
+GCDs and GPUs are connected via high-bandwidth Inﬁnity
+fabric, and 4 Cray network interfaces are connected directly to
+the 4 (dual GCD) GPUs. Perlmutter, which is presently in early
+access, consists of nodes with one AMD EPYC 7763 CPU
+connected via PCIe-4.0 to 4 NVIDIA A100 40 GiB GPUs. The
+GPUs are connected to each other with NVLink-3 and each
+node has 2 Cray network interfaces connected to the CPU. To
+compare performance on these machines, we present achieved
+throughput (DoF/second) normalized by logical GPUs (each of
+which has similar power requirements). GPU-aware MPI was
+used on Lassen (Spectrum MPI) and Crusher (Cray MPI), but
+was disabled on Summit (Spectrum MPI; because results were
+slower) and Perlmutter (Cray MPI; because of bugs). Table II
+describes the environment used on each machine.
+
+This study used the open source packages PETSc-3.17
+[28], hypre-2.24 [34], [49], Kokkos-3.6 [35], ParMETIS 4.0.3
+[50], libCEED-0.10.1 [15], and Ratel-0.1 [51]. The numeri-
+cal experiments “preload” by doing a crude tolerance solve
+that is discarded before starting timers in order to provide
+consistent timing representative of longer-running simulations.
+For more accurate proﬁling of individual events, the proﬁled
+
+TABLE II
+ENVIRONMENT FOR EACH HPC MACHINE.
+
+Computer Modules and environment
+
+Crusher
+Summit
+Lassen
+Perlmutter
+
+cce/13.0.0, rocm/4.5.2, craype-accel-amd-gfx90a
+gcc/9.3.0, cuda/11.1.1
+clang/13.0.1-gcc-8.3.1, cuda/11.2.0
+gcc/11.2.0, cuda/11.5.0, cray-mpich/8.1.13, craype-accel-
+nvidia90, cpe-cuda
+
+runs include some unnecessary synchronization with the GPU,
+introducing a slight latency penalty to the smallest model sizes.
+
+B. Operator application efﬁciency
+
+In addition to using less memory, the matrix-free repre-
+sentation is much more efﬁcient per DoF to apply. Figure 7
+presents performance by varying the domain size (thus total
+number of DoFs) on a test that runs 3 Newton steps with
+500 iterations of CG per step (preconditioned by Jacobi).
+The ﬁgure reports timing for the matrix multiplication op-
+eration only. The assembled matrix for this model averages
+about 63 nonzeros per row (i.e., per DoF) and the empirical
+STREAM bandwidth on Lassen is 820 GB/s so we expect
+the matrix multiply to plateau at 820/(63 · 12) ≈ 1 GDoF/s
+if it was only streaming ﬂoat64 matrix entries and int32
+column indices, without any cost to communicate or access
+vectors. We see that it achieves nearly that and similar math
+shows that the high order discretizations (with more nonzeros
+per DoF) also nearly saturate the STREAM bandwidth. The
+matrix-free discretizations achieve much higher throughput
+because they store less data per DoF. This model at order
+2 has about 30 DoF per element and each element has 27
+quadrature points that must store 17 ﬂoat64 values each,
+resulting in about 140 B/DoF (including the vectors) for the
+matrix-free operator, and a predicted streaming peak of a
+bit under 6 GDoF/s. About half of that is achieved, with
+the discrepancy attributable to atomic writes, vector zeroing
+and copies/packing related to communication and boundary
+conditions, and the computation to compute gradients and
+apply the quadrature points operations.
+
+Note that latency is an ever-present specter, with efﬁciency
+still rising at the point when GPU memory capacity is reached.
+Moreover, many applications have strict time-to-solution re-
+quirements imposed by business, policy, or human timelines,
+and thus it is informative to report the time at which, say 80%
+of peak efﬁciency is achieved. In the subsequent section, we
+will place time on the x axis, allowing us to compare efﬁciency
+of different machines and different parallel scale.
+
+C. Nonlinear solves
+
+To test the efﬁciency of end-to-end nonlinear solves, we
+choose the model from Figure 6 with (nondimensionalized)
+parameters thickness 0.2, Young’s modulus 1, and Poisson
+ratio 0.3, ﬁxed to the left wall with a compressive traction of
+0.02 applied from the right. This produces approximately 12%
+
+Fig. 7.
+Parallel operator application efﬁciency running on Lassen with
+assembled aijcusparse and matrix-free shell operator representations. Note
+that shell becomes more efﬁcient as the order increases while aijcusparse
+becomes less efﬁcient. Both are latency-limited for smaller problem sizes
+(left side of the ﬁgure) and plateau as memory is ﬁlled for larger sizes. The
+aijcusparse cases run out of memory for smaller numbers of DoFs because
+high order methods yield many nonzeros per row.
+
+strain at every resolution, which is just shy of where plastic
+yielding occurs for photopolymer additively manufactured
+products of these models [47]. This model requires 5 to 7
+Newton iterations across the range of resolutions, with each
+linear solve needing 9 to 25 preconditioned CG iterations to
+converge to a relative tolerance of 10−3 in the natural norm,
+with CG condition number estimates from 9.5 to 61 (mostly
+less than 15 iterations and condition numbers less than 20;
+depending on the Newton step).
+
+We sweep through a range of Primitive model extents up to
+203 per node of Crusher (184 MDoF), solve each model, and
+plot efﬁciency versus time per Newton iteration for Q2 and Q3
+elements in Figure 8 and Figure 9. The Q2 model is as depicted
+in Figure 6 with 2 reﬁnements and 2 extruded layers, while the
+Q3 model uses only one extruded layer to achieve somewhat
+better accuracy; see Table I. In such plots, perfect weak scaling
+would have the 1-node and 8-node curves on top of each
+other, with strong scaling limits visible in the minimum time
+at which acceptable efﬁciency can be achieved. This human-
+centric ﬁgure is meant to assist the analyst with cloud or
+HPC access in choosing an efﬁciency-versus-time tradeoff. For
+example, one may look at Figure 9 and decide that under 2 s
+per Newton iteration (about 10 s for the total nonlinear solve)
+delivers an acceptable efﬁciency-time tradeoff. Examining the
+Perlmutter curve with about 3 MDoF/s/GPU at 2 s, the target
+problem would be scaled to about 6 MDoF/GPU. The 1-node
+and 8-node Perlmutter curves lie on top of each other here,
+indicating that one can solve a 24 MDoF problem on one node
+(4 GPUs) with the same efﬁciency as a 192 MDoF problem
+on 8 nodes. Note that AMG requires a deeper V-cycle for the
+larger problem size, but this latency impact is hidden at the 2 s
+solve time with Q3 elements. Compare with Figure 8, in which
+there is a slight efﬁciency penalty to the weak scaling since
+a greater fraction of the solve time is spent in AMG when
+using Q2 elements. The solve can be made somewhat faster
+by using more GPUs (with some drop in efﬁciency) or more
+
+105106107108Global DoFs0.00.51.01.52.02.53.03.54.0Efficiency (GDoF/s/GPU)Operator Application EfficiencyOrder12345Nodes1MatTypeshellaijcusparseFig. 8. Efﬁciency per Newton iteration versus time for Q2 ﬁnite elements
+using matrix-free Newton-Krylov with p-MG preconditioning and Boomer-
+AMG coarse solve. Problem sizes (in MDoF) are annotated for the minimum
+and maximum sizes for each host and number of nodes combination. The
+impact of latency is ever-present, with memory capacity limiting the right
+end of each curve.
+
+Fig. 11. Linear solve efﬁciency spectrum for Q2 ﬁnite elements using matrix-
+free Newton-Krylov with p-MG preconditioning and BoomerAMG coarse
+solve. The times and efﬁciencies are per Newton iteration. Problem sizes
+(in MDoF) are annotated for the minimum and maximum sizes for each host
+and number of nodes combination.
+
+Fig. 9. Efﬁciency per Newton iteration versus time for Q3 ﬁnite elements
+using matrix-free Newton-Krylov with p-MG preconditioning and Boomer-
+AMG coarse solve. Problem sizes (in MDoF) are annotated for the minimum
+and maximum sizes for each host and number of nodes combination. Ideal
+weak scaling is evident on Perlmutter for Newton step time above 1.8 s where
+the 1-node and 8-node curves coincide, while communication latency leads to
+degradation at the smallest problem sizes (2 MDoF/GPU with time around
+1 s).
+
+efﬁcient by using fewer GPUs (while needing to wait longer).
+Different architectures can readily be compared in this metric
+by normalizing the efﬁciency axis by energy (DoF/joule) or
+monetary (DoF/dollar) cost.
+
+Figure 10 depicts the relative costs and relationship of
+the major phases, with linear solve (KSPSolve) and pre-
+
+Fig. 10. Flame graph for a typical setup and solve with Q2 elements. The
+two dominant costs are preconditioner application (left half; part of the linear
+solve) and setup (center-right third). The coarse solve (Level 0 and above)
+takes about half the time of the ﬁne (Level 1) and coarse setup (AMG) takes
+more time than ﬁne p-MG setup, despite the ﬁne having 8x more DoF.
+
+Fig. 12. Linear solve efﬁciency spectrum for Q3 ﬁnite elements using matrix-
+free Newton-Krylov with p-MG preconditioning and BoomerAMG coarse
+solve. The times and efﬁciencies are per Newton iteration. Problem sizes
+(in MDoF) are annotated for the minimum and maximum sizes for each host
+and number of nodes combination.
+
+conditioner setup (PCSetUp) dominating. The linear solve
+(Figure 11 and 12) is communication-intensive since each
+preconditioner application goes through a V-cycle (with an
+increasing number of levels as the model gets larger).
+
+Figure 13 considers preconditioner setup, which consists of
+algebraic multigrid analysis and Galerkin products as well as a
+few Krylov iterations to calibrate the smoothers. Assembly of
+the coarse Jacobian (SNESJacobianEval; far-right yellow in
+Figure 10) exhibits nearly perfect problem-size independence
+at about 20–25 MDoF/s/GPU ( with Q2 elements) on Crusher
+and Perlmutter, and is thus always less than 20% overhead.
+The relative cost of Jacobian assembly and preconditioner
+setup both decrease when going to Q3 elements because the
+coarse problem is a smaller fraction of the ﬁne problem size.
+When solving transient problems or nonlinear problems by
+quasi-Newton methods,
+the preconditioner setup can often
+be reused across many solves and thus this phase becomes
+insigniﬁcant in comparison to the increasingly dominant linear
+solve. Although these ﬁgures show Newton-Krylov methods
+due to their familiar properties and diagnostics, we observe
+
+Schwarz-P Q2 with hypre/CUDAMatSetPre..PCApplyKSPSetUpPCSetUpMatM..TSJacobianEvalP..V..KSPSolvePCSetUpRate..KSPSolveSNE..Rate..MGRes..KSPSolveMatRe..PCApplyM..R..TSF..MatM..TSStepMG..PC..MGSmooth Level 1MGSetup Level 0MGSmooth Level 0SNESJacobianEvalRate..KSPSolveSNESSolveMatMultRatelJacobianAppMGSetup Level 1MatM..M..MatSetPr..TABLE III
+PRECONDITIONER ROBUSTNESS FOR STRETCHING EXPERIMENT.
+
+Order
+
+Preconditioner
+
+Thickness 0.2
+Cond
+Its
+
+Thickness 0.05
+Cond
+
+Its
+
+1
+1
+2
+2
+2
+2
+2
+3
+3
+3
+
+Hypre
+GAMG
+Hypre
+GAMG
+p-MG, Hypre
+p-MG, GAMG
+p-MG, Cholesky
+p-MG, Hypre
+p-MG, GAMG
+p-MG, Cholesky
+
+12
+19
+14
+32
+19
+12
+8
+15
+12
+9
+
+10
+26
+14
+72
+59
+10
+7
+18
+11
+8
+
+27
+111
+55
+293
+74
+105
+52
+62
+104
+48
+
+91
+942
+253
+6545
+475
+854
+436
+386
+818
+369
+
+Fig. 13. Preconditioner setup efﬁciency spectrum for Q2 ﬁnite elements using
+matrix-free Newton-Krylov with p-MG preconditioning and BoomerAMG
+coarse solve. The times and efﬁciencies are per Newton iteration. Problem
+sizes (in MDoF) are annotated for the minimum and maximum sizes for each
+host and number of nodes combination.
+
+up to 2x performance improvement when using L-BFGS as
+described in subsection III-A, and recommend testing it on
+representative problems.
+
+In general, we observe greater volatility in the “strong
+scaling” regime at the left edge of Figures 8 to 13. Most
+conﬁgurations reach high efﬁciency weak scaling (solid and
+dotted lines very close) as the problem size per GPU increases,
+leading to Newton solve times increasing to around 2 s and
+higher. This efﬁcient weak scaling is usually realized at smaller
+(faster) solves than where performance plateaus, indicating
+that 1-node architectural latencies are a more insidious per-
+formance obstacle than multi-node communication. Although
+Crusher exhibits a regime of efﬁcient scaling, the efﬁciency
+is not
+degrades at
+present on other machines and our proﬁling points to network
+degradation not identiﬁable in microbenchmarks (or smaller
+problem sizes) that we hope will be resolved in the MPI
+implementation or tuning. Speciﬁcally, the majority of the
+degradation is attributable to point-to-point messaging and
+Jacobian assembly communication that performance models
+indicate should be cheap relative to volume work because these
+huge subdomains have low surface area to volume ratio.
+
+the largest problem sizes. This effect
+
+D. Robustness
+
+We now explore under what circumstances the p-MG limits
+convergence versus when it is limited by the AMG coarse
+solve. In order to make direct solvers affordable, we consider
+the Primitive model with extent (8,2,2) under 0.001 tension
+and report the iteration count and condition number from
+the ﬁrst solve using Hypre, GAMG, and Cholesky. Table III
+investigates convergence for the mildly stretched elements in
+the original thickness 0.2 and more stretched in thickness
+0.05, both with two layers. We have ﬁxed solver parameters
+to be representative of problems with both well-shaped and
+stretched elements; better convergence on stretched models
+can be obtained by tuning threshold and smoothing parameters
+for the worst quality elements, at the expense of degraded
+convergence for better-shaped elements (left column).
+
+E. Usability via Automatic Differentiation
+
+Efﬁcient use of matrix-free methods requires quadrature-
+point based linearization (“partial assembly”) of forward (and
+possibly adjoint) operators. While many problems have struc-
+ture [10], [23] that can reduce the memory footprint and
+operation count, it can be tedious to ﬁnd these formulations
+and it is onerous to have to develop the nonlinear residual and
+Jacobian action synchronously. Automatic differentiation (AD)
+tools simplify this process, automating the Jacobian action so
+that only the nonlinear forward model needs to be written by a
+human. Enzyme [52] is a new LLVM plugin with GPU support
+that provides split forward and reverse mode AD on LLVM
+intermediate representation (IR).
+
+We investigate applicability and performance computing
+the Jacobian action using Enzyme’s new (version 0.0.29)
+split forward-mode capability to provide derivatives of Neo-
+Hookean models. Split mode populates a “tape”, which con-
+tains opaque intermediate values at quadrature points, and
+is stored in ordinary libCEED arrays (output from residual
+computation and input to Jacobian evaluation). The material
+model expressed in current conﬁguration (3) is too simple for
+this test so we include tests of the same model expressed
+in initial conﬁguration: the second Piola-Kirchhoff stress as
+a function of the Green-Lagrange strain, S(E). This model
+contains matrix inverses and thus its analytic derivative uses
+the identity dC−1 = −C−1 dC C −1, but this is not known
+to Enyzme. Enzyme identiﬁes a straightforward and relatively
+low-memory representation (small tape) given the provided
+structure, and the resulting vectorized code is on par with
+naive hand-written code that doesn’t exploit symmetries and
+cancellation. Table IV compares total solve time (over many
+steps) on a small cube mesh with 3630 DoF (ﬁts in cache,
+thus stresses ﬂops) on a single process of an AMD EPYC
+7452. The initial conﬁguration cases need to store initial
+conﬁguration geometry ∇X ξ and quadrature-weighted deter-
+minants W , while the current conﬁguration maps directly
+to the solution-dependent current conﬁguration ∇xξ. Since
+Enzyme is language-agnostic (by virtue of operating on LLVM
+IR), this opens the door to constitutive modeling in safer/more
+convenient languages, such as Rust and Julia, with no impact
+on execution performance or environment.
+
+TABLE IV
+PERFORMANCE FOR DIFFERENT JACOBIAN REPRESENTATIONS IN
+NEO-HOOKEAN HYPERELASTICITY. STORED VALUES BEFORE THE
+SEMICOLON ARE CONSTANT DATA WHILE THOSE AFTER ARE A
+BYPRODUCT OF RESIDUAL EVALUATION.
+
+Problem
+
+Storage
+
+Scalars
+
+Time (s)
+
+current
+initial native
+initial tuned ∇X ξ, W ; ∇X u, C−1, λ log J
+initial AD
+
+W ; ∇xξ, τ , λ log J
+∇X ξ, W ; ∇X u
+
+∇X ξ, W ; ∇X u, S, tape
+
+17
+19
+26
+31
+
+7.097
+11.556
+9.498
+10.661
+
+VI. DISCUSSION
+
+High order methods have thus far made little impact on
+industrial practice of structural engineering primarily due to
+performance consequences of traditional sparse matrix ab-
+stractions, which offer increasingly poor utilization of modern
+hardware. We have shown that this performance landscape
+is inverted by changing data structures to matrix-free repre-
+sentations with linearization deﬁned at quadrature points, for
+which high order methods are signiﬁcantly cheaper per DoF.
+The 1-node Crusher examples solve problems of similar size
+(hundreds of MDoF) and complexity to the implicit structural
+mechanics problems in the 2002 [53] and 2004 [54] Gordon
+Bell Prizes, which are still considered large in industrial and
+research structural mechanics practice. Our methods enable
+pragmatic use of Q2 and Q3 elements while delivering much
+faster time to solution. While we have focused our study
+here on problems of size less then 2 GDoF to maximize
+interpretability and relevance to practitioners, the algorithms
+are scalable to much larger problems and node counts.
+
+Similar structure has previously been exploited by [55]
+to reduce memory requirements by not storing the ﬁne-grid
+matrix for bone structure analysis, while still constructing
+prolongation operators for smoothed aggregation AMG pre-
+conditioning. This work was restricted to linear elasticity on
+voxelized meshes and the setup and solve time was somewhat
+longer than with standard assembled methods. Other recent
+work [10] (based on the fast matrix-free operators [56] in
+the deal.II library) used geometric h-multigrid for high order
+ﬁnite elements applied to hyperelasticity on CPUs, showing
+excellent performance for a matrix-free methods relative to as-
+sembled methods. In particular, the matrix-free iteration counts
+were found to be much smaller than AMG applied directly to
+the assembled high-order discretization, and each iteration was
+cheaper by virtue of the matrix-free data structures. In that
+work, the high order discretization was preserved on nested
+coarse grids, which limits applicability to problems with high
+geometric complexity. Non-nested geometric multigrid [57]–
+[59] could be extended to high order elements, but studies
+of such methods in complex geometry [58] have encountered
+robustness problems relative to algebraic multigrid.
+
+The matrix-free p-multigrid approach presented here offers
+the robustness of low-order algebraic multigrid with much
+higher efﬁciency per DoF and simulation time to reach en-
+gineering tolerances. The use of high order elements has
+
+the additional beneﬁt that coarser meshes can be used, thus
+reducing preprocessing time and I/O costs related to element
+topology, though it requires more attention to element quality
+at the mesh generation stage. We ﬁnd that quadratic geometry
+is often sufﬁcient for large deformation with quadratic and
+cubic solution spaces, and thus these methods can be used
+with existing meshing and visualization tools, though tailoring
+to p-version ﬁnite element efﬁciency [60] is beneﬁcial. When
+cubic and higher order meshes are needed, one can use Gmsh
+[42] to generate arbitrary order meshes, but many popular
+mesh formats support at most second order elements and there
+is a need for improving data representation standards and
+postprocessing/visualization tools to better support high order
+geometry and solution ﬁelds [61]–[63].
+
+We ﬁnd that the algorithms here provide substantial beneﬁt
+already for quadratic elements, and thus is a viable drop-
+in technique any time quadratic geometry can be used, and
+sometimes even for linear geometry elements. One can switch
+from linear to quadratic elements on the same mesh for
+about double the cost, despite 8 times more DoFs. The
+method is applicable for almost any problem in which the
+coarsest geometry-resolving mesh is not accurate enough for
+simulation with linear elements. Despite equivalent asymptotic
+convergence in the presence of singularities for high order
+methods,
+the combination of constants for approximation
+and algorithmic implementation efﬁciency often leads to an
+order of magnitude reduction in cost to reach engineering
+tolerances, offering a transformative opportunity to make batch
+simulations interactive and greatly expand the use and ﬁdelity
+of solid mechanics simulation in science and industry. While
+the methods require revisiting the traditional centrality of
+sparse matrices for implicit ﬁnite element analysis, most of the
+algorithmic structure remains intact (with a new economy that
+inverts key instances of conventional wisdom to enable further
+efﬁciency gains). Note that libCEED was designed for use in
+legacy software; adoption by conventional CPU-based implicit
+FEA software is mostly a matter of calling material models
+in libCEED Q-functions and modest data structure abstraction
+in the solver via standard interfaces provided by PETSc and
+similar libraries.
+
+One limitation to the matrix-free p-multigrid technique
+is that Chebyshev/Jacobi smoothing degrades for highly
+stretched elements, such as appear in volumetric discretiza-
+tions of shell structures. One needs either semi-coarsening or
+block/line smoothers to make multigrid convergence uniform
+on such models, neither of which is especially convenient in
+the present framework. We note that shell structures usually
+have small vertex separators and thus direct solvers and
+parallel adaptive BDDC solvers such as PETSc’s PCBDDC
+[64] offer sharp convergence guarantees at manageable cost.
+
+ACKNOWLEDGMENT
+
+This research is supported by the Exascale Computing
+Project (17-SC-20-SC), a collaborative effort of two U.S.
+Department of Energy organizations (Ofﬁce of Science and
+the National Nuclear Security Administration) responsible for
+
+the planning and preparation of a capable exascale ecosys-
+tem,
+including software, applications, hardware, advanced
+system engineering and early testbed platforms, in support
+of the nation’s exascale computing imperative. This research
+is supported by the U.S. Department of Energy, Ofﬁce of
+Science, Ofﬁce of Advanced Scientiﬁc Computing Research
+under contract DE-AC02-06CH11357 and Award Number
+DE-SC0016140. The authors acknowledge support by the
+Department of Energy, National Nuclear Security Administra-
+tion, Predictive Science Academic Alliance Program (PSAAP)
+under Award Number DE-NA0003962. This research used
+resources of the Oak Ridge Leadership Computing Facility
+at the Oak Ridge National Laboratory, which is supported by
+the Ofﬁce of Science of the U.S. Department of Energy under
+Contract No. DE-AC05-00OR22725. This research used re-
+sources of the Livermore Computing Facility at the Lawrence
+Livermore National Laboratory. This research used resources
+of the National Energy Research Scientiﬁc Computing Center,
+which is supported by the Ofﬁce of Science of the U.S. Depart-
+ment of Energy under Contract No. DE-AC02-05CH11231.
+We thank PETSc, hypre, and libCEED developers, especially
+Mark Adams, Barry Smith, Stefano Zampini, Victor Paludetto
+Magri, Veselin Dobrev, Yohann Dudouit, and Tzanio Kolev, for
+collaboration on software development and algorithmic tuning.
+This research used Paraview, Seaborn, Matplotlib, and Pandas
+for data analysis and visualization.
+
+REFERENCES
+
+[1] Simulia Dassault Systemes. Abaqus Standard. https://www.3ds.com/
+products-services/simulia/products/abaqus/abaqusstandard/, 2021.
+[2] Ansys. Ansys Mechanical. https://www.ansys.com/products/structures/
+
+ansys-mechanical, 2021.
+
+[3] Ivo Babuˇska and Manil Suri. The p and h − p versions of the
+ﬁnite element method, basic principles and properties. SIAM Review,
+36(4):578–632, 1994.
+
+[4] ESRD.
+
+StressCheck Professional.
+
+https://www.esrd.com/products/
+
+stresscheck-professional/, 2021.
+
+[5] Wolfgang Bangerth and Oliver Kayser-Herold. Data structures and
+requirements for hp ﬁnite element software. ACM Transactions on
+Mathematical Software (TOMS), 36(1):1–31, 2009.
+
+[6] P. Frauenfelder and C. Lage. Concepts—An Object-Oriented Software
+Package for Partial Differential Equations. Mathematical Modelling and
+Numerical Analysis, 36(5):937–951, 2002.
+
+[7] Teseo Schneider, Yixin Hu, Xifeng Gao, J´er´emie Dumas, Denis Zorin,
+and Daniele Panozzo. A large-scale comparison of tetrahedral and
+hexahedral elements for solving elliptic pdes with the ﬁnite element
+method. ACM Transactions on Graphics, 41(3), mar 2022.
+
+[8] Alexander D¨uster, Stefan Hartmann, and Ernst Rank. p-fem applied
+to ﬁnite isotropic hyperelastic bodies. Computer Methods in Applied
+Mechanics and Engineering, 192(47-48):5147–5166, 2003.
+
+[9] A. George, J. Liu, and E. Ng. Computer Solution of Sparse Linear
+
+Systems. Oak Ridge National Laboratory, 1994.
+
+[10] Denis Davydov, Jean-Paul Pelteret, Daniel Arndt, Martin Kronbichler,
+and Paul Steinmann. A matrix-free approach for ﬁnite-strain hypere-
+International Journal for
+lastic problems using geometric multigrid.
+Numerical Methods in Engineering, 121(13):2874–2895, 2020.
+
+[11] Daniel Weber, Johannes Mueller-Roemer, Christian Altenhofen, Andr´e
+Stork, and Dieter Fellner. Deformation simulation using cubic ﬁnite
+elements and efﬁcient p-multigrid methods. Computers & Graphics,
+53:185–195, 2015.
+
+[12] Hari Sundar, Georg Stadler, and George Biros. Comparison of multi-
+grid algorithms for high-order continuous ﬁnite element discretizations.
+Numerical Linear Algebra with Applications, 22(4):664–680, 2015.
+
+[13] JJ Heys, TA Manteuffel, Steve F McCormick, and LN Olson. Algebraic
+multigrid for higher-order ﬁnite elements. Journal of Computational
+Physics, 204(2):520–532, 2005.
+
+[14] Einar M Rønquist and Anthony T Patera. Spectral element multigrid.
+I. formulation and numerical results. Journal of Scientiﬁc Computing,
+2(4):389–406, 1987.
+
+[15] Jed Brown, Ahmad Abdelfattah, Valeria Barra, Natalie Beams, Jean-
+Sylvain Camier, Veselin Dobrev, Yohann Dudouit, Leila Ghaffari, Tzanio
+Kolev, David Medina, et al. libceed: Fast algebra for high-order element-
+based discretizations. Journal of Open Source Software, 6(63):2945,
+2021.
+
+[16] Samuel Williams, Andrew Waterman, and David Patterson. Rooﬂine:
+an insightful visual performance model for multicore architectures.
+Communications of the ACM, 52(4):65–76, 2009.
+
+[17] Karl Rupp. CPU-GPU-MIC comparision charts. https://github.com/
+
+karlrupp/cpu-gpu-mic-comparison, 2020.
+
+[18] Tzanio Kolev, Paul Fischer, Misun Min, Jack Dongarra, Jed Brown,
+Veselin Dobrev, Tim Warburton, Stanimire Tomov, Mark S. Shephard,
+Ahmad Abdelfattah, Valeria Barra, Natalie Beams, Jean-Sylvain Camier,
+Noel Chalmers, Yohann Dudouit, Ali Karakus, Ian Karlin, Stefan
+Kerkemeier, Yu-Hsiang Lan, David Medina, Elia Merzari, Aleksandr
+Obabko, Will Pazner, Thilina Rathnayake, Cameron W. Smith, Lukas
+Spies, Kasia Swirydowicz, Jeremy Thompson, Ananias Tomboulides,
+and Vladimir Tomov. Efﬁcient exascale discretizations: High-order ﬁnite
+element methods. International Journal of High Performance Computing
+Applications, 2021.
+
+[19] Ahmad Abdelfattah, Valeria Barra, Natalie Beams, Ryan Bleile, Jed
+Brown, Jean-Sylvain Camier, Robert Carson, Noel Chalmers, Veselin
+Dobrev, Yohann Dudouit, Paul Fischer, Ali Karakus, Stefan Kerkemeier,
+Tzanio Kolev, Yu-Hsiang Lan, Elia Merzari, Misun Min, Malachi
+Phillips, Thilina Rathnayake, Robert Rieben, Thomas Stitt, Ananias
+Tomboulides, Stanimire Tomov, Vladimir Tomov, Arturo Vargas, Tim-
+othy Warburton, and Kenneth Weiss. GPU algorithms for efﬁcient
+exascale discretizations. Parallel Computing, 108:102841, 2021.
+
+[20] Dave A. May, Jed Brown, and Laetitia Le Pourhiet.
+
+pTatin3D:
+High-performance methods for long-term lithospheric dynamics.
+In
+Proceedings of SC14: International Conference for High Performance
+Computing, Networking, Storage and Analysis. ACM, 2014.
+
+[21] Arash Mehraban, Jed Brown, Henry Tufo, Jeremy Thompson, Rezgar
+Shakeri, and Richard Regueiro. Efﬁcient parallel scalable matrix-free
+3d high-order ﬁnite element simulation of neo-hookean compressible
+hyperelasticity at ﬁnite strain. In ASME International Mechanical Engi-
+neering Congress and Exposition, volume 85680, page V012T12A027.
+American Society of Mechanical Engineers, 2021.
+
+[22] Gerhard A Holzapfel. Nonlinear solid mechanics: a continuum approach
+
+for engineering science. Meccanica, 37(4):489–490, 2002.
+
+[23] Jed Brown. Efﬁcient nonlinear solvers for nodal high-order ﬁnite
+elements in 3D. Journal of Scientiﬁc Computing, 45(1-3):48–63, 2010.
+[24] M. G. Knepley, J. Brown, K. Rupp, and B. F. Smith. Achieving
+high performance with uniﬁed residual evaluation. arXiv:1309.1204,
+September 2013.
+
+[25] Robert C Kirby. Fast simplicial ﬁnite element algorithms using Bernstein
+
+polynomials. Numerische Mathematik, 117(4):631–652, 2011.
+
+[26] Jesse Chan and T. Warburton. GPU-accelerated Bernstein–B´ezier
+discontinuous Galerkin methods for wave problems. SIAM Journal on
+Scientiﬁc Computing, 39(2):A628–A654, 2017.
+
+[27] Thomas J R Hughes, Guglielmo Scovazzi, and Tayfun E Tezduyar. Sta-
+bilized methods for compressible ﬂows. Journal of Scientiﬁc Computing,
+43:343–368, 2010.
+
+[28] Satish Balay, Shrirang Abhyankar, Mark F. Adams, Steven Benson, Jed
+Brown, Peter Brune, Kris Buschelman, Emil Constantinescu, Lisan-
+dro Dalcin, Alp Dener, Victor Eijkhout, William D. Gropp, V´aclav
+Hapla, Tobin Isaac, Pierre Jolivet, Dmitry Karpeev, Dinesh Kaushik,
+Matthew G. Knepley, Fande Kong, Scott Kruger, Dave A. May,
+Lois Curfman McInnes, Richard Tran Mills, Lawrence Mitchell, Todd
+Munson, Jose E. Roman, Karl Rupp, Patrick Sanan, Jason Sarich,
+Barry F. Smith, Stefano Zampini, Hong Zhang, Hong Zhang, and
+Junchao Zhang. PETSc/TAO users manual. Technical Report ANL-
+21/39 - Revision 3.17, Argonne National Laboratory, 2022.
+
+[29] Richard Tran Mills, Mark F. Adams, Satish Balay, Jed Brown, Alp
+Dener, Matthew Knepley, Scott E. Kruger, Hannah Morgan, Todd
+Munson, Karl Rupp, Barry F. Smith, Stefano Zampini, Hong Zhang,
+and Junchao Zhang. Toward performance-portable PETSc for GPU-
+based exascale systems. Parallel Computing, 108:102831, 2021.
+
+[51] Jed Brown, Rezgar Shakeri, Karen Stengel, and Jeremy L. Thompson.
+Ratel: Extensible, performance-portable solid mechanics, 2022.
+[52] William S. Moses, Valentin Churavy, Ludger Paehler, Jan H¨uckelheim,
+Sri Hari Krishna Narayanan, Michel Schanen, and Johannes Doerfert.
+Reverse-mode automatic differentiation and optimization of gpu kernels
+via enzyme. In Proceedings of the International Conference for High
+Performance Computing, Networking, Storage and Analysis, SC ’21,
+New York, NY, USA, 2021. Association for Computing Machinery.
+[53] Manoj Bhardwaj, Kendall Pierson, Garth Reese, Tim Walsh, David Day,
+Ken Alvin, James Peery, Charbel Farhat, and Michel Lesoinne. Salinas:
+A scalable software for high-performance structural and solid mechanics
+simulations. In SC’02: Proceedings of the 2002 ACM/IEEE Conference
+on Supercomputing, pages 35–35. IEEE, 2002.
+
+[54] Mark F Adams, Harun H Bayraktar, Tony M Keaveny, and Panayiotis
+Papadopoulos. Ultrascalable implicit ﬁnite element analyses in solid
+In SC’04:
+mechanics with over a half a billion degrees of freedom.
+Proceedings of the 2004 ACM/IEEE Conference on Supercomputing,
+pages 34–34. IEEE, 2004.
+
+[55] Peter Arbenz, G Harry van Lenthe, Uche Mennel, Ralph M¨uller, and
+Marzio Sala. A scalable multi-level preconditioner for matrix-free µ-
+ﬁnite element analysis of human bone structures. International Journal
+for Numerical Methods in Engineering, 73(7):927–947, 2008.
+
+[56] Martin Kronbichler and Katharina Kormann. A generic interface for
+parallel cell-based ﬁnite element operator application. Computers &
+Fluids, 63:135–147, 2012.
+
+[57] YT Feng, D Peri´c, and DRJ Owen. A non-nested galerkin multi-
+grid method for solving linear and nonlinear solid mechanics problems.
+Computer Methods in Applied Mechanics and Engineering, 144(3-
+4):307–325, 1997.
+
+[58] Mark Adams. Evaluation of three unstructured multigrid methods on 3d
+ﬁnite element problems in solid mechanics. International Journal for
+Numerical Methods in Engineering, 55(5):519–534, 2002.
+
+[59] Fande Kong and Xiao-Chuan Cai. A highly scalable multilevel Schwarz
+method with boundary geometry preserving coarse spaces for 3D
+elasticity problems on domains with complex geometry. SIAM Journal
+on Scientiﬁc Computing, 38(2):C73–C95, 2016.
+
+[60] Xiao-Juan Luo, Mark S Shephard, Robert M O’bara, Rocco Nastasia,
+and Mark W Beall. Automatic p-version mesh generation for curved
+domains. Engineering with Computers, 20(3):273–285, 2004.
+
+[61] Jean-Franc¸ois Remacle, Nicolas Chevaugeon, Emilie Marchandise, and
+Christophe Geuzaine. Efﬁcient visualization of high-order ﬁnite ele-
+International Journal for Numerical Methods in Engineering,
+ments.
+69(4):750–771, 2007.
+
+[62] GLVis: OpenGL ﬁnite element visualization tool. https://glvis.org.
+[63] M Rasquin, Koen Hillewaert, Francesco Bassi, Alessandro Colombo,
+F Massa, G Rahier, E Martin, and F Renac. I/o post-and co-processing
+In TILDA: Towards Industrial LES/DNS in
+for high-order methods.
+Aeronautics, pages 321–345. Springer, 2021.
+
+[64] Stefano Zampini. PCBDDC: a class of robust dual-primal methods in
+PETSc. SIAM Journal on Scientiﬁc Computing, 38(5):S282–S306, 2016.
+
+[30] Jed Brown and Peter Brune. Low-rank quasi-Newton updates for robust
+Jacobian lagging in Newton-type methods. In International Conference
+on Mathematics and Computational Methods Applied to Nuclear Science
+and Engineering, pages 2554–2565, 2013.
+[31] Jorge Nocedal and Stephen J. Wright.
+
+Numerical Optimization.
+
+Springer-Verlag, New York, 1999.
+
+[32] Achi Brandt. Guide to multigrid development. In Multigrid methods,
+
+pages 220–312. Springer, 1982.
+
+[33] Alexander Heinecke, Greg Henry, Maxwell Hutchinson, and Hans Pabst.
+Libxsmm: Accelerating small matrix multiplications by runtime code
+In Proceedings of the International Conference for High
+generation.
+Performance Computing, Networking, Storage and Analysis, SC ’16.
+IEEE Press, 2016.
+
+[34] Robert D Falgout, Ruipeng Li, Bj¨orn Sj¨ogreen, Lu Wang, and Ul-
+rike Meier Yang. Porting hypre to heterogeneous computer architectures:
+Strategies and experiences. Parallel Computing, 108:102840, 2021.
+[35] Christian R. Trott, Damien Lebrun-Grandi´e, Daniel Arndt, Jan Ciesko,
+Vinh Dang, Nathan Ellingwood, Rahulkumar Gayatri, Evan Harvey,
+Daisy S. Hollman, Dan Ibanez, Nevin Liber, Jonathan Madsen, Jeff
+Miles, David Poliakoff, Amy Powell, Sivasankaran Rajamanickam,
+Mikael Simberg, Dan Sunderland, Bruno Turcksin, and Jeremiah Wilke.
+Kokkos 3: Programming model extensions for the exascale era. IEEE
+Transactions on Parallel and Distributed Systems, 33(4):805–817, 2022.
+[36] Junchao Zhang, Jed Brown, Satish Balay, Jacob Faibussowitsch,
+Matthew Knepley, Oana Marin, Richard Tran Mills, Todd Munson,
+Barry F. Smith, and Stefano Zampini. The PetscSF scalable commu-
+nication layer. IEEE Transactions on Parallel and Distributed Systems,
+33, 2022.
+
+[37] Zhisong Fu, T James Lewis, Robert M Kirby, and Ross T Whitaker.
+Architecting the ﬁnite element method pipeline for the gpu. Journal of
+Computational and Applied Mathematics, 257:195–211, 2014.
+
+[38] Cris Cecka, Adrian J Lew, and Eric Darve. Assembly of ﬁnite element
+International Journal for Numerical
+
+methods on graphics processors.
+Methods in Engineering, 85(5):640–669, 2011.
+
+[39] GR Markall, A Slemmer, DA Ham, PHJ Kelly, CD Cantwell, and
+SJ3001216 Sherwin.
+Finite element assembly strategies on multi-
+core and many-core architectures. International Journal for Numerical
+Methods in Fluids, 71(1):80–97, 2013.
+
+[40] Adam Dziekonski, Piotr Sypek, Adam Lamecki, and Michal Mrozowski.
+Finite element matrix generation on a GPU. Progress In Electromag-
+netics Research, 128:249–265, 2012.
+
+[41] Matthew G. Knepley, Karl Rupp, and Andy R. Terrel. Finite element
+integration with quadrature on the GPU. arXiv:1607.04245, 2016.
+[42] Christophe Geuzaine and Jean-Franc¸ois Remacle. Gmsh: A 3-d ﬁnite
+element mesh generator with built-in pre-and post-processing facili-
+International Journal for Numerical Methods in Engineering,
+ties.
+79(11):1309–1331, 2009.
+
+[43] Xiaojuan Luo, Mark S Shephard, Jean-Franc¸ois Remacle, Robert M
+O’Bara, Mark W Beall, Barna A Szab´o, and Ricardo Actis. p-version
+mesh generation issues. In IMR, pages 343–354. Citeseer, 2002.
+[44] Jens M Melenk, Klaus Gerdes, and Christoph Schwab. Fully discrete
+hp-ﬁnite elements: Fast quadrature. Computer Methods in Applied
+Mechanics and Engineering, 190(32-33):4339–4364, 2001.
+
+[45] Sebastian C Kapfer, Stephen T Hyde, Klaus Mecke, Christoph H Arns,
+and Gerd E Schr¨oder-Turk. Minimal surface scaffold designs for tissue
+engineering. Biomaterials, 32(29):6875–6882, 2011.
+
+[46] Nesma T Aboulkhair, Marco Simonelli, Luke Parry, Ian Ashcroft,
+Christopher Tuck, and Richard Hague.
+3d printing of aluminium
+alloys: Additive manufacturing of aluminium alloys using selective laser
+melting. Progress in Materials Science, 106:100578, 2019.
+
+[47] Ian Maskery, Logan Sturm, Adedeji O Aremu, Ajit Panesar, Christo-
+pher B Williams, Christopher J Tuck, Ricky D Wildman, Ian A Ashcroft,
+and Richard JM Hague. Insights into the mechanical properties of sev-
+eral triply periodic minimal surface lattice structures made by polymer
+additive manufacturing. Polymer, 152:62–71, 2018.
+
+[48] Ian Maskery, LA Parry, D Padr˜ao, RJM Hague, and IA Ashcroft. Flatt
+pack: A research-focussed lattice design program. Additive Manufac-
+turing, 49:102510, 2022.
+
+[49] Allison H Baker, Tz V Kolev, and Ulrike Meier Yang.
+
+Improving
+algebraic multigrid interpolation operators for linear elasticity problems.
+Numerical Linear Algebra with Applications, 17(2-3):495–517, 2010.
+
+[50] George Karypis and Vipin Kumar. A parallel algorithm for multilevel
+graph partitioning and sparse matrix ordering. Journal of Parallel and
+Distributed Computing, 48:71–85, 1998.
+
+

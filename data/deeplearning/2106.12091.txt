@@ -1,0 +1,2077 @@
+1
+2
+0
+2
+
+n
+u
+J
+
+2
+2
+
+]
+
+C
+D
+.
+s
+c
+[
+
+1
+v
+1
+9
+0
+2
+1
+.
+6
+0
+1
+2
+:
+v
+i
+X
+r
+a
+
+BFTrainer: Low-Cost Training of Neural Networks on Unfillable
+Supercomputer Nodes
+
+Zhengchun Liu
+Argonne National Laboratory
+zhengchun.liu@anl.gov
+
+Michael E. Papka
+Argonne National Laboratory
+Northern Illinois University
+papka@anl.gov
+
+Rajkumar Kettimuthu
+Argonne National Laboratory
+kettimut@anl.gov
+
+Ian Foster
+Argonne National Laboratory
+The University of Chicago
+foster@anl.gov
+
+ABSTRACT
+Supercomputer FCFS-based scheduling policies result in many tran-
+sient idle nodes, a phenomenon that is only partially alleviated by
+backfill scheduling methods that promote small jobs to run before
+large jobs. Here we describe how to realize a novel use for these
+otherwise wasted resources, namely, deep neural network (DNN)
+training. This important workload is easily organized as many small
+fragments that can be configured dynamically to fit essentially any
+node×time hole in a supercomputer’s schedule. We describe how
+the task of rescaling suitable DNN training tasks to fit dynamically
+changing holes can be formulated as a deterministic mixed integer
+linear programming (MILP)-based resource allocation algorithm,
+and show that this MILP problem can be solved efficiently at run
+time. We show further how this MILP problem can be adapted to
+optimize for administrator- or user-defined metrics. We validate
+our method with supercomputer scheduler logs and different DNN
+training scenarios, and demonstrate efficiencies of up to 93% com-
+pared with running the same training tasks on dedicated nodes.
+Our method thus enables substantial supercomputer resources to
+be allocated to DNN training with no impact on other applications.
+
+KEYWORDS
+High-Performance Computing, Deep Learning, Scheduling, Re-
+source Management
+
+1 INTRODUCTION
+Supercomputers typically service requests for computational re-
+sources with policies that adhere roughly to first come first serve
+(FCFS) semantics. This approach inevitably results in idle nodes as
+larger tasks block subsequent tasks from executing. Backfilling [38],
+a strategy by which later tasks are promoted to run sooner if doing
+so does not delay other tasks, can improve efficiency, but substantial
+idle resources inevitably remain. For example, if tasks T1, T2, and
+T3 request 20%, 90%, and 50% of all nodes, respectively, FCFS will
+run these tasks sequentially, in that order, with the result that 80%
+and 10% of the machine is idle as T1 and T2 execute, respectively.
+If T3 requires less time than T1, then backfilling can promote it to
+run concurrently with T1, but substantial idle resources remain.
+
+Such unfillable nodes are common on leadership-class supercom-
+puters that operate under policies that prioritize large applications
+that cannot run on small clusters or would take so long as to be
+impractical: what is known as capability computing [3, 23, 28]. We
+
+refer to a node that the main scheduler does not use for (regular or
+backfilled) jobs as an idle node, and denote the set of all idle nodes
+at a particular time as N .
+
+We describe here how N can be used effectively for DNN train-
+ing, an activity that consumes growing numbers of compute re-
+sources in the cloud [30] and at supercomputer centers [45]. DNN
+training is malleable due to the data parallelism mechanism used
+to process a batch of data for gradient calculation, and can easily
+be rescaled as one needs to checkpoint only the model weights and
+(in the case of stateful optimizers) optimizer state. Indeed, deep
+learning frameworks such as AdaptDL [30], TorchElastic of Py-
+Torch [27], and Elastic Horovod [34] enable scaling up and down
+the number of workers dynamically at runtime with slight cost,
+without requiring a restart or resuming from checkpoints saved to
+durable storage.
+
+Our proposed BFTrainer leverages this malleability of DNN
+training to make optimal use of non-backfilled idle supercomputer
+nodes. Basically, BFTrainer collects idle nodes into a resource pool,
+N , from which it reallocates them for DNN training jobs (referred
+to as Trainers in the rest of the paper). The core idea is that because
+nodes in N can come and leave without any commitment, the use
+of BFTrainer does not affect jobs submitted to the main scheduler.
+That same characteristic makes it difficult for conventional HPC
+applications that are not malleable, and are expensive to migrate or
+checkpoint and restart, to use N effectively.
+
+BFTrainer may be used in two ways. In the first, a single user
+runs multiple Trainers: for example, for hyperparameter optimiza-
+tion (HPO) or neural architecture search (NAS). Here each user has
+an isolated BFTrainer instance and specifies a metric (e.g., aggre-
+gated throughput) for BFTrainer to allocate nodes optimally for
+their Trainers. To support multiple users or if a single user cannot
+consume all idle nodes, we can divide the entire supercomputer
+into several small clusters logically and have one BFTrainer for
+each small cluster to manage idle nodes for that cluster. In the sec-
+ond scenario, all users submit to a single BFTrainer instance; in
+this case, an administrator needs to propose a priority score (e.g.,
+efficiency) for BFTrainer to plan resource allocation optimally.
+
+Specific benefits of BFTrainer include the following:
+
+• Zero cost to jobs in the main scheduler: All Trainers
+running on idle nodes are fully preemptable at all times;
+thus, BFTrainer has no impact on other jobs.
+
+ 
+ 
+ 
+ 
+ 
+ 
+• Optimal elastic scheduling: A mathematical optimization
+model is used to identify node allocations for Trainers that
+are optimal given available information.
+
+• Customizable objective: Administrators or users can as-
+sign a metric, for example, throughput, scaling efficiency,
+or priority score, and BFTrainer will allocate resources to
+different Trainers to optimize the metric.
+
+The use of BFTrainer can deliver benefits to both supercom-
+puter centers and supercomputer users. For a supercomputer center,
+BFTrainer can increase the amount of computing performed; for
+users, assuming that their supercomputer center incentivizes the
+use of BFTrainer by reduced charges, it can reduce their costs if
+they are prepared to accept a less certain scheduling approach (e.g.,
+AWS spot instances provide a similar tradeoff). Note that depending
+on relative demand, BFTrainer may run slower or faster than the
+main queue.
+
+We next use Summit supercomputer logs to obtain quantitative
+data on the frequency of unfillable nodes (§2); define an MILP model
+for allocating nodes in N to Trainers (§3); introduce our experi-
+mental setup and evaluation metrics (§4); evaluate our resource
+allocation algorithm by replaying real traces with real DNN models
+(§5); review related work (§6); and conclude (§7).
+
+2 SITUATION IN PRACTICE
+Our first concern is the characteristics of idle nodes of modern
+supercomputers and the limitations of current implementations.
+Specifically, we want to answer the following questions before
+designing the resource allocation scheme: What is the quantity
+of idle nodes on average? Is it large enough to motivate having
+the BFTrainer? What is the typical lifetime of an idle node? How
+frequently does N change (nodes join and leave)?
+
+2.1 Idle-node characterization
+We studied idle nodes on Summit, a 4608-node supercomputer
+at Oak Ridge National Laboratory that uses IBM Spectrum Load
+Sharing Facility (LSF) as its batch scheduler. To identify idle nodes,
+we ran, every 10 seconds, the LSF jobstat command to identify
+jobs that are currently running or scheduled to run, and bslots
+to inspect backfill windows and identify currently idle nodes. We
+remove from the resulting list of idle nodes those listed as idle in
+the period between when one job releases a node and the next job
+starts to use that node (these usually appear only in one bslots
+record). We then generate events by removing records for which
+there is no change in N from one record to the next.
+
+We monitored the state of each node continuously for two months;
+see Tab. 1. Here we study the characteristics of the idle state of each
+node for the first two weeks that we will use for experiments in §4
+and §5. Integrating the number of nodes over time, we determined
+that Summit nodes are idle for a total of 137 639 node-hours over
+the two weeks, equivalent to 407 nodes or 8.6% of the whole ma-
+chine being idle for two weeks. For ease of reference, we refer to
+each change in the composition of N , whether by nodes joining
+and/or leaving, as an event. If multiple nodes join or leave N at the
+same time, we treat this as one event. We use fragment to represent
+a period during which a particular node is idle; thus, one physical
+node may lead to many fragments in the logs at different times.
+
+We identified 22 883 events (∼68 per hour), during two arbitrary
+weeks: 14 049 in which at least one node joined N (∼42 per hour)
+and 10 573 in which at least one node left N (∼31 per hour).
+
+Figure 1: Cumulative distribution of fragment length.
+
+Besides the frequency of the change to N , the length of frag-
+ments, which indicates the granularity of resources, is also impor-
+tant for the design of the resource allocation algorithm. Fig. 1 shows
+a cumulative distribution of the fragment length. We see that most
+idle node times are short: for example, about 58% of the fragments
+are idle less than 10 minutes. Although those short fragments ac-
+count for only a small portion of all idle resources in node×time
+(e.g., these 58% short node-spans contribute to only about 10% of
+total idle node×time), there is a static cost in scaling up applica-
+tions in order to make use of each node span. Moreover, because of
+the stochastic pattern of job submission and the uncertainties of
+wall-time estimation, we cannot know the size of fragment at the
+time when a node joins N . Thus, these short fragments may lead
+us to pay the rescaling cost to scale up Trainers when nodes join N
+and then soon be forced to scale down (with a cost) by preemption
+and end up with no progress on Trainers.
+
+Tab. 1 summarizes idle nodes on three leadership-class super-
+computers based on their scheduler logs. The number of idle nodes
+changes less frequently on Theta and Mira (both on full 2019 logs)
+than on Summit (2021 Feb. and Mar.), because the former machines
+constrain the minimum number of nodes that can be requested (128
+and 512 for Theta and Mira, respectively) in order to encourage
+large-scale jobs that cannot be run elsewhere [3, 23], whereas Sum-
+mit allows requests of a single node. Constraining the minimum
+number of nodes leads to fewer changes, but more idle resources.
+
+Table 1: Characteristics of resources that cannot be backfilled. INC/h
+and DEC/h indicate the average number of times per hour that idle
+nodes increased and decreased, respectively. eq-Nodes denotes the
+number of nodes that would need to be available continuously to
+deliver resources equal to the idle resources in node×time.
+
+System Duration INC/h DEC/h Ratio
+11.1%
+Summit
+12.5%
+Theta
+10.3%
+Mira
+
+2 months
+1 year
+1 year
+
+41.7
+6.3
+2.8
+
+28.6
+6.2
+2.4
+
+eq-Nodes
+524
+547
+5071
+
+These availability characteristics make it challenging to use such
+fragmented resources efficiently because there is always a cost
+to rescale/restart an application. For example, if scaling up a job
+takes 20 seconds and a job is running on 10 nodes, then adding one
+
+2
+
+10203040506090120Lifespan Length (minutes)020406080100Cumulative probability(%)024681001020304050By Node*TimeBy Countidle node to that job will result in 10 nodes waiting 20 seconds as
+the new node is initialized and integrated into the job: a cost of
+200 node-seconds. Thus, an efficient strategy is needed to decide,
+whenever N changes, whether and how to rescale each Trainer.
+
+Observation 1. On average, about 10% of nodes cannot be
+backfilled, a number that is larger on supercomputers that im-
+pose large minimum job sizes to encourage capability com-
+puting. Most idle fragments are short and contribute little
+node×time; for example, 58% are smaller than 10 minutes and
+contribute only 10% of total node×time on Summit. Short frag-
+ments are challenging to use because there is a fixed cost to
+rescale a running job and we cannot know fragment duration.
+
+2.2 Existing implementations
+The killable queue of Summit is a preemptable queue that allows
+jobs within a certain size constraint to request wall time of up
+to 24 hours. A job submitted to this queue become preemptable
+once it reaches the guaranteed runtime limit, which depends on job
+size. killable is beneficial to applications, including deep learning
+training, that can easily restart from a checkpoint. Assume a job (cid:98)𝐽
+submitted to the killable queue with size of (cid:98)𝑁 asking for a guar-
+anteed runtime of (cid:98)𝑇 started to run at time 𝑡=0. The key differences
+between killable and BFTrainer are as follows:
+
+(1) (cid:98)𝐽 can use only exactly (cid:98)𝑁 nodes, that is, any additional idle
+nodes from 𝑡=0 to (cid:98)𝑇 cannot be used even if (cid:98)𝐽 is malleable.
+(2) If any nodes that were allocated to (cid:98)𝐽 are not available after (cid:98)𝑇 ,
+the job will be killed instead of being rescaled or migrated.
+(3) BFTrainer collects all idle nodes into a N and allocates
+them to multiple Trainers so that the goal (e.g., utilization
+efficiency, aggregated throughput) is optimized.
+
+In summary, the scheduling strategies used on leadership-class
+systems to support capability computing unavoidably result in
+considerable idle but fragmented resources. BFTrainer is designed
+to improve the utilization of such systems without impacting the
+resources delivered to other jobs (whether currently in the queue
+or to be submitted in the future) by the main scheduler. Other
+utilization-improving solutions such as dynamic priorities between
+users and groups [2, 39] are complementary.
+
+3 MILP MODEL
+As noted in §2.1, nodes may join N at any time, without any com-
+mitment, and may leave N at any time, without warning. From
+the point of view of a Trainer, a preemption cost is unavoidable
+when one or more of the nodes that it is using leave, and there is
+always a cost when scaling a Trainer up or down. Thus, we face
+the challenge of determining an allocation of nodes to Trainers at
+each event or when a Trainer completes, in order to maximize the
+return (e.g., aggregated throughput).
+
+Fig. 2 demonstrates the rescaling decision choices that arise for
+a Trainer when nodes leave N at time 𝑇𝑒 , forcing some Trainers to
+scale down and thus creating a potentially suboptimal use of nodes.
+There are 𝐽 Trainers in BFTrainer, and for each we may do the
+following: (i) not change the number of nodes: incurs no rescaling
+cost; (ii) scale up (other Trainers must scale down to release nodes):
+incurs cost 𝑅𝑢𝑝 ; or (iii) scale down (will scale up others to use the
+
+Figure 2: The |Sj | decision choices that arise when rescaling a
+Trainer, shown here for the case |Sj |=7.
+
+𝑗
+
+..𝑁 𝑚𝑎𝑥
+𝑗
+
+released nodes): incurs cost 𝑅𝑑𝑤. The task is the same if nodes join
+N at time 𝑇𝑒 . Fig. 3 illustrates decisions that BFTrainer needs to
+make in different scenarios (two Trainers try to fill fragments out
+of 11 nodes). Since each Trainer can run on a number of nodes
+𝑛 𝑗 ∈ 𝑆 𝑗 = {0, 𝑁 𝑚𝑖𝑛
+}, where 𝑛 𝑗 = 0 corresponds to setting
+the Trainer to a “waiting” state, there are a total of |𝑆 𝑗 | decision
+choices for each Trainer. Although it is straightforward to quantify
+the gain and loss associated with each choice (i.e., the slope that
+denotes the rate of progress increases or decreases), the search space
+will be |𝑆1|×|𝑆2|. . . |𝑆𝐽 | (i.e., (cid:81)𝐽
+𝑗 =1|𝑆 𝑗 |) to find the optimal decision
+to maximize the total throughput of 𝐽 Trainers. This exponentially
+increasing search space leads us to seek a deterministic global
+optimization solution from mathematical programming solutions.
+
+Figure 3: Event-driven resource reallocation and rescaling. C: Con-
+tinue; P: Preemption; U: Upscaling; D: Downscaling. Black fill: main
+scheduler occupancy; White gap: rescaling/preemption cost.
+
+Linear programming (LP) is a technique for optimizing a linear
+objective function, subject to linear equality and linear inequality
+constraints. Mixed-integer linear programming (MILP), a subset of
+LP, involves problems in which some variables are constrained to
+be integers, while others may be nonintegers. A LP problem com-
+prises three elements: decision variables, quantities that need to be
+determined in order to solve the optimization problem; an objective
+function, which provides a criterion to be maximized or minimized;
+and constraints, which describe the limitations that restrict choices
+of decision variables. All constraints and the objective function
+must be linear and continuous in order to be solvable.
+
+Here, we optimize resource allocation by solving a MILP problem
+where the decision variable is the allocation of each node and the
+objective function is the metric (e.g., total throughput) to optimize.
+In practice, we solve a MILP whenever there is a change to N ,
+a Trainer completes, or a new Trainer is ready to run. We detail
+the three elements (decision variables, constraints, and objective
+function) of our MILP problem in §3.2, §3.3, and §3.4 respectively.
+
+3
+
+TeTe+RupTe+RdwTpTime ElapsedProgressnj=7nj=6nj=5nj=4nj=3nj=2nj=1nj=0Current, nj=4Scale UpScale DownJ2J1T1T2T3-2 n+1 n-1/+1 nUCPCPDPUDT4PU-2/+1 nNode3.1 Definition of Sets and Indices
+We represent the resources managed by BFTrainer by three sets:
+Nodes, N, is the set of idle nodes.
+Jobs, J, is the set of Trainers running in BFTrainer.
+Event, E, is the events (𝑒1, 𝑒2, . . . , 𝑒𝑖, . . .) in which nodes join and/or
+
+leave N at time 𝑇𝑒𝑖 .
+
+We represent a Trainer 𝑗, 𝑗 ∈ J by the following variables.
+𝑁 𝑚𝑖𝑛
+𝑗
+
+are the minimum and maximum number of nodes
+
+and 𝑁 𝑚𝑎𝑥
+𝑗
+on which Trainer 𝑗 can run.
+
+Job Scale, 𝑁 𝑗
+
+is the number of nodes on which Trainer 𝑗 is cur-
+
+rently running.
+
+Scale Up, 𝑅𝑢𝑝
+𝑗
+
+Throughput, 𝐴𝑡ℎ𝑟 , is a measure of application throughput: for
+deep learning model training, we use samples per second.
+is the time in seconds to scale up Trainer 𝑗; i.e., the
+time that 𝑁 𝑗 nodes sit idle as the new node(s) are prepared
+(clone current model and initialize data pipeline).
+
+Scale Down, 𝑅𝑑𝑤
+
+𝑗
+
+, the time in seconds to scale down Trainer 𝑗, is
+
+usually smaller than 𝑅𝑢𝑝
+𝑗
+
+.
+Objective Metric, 𝑂 𝑗 (cid:0)𝑁 𝑗 (cid:1), a function of Trainer scale (𝑁 𝑗 ), de-
+notes the gain (toward the objective) obtained per second
+if Trainer 𝑗 is run on 𝑁 𝑗 nodes. 𝑂 𝑗 (cid:0)𝑁 𝑗 (cid:1) is agnostic to weak
+or strong scaling. A Trainer can either fix global batch size
+by adjusting batch size per node or fix the batch per node
+with dynamic global batch. In the latter case, we assume that
+the user employs strategies, e.g., Adasum [25], for dynamic
+global batches.
+
+Values must be supplied for 𝑁 𝑚𝑖𝑛
+
+. The
+𝑗
+function 𝑂 𝑗 (cid:0)𝑁 𝑗 (cid:1) (e.g., throughput) can be determined by BFTrainer
+by experiment; alternatively, it can be provided by the user.
+BigM, 𝑀, is a sufficiently large constant (> |N |) used for modeling
+
+, and 𝑅𝑑𝑤
+
+, 𝑁 𝑚𝑎𝑥
+𝑗
+
+𝑗
+
+, 𝑅𝑢𝑝
+𝑗
+
+purposes.
+
+Nodes to Trainer map, 𝑐 𝑗𝑛, is a 2D binary matrix, indexed by 𝑗
+and 𝑛; each element is 1 iff node 𝑛 (𝑛 ∈ N ) is allocated for
+Trainer 𝑗 (𝑗 ∈ J ).
+
+3.2 Decision Variables
+The decision variable 𝑥 𝑗𝑛 is binary, with value 1 iff node 𝑛 is allo-
+cated for Trainer 𝑗. Basically, solving the MILP problem transfers
+𝑐 𝑗𝑛 to 𝑥 𝑗𝑛 to maximize the objective (gain integral) for each event
+𝑒 ∈ E; the number of nodes allocated to Trainer 𝑗 changes from
+
+𝑁 𝑚𝑎𝑥
+𝑗
+
+. Logically, it is equivalent to
+
+𝑁 𝑚𝑖𝑛
+≤ 𝑁 𝑗
+𝑗
+𝑁 𝑗 ≤ 𝑁 𝑚𝑎𝑥
+
+𝑗
+
+|| 𝑁 𝑗 = 0
+|| 𝑁 𝑗 = 0
+∀𝑗 ∈ J .
+
+(3)
+
+We then reformulate the nonlinear constraints described as
+
+Eqn. 3 into Eqn. 4 to satisfy the requirements of MILP:
+
+𝑗
+
+𝑁 𝑚𝑎𝑥
+𝑗
+
+𝑁 𝑗 ≥ 𝑁 𝑚𝑖𝑛
+
+− 𝑀𝑦𝑙
+𝑗 ,
+𝑁 𝑗 ≤ 𝑀(𝑖 − 𝑦𝑙
+𝑗 ),
+≥ 𝑁 𝑗 − 𝑀𝑦𝑢
+𝑗 ,
+𝑁 𝑗 ≤ 𝑀(1 − 𝑦𝑢
+𝑗 ),
+𝑗 ∈ {0, 1}, ∀𝑗 ∈ J,
+
+𝑗 , 𝑦𝑢
+𝑦𝑙
+
+(4)
+
+where 𝑦𝑙
+
+𝑗 and 𝑦𝑢
+
+𝑗 are auxiliary (binary) decision variables.
+
+3.3.2 Node allocation constraints. As each node can be allocated
+only to at most one Trainer, we have constraints
+
+𝑥𝑛
+𝑗 ≤ 1 ∀𝑛 ∈ N .
+
+∑︁
+
+𝑗 ∈ J
+
+(5)
+
+Job migration constraints. Since the migration of a Trainer
+3.3.3
+from one node to another will always introduce a cost and provides
+no benefit in this study, we include constraints to disallow it:
+
+𝑥 𝑗𝑛 ⊕ 𝑐 𝑗𝑛 =
+
+∑︁
+
+𝑛 ∈N
+
+∑︁
+
+(cid:12)
+(cid:12)
+(cid:12)
+(cid:12)
+(cid:12)
+𝑛 ∈N
+
+𝑥 𝑗𝑛 − ∑︁
+𝑛 ∈N
+
+𝑐 𝑗𝑛
+
+(cid:12)
+(cid:12)
+(cid:12)
+(cid:12)
+(cid:12)
+
+∀𝑗 ∈ J,
+
+(6)
+
+where ⊕ denotes the XOR (exclusive or) operation. Eqn. 6 is equiva-
+lent to
+
+∑︁
+
+𝑛 ∈N
+
+𝑥 𝑗𝑛 − ∑︁
+𝑛 ∈N
+
+𝑐 𝑗𝑛 ≥ ∑︁
+𝑛 ∈N
+
+𝑥 𝑗𝑛 ⊕ 𝑐 𝑗𝑛
+
+∑︁
+
+𝑛 ∈N
+
+𝑥 𝑗𝑛 − ∑︁
+𝑛 ∈N
+
+𝑐 𝑗𝑛 ≤ −
+
+(cid:32)
+
+∑︁
+
+𝑛 ∈N
+
+OR
+(cid:33)
+
+𝑥 𝑗𝑛 ⊕ 𝑐 𝑗𝑛
+
+∀𝑗 ∈ J,
+
+which can further be formulated as linear constraints
+
+∑︁
+
+𝑥 𝑗𝑛 − ∑︁
+𝑛 ∈N
+𝑐 𝑗𝑛 ≤ − ∑︁
+𝑛 ∈N
+
+𝑛 ∈N
+𝑥 𝑗𝑛 − ∑︁
+𝑛 ∈N
+
+𝑥 𝑗𝑛 ⊕ 𝑐 𝑗𝑛 − 𝑀𝑧 𝑗 ,
+
+𝑐 𝑗𝑛 ≥ ∑︁
+𝑛 ∈N
+𝑥 𝑗𝑛 ⊕ 𝑐 𝑗𝑛 + 𝑀(1 − 𝑧 𝑗 )
+
+∑︁
+
+𝑛 ∈N
+
+(7)
+
+(8)
+
+𝐶 𝑗 = ∑︁
+𝑛 ∈N
+
+𝑐 𝑗𝑛 ∀𝑗 ∈ J
+
+𝑁 𝑗 = ∑︁
+𝑛 ∈N
+
+𝑥 𝑗𝑛 ∀𝑗 ∈ J
+
+to
+
+after the event.
+
+3.3 Constraints
+3.3.1
+𝑁 𝑗 must satisfy 𝑁 𝑗 = 0 (i.e., the Trainer sits idle) or 𝑁 𝑚𝑖𝑛
+
+Job size constraints. The number of nodes allocated to Trainer
+≤ 𝑁 𝑗 ≤
+
+𝑗
+
+(1)
+
+(2)
+
+𝑧 𝑗 ∈ {0, 1}, ∀𝑗 ∈ J
+
+by introducing an auxiliary (binary) variable 𝑧 𝑗 ∈ {0, 1}.
+
+To reformulate the XOR operation of variable 𝑥 𝑗𝑛 and constant
+𝑐 𝑗𝑛, we define auxiliary variable 𝑢 𝑗𝑛 ∈ {0, 1}, ∀𝑗 ∈ J, ∀𝑛 ∈ N to
+represent 𝑥 𝑗𝑛 ⊕ 𝑐 𝑗𝑛, and introduce these constraints:
+
+𝑢 𝑗𝑛 ≤ 𝑥 𝑗𝑛 + 𝑐 𝑗𝑛
+𝑢 𝑗𝑛 ≥ 𝑥 𝑗𝑛 − 𝑐 𝑗𝑛
+𝑢 𝑗𝑛 ≥ 𝑐 𝑗𝑛 − 𝑥 𝑗𝑛
+𝑢 𝑗𝑛 ≤ 2 − 𝑥 𝑗𝑛 − 𝑐 𝑗𝑛
+𝑢 𝑗𝑛 ∈ {0, 1}, ∀𝑗 ∈ J, ∀𝑛 ∈ N .
+
+(9)
+
+4
+
+Thus, we get the final constraints to disallow Trainer migration
+
+by substituting 𝑢 𝑗𝑛 into Eqn. 8, leading to
+∑︁
+
+𝑛 ∈N
+
+𝑥 𝑗𝑛 − ∑︁
+𝑛 ∈N
+(cid:32)
+
+𝑐 𝑗𝑛 ≥ ∑︁
+𝑛 ∈N
+(cid:33)
+
+𝑢 𝑗𝑛 − 𝑀𝑧 𝑗 ,
+
+∑︁
+
+𝑛 ∈N
+
+𝑥 𝑗𝑛 − ∑︁
+𝑛 ∈N
+
+𝑐 𝑗𝑛 ≤ −
+
+∑︁
+
+𝑛 ∈N
+
+𝑢 𝑗𝑛
+
++ 𝑀(1 − 𝑧 𝑗 )
+
+∀𝑗 ∈ J .
+
+(10)
+
+3.4 Objective Function
+The objective function has two parts: the calculation of the objective
+function value for the new resource allocation map and the cost
+to rescale (up or down) Trainers. The new objective is calculated
+based on an expected steady time, T fwd, referred to as forward-
+looking time, during which we assume no nodes will leave N (i.e.,
+no Trainer will be forced to scale down). The cost to rescale Trainers
+is a one-time cost regardless of T fwd.
+
+3.4.1 Objective metric approximation. A Trainer’s objective met-
+ric, such as scalability, is usually a nonlinear function. Consider a
+nonlinear scalability function 𝑂 𝑗 (𝑁 𝑗 ) that models the throughput
+of Trainer 𝑗 when run with different numbers of nodes (𝑁 𝑚𝑖𝑛
+≤
+𝑁 𝑗 ≤ 𝑁 𝑚𝑎𝑥
+). The graph in Fig. 4 depicts the growing of 𝑂 𝑗 (𝑁 𝑗 ) for
+𝑁 𝑗 ∈ [1, 60]. Triangles indicate selected discretization points for
+
+𝑗
+
+𝑗
+
+𝑗 , . . . , 𝑤 𝐷
+
+0.0 ≤ 𝑤 1
+𝑗 ≤ 1.0 ∀𝑗 ∈ J (i.e., this optimization be-
+comes MILP because of the variable 𝑤). Then, for any given 𝑛𝑥 ∈
+[𝑁 𝑚𝑖𝑛
+], the approximation of 𝑂(𝑛𝑥 ) could be computed with
+𝑗
+the following constraints over 𝑛, 𝑠, and 𝑤 1
+∑︁
+
+𝑗 , . . . , 𝑤 𝐷
+𝑗 :
+𝑤𝑖
+
+, 𝑁 𝑚𝑎𝑥
+𝑗
+
+𝑗 = 1
+
+∑︁
+
+𝑖 ∈ D
+𝑗 𝑁 𝑖
+𝑤𝑖
+
+𝑗 = 𝑛𝑥
+
+(11)
+
+0.0 ≤ 𝑤𝑖
+
+𝑖 ∈ D
+𝑖 ≤ 1.0, ∀𝑖 ∈ D𝑗 , ∀𝑗 ∈ J,
+
+provided that {(𝑤1, 𝑛1), . . . , (𝑤𝐷, 𝑛𝐷 )} is included as an S2 in the
+solver, where D𝑗 = {1, . . . , 𝐷 𝑗 }. The approximated 𝑂 𝑗 (𝑛) is then:
+
+𝑂 𝑗 (𝑛) = ∑︁
+𝑖 ∈ D𝑗
+
+𝑤𝑖
+
+𝑗𝑠𝑖
+𝑗 .
+
+(12)
+
+3.4.2 Rescaling cost. Scaling up is usually more expensive than
+scaling down because of the significant initialization (e.g., data
+pipeline) costs incurred on the new nodes. Basically the rescaling
+cost, 𝑅 𝑗 in seconds, for Trainer 𝑗 will be
+
+𝑅𝑑𝑤
+𝑗
+0
+𝑅𝑢𝑝
+𝑗
+
+𝑁 𝑗 < 𝐶 𝑗
+𝑁 𝑗 = 𝐶 𝑗
+𝑁 𝑗 > 𝐶 𝑗
+
+,
+
+(13)
+
+𝑅 𝑗 =
+
+
+
+
+
+𝑗
+
+and 𝑅𝑢𝑝
+𝑗
+
+where 𝑅𝑑𝑤
+are Trainer-dependent scale-down and scale-up
+costs, respectively; 𝑁 𝑗 = (cid:80)𝑛 ∈N 𝑥 𝑗𝑛 is the number of nodes to be
+allocated to Trainer 𝑗; and 𝐶 𝑗 = (cid:80)𝑛 ∈N 𝑐 𝑗𝑛 is the number of nodes
+on which Trainer 𝑗 is currently running. We introduce two auxiliary
+variables, 𝑧𝑢
+𝑗 ∈ {0, 1}, for each Trainer to represent scale-up and
+scale-down costs, respectively, and reformulate Eqn. 13 as
+(cid:16)
+𝑅𝑢𝑝
+𝑗 𝑧𝑢
+
+𝑗 + 𝑅𝑑𝑤
+
+𝑗 𝑧𝑑
+𝑗
+
+𝑗 , 𝑧𝑑
+
+(14)
+
+(cid:17)
+
+,
+
+𝑅 𝑗 = ∑︁
+𝑗 ∈ J
+
+Figure 4: Example of approximating parallel application scalability.
+𝑁 𝑗 . We observe that in this case the approximation (straight lines
+connecting the triangles) remains close to the real curve using only
+just a few discretization points. Additional discretization points
+can be included, not necessarily evenly distributed, for improved
+precision.
+
+To enable the MILP model to work with these functions, we
+use special ordered sets (SOSs) to obtain linear approximations.
+SOSs are ordered sets of variables in which only one or two con-
+tiguous variables can assume nonzero values [7]. They provide
+powerful means of modeling nonconvex functions [6] and can im-
+prove the performance of the branch-and-bound algorithm. Type 2
+SOS (S2), a set in which up to two consecutive variables may assume
+nonzero values, are especially useful for modeling piecewise linear
+approximations of nonlinear functions. Here we use S2 to model or
+approximate the scalability function of 𝑂 𝑗 (𝑁 𝑗 ).
+
+To approximate 𝑂 𝑗 (𝑁 𝑗 ), for each Trainer 𝑗 ∈ J , we discretize
+its scalability into 𝐷 𝑗 -1 sections, in other words, for consecutive
+𝐷 𝑗
+points 𝑁 𝑗 ∈ {𝑁 1
+}, which correspond to 𝑂 𝑗 =
+𝑗
+𝑂 𝑗 (𝑁𝑖 ) ∈ {𝑠1
+𝑗 }. We define auxiliary continuous variables
+
+𝑗 <, . . . , < 𝑁
+
+𝑗 , . . . , 𝑠𝐷
+
+which is constrained to
+
+𝑁 𝑗 ≤ 𝐶 𝑗 + (𝑀 − 𝐶 𝑗 )𝑧𝑢
+𝑗
+𝑁 𝑗 ≥ (𝐶 𝑗 + 1)𝑧𝑢
+𝑗
+𝑁 𝑗 ≤ (𝐶 𝑗 − 1) + (cid:0)𝑀 − (𝐶 𝑗 − 1)(cid:1) (1 − 𝑧𝑑
+𝑗 )
+𝑁 𝑗 ≥ 𝐶 𝑗 (1 − 𝑧𝑑
+𝑗 )
+∀𝑗 ∈ J
+
+(15)
+
+to satisfy linear programming. If the objective function is an integra-
+tion of time (e.g., total outcome in T fwd), we will need to integrate
+the Trainer throughput over the cost on time (Eqn. 14) to compute
+the rescaling cost in the objective function.
+
+3.4.3 Objective function. The final objective function will be
+𝑇 fwd 𝑓𝑗 (𝑁 𝑗 ) − ∑︁
+𝑗 ∈ J
+
+𝑓𝑗 (𝐶 𝑗 )𝑅 𝑗 ,
+
+𝑗 ∈ J
+
+∑︁
+
+(16)
+
+where T fwd is the forward-looking time during which we assume
+no nodes leave N . If T fwd is too optimistic, the decision will not
+be optimal because Trainers will be forced to scale down due to
+preemption. If T fwd is too conservative, we lose flexibility to get
+even better allocation in decision-making. In §5.1 we evaluate the
+influence of T fwd with real experiments. In practice, T fwd is not
+predictable because of the uncertainty of job submission to the
+main queue. For a new system, however, we can look into the
+
+5
+
+102030405060Parallelism (number of nodes)0246810121416SpeedupDiscretizationContinousscheduler logs to extract a representative T fwd statistically and
+use that value in the optimization. If T fwd shows high variance in
+real scheduler logs, an estimation (with reduced variance) based
+on the current state of scheduler queue using machine learning or
+advanced statistical techniques may benefit the optimization.
+
+3.5 Full Model
+The complete mixed-integer optimization problem is then
+
+maximize
+𝑥
+subject to
+
+(16)
+
+objective
+
+(4)
+(5)
+(9)(10)
+
+job size constraints
+resource allocation
+job migration constraints,
+
+where we list here only the variables 𝑥 that represents the resource
+allocation map. In actual runs, all auxiliary variables (e.g., 𝑦𝑙 , 𝑦𝑢 , 𝑧𝑢 ,
+𝑧𝑑, 𝑤) are also resolved. The MILP is implemented using Gurobi [12]
+optimizer and open source 1.
+
+3.6 MILP Solution Time Benchmark
+Solving a MILP problem is NP-hard. We need to solve a MILP prob-
+lem, with varying size and values of constant variables, each time
+N or J change, in order to optimally reallocate nodes for Trainers.
+If solving the MILP problem for a particular event takes time 𝑡, then
+idle nodes are used suboptimally for 𝑡 seconds. For example, if 𝑛
+nodes join N at time 𝑡0, these 𝑛 nodes will be idle until 𝑡0 + 𝑡. Thus,
+the time to solve the MILP problem affects resource utilization
+efficiency. Here, we benchmarked the time to solve the MILP for
+varying J and N , using the Gurobi [12] optimizer on a commodity
+computer without any customized improvement schemes such as
+heuristic branch-and-cut algorithms. Since the time to solve a MILP
+problem also depends on the initial condition, we repeated each
+experiment 10 times with different initial conditions and took an
+average. While one can optimize solving MILP problems in many
+ways, exploring these methods is out of the scope for this study.
+
+Figure 5: Optimization time vs. number of jobs and nodes.
+
+Although N occasionally exceeds more than one thousand nodes,
+this occurs only rarely and briefly, as shown in Fig. 1. The average
+number of idle nodes is about 9% of of Summit: about 400 nodes.
+Thus we set the maximum MILP problem size in this benchmark
+to be 800 nodes. We randomly initialized 𝑐 to meet all constraints
+for each repetition, called the MILP solver to reallocate nodes for
+
+1https://github.com/lzhengchun/BFTrainer
+
+Trainers, and measured the wall time taken. The solution time on a
+2.3 GHz 8-Core Intel Core i9 processor (see Fig. 5) is typically less
+than one second: negligible because relatively short when compared
+with the time gaps between events. Furthermore, nodes in N are
+not idle but just used suboptimally during the optimization.
+
+Since all variables except the S2 are binary, the high dimension-
+ality of the model is the major contributor to computation costs.
+The resulting search problem thus has limited opportunities for
+parallelism, and the best approach to further acceleration is likely
+to be using processors with better single-core performance [19].
+Systems with higher clock rates (instead of more cores) and the
+fastest available memory can be used with parallel and distributed
+optimization solvers [12] to accelerate solving large MILP problems.
+Furthermore, because MILP problems are generally solved by using
+a LP-based branch-and-bound algorithm, we can set a timeout for
+the MILP solver in practice. If the solver returns a status of timeout
+but finds feasible solutions, we pick the better one between the
+current map 𝑐 and the best-so-far solution. Otherwise, if it does
+not come back with any feasible solution within the time limit, we
+keep the current nodes-to-Trainers map (i.e., let 𝑥 be 𝑐).
+
+4 EXPERIMENTAL SETUP
+We introduce evaluation metrics, computing resources, DNN train-
+ing scenarios, and design of the experiment for evaluating resource
+utilization and observing best practices of parameter configuration.
+
+4.1 Evaluation Metrics
+4.1.1 Resource integral. Makespan, a widely used metric for evalu-
+ating scheduling policies, is not well suited to our context because
+of the frequent fluctuations in N . For example, if we observe on a
+computer system of fixed size that two policies take 10 and 11 hours,
+respectively, to run the same workload, we may conclude that the
+second policy is just 10% less efficient than the first. In our context,
+however, there may have been many more idle nodes during that
+11th hour. Thus, we instead use the actual resources consumed—the
+integral of |N | over time: Eqn. 17—for comparing different policies.
+It is the same as makespan times the number of nodes (i.e., leads to
+node×time) in conventional scheduling for dedicated nodes. Specif-
+ically, assume that there are 𝐾 events {𝑒1, 𝑒2, . . . 𝑒𝐾 } ∈ E during
+a given period of 𝑡 = 𝑇𝑒𝐾 − 𝑇𝑒1 seconds. Then the total resource
+amount can be quantified, in node-hours, as
+
+𝑅𝑒1→𝑒𝐾 =
+
+𝐾−1
+∑︁
+
+𝑘=1
+
+𝑁𝑒𝑘
+
+𝑇𝑒𝑘+1 − 𝑇𝑒𝑘
+3600
+
+,
+
+(17)
+
+where 𝑁𝑒 is the size of N between 𝑒𝑘 and 𝑒𝑘+1. This amount is
+theoretical; the effective resources usable for running Trainers will
+be smaller than 𝑅𝑒1→𝑒𝐾 because both preemption (when nodes
+leave N ) and rescaling Trainers (when J or N change) incur costs.
+4.1.2 Resource utilization efficiency. 𝑅𝑒1→𝑒𝐾 is equivalent to hav-
+ing a static 𝑁 𝑒𝑞
+𝑒1→𝑒𝐾 nodes for 𝑡 = 𝑇𝑒𝐾 − 𝑇𝑒1 seconds from the
+perspective of node-hours, where
+(cid:80)𝐾−1
+𝑘=1
+
+(18)
+
+𝑁 𝑒𝑞
+𝑒1→𝑒𝐾 =
+
+𝑁𝑒𝑘 (𝑇𝑒𝑘+1 − 𝑇𝑒𝑘 )
+𝑇𝑒𝐾 − 𝑇𝑒1
+
+.
+
+Let 𝐴𝑒 be the total outcome (e.g., total samples processed) when
+BFTrainer is used to run a set of Trainers, J , from 𝑇𝑒1 to 𝑇𝑒𝐾 , and
+
+6
+
+Number of Jobs51015202530Number of Nodes100200300400500600700Time(s)0.00.51.01.52.02.53.03.54.04.51234𝐴𝑠 the total outcome if we run J using static 𝑁 𝑒𝑞
+𝑒1→𝑒𝐾 nodes for 𝑡
+seconds (assume J is too large to finish in 𝑡 seconds). Since there
+is no additional cost when using static 𝑁 𝑒𝑞
+𝑒1→𝑒𝐾 nodes, we can use
+𝐴𝑠 as a baseline for the machine time of 𝑅𝑒1→𝑒𝐾 to run the given
+list of Trainers using BFTrainer for 𝑡 seconds. We can then define
+the resource utilization efficiency of BFTrainer as 𝑈 =
+∗ 100%.
+While the unavoidable preemption costs incurred when nodes leave
+N mean that 𝐴𝑒 < 𝐴𝑠 , we can improve 𝐴𝑒 by identifying a better
+resource allocation for Trainers (e.g., via the proposed MILP model).
+
+𝐴𝑒
+𝐴𝑠
+
+4.2 DNN Training Scenarios
+Data parallelism is commonly used for DNN training in distributed-
+computing environments [8]. In data parallelism, a model is repli-
+cated across a set of distributed nodes, and each minibatch is divided
+into equal-sized partitions per node. Each node computes a local
+gradient using its own data partition; these local gradients are
+then averaged across all replicas (typically by using a collective
+all-reduce operation or parameter servers) to obtain the desired gra-
+dients for the optimizer. Then, on each node the optimizer updates
+the weights of the model replica using the desired gradients.
+
+In an isolated network environment such as HPC, the time
+needed to average local gradients and synchronize model parame-
+ters across all Trainer replicas depends only on model size. Accord-
+ing to Amdahl’s law [4], the runtime for each training iteration is
+lower bounded by the model synchronization time. Therefore, it is
+desirable to increase the batch size so that a larger proportion of
+time can be spent on computing the local gradient estimates instead
+of synchronizing gradients and the model [30]. However, although
+a larger batch size is beneficial to computation, simply increasing
+batch size without also increasing learning rate cannot accelerate
+model training convergence [37, 45].
+
+The learning rate and batch size are training parameters typi-
+cally chosen by the model developer. In BFTrainer, the per-node
+minibatch size is fixed, and thus the global batch size depends on
+the number of nodes that BFTrainer allocates to a Trainer. The
+user specifies on submission the minimum and maximum num-
+ber of nodes on which the application can run; and a learning rate
+scheduler that can adjust learning rate according to the global batch
+size [13, 45]. Tab. 2 shows the (weak) scaling of several DNN models
+for the ImageNet dataset on Summit using a minibatch of 32 per
+GPU. Of these seven DNNs, AlexNet, developed in 2012, is the least
+compute-intensive (727 MFLOPs/sample), and DenseNet, published
+in 2016, is the most compute-intensive (3 GFLOPs/sample). We ran
+100 epochs for each DNN in Tab. 2, corresponding to processing 130
+million samples in each case. We note that although we consider
+weak scaling in this experiment, a BFTrainer user can employ ei-
+ther strong scaling, with a static global batch size, or weak scaling,
+with strategies to deal with dynamic global batch size [25]. To make
+the evaluation more representative, we designed experiments that
+need to run at least one week in practice.
+
+4.3 Use of Summit Logs to Drive Simulations
+We used events in logs for an arbitrarily chosen 1024 Summit nodes
+over a week (see Fig. 6) to drive our simulations of N behavior.
+We used Horovod [34] with PyTorch [27] and model architecture
+
+7
+
+Table 2: Performance of ImageNet models, in samples per second
+(×1000), vs. number of nodes when running with data parallelism
+and a minibatch of 32 per GPU on Summit.
+
+Nodes
+
+DNN
+
+AlexNet [20]
+ResNet18 [14]
+MnasNet [41]
+MobileNets [16]
+ShuffleNet [46]
+VGG-16 [36]
+DenseNet [17]
+
+1
+
+7.1
+5.2
+3.2
+3.0
+2.8
+1.2
+1.0
+
+2
+
+4
+
+8
+
+16
+
+32
+
+64
+
+13.1
+10.6
+6.0
+5.9
+5.3
+2.4
+2.0
+
+21.1
+20.4
+11.5
+11.4
+10.0
+4.7
+3.8
+
+40.5
+39.6
+23.1
+22.0
+20.4
+9.3
+7.6
+
+74.0
+78.0
+43.9
+42.5
+38.9
+18.3
+15.0
+
+130.8
+144.8
+83.5
+82.3
+74.1
+36.2
+28.8
+
+202.1
+262.7
+160.5
+155.2
+145.1
+70.2
+57.8
+
+Figure 6: Characteristics of idle nodes, N, over a week. The number
+above each bar indicates the percent of all nodes that are idle.
+
+implementations from the torchvision package (a part of the Py-
+Torch project) for the experiments in this study. Elastic Horovod
+enables Horovod to scale up and down the number of workers (i.e.,
+nodes in this study) dynamically at runtime, without requiring a
+restart or resuming from checkpoints saved to durable storage. To
+use BFTrainer, a user simply provides a training script as would be
+done if running in a conventional manner, with the one difference
+being that it needs to have Elastic Horovod enabled. BFTrainer
+then runs the resulting Trainer elastically, starting it or rescaling
+it to fit in a series of suitable fragments whenever the MILP al-
+gorithm indicates that it is cost-effective to do so. BFTrainer can
+also work with other DNN distributed training frameworks such as
+AdaptDL [30] and TorchElastic (a framework of PyTorch [27]). In
+principle, any iterative applications that can scale up and down at
+runtime with reasonably small cost can be run using BFTrainer.
+
+5 EXPERIMENTS AND EVALUATIONS
+We present experiment results for BFTrainer in two scenarios:
+single-user HPO/NAS and as a central resource manager for multi-
+ple users. Our experiments evaluate MILP in these different scenar-
+ios and provide guidance for best practices.
+
+5.1 Hyperparameter Optimization
+HPO is an essential step in deep learning workflows. It increases
+model quality by systematically evaluating many different sets of
+hyperparameters (each called a “trial") and picking the best out-
+come. HPO is resource intensive, with the resource demand roughly
+proportional to the number of trials performed.
+
+In the HPO context, we assume that all trials within an exper-
+iment have the same scaling properties (parameters that control
+
+1224364860728496108120132144156168Elapsed Time (hour)0100200300400500600700800900Events in 12 hours4.8%2.0%8.5%13.0%13.1%11.8%4.7%9.4%2.6%11.5%4.9%6.7%17.4%5.6%the model architecture are considered as NAS) [21]. We arbitrar-
+ily chose ShuffleNet [46] from Tab. 2 to evaluate BFTrainer for
+HPO. We used total throughput from all nodes as the objective
+metric to optimize when allocating nodes to Trainers. ShuffleNet is
+a high-accuracy neural network with 5.4 M parameters and 524 M
+multiply-accumulates (MACs); its relatively low number of FLOPS
+makes it suitable for edge devices, and it usually benefits more
+from HPO when dealing with the trade-off between MACs and
+accuracy [15]. In this experiment, we ran 1000 trials while replay-
+ing Summit logs for the dynamics of N . Fig. 6 shows the statistics
+for the first 168 hours. Depending on the parameter T fwd in MILP,
+about 200 hours of log time are needed to complete all 1000 trials.
+We compare these results against those achieved with a baseline
+scheme that distributes nodes equally to Trainers. If there is no
+preemption within the forward-looking time, MILP is guaranteed
+to perform no worse than the baseline because the heuristic also
+meets all MILP constraints. That is, the baseline scheme produces
+the optimal MILP solution when there is no rescaling cost and
+no preemption (i.e., resources are dedicated). We also conducted
+experiments with different T fwd to study the influence of T fwd and
+identify guidelines for picking a good T fwd.
+
+Forward-looking time implication. Fig. 7a shows the percent-
+5.1.1
+age of preemption within the forward-looking time. As expected,
+the chance of preemption within forward-looking time increases
+with T fwd and reaches 90% when T fwd ≥ 170 seconds.
+
+(a) Preemption within Tfwd.
+
+(b) Rescaling cost per event.
+
+Figure 7: Influence of forward-looking time on preemption.
+
+Since the MILP tries to maximize total outcome and minimize
+rescaling cost (i.e., Eqn. 16), we show in Fig. 7b the rescaling cost.
+This cost increases with forward-looking time because the rescal-
+ing cost is static regardless of the forward-looking time. The MILP
+model will try to aggressively rescale Trainers to maximize the ag-
+gregated outcome when the forward-looking time is long, because
+the rescaling cost is then small relative to total outcome in T fwd. As
+a comparison, the average rescaling cost of the baseline is 1.03×106
+samples per event, that is, 76× more (worse) than the MILP with a
+forward-looking time of 10 seconds.
+
+For a given event 𝑒𝑖 , MILP optimally (re)allocates nodes to Train-
+ers to maximize the total outcome within the given forward-looking
+time. If we view the rescaling cost as an investment and the total
+outcome from 𝑒𝑖 to 𝑒𝑖+1 as return, Fig. 8 compares the return on
+investment (ROI) when different forward-looking times are used.
+Here we do not compare the return within the forward-looking
+time because it is an expectation. Preemption may happen within
+the forward-looking time, thus leading to a suboptimal operation.
+As one can see from Fig. 8, the ROI decreases with the increase of
+forward-looking time. This decrease is because the rescaling cost
+(i.e., investment) increases with forward-looking time as shown
+
+Figure 8: Influence of forward-looking time on rescaling invest-
+ment and return. Solid red line is average return on investment.
+
+in Fig. 7b but the total outcome increases with forward-looking
+time only to some extent and then is saturated (green dotted line
+in Fig. 8). Moreover, since T fwd does not appear in any of MILP’s
+constraints, the optimal solution for a shorter T fwd is a (suboptimal)
+solution of a longer T fwd, and vice versa. Although a longer T fwd
+cannot keep increasing the throughput after a certain value, it does
+give a smaller yet more stable ROI.
+
+5.1.2 Resource utilization efficiency. The dynamic nature of N
+introduces costs to Trainers as BFTrainer needs to rescale them to
+fit N . We use resource utilization efficiency, 𝑈 , defined in §4.1 to
+quantify how well MILP can use nodes in N . Basically three factors
+influence resource utilization efficiency: preemption cost, rescaling
+cost, and the scale at which Trainers run. The preemption cost is
+caused by the dynamics of N and is outside of our control. Enabling
+Trainers to run at a more efficient scale needs more investment to
+rescale running Trainers, for example, by migrating nodes from
+large Trainers to smaller Trainers. In our MILP, a longer T fwd
+allows for more efficient resource allocation, since the MILP can
+then expect a better return and can thus invest more in rescaling.
+
+Figure 9: HPO resource utilization efficiency as a function of
+forward-looking time.
+
+Fig. 9 shows how resource utilization efficiency varies with T fwd.
+Efficiency initially increases with T fwd but soon saturates at around
+T fwd=120 seconds. We note that the efficiency of the heuristic
+scheme is 75%. As shown in Fig. 7b, although a longer T fwd results
+in more rescaling cost, the resource utilization is not affected, as
+seen in Fig. 9. The reason is that there are two ways to achieve
+high efficiency: (1) save cost by using a conservative T fwd but limit
+rescaling Trainers to run at the most efficiency scale and (2) invest
+more cost to enable rescaling Trainers to run at more efficient scale.
+In some cases both ways can lead to similar efficiency based on the
+dynamics of N (e.g., the one we used in this experiment).
+
+To get more insight into the relationships between the dynamics
+of N and 𝑈 , we focused on T fwd=120 seconds and computed 𝑈
+
+8
+
+50100150200250300Forward-looking time (seconds)020406080100Preemption within Tfwd (%)50100150200250300Forward-looking time (seconds)020406080100120140160Avg. Rescaling cost (£103)51020406080100120140160180200220240260280300Forward-looking time (seconds)20406080100Return on Investment72.072.573.073.574.074.5Mean Retrun (£103)50100150200250300Forward-looking Time (seconds)78798081828384Utilization Efficiency (%)of the MILP that needs to be set based on the dynamics of
+the N . A small T fwd discourages rescaling Trainer that leads
+to inefficient use of fragments. The MILP is more robust to a
+large T fwd setting because it relaxes the rescaling cost and thus
+enables exploring more efficient use of fragments.
+
+5.2 Diverse Trainers
+We evaluated a scenario in which Trainers in J are diverse in
+order to mimic the scenario where only one BFTrainer instance is
+managed by administrators and users submit DNNs with diverse
+scalability. It can also mimic scenarios in which a user employs
+BFTrainer for NAS. We modeled Trainer submission as a Poisson
+process but limited the number of concurrent Trainers to 10 in
+this experiment. The characteristics of the DNN for each Trainer
+submission were cyclically sampled from Tab. 2 for 1000 Trainers.
+
+5.2.1 Objective metric. Resource allocation aims to rescale Train-
+ers to optimize the aggregated objective metric. Besides constraints
+such as the minimum and maximum scale of each Trainer, the main
+consideration when rescaling a Trainer is the trade-off between
+rescaling cost and potential (based on the forward-looking time)
+increase in the objective metric. Throughput is a straightforward
+objective metric to maximize. However, MILP biases resource allo-
+cation to high throughput rather than compute-intensive Trainers
+when scheduling Trainers with diverse scalability and resource
+demands. Another metric can be scaling efficiency, a normalized
+version of throughput that is agnostic to DNN throughput.
+
+We used both metrics for a comparison study to elucidate their
+implications for recommending best practices. Fig. 12 compares the
+average runtime of different DNNs using the different optimiza-
+tion metrics. We see that every DNN gets similar runtime when
+using the normalized scaling efficiency as the objective metric, al-
+though their computing demands are different according to Tab. 2.
+When using throughput as the metric, however, MILP apparently
+gives priority to high-throughput DNNs such as AlexNet; compute-
+intensive DNNs such as DenseNet take much more time. We note
+that although different DNNs will have different runtimes even if
+the same resources are allocated because of their difference in com-
+puting demand, it is not as different as shown in Fig. 12 according to
+Tab. 2. For example, the difference between Alexnet and DenseNet
+on throughput is only about 7×, but the runtime difference is more
+than 40× on average and up to 70×. We conclude that throughput
+is not a good metric in terms of fair share when Trainers differ
+significantly in their throughput. We note that although MILP bi-
+ases resource allocation to higher-throughput Trainers when raw
+throughput is used as the objective metric, it still needs to follow the
+FCFS policy. Thus, limiting maximum parallel jobs helps alleviate
+starvation of Trainers with low throughput (see §5.3 for details).
+
+Fig. 13 shows how resource utilization efficiency varies with ob-
+jective metric and forward-looking time. The influence of the latter
+on efficiency is similar to in the HPO scenarios. 𝑈 is consistently
+better when scaling efficiency is used as the objective metric be-
+cause MILP biases resources to high-throughput Trainers, leading
+them to run on many nodes but with reduced efficiency.
+
+Figure 10: HPO resource utilization efficiency over a week.
+
+every six hours in a week. Fig. 10 shows results for the MILP and
+heuristic schemes. As expected, MILP performs better than the
+heuristic, achieving up to 32% higher efficiency. On average, MILP
+achieved an efficiency of 80% and up to ∼90% for three of the six-
+hour periods. The efficiency also depends on the size of N and on
+dynamic features such as the number of events, as shown in Fig. 6.
+For example, if nodes join and leave N only rarely, both the heuristic
+and MILP should easily get close to 100%. However, if events are
+frequent, that is, if the length of fragments is extremely short, it
+is impractical to get high efficiency because of the unavoidable
+rescaling cost and preemption.
+
+(a) Jobs preemption cost.
+
+(b) Rescaling cost.
+
+Figure 11: Job preemption and rescaling costs over a week.
+
+To obtain further insight into why MILP can use fragmented
+resources efficiently, we computed its preemption and rescaling
+costs (Fig. 11). We ee do not control the preemption cost we see
+in Fig. 11a little difference between the heuristic and MILP. Since
+MILP tries to maximize aggregated throughput (within the forward-
+looking time), thus also minimizing the rescaling cost in Eqn. 16,
+its rescaling cost is much less than that of the heuristic (Fig. 11b).
+This explains why MILP uses resources more efficiently (Fig. 10).
+To evaluate the effectiveness of MILP resource allocations, we
+computed the number of images processed between pairs of con-
+tiguous events and divided the outcome of BFTrainer by that of
+the baseline scheme to get a speedup metric. We find that because
+the change of preemption is unknown, MILP is not always superior
+to the heuristic, performing worse for 6.9% of events. However,
+rescaling cost and Trainer scalability considerations lead to MILP
+being better than the heuristic in most cases: 2× and 5× better for
+11% and 3% of events, respectively. Average MILP speedup is 2.9×,
+but we note that this is not a reliable metric in this context because
+it can be skewed by high speedup of a few events; the total outcome
+also depends on the elapsed time between contiguous events.
+
+Observation 2. HPO is a good application scenario for
+BFTrainer because it is resource-consuming and all trials have
+the same scalability. The forward-looking time is a parameter
+
+9
+
+1224364860728496108120132144156168Elapsed Time (hour)556065707580859095Utilization Efficiency (%)HeuristicMILP1224364860728496108120132144156168Elapsed Time (hour)0.00.51.01.52.02.5Preemption cost(£109)HeuristicMILP1224364860728496108120132144156168Elapsed Time (hour)7.07.58.08.59.09.5Rescaling cost(log10)HeuristicMILPFigure 12: DNN times when optimizing for two different objectives.
+
+Figure 13: Resource utilization efficiency using different objective
+metrics and forward-looking time.
+
+Observation 3. BFTrainer understands user goals through
+an objective metric. Selecting this metric is straightforward
+for a single user training diverse DNNs (e.g., for NAS) because
+the user has a single goal. With multiple users, the choice is
+a game between resource provider and users; a Trainer-wise
+normalized metric provides better fairness.
+
+5.3 Maximum Parallel Trainers
+In conventional HPC scheduling, each job has a fixed size and thus
+the number of parallel running jobs, Pjmax, is determined by job
+sizes and computer size. However, in BFTrainer each job is elastic,
+and the number of nodes changes dynamically. The maximum
+number of parallel Trainers should in principle depend on the size of
+N and the minimum scale of the Trainers in the queue. If Trainers in
+the queue are treated as FCFS, there is no need for MILP to consider
+a number of Trainers more than the maximum, since doing so will
+cause serious job starvation [10]. In this experiment we ran the
+two cases in §5.2 (i.e., diverse Trainers with two different objective
+metrics) with different Pjmax. Fig. 14 shows resource integrals, run
+time and average runtimes when different Pjmax are used.
+
+As expected, if at a given time Pjmax increases, each Trainer’size
+decreases because N is fixed. Since Trainer’s scaling efficiency de-
+creases with Trainer size, the resource utilization increases (Fig. 14c).
+The resource integral (in aggregated node-hours shown in Fig. 14a)
+decreases, because each application runs at a more efficient scale
+with a larger Pjmax. However, as shown in Fig. 14b, Trainer’s run-
+time also increases significantly. The trade-off between the resource
+integral (or resource utilization efficiency) and Trainer runtime is
+clear: for example, a 28% decrease in the resource integral leads
+to a 442% increase in average Trainer runtime in this particular
+
+10
+
+(a)
+
+(b)
+
+(c)
+
+Figure 14: Evaluation of the maximum parallel Trainers. We run
+1000 Trainers composed with diverse DNNs, using different settings
+of the maximum parallel Trainers. Left: Comparison of resource
+consumption in node×time. Center: Average runtime of Trainer.
+Right: Influence on resource utilization efficiency.
+
+scenario when we increase the maximum number of parallel Train-
+ers from 5 to 35. In this experiment 12.4% and 2.1% of the machine
+time in the cases of 5 and 10 parallel Trainers, respectively, are
+unoccupied because the size of N is larger than the sum of the
+maximum sizes of all Trainers at a few events. All other cases are
+fully occupied. This is why the resource integral for the Pjmax=5
+case is significantly larger than others and the efficiency is much
+smaller than others. Since the total computation demand are the
+same in all cases, the resource utilization efficiency increases with
+Pjmax, as shown in Fig. 14c. This is because a larger Pjmax gives
+the scheduler opportunity to make more Trainers run at a more
+efficient size (i.e., smaller scale).
+
+A proper number of parallel Trainers depends on the trade-off be-
+tween the resource integral (directly related to resource utilization
+efficiency) and runtime of each individual Trainer. For applications
+such as HPO using grid search, since the runtime of each individual
+Trainer does not make a difference but the resource integral makes
+a bigger difference, it is desirable to use a large number of parallel
+Trainers (e.g., upper bounded by maximum estimated N size and
+the minimum scale of each Trainer). However, in cases such as
+reinforcement learning or differential-method-based neural net-
+work architecture search [22, 29, 44] or heuristic algorithm-based
+HPO [18] where the next batch of Trainers depends on the outcome
+of the current Trainer, a shorter Trainer runtime is preferred and
+can be achieved by using less parallelism.
+
+Table 3: Average runtime (hours) of different Trainers with samples
+per second used as the objective metric.
+
+Pjmax
+
+DNN
+
+AlexNet
+ResNet18
+MnasNet
+MobileNets
+ShuffleNet
+VGG-16
+DenseNet
+
+5
+
+0.5
+0.4
+0.7
+0.8
+0.9
+2.3
+4.1
+
+10
+
+0.6
+0.4
+0.7
+0.9
+1.0
+3.4
+9.5
+
+15
+
+20
+
+25
+
+30
+
+35
+
+0.5
+0.4
+0.8
+0.8
+0.9
+4.1
+16.1
+
+0.6
+0.4
+0.8
+0.9
+1.2
+5.4
+22.4
+
+0.5
+0.5
+0.9
+1.0
+1.4
+6.1
+29.2
+
+0.5
+0.5
+0.9
+1.2
+1.6
+6.3
+36.3
+
+0.6
+0.5
+1.1
+1.4
+1.8
+7.4
+42.3
+
+Tab. 3 compares average DNN runtimes for different Pjmax with
+samples per second as the objective metric. As shown in Tab. 2,
+AlexNet and DenseNet have the highest and lowest throughputs, re-
+spectively. For easy comparison, Tab. 3 is ordered by DNN through-
+put. Comparing DNNs by row, we see a clear increasing trend
+because MILP biased resources to high-throughput DNNs on the
+top. Comparing by columns, we see that high-throughput DNNs can
+
+AlexNetResNet18MnasNetMobileNetsShuffleNetVGG-16DenseNet024681012141618Avg. Run Time (hour)Scaling EfficiencySamples per Second050100150200250300Forward-looking Time (seconds)78798081828384858687Utilization Efficiency (%)Scaling EfficiencySamples per Second5101520253035Max. Number of Parallel Jobs18192021222324252627Resource Integral (£103)Scaling EfficiencySamples per Second5101520253035Max. Number of Parallel Jobs0100200300400500Run time (min.)Scaling EfficiencySamples per Second5101520253035Max. Number of Parallel Jobs65707580859095Efficiency (%)Samples per SecondScaling Efficiencymaintain the runtime regardless of Pjmax because they always get
+high priority, but the runtime of DenseNet (always lowest priority)
+increases significantly with Pjmax.
+
+Table 4: Average runtime (in hours) of different Trainer when scal-
+ing efficiency is used as objective metric.
+
+Pjmax
+
+DNN
+
+VGG-16
+DenseNet
+ResNet18
+MobileNets
+ShuffleNet
+MnasNet
+AlexNet
+
+5
+
+10
+
+15
+
+20
+
+25
+
+30
+
+35
+
+1.98
+2.58
+0.77
+0.89
+1.15
+1.15
+0.94
+
+2.8
+3.4
+1.1
+1.8
+2.1
+2.3
+2.4
+
+3.3
+4.6
+1.5
+2.7
+2.9
+3.8
+3.9
+
+3.8
+5.2
+1.9
+3.8
+4.2
+5.5
+5.3
+
+4.5
+6.4
+2.1
+4.7
+5.4
+7.0
+6.8
+
+5.0
+6.5
+2.4
+5.9
+7.2
+9.4
+7.6
+
+5.2
+7.8
+2.6
+7.4
+8.5
+10.7
+8.8
+
+Similarly, Tab. 4 compares the average runtime of different DNNs
+for different Pjmax with scaling efficiency as the objective metric.
+Comparing with Tab. 3, we see that different DNNs get relatively
+similar runtimes for each Pjmax. AlexNet has the worst scaling effi-
+ciency and VGG-16 is the best according to Tab. 2. Lower priorities
+are given to AlexNet, especially for large Pjmax where fewer re-
+sources are allocated to each Trainer, and thus Trainers with bad
+scalability are starved more. DNNs with bad scalability are more
+sensitive to Pjmax. For example, the runtime of AlexNet increases
+nearly 10× (i.e., starved) while VGG-16 increases only 2.6× when
+Pjmax increases from 5 to 35. Therefore, using a large Pjmax can in-
+crease the resource utilization and thus reduce the resource integral
+(Fig. 14a), but it also starves Trainer.
+
+Observation 4. Because Trainers are malleable, the number of
+jobs that can be run in parallel on a given number of nodes is
+flexible. Greater parallelism enables more efficient resource use
+but lengthens the runtimes, especially for Trainers that get low
+priority based on the objective metric. Pjmax needs to be adjusted
+depending on the particular goal(s) of a resource provider or user.
+
+5.4 Further discussion of diverse Trainers
+Two things of Trainers determine if they can be efficiently run using
+BFTrainer: scalability and rescaling cost. In this section we design
+experiments to evaluate the efficiency of BFTrainer by varying
+the scalability and rescaling cost of Trainers respectively.
+
+Scalability. The scalability of a DNN depends, according to
+5.4.1
+Amdahl’s law [4], on the relative time spent in computation and
+communication, assuming that file I/O is not the bottleneck. For
+example, different models for the same ImageNet classification
+problem have quite different scalabilities, as shown in Tab. 2.
+
+In order to evaluate BFTrainer’s efficiency 𝑈 for DNNs with
+different scalabilities, we run the HPO experiment for each DNN
+shown in Tab. 2. As the shortest-running (AlexNet) only took about
+70 hours to complete, we compute overall resource utilizations for
+each DNN over just the first 60 hours, so that all see the same
+resource availability. Our results are in Fig. 15.
+
+We see that all DNNs studied achieve >75% resource utilization
+with BFTrainer, with utilization efficiency increasing slightly with
+DNN scalability, from 75% for AlexNet to 83% for DenseNet. These
+
+Figure 15: A comparison of resource utilization efficiency when per-
+form HPO for models with different scalability. DNN scaling effi-
+ciency increases from left to right.
+
+results imply that optimizations that improve the scalability of
+individual Trainers are also beneficial to BFTrainer. We note that
+while DNN training tasks that are less scalable on dedicated nodes
+are also less efficient with BFTrainer, due to their less efficient use
+of larger resources, we see no evidence that they perform relatively
+worse than more scalable DNNs when run with BFTrainer rather
+than on dedicated nodes.
+
+5.4.2 Rescaling cost. BFTrainer efficiency is also influenced by
+Trainer’s rescaling costs. For example, as illustrated in Fig. 2, scaling
+up from 𝑛 𝑗 = 4 to 𝑛 𝑗 = 7 involves an investment of 𝑅𝑢𝑝 , which
+becomes profitable only after time 𝑇𝑝 . A larger 𝑅𝑢𝑝 leads to a later
+𝑇𝑝 , and as a Trainer can be preempted at any time, further increases
+the chance of preemption (and thus a negative return). If 𝑅𝑢𝑝 is
+large, the MILP will scale up only if it can do so by a large factor; if
+not, it will keep available nodes idle, leading to a lower 𝑈 . To study
+the influence of rescaling cost on utilization efficiency, we repeat
+the experiment of §5.1 while artificially increase rescaling costs by
+from 2 to 10×. We present our results in Fig. 16. As one can see, the
+
+Figure 16: A comparison of resource utilization efficiency with dif-
+ferent artificial rescaling costs.
+
+resource utilization efficiency achieved by BFTrainer decreased
+slightly with increased rescaling cost but much sublinearly.
+
+Observation 5. BFTrainer is agnostic to DNN tasks. The scal-
+ability and rescaling cost of a particular DNN determine if it can
+be run efficiently using BFTrainer. DNNs with bad scalability is
+not appropriate for distributed training neither for BFTrainer.
+DNNs with more costly rescaling, including cost of cache miss-
+ing in data pipeline because of rescaling, will lower the resource
+utilization efficiency of BFTrainer.
+
+11
+
+AlexNetResNet18MnasNetMobileNetsShuffleNetVGG-16DenseNet020406080Utilization Efficiency (%)1x2x3x4x5x6x7x8x9x10xRescaling Cost020406080Utilization Efficiency (%)6 RELATED WORK
+Researchers have developed methods for running preemptable
+jobs on otherwise idle computers [5, 26, 42]; others have investi-
+gated methods for backfilling non-preemptable jobs in batch sched-
+ulers [38, 40, 47, 48], but always in the context of arbitrary, typically
+nonmalleable jobs. BFTrainer, in contrast, leverages specialized
+properties of DNN training jobs to make efficient use of otherwise
+unusable idle resources.
+
+Rodrigo et al. [32] proposed an HPC application-aware schedul-
+ing model to enable flexible backfilling of data-intensive applica-
+tions by making use of dynamically malleable applications. Their
+survey of current scheduling challenges showed that malleable jobs
+are becoming increasingly common but that few HPC schedulers
+can exploit their particular characteristics.
+
+The AdaptDL [30] resource-adaptive DNN training and sched-
+uling framework aims to make distributed deep learning easy and
+efficient in dynamic-resource environments such as shared clusters
+and the cloud. It uses Kubernetes [1] for scheduling, rescaling, and
+reconfiguring job batch size and learning rate to optimize training
+performance and resource utilization. In contrast to BFTrainer, it
+works actively but not preemptively.
+
+Pilot-job systems (e.g., [11, 24, 31, 33, 35], and this comprehensive
+survey [43]), which submit placeholder jobs to queues, have long
+been used to enable flexible use of HPC resources. Some such sys-
+tems rescale jobs to make efficient use of these computing nodes [9].
+In contrast, BFTrainer does not provision and hold nodes; instead,
+it passively uses whatever nodes cannot be used by other jobs in
+the main batch queue.
+
+7 CONCLUSION AND FUTURE WORK
+BFTrainer makes optimal use of idle supercomputer nodes that
+cannot be, or are not, backfilled, to run applications (Trainers) that
+are (1) runnable at a range of scales and (2) re-scalable at modest
+cost. It does so while optimizing a performance metric of choice by
+using mixed integer linear programming to reallocate resources for
+Trainers each time there is a change in idle resources or the number
+of Trainers. We focused in this proposal on one particular class
+of Trainers, deep neural network training, due to their growing
+importance at many supercomputer centers. In future work, we
+will explore the application of BFTrainer to other applications,
+and also investigate how to incorporate supercomputer network
+topology into the resource allocation algorithm, so as to consider
+the location of idle nodes when allocating to tasks.
+
+REFERENCES
+[1] [n.d.]. Kubernetes. https://kubernetes.io. Accessed April 1, 2021.
+[2] Goodhead Tomvie Abraham, Anne James, and Norlaily Yaacob. 2015. Priority-
+grouping method for parallel multi-scheduling in grid. J. Comput. System Sci. 81,
+6 (2015), 943–957.
+
+[3] William Allcock, Paul Rich, Yuping Fan, and Zhiling Lan. 2017. Experience
+and practice of batch scheduling on Leadership Supercomputers at Argonne. In
+Workshop on Job Scheduling Strategies for Parallel Processing. Springer, 1–24.
+[4] Gene M. Amdahl. 1967. Validity of the Single Processor Approach to Achieving
+Large Scale Computing Capabilities. In Spring Joint Computer Conference. ACM,
+483—-485. https://doi.org/10.1145/1465482.1465560
+
+[5] David P Anderson, Jeff Cobb, Eric Korpela, Matt Lebofsky, and Dan Werthimer.
+2002. SETI@home: An experiment in public-resource computing. Commun. ACM
+45, 11 (2002), 56–61.
+
+[6] EML Beale and John JH Forrest. 1976. Global optimization using special ordered
+
+sets. Mathematical Programming 10, 1 (1976), 52–69.
+
+12
+
+[7] Evelyn Martin Lansdowne Beale and John A Tomlin. 1970. Special facilities in
+a general mathematical programming system for non-convex problems using
+ordered sets of variables. OR 69, 447-454 (1970), 99.
+
+[8] Tal Ben-Nun and Torsten Hoefler. 2019. Demystifying parallel and distributed
+deep learning: An in-depth concurrency analysis. Comput. Surveys 52, 4 (2019),
+1–43.
+
+[9] Fran Berman, Richard Wolski, Silvia Figueira, Jennifer Schopf, and Gary Shao.
+1996. Application-level scheduling on distributed heterogeneous networks. In
+ACM/IEEE Conference on Supercomputing. IEEE, 39–39.
+
+[10] Yuping Fan, Zhiling Lan, Taylor Childers, Paul Rich, William Allcock, and
+Michael E Papka. 2021. Deep Reinforcement Agent for Scheduling in HPC.
+arXiv preprint arXiv:2102.06243 (2021).
+
+[11] James Frey, Todd Tannenbaum, Miron Livny, Ian Foster, and Steven Tuecke.
+2002. Condor-G: A computation management agent for multi-institutional grids.
+Cluster Computing 5, 3 (2002), 237–246.
+
+[12] G Glockner. 2015. Parallel and distributed optimization with Gurobi optimizer.
+
+https://www.gurobi.com.
+
+[13] Priya Goyal, Piotr Dollár, Ross Girshick, Pieter Noordhuis, Lukasz Wesolowski,
+Aapo Kyrola, Andrew Tulloch, Yangqing Jia, and Kaiming He. 2017. Ac-
+curate, large minibatch SGD: Training ImageNet in 1 hour. arXiv preprint
+arXiv:1706.02677 (2017).
+
+[14] Kaiming He, Xiangyu Zhang, Shaoqing Ren, and Jian Sun. 2016. Deep residual
+learning for image recognition. In IEEE Conference on Computer Vision and Pattern
+Recognition. 770–778.
+
+[15] Ali HeydariGorji, Siavash Rezaei, Mahdi Torabzadehkashi, Hossein Bobarshad,
+Vladimir Alves, and Pai H Chou. 2020. HyperTune: Dynamic hyperparameter
+tuning for efficient distribution of DNN training over heterogeneous systems. In
+IEEE/ACM International Conference On Computer Aided Design (ICCAD). IEEE,
+1–8.
+
+[16] Andrew G Howard, Menglong Zhu, Bo Chen, Dmitry Kalenichenko, Weijun
+Wang, Tobias Weyand, Marco Andreetto, and Hartwig Adam. 2017. MobileNets:
+Efficient convolutional neural networks for mobile vision applications. arXiv
+preprint arXiv:1704.04861 (2017).
+
+[17] Gao Huang, Zhuang Liu, Laurens Van Der Maaten, and Kilian Q Weinberger.
+2017. Densely connected convolutional networks. In IEEE Conference on Computer
+Vision and Pattern Recognition. 4700–4708.
+
+[18] Hadi S Jomaa, Josif Grabocka, and Lars Schmidt-Thieme. 2019. Hyp-RL: Hyperpa-
+rameter optimization by reinforcement learning. arXiv preprint arXiv:1906.11527
+(2019).
+
+[19] Thorsten Koch, Tobias Achterberg, Erling Andersen, Oliver Bastert, Timo
+Berthold, Robert E Bixby, Emilie Danna, Gerald Gamrath, Ambros M Gleixner,
+Stefan Heinz, et al. 2011. MIPLIB 2010. Mathematical Programming Computation
+3, 2 (2011), 103–163.
+
+[20] Alex Krizhevsky, Ilya Sutskever, and Geoffrey E Hinton. 2012. ImageNet classifi-
+cation with deep convolutional neural networks. Advances in neural information
+processing systems 25 (2012), 1097–1105.
+
+[21] Richard Liaw, Romil Bhardwaj, Lisa Dunlap, Yitian Zou, Joseph E Gonzalez, Ion
+Stoica, and Alexey Tumanov. 2019. HyperSched: Dynamic resource reallocation
+for model development on a deadline. In ACM Symposium on Cloud Computing.
+61–73.
+
+[22] Hanxiao Liu, Karen Simonyan, and Yiming Yang. 2018. DARTS: Differentiable
+
+architecture search. arXiv preprint arXiv:1806.09055 (2018).
+
+[23] Zhengchun Liu, Ryan Lewis, Rajkumar Kettimuthu, Kevin Harms, Philip Carns,
+Nageswara Rao, Ian Foster, and Michael Papka. 2020. Characterization and Iden-
+tification of HPC Applications at a Leadership Computing Facility. In 34th ACM
+International Conference on Supercomputing. https://doi.org/10.1145/3392717.
+3392774
+
+[24] André Luckow, Lukasz Lacinski, and Shantenu Jha. 2010. SAGA BigJob: An
+extensible and interoperable pilot-job abstraction for distributed applications
+and systems. In 10th IEEE/ACM International Conference on Cluster, Cloud and
+Grid Computing. IEEE, 135–144.
+
+[25] Saeed Maleki, Madan Musuvathi, Todd Mytkowicz, Olli Saarikivi, Tianju Xu,
+Vadim Eksarevskiy, Jaliya Ekanayake, and Emad Barsoum. 2021. Scaling Dis-
+tributed Training with Adaptive Summation. Machine Learning and Systems 3
+(2021).
+
+[26] Paul Marshall, Kate Keahey, and Tim Freeman. 2011. Improving utilization of
+infrastructure clouds. In 11th IEEE/ACM International Symposium on Cluster,
+Cloud and Grid Computing. IEEE, 205–214.
+
+[27] Adam Paszke, Sam Gross, Francisco Massa, Adam Lerer, James Bradbury, Gregory
+Chanan, Trevor Killeen, Zeming Lin, Natalia Gimelshein, Luca Antiga, et al. 2019.
+PyTorch: An imperative style, high-performance deep learning library. arXiv
+preprint arXiv:1912.01703 (2019).
+
+[28] Tirthak Patel, Zhengchun Liu, Rajkumar Kettimuthu, Paul Rich, William Allcock,
+and Devesh Tiwari. 2020. Job Characteristics on Large-Scale Systems: Long-Term
+Analysis, Quantification and Implications. In 2020 SC20: International Conference
+for High Performance Computing, Networking, Storage and Analysis (SC). IEEE
+Computer Society, 1186–1202.
+
+[29] Hieu Pham, Melody Guan, Barret Zoph, Quoc Le, and Jeff Dean. 2018. Efficient
+neural architecture search via parameters sharing. In International Conference on
+Machine Learning. PMLR, 4095–4104.
+
+[30] Aurick Qiao, Willie Neiswanger, Qirong Ho, Hao Zhang, Gregory R Ganger, and
+Eric P Xing. 2020. Pollux: Co-adaptive cluster scheduling for goodput-optimized
+deep learning. arXiv preprint arXiv:2008.12260 (2020).
+
+[31] Ioan Raicu, Yong Zhao, Catalin Dumitrescu, Ian Foster, and Mike Wilde. 2007.
+Falkon: A Fast and Light-weight tasK executiON framework. In ACM/IEEE Con-
+ference on Supercomputing. 1–12.
+
+[32] Gonzalo Pedro Rodrigo Álvarez, Per-Olov Östberg, Erik Elmroth, and Lavanya
+Ramakrishnan. 2015. A2l2: An application aware flexible HPCscheduling model
+for low-latency allocation. In 8th International Workshop on Virtualization Tech-
+nologies in Distributed Computing. 11–19.
+
+[33] Antonio J Rubio-Montero, Eduardo Huedo, Francisco Castejón, and R Mayo-
+García. 2015. GWpilot: Enabling multi-level scheduling in distributed infrastruc-
+tures with GridWay and pilot jobs. Future Generation Computer Systems 45 (2015),
+25–52.
+
+[34] Alexander Sergeev and Mike Del Balso. 2018. Horovod: fast and easy distributed
+
+deep learning in TensorFlow. arXiv preprint arXiv:1802.05799 (2018).
+
+[35] Igor Sfiligoi, Daniel C Bradley, Burt Holzman, Parag Mhashilkar, Sanjay Padhi,
+and Frank Wurthwein. 2009. The pilot way to grid resources using glideinWMS.
+In WRI World Congress on Computer Science and Information Engineering, Vol. 2.
+IEEE, 428–432.
+
+[36] Karen Simonyan and Andrew Zisserman. 2014. Very deep convolutional networks
+for large-scale image recognition. arXiv preprint arXiv:1409.1556 (2014).
+[37] Samuel L Smith, Pieter-Jan Kindermans, Chris Ying, and Quoc V Le. 2017. Don’t
+decay the learning rate, increase the batch size. arXiv preprint arXiv:1711.00489
+(2017).
+
+[38] Srividya Srinivasan, Rajkumar Kettimuthu, Vijay Subramani, and P Sadayappan.
+2002. Characterization of backfilling strategies for parallel job scheduling. In
+International Conference on Parallel Processing Workshop. IEEE, 514–519.
+[39] Craig P Steffen. 2019. A Better Way of Scheduling Jobs on HPC Systems: Simul-
+
+taneous Fair-Share. (2019).
+
+[40] David Talby and Dror G Feitelson. 1999. Supporting priorities and improving
+utilization of the IBM SP scheduler using slack-based backfilling. In 13th In-
+ternational Parallel Processing Symposium and 10th Symposium on Parallel and
+Distributed Processing. IEEE, 513–517.
+
+[41] Mingxing Tan, Bo Chen, Ruoming Pang, Vijay Vasudevan, Mark Sandler, Andrew
+Howard, and Quoc V. Le. 2019. MnasNet: Platform-Aware Neural Architecture
+Search for Mobile. In IEEE Conference on Computer Vision and Pattern Recognition.
+
+[42] Douglas Thain, Todd Tannenbaum, and Miron Livny. 2005. Distributed computing
+in practice: The Condor experience. Concurrency and Computation: Practice and
+Experience 17, 2-4 (2005), 323–356.
+
+[43] Matteo Turilli, Mark Santcroos, and Shantenu Jha. 2018. A comprehensive
+
+perspective on pilot-job systems. Comput. Surveys 51, 2 (2018), 1–32.
+
+[44] Arash Vahdat, Arun Mallya, Ming-Yu Liu, and Jan Kautz. 2020. UNAS: Differen-
+tiable architecture search meets reinforcement learning. In IEEE/CVF Conference
+on Computer Vision and Pattern Recognition. 11266–11275.
+
+[45] Yang You, Zhao Zhang, Cho-Jui Hsieh, James Demmel, and Kurt Keutzer. 2018. Im-
+ageNet training in minutes. In 47th International Conference on Parallel Processing.
+1–10.
+
+[46] Xiangyu Zhang, Xinyu Zhou, Mengxiao Lin, and Jian Sun. 2018. ShuffleNet: An
+extremely efficient convolutional neural network for mobile devices. In IEEE
+Conference on Computer Vision and Pattern Recognition. 6848–6856.
+
+[47] Yanyong Zhang, Hubertus Franke, Jose Moreira, and Anand Sivasubramaniam.
+2003. An integrated approach to parallel scheduling using gang-scheduling,
+backfilling, and migration. IEEE Transactions on Parallel and Distributed Systems
+14, 3 (2003), 236–247.
+
+[48] Dmitry Zotkin and Peter J Keleher. 1999. Job-length estimation and performance
+in backfilling schedulers. In 8th International Symposium on High Performance
+Distributed Computing. IEEE, 236–243.
+
+GOVERNMENT LICENSE
+The submitted manuscript has been created by UChicago Argonne,
+LLC, Operator of Argonne National Laboratory (“Argonne”). Ar-
+gonne, a U.S. Department of Energy Office of Science laboratory, is
+operated under Contract No. DE-AC02-06CH11357. The U.S. Gov-
+ernment retains for itself, and others acting on its behalf, a paid-up
+nonexclusive, irrevocable worldwide license in said article to repro-
+duce, prepare derivative works, distribute copies to the public, and
+perform publicly and display publicly, by or on behalf of the Gov-
+ernment. The Department of Energy will provide public access to
+these results of federally sponsored research in accordance with the
+DOE Public Access Plan. http://energy.gov/downloads/doe-public-
+access-plan.
+
+13
+
+

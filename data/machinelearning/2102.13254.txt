@@ -1,0 +1,1012 @@
+Tensors Fitting Perfectly
+
+Adam Paszke
+Google Research
+apaszke@google.com
+
+Brennan Saeta
+Google Research
+saeta@google.com
+
+Abstract
+
+1
+2
+0
+2
+
+b
+e
+F
+6
+2
+
+]
+L
+P
+.
+s
+c
+[
+
+1
+v
+4
+5
+2
+3
+1
+.
+2
+0
+1
+2
+:
+v
+i
+X
+r
+a
+
+Multidimensional arrays (NDArrays) are a central abstraction in modern scientiﬁc computing environments.
+Unfortunately, they can make reasoning about programs harder as the number of diﬀerent array shapes used
+in an execution of a program is usually very large, and they rarely appear explicitly in program text. To make
+things worse, many operators make implicit assumptions about the shapes of their inputs: array addition
+is commonly enriched with broadcasting semantics, while matrix multiplication assumes that the lengths of
+contracted dimensions are equal. Because precise reasoning about shapes is crucial to write correct programs
+using NDArrays, and because shapes are often hard to infer from a quick glance at the program, we developed
+Tensors Fitting Perfectly, a static analysis tool that reasons about NDArray shapes in Swift for TensorFlow
+programs by synthesizing a set of shape constraints from an abstract interpretation of the program. It can
+both (1) check for possible inconsistencies, and (2) provide direct insights about the shapes of intermediate
+values appearing in the program, including via a mechanism called shape holes. The static analysis works in
+concert with optional runtime assertions to improve the productivity of program authors.
+
+1
+
+Introduction
+
+Numerical computing has been completely transformed by the concept of multidimensional arrays and a signif-
+icant fraction of modern scientiﬁc computing workloads are written as compositions of multidimensional array
+operations, instead of explicit, nested loops operating on scalars. There are two key reasons for why this abstrac-
+tion ended up being so useful for eﬃcient execution of scientiﬁc simulations. First, even though most of those
+programs are written in an imperative language with sequential semantics, most array operators are deeply par-
+allel in nature, and so such programs easily map to modern vectorized hardware which is the main driving force
+of performance improvements since the end of Dennard scaling. Second, because the number of array operators
+invoked is usually orders of magnitude smaller than the number of corresponding scalar operations that need to
+be performed, the whole computation can be expressed in a relatively ineﬃcient high-level language, enabling
+rapid development and iteration. This paradigm, pioneered by APL [13], has fuelled major breakthroughs in
+science, and led to the development of numerous software packages with similar functionality, such as Matlab or
+NumPy [17]. More recently libraries like Theano [21], TensorFlow [1], PyTorch [18] and JAX [4] have extended
+the NDArray abstraction to allow seamless execution of array operators on accelerators like GPUs, and eﬃciently
+perform automatic diﬀerentiation.
+
+While this paradigm has been very fruitful, one of its biggest unsolved pain points is shape mismatch errors.
+Every multidimensional array is associated with a ﬁnite sequence of natural numbers which represent the domain
+of indices valid for accessing its elements. For example, Rn×m matrices would usually be represented by arrays
+of shape [n, m] (although the ordering of those dimensions depends on the convention of the libraries and user
+code). The length of the shape sequence is often called the rank. If one wants to take a matrix product A.dot(B),
+then they need to ensure that both A and B are rank 2, and that the equality A.shape[1] == B.shape[0] holds.
+In most widely used systems this condition is checked solely at run time, meaning that such errors often go
+unnoticed until such an operation is invoked. Because many of these NDArray-based programs run for hours or
+days before completing (e.g. evaluating model performance on a validation or test dataset, or pre-training on a
+large unsupervised dataset before ﬁne-tuning for a supervised task), iteratively running the program to debug
+shape errors can be costly and unproductive.
+
+Scientiﬁc computing has greatly beneﬁted from the rise of the open source culture, but unfortunately the
+diﬃculty of reasoning about shapes manifests itself especially clearly when analyzing published code. Most
+projects treat shapes as irrelevant metadata, and shape contracts of individual user or library functions are
+left completely implicit. However, because the semantics of many operations depend on the shapes, having no
+annotations makes those programs diﬃcult to understand, modify, and maintain, reducing the beneﬁts of free
+
+1
+
+ 
+ 
+ 
+ 
+ 
+ 
+code sharing. Additionally, when shape mismatches are encountered at runtime, the errors usually originate from
+the lowest levels of abstraction, often with little context. In practice, NDArray program authors inevitably need
+to understand the implementations of the abstractions they consume, reducing the value of the abstraction itself.
+One partial solution to that issue, taken by some authors, is to defensively annotate the programs with
+comments signifying the shape of intermediate variables. While this makes it much easier for readers to understand
+what the program is actually doing, such documentation is not checked and can easily get out of date. Because
+the shape is just a list of numbers, it seems natural to ask to have it checked by a computer. Unfortunately, no
+such systems are used today (although some early prototypes are under development [16]).
+
+Most NDArray libraries support implicit broadcasting, or dynamically increasing the rank of an NDArray
+by repeating its contents in order to satisfy the shape constraints of a given operation. For example, adding a
+vector v of size Rn to a matrix m of size Rn×m results in v being implicitly tiled m times to form a Rn×m matrix.
+Broadcasting improves performance by avoiding materializing copies of v in memory, and implicit broadcasting
+allows users to write rank-polymorphic code. Unfortunately, implicit broadcasting makes reasoning about shapes
+and their resulting errors substantially more diﬃcult and sometimes can even mask them, resulting in a silent
+divergence from the desired program semantics.
+
+Another possible solution to the shape mismatch problem would be to encode all of the shape constraints in
+a type system, such that the type checking procedure would additionally prove that no shape errors can occur
+at run time. Unfortunately, while type systems that are expressive enough for that exist (e.g.
+in Haskell [8]),
+their corresponding type checking problems are undecidable and still require a fair amount of user supervision
+to have their program accepted, even if it is correct. On the other hand, type systems used in the most popular
+imperative languages are not up to the task, and cannot deal with typing of common operations with sophisticated
+constraints (e.g. functions that would accept inputs of arbitrary ranks, but with some constraints on the trailing
+dimensions).
+
+In this article, we propose to address the problem with a combination of a static analysis tool coupled with
+more precise optional run-time shape checking. Instead of trying to prove that the user program is correct, our
+static analysis tool searches for provable failures, and will raise an error if any of those are found. In this way,
+while the checking procedure is not complete and can miss some issues, we can provide a low-noise signal. Run-
+time assertions complement the static analysis to reason about shapes more accurately, but in case their costs
+are prohibitive for any application, most programming languages (Swift included) allow skipping their evaluation
+entirely through a compiler or interpreter ﬂag.
+
+Apart from checking, our tool is also able to provide the user with some hints about the shape semantics of the
+program through functionality like shape holes that will be discussed in Section 3.8. Future work could integrate
+functionality into the popular editors to interactively assist the researchers and programmers in their daily tasks.
+
+2 High level overview
+
+This article is a description of Tensors Fitting Perfectly, an open-source tool1 for ﬁnding shape bugs in Swift
+programs developed as part of the Swift for TensorFlow project [19]. It takes a list of Swift ﬁles as input and
+passes those on to the Swift compiler, which is asked to lower it to the Swift Intermediate Language (SIL) instead
+of producing an executable or a library. SIL is a static single assignment (SSA) based intermediate representation
+(IR) of the user program. One interesting note is that SIL does not make use of phi-instructions, but instead allows
+each block to take a list of arguments. All jumps to that block have to specify the values that those arguments
+are supposed to take. SIL preserves the full power of the Swift type system, and allows for storing most (e.g.
+compound) values in virtual registers. Additionally, while the supported instruction set is quite complex, it
+already desugars and normalizes most of the numerous language features of Swift into much simpler constructs;
+for example all closures are already converted into top-level functions at this point. This step also includes type
+checking of the program, so it lets us ensure that we only process well-formed code, but unfortunately limits the
+use in the context of incomplete programs which would be necessary to provide live hints in text editors.
+
+Each top level function in the analyzed SIL ﬁle is preprocessed to eliminate loops (Section 3.2) from its
+control ﬂow graph (CFG) and to remove the need to analyze memory loads and stores (e.g. stack allocations
+are hoisted into virtual registers). Each block appearing in the SIL representation is then subjected to symbolic
+execution (Section 3.3), which attempts to recover the assertions speciﬁed by the user, and lift them into the raw
+form of the constraint language used later. Initially the representation includes function calls which have to be
+resolved to produce the canonical form on which checking can be performed. After processing each function, we
+
+1https://github.com/google-research/swift-tfp
+
+2
+
+// A sample program entry point to check.
+let m = Model()
+let batchSize = 12
+let input = Tensor(zeros: (12, 32, 32, 3))
+let output = m(input)
+
+|-> [batchSize, 10]
+
+// Select operator implementations,
+// including shape assertions.
+
+// Computes the valid shape for the output
+// of the maxPool2D and conv2D operations.
+func validWindowShape(
+
+// A simple model used in the program.
+//
+// A couple shape assertions are
+// sprinkled throughout the model.
+struct Model {
+
+let conv = Conv2D(
+
+filterShape: (2, 2, 3, 5),
+strides: (2, 2))
+let dense = Dense(
+inputSize: ____,
+outputSize: 10)
+
+func callAsFunction(
+_ input: Tensor
+
+) -> Tensor {
+
+let batchSize = input.shape[0]
+let c = relu(conv(input))
+let m = maxPool2D(c, stride: (2, 2))
+
+|-> [batchSize, 16, 16, 5]
+
+// !!!!
+
+let dIn = flatten(m)
+let dOut = dense(dIn)
+
+|-> [batchSize, 10]
+
+// Optional.
+
+return dOut
+
+}
+
+}
+
+infix operator |->
+func |-> (
+
+_ a: Tensor,
+_ b: TensorShape
+
+) -> Tensor {
+
+// Shape assert operator
+
+assert(a.shape == b)
+return a
+
+}
+
+extension Tensor {
+
+var shape4d: (Int, Int, Int, Int) {
+
+assert(self.rank == 4)
+let shape = self.shape
+return (
+
+shape[0], shape[1],
+shape[2], shape[3])
+
+}
+
+}
+
+_ input: Tensor,
+kernelSize: (Int, Int),
+stride: (Int, Int),
+output: Int
+
+) -> TensorShape {
+
+let (iN, iH, iW, _) = input.shape4d
+return [
+iN,
+(iH - kernelSize.0) / stride.0 + 1,
+(iW - kernelSize.1) / stride.1 + 1,
+outputs
+
+]
+
+}
+
+func maxPool2D(
+
+_ input: Tensor,
+kernelSize: (Int, Int),
+stride: (Int, Int) = (2, 2)
+
+) -> Tensor {
+
+let result = TF.maxPool2D(
+
+input, kernelSize, stride)
+
+// Shape assertion without shape
+// assertion operator.
+assert(result.shape == validWindowShape(
+
+input,
+kernelSize: kernelSize,
+stride: stride,
+output: input.shape[3])
+
+// Channels.
+
+return result
+
+}
+
+func conv2D(
+
+_ input: Tensor,
+_ weight: Tensor
+
+) -> Tensor {
+
+let (_, iH, iW, iC) = input.shape4d
+let (kH, kW, iF, oF) = weight.shape4d
+assert(bF == oF); assert(iC == iF)
+assert(iH >= kH); assert(iW >= kW)
+let result = TF.conv2D(input, weight)
+
+|-> validWindowShape(
+
+input, kernelSize: (kH, kW),
+stride: (1, 1), output: oF)
+
+return result
+
+}
+
+Listing 1: A sample program instantiating a neural network and evaluating the network at a given input, along
+with select implementations of library operations and their shape assertions. The shape assertion operator (|->) is
+deﬁned in terms of the assert primitive. maxPool2D and conv2D are examples of sophisticated shape constraints
+inherent in neural networks. The static analysis tool highlights a shape error on the line annotated with !!!!;
+the correct shape for m is: [batchSize, 8, 8, 5]. Finally, the static analysis tool informs the user that the
+shape hole (
+
+) should be replaced with 320.
+
+3
+
+produce a function summary which includes the set of constraints (including calls to other functions) as well as
+the expressions corresponding to the arguments and returned values. Note that the produced summary is not
+of bounded size. In general, the inputs to the veriﬁcation procedure may grow even exponentially together with
+the size of the program (due to inlining), but the pathological examples generally do not resemble real world
+programs.
+
+Once an entry point and a path condition is chosen by the veriﬁcation procedure (Section 3.5), function calls
+are resolved by recursively instantiating the summaries of called functions in a single constraint system (with
+appropriate substitutions applied). The system is then simpliﬁed (some operations are expensive to represent in
+the language of the solver), translated into the solver’s intermediate representation (eﬀectively a logical formula),
+and checked. If the solver reports that the system is unsatisﬁable, a failure is reported to the user.
+
+3
+
+Implementation details
+
+In this section, we discuss the inner workings of the tool in more detail. We start with an overview of all the
+steps that prepare the program for symbolic execution, and then discuss the algorithm that decides whether it
+should be accepted or not. Finally, since the goal is to provide useful insights to our users, we comment on how
+to present veriﬁcation failures (i.e. shape errors) in a way that makes them more approachable.
+
+3.1 Shape Assertions
+
+The static analysis tool is conﬁgured with special knowledge of two symbols: the NDArray type (e.g. Swift
+for TensorFlow’s Tensor type), and the corresponding shape type (e.g. TensorShape). Standard assertions are
+sprinkled throughout the implementation of Tensor methods which form the basis for how the tool reasons about
+the user’s code. Importantly, the tool is not given any special knowledge of the semantics of the operations on
+NDArray; instead everything is built up from these assertions within the NDArray implementation.
+
+3.2 Making the control ﬂow graph loop-free
+
+One of the important decisions that have to be made when designing a veriﬁcation tool based on SMT solvers is
+how to handle loops or recursion. Although loops do not play a crucial role in typical NDArray programs, their
+presence should not prevent the tool from applying the facts derived about the program before the loop to the
+continuation after the loop ﬁnishes.
+
+Because there is no way to express ﬁxed points in standard propositional and ﬁrst-order logic [2], there are a
+number of techniques to model back edges in the control ﬂow graph. One common approach is to rewrite each
+loop appearing in the program as a deeply nested tower of conditional statements, eﬀectively assuming that all
+loops have their trip counts bounded by the unrolling factor. However, if one considers all trip counts up to the
+unrolling factor as possible program paths, then this approach would additionally assume that the loops might
+execute as many times as this threshold, which might cause e.g. some shapes to appear to become negative on
+those paths if the loop shrinks them. Because we have tried to err on the side of soundness (i.e. trying to not
+report errors for programs that can execute successfully) when designing the tool, we did not take that approach.
+Instead, we replace each loop with a single conditional statement, representing a choice between running the
+loop at least once or skipping it entirely. If the loop executes at least once then, assuming that the loop terminates,
+we know that there exists the ﬁrst and the last iteration, and so we repeat the loop body twice. The only question
+is what happens with loop carried variables, and the answer is that the ﬁrst instance uses the regular loop inputs
+that would get passed in to the ﬁrst iteration, while the second instance gets “fresh” inputs in the sense that they
+get materialized out of thin air and we do not know of any dependencies between them and any other program
+variable. Note that after this transformation, although the program can no longer be executed (as we would need
+a way to actually supply the values for the second iteration), it can still be analyzed. What this means is that we
+eﬀectively reject to analyze how the shapes change throughout the loop, but only want to use the assertions from
+inside of the loop body to be cross-checked with the ones that appear both after and before the loop. It also has
+the beneﬁt of reducing the number of possible program paths that have to be considered.
+
+3.3 Symbolic execution
+
+Now that the control ﬂow graph is loop-free the program is executed symbolically to extract the assertions
+appearing inside it. We initialize arguments of every block to a variable of their corresponding type, if it is a
+
+4
+
+// Swift source.
+
+// SIL-like SSA repr.
+
+// Function summary.
+
+func loopingFn(
+k: Int,
+input: Tensor
+
+) -> Tensor {
+
+var x = input
+x = preOp(x)
+for i in 0..<k {
+x = loopOp(x)
+
+}
+return postOp(x)
+
+}
+
+func loopingFn {
+bb0(%
+
+br bb1(loopCount, %
+
+bb1(%
+
+cond_br %
+
+bb2:
+
+br bb1(%
+
+bb3:
+
+return %
+
+}
+
+loopingFn(s1, s7):
+// Before loop
+preOp(s1, s2)
+s4a == s2
+loopOp(s4a, s6a)
+// After loop
+loopOp(s6b, s4b)
+postOp(s4b, s7)
+
+Listing 2: A simple function containing a loop and tensor operations, a SIL-like SSA representation of the function
+that is used as input to the TFP tool, and a representation of the resulting shape constraint summary inferred
+from the function’s control ﬂow graph. In the function summary, the calls to sub-procedures should be understood
+to calls to their summaries, which constrain the shapes of input and output tensors.
+
+supported type, and an additional variable is created to represent the value returned from the function. Note that
+there are no variables for compound types, so compound arguments are associated with a compound expression
+containing variables. SIL does not have a concept of methods (they are lowered to curried top-level functions),
+so we treat compound data types like structs as isomorphic to tuples containing their members.
+
+Integer expressions n :: = l | v
+
+Literals / variables
+
+|
+
+(loc)
+
+| rank(s)
+
+| s[c]
+
+Shape hole (loc is a source location)
+
+Rank (number of dimensions)
+
+Dimension size
+
+| n + n | n − n | n · n | n/n
+
+Arithmetic (division rounds down)
+
+Boolean expressions
+
+b :: = true | false | v
+
+| ¬b
+
+| b ∧ . . . ∧ b | b ∨ . . . ∨ b
+
+| n = n | s = s | b = b
+
+Literals / variables
+
+Negation
+
+Conjunction / disjunction
+
+Primitive type equality
+
+| n > n | n ≥ n | n < n | n ≤ n
+
+Relations between naturals
+
+Shape expressions
+
+s :: = v
+
+| [n, . . . , n]
+
+| broadcast(s, s)
+
+Variables
+
+Literals
+
+Broadcasting operation
+
+Compound expressions
+
+c :: = (e, . . . , e)
+
+Tuple
+
+Expressions
+
+e :: = integer(n) | boolean(b)
+
+| shape(s) | compound(c)
+
+Figure 1: Language of shape constraints
+
+In the following, a path condition for a given simple block should be understood as a logical formula that
+has to be satisﬁable if the block is to be reachable. Intuitively, when we encounter a program that corresponds
+to an if statement, the block corresponding to one of its branches will have the checked expression in its path
+condition, while the other one will have its negation. This way we ensure that we never attempt to cross-verify
+assertions made in one branch with those made in the other one, since those can easily be contradictory, while
+the actual program will only ever be subject to one of them.
+
+We begin the execution by setting the path condition of the function entry block to true, and conditions of
+all other blocks to false. When processing a block, all instructions in its body are executed symbolically over a
+limited set of abstract values which is a superset of the constraint language supported by TFP (Figure 1) that
+
+5
+
+additionally includes e.g. function pointers and their partial applications. Any calls to the assert built-in function
+are added to the set of constraints, guarded by the block’s path condition. Once a block-terminating instruction is
+reached, the set of constraints is extended with equations between the symbolic values of the terminator operands
+and the arguments of the successor blocks (if the terminator is a jump), or with the variable representing the
+function result. Finally, the successor blocks have their path condition extended by taking a disjunction of their
+current condition and a conjunction of the current block’s path condition with the condition derived from the
+terminator if possible (e.g. if it is a conditional jump) or true otherwise (e.g. if it is an unconditional jump).
+
+3.4 Representing shape formulas in UFNIA
+
+To verify speciﬁcations represented in the constraint language (Figure 1), we translate those into formulas over
+the UFNIA logic (uninterpreted functions and non-linear integer arithmetic). All shape variables are represented
+as uninterpreted functions from integers to integers and a single integer encoding its rank. This representation
+is motivated by the fact that we cannot constrain the domain to a ﬁnite subset of natural numbers a priori,
+because the rank does not have to be known statically. However, at each point where this function is evaluated,
+an assertion ensuring that its argument falls between 0 and the rank is added, guaranteeing that the formulas
+only reason about the fragment of the domain bounded by the corresponding rank variable. The full translation
+procedure is described in Figure 2.
+
+Despite the fact that there is no decision procedure for the UFNIA logic and that undecidable problems can
+easily be encoded in the language of TFP, the Z3 solver we have used in our implementation has not failed to resolve
+any of the representative examples we have tried so far. One practical note is that representing shape equality is
+quite expensive, as it requires the use of universal quantiﬁcation to express function equality. It is however one of
+the most fundamental operations in our constraint language, and because of that we preprocess the constraints
+before the UFNIA translation by trying to eliminate as many equalities as we can (by eliminating variables that
+can be substituted without aﬀecting correctness). With this simple preprocessing step, the veriﬁcation process is
+very quick, but one can easily get solver timeouts if it is skipped.
+
+3.5 Checking procedure
+
+To verify the program, the algorithm ﬁrst gathers all possible path conditions appearing in the program con-
+straints. For each such condition, we ﬁrst check that this path is actually feasible, i.e. that the blocks labeled by
+this condition are actually reachable. This is performed by asserting all constraints except those that are guarded
+by the current condition along with the condition. The intuition here is that we want to verify whether all the
+constraints that are in blocks which are less constrained than this one actually allow for its execution. If the path
+feasibility check succeeds, we additionally assert the conditions that we have omitted in the check, and run the
+analysis.
+
+To see why verifying satisﬁability of the path condition alone is not suﬃcient consider the following program:
+
+func g(_ y: Int) {
+if (y == 2) {
+
+...
+
+}
+
+}
+
+func f(_ x: Int) {
+if (x == 1) {
+
+g(x)
+
+}
+
+}
+
+After processing, the system of constraints derived from f would look approximately like this: (x = 1 ⇒ y =
+x) ∧ (x = 1 ∧ y = 2 ⇒ true). While x = 1 ∧ y = 2 is certainly a satisﬁable formula on its own, it is not a good
+assumption to make in this program given that it implies the path condition of the equality y = x.
+
+A careful reader will notice that the above algorithm has a failure mode which is that if blocks that have
+weaker path conditions contain a shape contradiction then it will be considered as a reason to reject the strongly
+constrained path as unfeasible. This however should not be an issue, as it means that the program does in fact
+
+6
+
+IJlK = l
+
+IJvK = v
+
+IJ
+
+(loc)K = vloc (a variable name unique to program location loc where the hole appeared)
+
+IJrank(s)K = SJsK.rank
+
+IJs[c]K =
+
+(
+
+SJsK.shape(c) assuming 0 < −c ≤ SJsK.rank
+if c < 0
+SJsK.shape(SJsK.rank − c) assuming 0 ≤ c < SJsK.rank if c ≥ 0
+
+IJn1 ⊙ n2K = IJn1K ⊙ IJn2K (where ⊙ ∈ {+, −, ·, /})
+
+BJtrueK = ⊤
+
+BJfalseK = ⊥
+
+BJvK = v
+
+BJ¬bK = ¬BJbK
+
+BJb1 ⋄ . . . ⋄ bkK = BJb1K ⋄ . . . ⋄ BJbkK (where ⋄ ∈ {∧, ∨})
+
+BJn1 = n2K = IJn1K = IJn2K
+
+BJb1 = b2K = BJb1K = BJb2K
+
+BJn1 ⋄ n2K = IJn1K ⋄ IJn2K (where ⋄ ∈ {>, ≥, <, ≤})
+
+BJs1 = s2K = (SJs1K.rank = SJs2K.rank) ∧ (∀i SJs1K.shape(i) = SJs2K.shape(i))
+
+SJvK = (v, vrank)
+
+SJ[n1, . . . , nk]K = (vf , vfrank ) assuming SJvf K.rank = k ∧
+
+SJvf K.shape(i) = IJniK
+
+SJbroadcast(s1, s2)K = (vf , vfrank ) assuming SJvf K.rank = max (SJs1K.rank, SJs2K.rank)
+
+^
+
+∀i SJvf K.shape(i) = max (SJs1K.shape(i), SJs2K.shape(i))
+∀i SJs1K.shape(i) = 1 ∨ SJs2K.shape(i) = 1
+
+∨ SJs1K.shape(i) = SJs2K.shape(i)
+
+Figure 2: Translation of shape constraints into the UFNIA logic. vf denotes a fresh variable that is created each
+time a rule is used. Additionally, each time a rule containing assuming φ is evaluated, the formula φ is added
+to the set of assumptions. The result is a conjunction of the output formula and all assumptions made during
+the translation. The result of SJ·K is assumed to be a named pair, with ﬁrst component named dims and second
+component named rank. Also, SJxK.shape(i) is syntax sugar for SJxK.dims(SJxK.rank − i − 1).
+
+contain an error. Because we iterate over all possible path conditions it will be reported when we reach the
+weakest possible assumption that is necessary to prove it.
+
+Instead of verifying all possible conditions one could also reﬁne the algorithm such that it ﬁrst considers the
+most restricted conditions, and only descends to those implied by it if a failure is found or the path is found to
+be infeasible. This however is left for a future improvement.
+
+3.6 Error reporting
+
+One of the most signiﬁcant challenges facing veriﬁcation tools that depend on SMT solvers is providing good
+error messages. In our case, it is very hard to analyze the exact cause of failure, and the proofs produced by
+Z3 on small programs can easily grow to thousands of operations. Providing those explanations is hard, but
+making it easy to understand the failures for users is crucial for success of a static analysis tool. Hence, to give
+users some insights, we extract an unsat core from the solver (i.e. a subset of the input assertions that lead to a
+contradiction), and apply a simpliﬁcation procedure to those. It looks for expressions of the form v = ..., and
+tries to eliminate the variable v from the constraint system by inlining the other side of the equality into other
+constraints and simplifying those. As it turns out, this method works quite well in practice.
+
+To see what kind of output can be provided with this method, consider a program shown in Listing 3. Running
+TFP over it, would produce the error in Listing 4, pointing to a single assertion that (after simpliﬁcation) is
+suﬃcient to prove the error. Note that it is also printed as 10 = 30, which shows what kind of abstract values
+
+7
+
+func matmul(_ x: Tensor<Float>, _ y: Tensor<Float>) -> Tensor<Float> {
+
+assert(x.shape[1] == y.shape[0])
+let r = TensorFlow.matmul(x, y)
+assert(r.shape == [x.shape[0], y.shape[1]])
+return r
+
+}
+
+let x = randn([20, 10])
+let y = randn([30, 10])
+let z = matmul(x, y)
+
+Listing 3: An incorrect use of the matrix multiplication function.
+
+In main():
+Something doesn't fit!
+
+- 10 = 30
+
+Asserted at tmp.swift:2
+
+2
+
+| func matmul(_ x: Tensor<Float>, _ y: Tensor<Float>) -> Tensor<Float> {
+|
+|
+
+assert(x.shape[1] == y.shape[0])
+let r = TensorFlow.matmul(x, y)
+
+Listing 4: An error reported by the TFP tool when checking the program shown in Listing 3.
+
+were deduced for both sides of this equality.
+
+In the future there are two potential improvements that we could consider. Firstly, instead of using Z3 for all
+the solving, there’s an option of writing a custom model checker that only defers to an SMT solver for arithmetic
+reasoning, which would allow it to give more context when a failure occurs. Secondly, one could try to synthesize
+summaries from Z3 unsat proofs (e.g. match some patterns of most common shape errors), but that might not
+be robust in practice.
+
+3.7 Higher level abstractions
+
+Although our system supports analysing un-annotated user programs, the more assertions appear in the program,
+the better the error messages produced by TFP become. Additionally, the tool can know whether the shape error
+is within the implementation of a function or in the use of the function. As a result, developing ergonomic syntax
+for expression assertions is an integral part of a successful tool.
+
+Because the tool derives shape analysis from standard assertions and not from the semantics of the NDArray
+operations themselves, the entire system gracefully extends to arbitrary user abstractions. For example, deep
+learning libraries often vend a variety of Layer abstractions (e.g. a convolutional layer). Library authors simply
+add standard asserts within their code.
+
+In Tensors Fitting Perfectly, we leverage Swift’s support for deﬁning custom operators to deﬁne the |->
+operator which is syntactic sugar for shape assertions. (See Listing 1 for the implementation.) It asserts the
+Tensor has a given (symbolic) shape, and returns the Tensor itself, allowing for ergonomic use in variable
+assignment. The following is an example in practice:
+
+func runDigitDetection(
+
+_ images: Tensor<Float>
+
+) -> Tensor<Float> {
+
+let batchSize = input.shape[0]
+let output = network(input)
+|-> [batchSize, 10]
+
+// 10 digits
+
+let predictions = softmax(output)
+
+|-> [batchSize]
+
+return predictions
+
+}
+
+In addition to providing information about shapes statically, these assertions are validated at runtime to help
+debug shape errors static analysis did not catch. Note: the runtime checks are disabled when compiling with
+
+8
+
+In main() -> ():
+
+- The hole at tmp.swift:2:19 has to be exactly 10
+
+2
+
+|
+|
+|
+
+let x = randn([20, 10])
+let y = randn([____, ____])
+let z = matmul(x, y)
+
+- Some example values that the hole at tmp.swift:2:25 might take are: 1, 2, 3
+
+2
+
+|
+|
+|
+
+let x = randn([20, 10])
+let y = randn([____, ____])
+let z = matmul(x, y)
+
+Listing 5: Tool output guiding the user to values for shape holes that allow the program to execute correctly.
+There are 2 shape holes—both on line 2—in this program. The tool prints the valid value when only a single
+shape value satisﬁes all the program’s constraints (the ﬁrst shape hole), while suggesting a range of valid values
+if the constraints do not force a single solution (the second shape hole).
+
+optimizations to avoid introducing any overheads for high performance applications.
+
+3.8 Shape holes
+
+Finding shape errors can deﬁnitely make writing correct programs easier, but that functionality alone does not
+really improve one’s understanding of the shape semantics of the code.
+Ideally, one could imagine having an
+editing environment in which e.g. hovering over a tensor expression or variable would reveal its shape in relation
+to other variables present in scope, or some globally deﬁned constants (like batch size for example). Such a tight
+integration is not yet supported by our tool, but we do provide a way to synthesize constants in the user program
+based on the shape constraints which we call shape holes.
+
+More concretely, whenever an identiﬁer
+
+(of type Int) is present in the user program, Tensors Fitting
+Perfectly will treat it as a shape hole. As shown in the constraint language speciﬁcation (Figure 1) each hole is
+associated with its program location. Later, during the translation to logical formulas (Figure 2) each hole eﬀec-
+tively gets assigned a unique variable labelled by its program location. Assuming that there are no contradictions
+in the extracted shape speciﬁcation, we can retrieve the model from the SMT solver, and see what the valuation of
+each such special variable is. Moreover, once we see an example valuation we can query the solver for alternative
+solutions to determine whether each such value is in fact unique, or to generate a number of examples. Based on
+that, if the checking procedure succeeds, TFP will display a message showcasing a few possible values for each
+program hole, making it very easy to ﬁll e.g. incomplete machine learning model speciﬁcations automatically.
+
+For example, consider this program where randn creates a new array with a given size and all entries sampled
+
+i.i.d. from the unit Normal distribution and matmul being the matrix multiplication function:
+
+let x = randn([20, 10])
+let y = randn([____, ____])
+let z = matmul(x, y)
+
+Matrix multiplication requires that the contracted dimensions (i.e. second dimension of x and ﬁrst dimension
+of y) be equal, while the second dimension of y is completely unconstrained in this case. Running TFP over it
+would produce the output in Listing 5.
+
+This conﬁrms the insights stated in the previous paragraph and indicates that the ﬁrst dimension of y neces-
+sarily has to be of size 10, or a shape error will occur otherwise. It is clear that this approach can be extended
+further and used for providing functionality like tooltips for code editors or synthesis of program constants that
+might be hard to compute by hand (a good example here is e.g. the number of features after ﬂattening of a
+sequence of convolutional layers).
+
+4 Related work
+
+While the approach to shape checking taken in this paper is novel, the technique of applying model checkers
+for bug ﬁnding has been known for a long time.
+In fact, our tool works similarly to the sketch described in
+the seminal work of Engler et al. [9]: we infer the speciﬁcation from the user program, and report errors if it is
+contradictory. Another tool that has adopted a similar approach is PREﬁx [5]. However, both of those are mostly
+
+9
+
+focused on ﬁnding e.g. memory safety issues instead of reasoning about numerical metadata like shapes. A good
+introduction to those methods can be found in an excellent review by the authors of the Z3 SMT solver [3].
+
+Much more academic work has been devoted to the task of proving the absence of errors instead. If we do
+not limit ourselves to the shape checking problem stated previously, techniques like abstract interpretation [7, 6]
+have been quite successful. However, their reliance on the over-approximation of the set of reachable states means
+that they can often report errors which are not actually present in the user code. This does not work very well in
+the context of shape veriﬁcation, because one does not want to force all users into a defensive mode where they
+have to write a lot of code devoted to checking shape conditions. It has also been known to have trouble scaling
+to larger programs, but successful reasoning about shapes without annotations crucially depends on extracting
+knowledge from large fragments of the program via inter-procedural analysis.
+
+Annotation checkers [14, 10] also deserve a mention here, but those require numerous extra directives from the
+user, which is very time-consuming in large programs. Such a productivity hit certainly outweighs the beneﬁts
+in many research applications where most programs are run once and then modiﬁed or discarded.
+
+When one turns to shape veriﬁcation, most tools built speciﬁcally for that purpose are based on an attempt
+to design a decidable type system that can eﬀectively prove that no shape errors can occur at run time. Those
+are usually explored in the context of functional programming, and some good examples include languages like
+Remora [20], Dex [15] or Futhark [11]. Unfortunately, many operators used commonly in practice today require
+features that would make the type system undecidable, meaning that all those approaches cannot possibly scale
+to the way those programs are expressed today. This is not to say that the current interfaces are perfect and
+a decidable dialect cannot be made useful. It is only that those attempts cannot help the thousands of people
+writing e.g. NumPy programs today.
+
+Projects utilizing undecidable systems aided by solvers like Hasktorch [12] deserve a mention too. They can
+usually assign types to most of the commonly used operators, and the modern solvers are actually powerful
+enough to discharge most constraints emitted by the type checking procedure. However, their success critically
+depends on the interesting programs actually forming a decidable subset of the type checking problem, which can
+be handled with available solvers.
+
+The approaches discussed above provide a lot of safety and can certainly be beneﬁcial in mission critical
+applications. However, many numerical programs are written purely for research purposes, and do not need the
+full guarantee of correctness, especially at a cost of the veriﬁcation process restricting the expressiveness of the
+language or signiﬁcantly slowing down the development speed. Additionally, all of the typing approaches have
+been presented in functional programming languages which are not the tool of choice for the vast majority of
+users today. Hence, applying those techniques without signiﬁcantly disrupting existing workﬂows seems very
+hard. This is why we believe that bug ﬁnding approaches like the one proposed in this article are an interesting
+alternative, as they can provide insights into the programs, while avoiding the need for the user to spend too
+much time wrangling with the tool.
+
+5 Conclusion and future work
+
+This article introduces Tensors Fitting Perfectly, a static analysis tool that attempts to infer tensor shape spec-
+iﬁcation from optionally annotated user programs, and ﬁnd shape errors based on those. The error checking is
+based on encoding the speciﬁcation in the UFNIA logic, and using an SMT solver to answer satisﬁability queries.
+This is unlike any prior work, where all shape checks are either solely carried out at run time or are encoded
+as part of the type-checking problem, leading to certain limitations and forcing users to change their workﬂows
+signiﬁcantly. This work presents a practical alternative that gracefully combines a novel static representation of
+programs with optional dynamic checks to form a pragmatic and practical system to improve user eﬃciency.
+
+Apart from that, TFP provides the means to infer values of diﬀerent shape constants, making it possible
+for programmers to get interactive feedback about the shapes without executing the code. All of this has been
+designed to potentially work with partially incomplete or incorrect code (containing e.g. syntax errors), such that
+in the future it can be used to power high-level code intelligence tools and provide direct insights from within the
+editors. Some other future plans for our work include: (a) Expanding support for more language constructs (e.g.
+var declarations); (b) Adding support for veriﬁcation across Swift modules; and (c) Writing front-ends for other
+languages (e.g. Python).
+
+10
+
+References
+
+[1] Mart´ın Abadi, Ashish Agarwal, Paul Barham, Eugene Brevdo, Zhifeng Chen, Craig Citro, Greg S. Corrado,
+Andy Davis, Jeﬀrey Dean, Matthieu Devin, Sanjay Ghemawat, Ian Goodfellow, Andrew Harp, Geoﬀrey
+Irving, Michael Isard, Yangqing Jia, Rafal Jozefowicz, Lukasz Kaiser, Manjunath Kudlur, Josh Levenberg,
+Dandelion Man´e, Rajat Monga, Sherry Moore, Derek Murray, Chris Olah, Mike Schuster, Jonathon Shlens,
+Benoit Steiner, Ilya Sutskever, Kunal Talwar, Paul Tucker, Vincent Vanhoucke, Vijay Vasudevan, Fernanda
+Vi´egas, Oriol Vinyals, Pete Warden, Martin Wattenberg, Martin Wicke, Yuan Yu, and Xiaoqiang Zheng.
+TensorFlow: Large-scale machine learning on heterogeneous systems, 2015. Software available from tensor-
+ﬂow.org.
+
+[2] Alfred V Aho and Jeﬀrey D Ullman. Universality of data retrieval languages. In Proceedings of the 6th ACM
+
+SIGACT-SIGPLAN symposium on Principles of programming languages, pages 110–119. ACM, 1979.
+
+[3] Nikolaj Bjørner and Leonardo de Moura. Applications of SMT solvers to program veriﬁcation. 2014.
+
+[4] James Bradbury, Roy Frostig, Peter Hawkins, Matthew James Johnson, Chris Leary, Dougal Maclau-
+JAX: composable transformations of Python+NumPy programs.
+
+rin, and Skye Wanderman-Milne.
+http://github.com/google/jax, 2018.
+
+[5] William R Bush, Jonathan D Pincus, and David J Sielaﬀ. A static analyzer for ﬁnding dynamic programming
+
+errors. Software: Practice and Experience, 30(7):775–802, 2000.
+
+[6] Patrick Cousot and Radhia Cousot. Introduction to abstract interpretation. 1998.
+
+[7] Patrick Cousot, Radhia Cousot, J´erˆome Feret, Laurent Mauborgne, Antoine Min´e, David Monniaux, and
+Xavier Rival. The astr´ee analyzer. In European Symposium on Programming, pages 21–30. Springer, 2005.
+
+[8] Richard A Eisenberg. Dependent types in haskell: Theory and practice. PhD thesis, University of Pennsyl-
+
+vania, 2016.
+
+[9] Dawson Engler, David Yu Chen, Seth Hallem, Andy Chou, and Benjamin Chelf. Bugs as deviant behavior: A
+general approach to inferring errors in systems code. In ACM SIGOPS Operating Systems Review, volume 35,
+pages 57–72. ACM, 2001.
+
+[10] Cormac Flanagan, Cormac Flanagan, K Rustan M Leino, Mark Lillibridge, Greg Nelson, James B Saxe, and
+Raymie Stata. Extended static checking for java. In ACM Sigplan Notices, volume 37, pages 234–245. ACM,
+2002.
+
+[11] Troels Henriksen, Niels GW Serup, Martin Elsman, Fritz Henglein, and Cosmin E Oancea. Futhark: purely
+functional gpu-programming with nested parallelism and in-place array updates. In ACM SIGPLAN Notices,
+volume 52, pages 556–571. ACM, 2017.
+
+[12] Austin Huang, Junjie Hashimoto, Adam Paszke, Sam Stites, and Torsten Scholak.
+
+Hasktorch.
+
+https://github.com/hasktorch/hasktorch, 2019.
+
+[13] Kenneth E. Iverson. A Programming Language. John Wiley & Sons, Inc., New York, NY, USA, 1962.
+
+[14] Daniel Jackson. Aspect: Detecting bugs with abstract dependences. ACM Transactions on Software Engi-
+
+neering and Methodology (TOSEM), 4(2):109–145, 1995.
+
+[15] Dougal Maclaurin, Radulm Alexey, Matthew J. Johnson, and Dimitrios Vytiniotis. Dex: array programming
+
+with typed indices. In NeurIPS Program Transformations Workshop, 2019.
+
+[16] Nishant Sinha. tsanley. https://github.com/ofnote/tsanley, 2019.
+
+[17] Travis Oliphant. NumPy: A guide to NumPy. USA: Trelgol Publishing, 2006.
+
+[18] Adam Paszke, Sam Gross, Francisco Massa, Adam Lerer, James Bradbury, Gregory Chanan, Trevor Killeen,
+Zeming Lin, Natalia Gimelshein, Luca Antiga, Alban Desmaison, Andreas Kopf, Edward Yang, Zachary
+DeVito, Martin Raison, Alykhan Tejani, Sasank Chilamkurthy, Benoit Steiner, Lu Fang, Junjie Bai, and
+Soumith Chintala. Pytorch: An imperative style, high-performance deep learning library. In Advances in
+Neural Information Processing Systems, 2019.
+
+11
+
+[19] Brennan Saeta, Denys Shabalin, Marc Rasi, Brad Larson, Xihui Wu, Parker Schuh, Michelle Casbon, Daniel
+Zheng, Saleem Abdulrasool, Aleksandr Efremov, Dave Abrahams, Chris Lattner, and Richard Wei. Swift
+for TensorFlow: A portable, ﬂexible platform for deep learning. MLSys, 2021.
+
+[20] Justin Slepak, Olin Shivers, and Panagiotis Manolios. An array-oriented language with static rank polymor-
+phism. In European Symposium on Programming Languages and Systems, pages 27–46. Springer, 2014.
+
+[21] Theano Development Team. Theano: A Python framework for fast computation of mathematical expressions.
+
+arXiv e-prints, abs/1605.02688, May 2016.
+
+12
+
+

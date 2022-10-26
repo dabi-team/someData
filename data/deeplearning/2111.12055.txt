@@ -1,0 +1,821 @@
+GENERATING GPU COMPILER HEURISTICS USING
+REINFORCEMENT LEARNING
+
+Ian Colbert∗, Jake Daly, Norm Rubin
+
+Advanced Micro Devices, Inc.
+
+ABSTRACT
+
+GPU compilers are complex software programs with many optimizations speciﬁc to target hardware.
+These optimizations are often controlled by heuristics hand-designed by compiler experts using time-
+and resource-intensive processes. In this paper, we developed a GPU compiler autotuning framework
+that uses off-policy deep reinforcement learning to generate heuristics that improve the frame rates
+of graphics applications. Furthermore, we demonstrate the resilience of these learned heuristics
+to frequent compiler updates by analyzing their stability across a year of code check-ins without
+retraining. We show that our machine learning-based compiler autotuning framework matches or
+surpasses the frame rates for 98% of graphics benchmarks with an average uplift of 1.6% up to 15.8%.
+
+Keywords Compiler Autotuning · Compiler Heuristics · GPUs · Machine Learning · Reinforcement Learning
+
+1
+
+Introduction
+
+The beneﬁts of compiler optimizations often depend on characteristics of the code and the capabilities of the target
+hardware. For example, an optimization that reorders instructions to increase the number of overlapped loads can
+often speed up execution. However, as the number of parallel threads increases, this optimization can exceed hardware
+limits and slow down execution. Often, compiler optimizations are controlled by complex decision functions, typically
+referred to as heuristics, that are hand-crafted by experts. As the number of code optimizations in production compilers
+has grown, compiler writers have sought ways to automate the process of tuning these heuristics through autotuning - a
+technique used to explore code optimizations based on an objective function.
+
+As shown in Figure 1, we separate standard autotuning frameworks into "black box" or "glass box" paradigms. "Black
+box" compiler autotuning frameworks inject pragmas and code optimization ﬂags to externally tune options to maximize
+performance for a hardware target. In this paradigm, the learning agent (e.g., a human expert or computational model)
+is external to the compiler. However, this limits the beneﬁts of a well-tuned solution when new code is introduced in
+production as the learning agent is often not shipped with the compiler. Alternatively, "glass box" compiler autotuning
+frameworks integrate the learning agent in the compiler, where a well-trained solution can act on new code introduced
+when deployed in a production setting.
+
+1
+2
+0
+2
+
+v
+o
+N
+3
+2
+
+]
+
+G
+L
+.
+s
+c
+[
+
+1
+v
+5
+5
+0
+2
+1
+.
+1
+1
+1
+2
+:
+v
+i
+X
+r
+a
+
+∗Corresponding author: ian.colbert@amd.com
+
+ 
+ 
+ 
+ 
+ 
+ 
+I. Colbert et al.: Generating GPU Compiler Heuristics using Reinforcement Learning
+
+Figure 1: Compiler Autotuning Frameworks. The “black box" framework injects code optimization ﬂags to externally tune
+options for a hardware target. Alternatively, the “glass box" framework integrates the learning agent in the compiler to act directly on
+the intermediate representation (IR).
+
+As such, we have focused on two problems under this "glass box" paradigm: (1) learning stable GPU compiler heuristics
+through reinforcement learning-based (RL-based) autotuning and (2) deploying these trained models as heuristics in
+production compilers. To our knowledge, this is the ﬁrst ML-based autotuning framework used to learn, integrate, and
+deploy heuristics in a production GPU compiler. Below, we summarize our contributions:
+
+1. We formulated production GPU compiler autotuning as an off-policy reinforcement learning problem to
+
+maximize the reuse of performance data in a production setting (Section 3).
+
+2. We designed an autotuning framework that addresses both the unique complexities that arise when optimizing
+for multi-threaded hardware as well as the stability required of deployed learned heuristics in constantly
+evolving production compilers (Section 4).
+
+3. We applied our framework to a unique compiler optimization over two GPUs and deployed the resulting
+
+models in the production AMD Radeon™ Software graphics compiler (Section 5).
+
+4. We show the inherent resilience of our trained models to software updates by analyzing the stability of our
+
+deployed compilers heuristics over a year of production code check-ins without retraining (Section 5).
+
+2 Background
+
+One could be guaranteed to ﬁnd the optimal heuristic settings by exhaustively searching the code optimization
+space using iterative trial-and-error. However, the cost of these experiments quickly becomes a limiting factor as
+graphics benchmarks have non-trivial runtimes and production compilers are constantly evolving. In practice, standard
+approaches to compiler heuristic autotuning follow expert-driven or machine learning-based (ML-based) strategies.
+Using expert-driven autotuning, compiler optimizations are controlled by heuristics typically hand-tuned over a focused
+subset of representative benchmarks that are selected and analyzed by compiler (or hardware) experts. This approach
+requires a signiﬁcant amount of expertise as optimizations become more complex and may fail to exploit complex
+high-dimensional patterns. Alternatively, machine learning offers a robust means of automatically learning non-linear
+decision functions in high dimensional spaces. This makes it an ideal ﬁt for compiler autotuning problems, where
+the space to tune a single compiler optimization heuristic is non-linear with many local minima and can vary across
+target hardware [1]. Given a representative and accurately labeled dataset, ML-based autotuning can generalize to new
+programs easier and be re-tuned for new hardware faster [2]. In a "glass box" compiler autotuning framework, these
+learned models are later integrated into the compiler to control code optimizations as heuristics.
+
+2.1 Production GPU Compiler Autotuning
+
+Modern graphics applications such as computer games contain dedicated kernels, referred to as shaders, that concurrently
+execute as pipelined functions when rendering a frame. The frames rendered by these applications represent views
+of a virtual 3D scene deﬁned by complex geometry, material properties, and light sources. The shader pipelines used
+to render these frames are designed to project the geometric primitives of the 3D virtual scene (e.g., points, lines,
+and triangles) onto the 2D screen and calculate the color and opacity of each pixel. These shaders are written in a
+high-level device-independent language which makes use of a large, ﬁltered look-up table parameterized by a collection
+of multi-dimensional arrays referred to as resources. Often, before the application ships, these shaders are compiled
+by a front-end compiler into device-independent byte code. Later, these byte codes are separately used as inputs to a
+supplied driver which then translates them into machine-dependent byte codes to ﬁnally be compiled by the back-end
+compiler into a target-speciﬁc instruction set architecture (ISA). The ISA and dynamic resource information is then
+
+2
+
+I. Colbert et al.: Generating GPU Compiler Heuristics using Reinforcement Learning
+
+packaged together and handed off to the GPU for execution. Additionally, the application can execute one or more
+pipelines asynchronously.
+
+Recent work has tried to capture dynamic information to guide program optimization [3]; however, neither resource
+information nor concurrently executing shader pipelines are known to the back-end compiler at compile time. Conse-
+quently, heuristics controlling code optimizations are simpliﬁed by assuming that speeding up each program individually
+leads to speed-ups on the application globally. While this is often true for single-threaded applications, GPU graphics
+applications are highly parallel multi-threaded optimization problems where programs execute concurrently and compete
+for shared hardware resources. In this environment, focusing on improving the execution time of an individual program
+in isolation will not always lead to speed-ups on the application globally. Allocating resources either detracts from the
+shared pool or reduces the ability for multiple programs to run concurrently.
+
+In this paper, we view the back-end compiler and driver as a single object. As such, we refer to both the back-end
+compiler and the driver as "the compiler". The non-deterministic nature of graphics applications, the multi-threaded
+execution model of the GPU, and the constant evolution of production software introduce unique complexities on top of
+standard compiler autotuning problems. We summarize these complexities as follows:
+
+1. Decisions made by the front-end compiler cannot be undone. Different front-end compilers can generate
+radically different byte code, all of which have to be supported and optimized by the back-end compiler.
+2. There are many opportunities for parallel processing that are difﬁcult to account for. The unpredictable
+cost of executing each shader and the constraints on the order of their execution introduce dynamic dependen-
+cies that complicate parallel implementations.
+
+3. The computational and bandwidth requirements can vary signiﬁcantly depending on the behavior of
+shaders and properties of a scene. The compiler has very little insight into this; for example, if the same
+shader is used in multiple pipelines, the compiler typically cannot optimize them differently in each pipeline.
+4. The frequency of production compiler updates can change and inadvertently destabilize tuned heuris-
+tics. As production compilers are updated, their intermediate representation (IR) of each shader can change.
+As such, heuristics deployed in production compilers need to be robust to these shifts in compiler IR.
+
+We address this problem of per-shader code optimization under the unique conditions that arise from production GPU
+compiler autotuning.
+
+2.2 Supervised Learning
+
+The majority of ML-based autotuning frameworks focus on supervised learning (SL) approaches to ﬁt a predictive
+model to labeled data. This strategy has provided state-of-the-art performance in the ﬁeld of compiler autotuning [4, 5,
+6, 7, 8, 9, 10, 11]. Under the SL training paradigm, inputs to the model are derived from characteristics of program code
+and/or the target hardware while labels are derived from performance measurements. However, the success of SL on
+discriminative tasks is reliant on the quality of the training dataset [12, 13, 14]. As shown by Zhang et al. [13], DNNs
+can ﬁt to entire training sets even in the presence of corruption, which leads to poor generalizability when deployed in
+the real world. In the scope of GPU compiler autotuning for real-world graphics applications, accurate labels derived
+from frame rates or execution times are either unknown or become computationally intractable to determine with the
+non-deterministic multi-threaded execution model.
+
+2.3 Reinforcement Learning
+
+Unlike SL, reinforcement learning (RL) algorithms do not rely on accurate pre-determined labels, but rather on a
+reward signal received from interacting with an environment by observing states and selecting actions in accordance
+to a decision function, as shown in Figure 2. The decision function, referred to as a policy, is used to map states to
+actions and, in deep reinforcement learning (DRL), can be modeled using a DNN. The DRL training process aims to
+optimize an objective function by trial-and-error using reward signals generated by the environment to guide parameter
+updates [15]. The objective under this paradigm is to learn a policy (π) that maximizes the cumulative expected rewards
+for a sequence of states, typically referred to as a trajectory (τ ). The "state, action, reward" tuples are generated through
+a controlled feedback loop between the policy and the environment.
+
+RL algorithms are typically applied to sequential decision-making problems but have been shown to achieve high
+performance in single-time step domains such as classiﬁcation or detection tasks [16, 17]. Unlike SL algorithms which
+train on large static datasets, RL algorithms often dynamically collect data throughout training2. As discussed further in
+
+2It is important to note that there are cases in which supervised learning algorithms train on dynamically changing datasets -
+
+online learning strategies, for example. There are also applications where reinforcement learning learn entirely on static datasets.
+
+3
+
+I. Colbert et al.: Generating GPU Compiler Heuristics using Reinforcement Learning
+
+Section 7, select previous works approach compiler autotuning using DRL [18, 19, 20, 21]. Here, states are derived
+from characteristics of program code, actions are applied code optimizations or heuristic settings, and rewards are
+derived from performance measurements.
+
+2.3.1 Q-Learning
+
+Q-Learning is a simple, computationally efﬁcient RL strategy that learns how to act optimally by iteratively improving
+evaluations of the quality of particular actions at particular states, often referred to as state-action pairs [22]. In discrete
+action spaces, these evaluations are stored in a data structure often referred to as a Q-table3, where the value of each
+state-action pair is calculated using the expected cumulative reward discounted by a time factor (γ) when taking action
+a in state s using policy π, as shown in Eq. 1. Here, each element is interpreted as the estimated value of a given action
+at a given state when following policy π through trajectory τ . When greedily following the Q-table, an agent chooses
+the sequence of actions that maximize the expected reward from initial state s0. Watkins et al. [22] prove in detail that,
+in discrete action spaces, Q-learning converges to the optimal values of state-action pairs with probability 1 given that
+all state-action pairs are repeatedly sampled. These optimal values constitute the optimal Q-table, often referred to
+as Q∗(s, a), and are interpreted as the expected cumulative discounted reward when following the optimal policy π∗
+through a trajectory τ of size T .
+
+Qπ(s, a) = Es0=s,a0=a[
+
+(cid:88)
+
+γtrt]
+
+t∈τ
+
+(1)
+
+Figure 2: Supervised Learning (SL) vs. Reinforcement Learning (RL). Under a SL paradigm, a predictive model is
+ﬁt to labeled data previously collected to represent a target environment. Under a RL paradigm, a decision function is
+trained to select the action for a given state that maximizes the expected reward through trial-and-error interactions with
+a target environment.
+
+3 Problem Formulation and Solution Overview
+
+Standard DRL algorithms are active learning processes which requires frequent interaction with a stationary environ-
+ment [24]. Throughout the trial-and-error training process, the data collected when interacting with the environment
+using the current policy can only be used to update internal parameters once [15]. As such, when the policy changes (or
+the environment changes), the data can no longer be used. By continually discarding old data, this class of learning
+algorithms, referred to as "on-policy" DRL, is sample inefﬁcient [15]. Gleeson et. al [25] show that on-policy algorithms
+are at least 3.5x more simulation-bound than off-policy algorithms. If we were to use on-policy DRL for GPU compiler
+autotuning, the system would be heavily bottlenecked by the duration of graphics benchmarks, which can each run
+several minutes. With the frequency of production compiler updates and as the number of code optimizations under
+consideration increases, the detrimental impact of this bottleneck exponentially increases.
+
+Alternatively, "off-policy" DRL algorithms learn from previously collected data without reliance on frequent inter-
+actions, even with updated policies in non-stationary environments. For this reason, we focus on off-policy DRL
+for GPU compiler autotuning and separate data collection and model training to inexpensively leverage pre-existing
+performance automation workﬂows to build ofﬂine datasets to train on. However, without corrective feedback, off-policy
+reinforcement learning strategies are notoriously instable and sensitive to hyperparameter tuning [24, 26]. To both
+reintroduce corrective feedback and alleviate data collection bottlenecks, we introduce the Q-learning strategy discussed
+in Section 4 that decouples data collection and model training to each run continuously in a controlled feedback loop.
+
+3In domains with continuous action spaces, this is often referred to as a Q-function and modeled using a DNN [23]
+
+4
+
+I. Colbert et al.: Generating GPU Compiler Heuristics using Reinforcement Learning
+
+3.1 Problem Formulation
+
+The goals of our RL-based GPU compiler autotuning training strategy are: (1) to determine the heuristic setting for a
+given shader that yields the highest average frame rate increase over a target set of graphics applications; and (2) to
+deploy the learned decision function as a compiler heuristic that is stable in the presence of frequent code changes. To
+this end, we deﬁne the following:
+
+Environment: Unlike standard DRL problems, which assume a stationary environment, frequent code changes create
+a dynamic environment that is non-stationary, although the target hardware is static. As such, we refer to the target
+hardware and the dynamically changing production compiler as the non-stationary environment E. We refer to a
+compiler built at revision t as Et such that Et ∈ E, where t is a time step measured in code check-ins.
+
+States: We derive the state (s) from the compiler intermediate representation (IR) of a shader as further described in
+Section 4.2. In production, as the compiler is updated, the same shader may be compiled into different IR and, therefore,
+many possible states.
+
+Action: We deﬁne the action (a) as the heuristic setting applied to the IR during compilation. We deﬁne the actions
+taken when greedily following the optimal policy (π∗) as the optimal action (a∗), further described in Section 4.3.
+
+Rewards: We derive the reward (r) from the observed frame rate when taking action a for state s, further discussed in
+Section 4.1.2.
+
+Trajectory: Because the compilation strategy of modern GPU compilers addresses each shader program in isolation,
+we deﬁne each trajectory (τ ) as a single time-step Markov decision process (MDP) such that τi = {si}.
+
+Policy: We refer to the decision function that maximizes the expected frame rate improvement over a given set of
+graphics applications (A) executed in environment Et as the optimal policy (π∗). Our decision policy (πθ) throughout
+training is modeled using a DNN with learnable parameters θ. We interpret this decision policy as the probability of
+taking action a for a given state s such that πθ (a|s).
+
+3.2 Solution Overview
+
+We introduce the training strategy depicted in Figure 3 and detailed in Section 4.3 to generate GPU compiler heuristics
+using an off-policy reinforcement learning (RL) algorithm based on Q-learning. The training objective under this
+paradigm is to ﬁnd the optimal Q-table that maximizes the expected frame rate improvement when applying heuristic
+setting a to a given state s. The inference objective is to then ﬁt a DNN decision policy (πθ) to the empirically estimated
+optimal policy (π∗) by learning the set of parameters θ that minimize its divergence from π∗. Once trained ofﬂine, the
+learned inference model is then integrated directly into the compiler to act as a heuristic decision function. For clarity,
+we differentiate between decision policy πθ (a|s) and behavior policy πβ (a|s). We deﬁne the behavior policy πβ as
+the inference model counterpart to πθ, where the parameters of πβ are pre-trained and frozen from the decision policy.
+Whereas the decision policy is iteratively updated throughout training, the behavior policy is frozen at inference time.
+
+4 RL-based GPU Compiler Autotuning
+
+The non-trivial cost of running a GPU graphics benchmark requires an autotuning framework that is both robust to
+an evolving compiler and generalizable across an application suite. To learn stable heuristics, our RL-based GPU
+compiler autotuning framework, given by Algorithm 1 and depicted in Figure 3, consists of three modules pipelined
+in a controlled feedback loop - continuous integration, data collection, and model training. Starting from a randomly
+initialized decision policy (πθ), we use continuous integration (CI) to deploy the behavior policy (πβ) as a heuristic in the
+latest production compiler (see Section 4.1). We then collect the observed performance measurements and intermediate
+representations (IR) of the shaders in each graphics benchmark in our set of applications (A) (see Section 4.2). After
+updating (or expanding) the Q-table, we train πθ to approximate the empirically optimal decision policy (π∗) to
+maximize the expected frame rate over A (see Section 4.3). The learned parameters of πθ are periodically used to
+update πβ to be deployed as a heuristic in the latest compiler using CI to restart the feedback loop.
+
+4.1 Continuous Integration
+
+Continuous integration (CI) is the large-scale software engineering practice of merging developers’ working source
+code revisions into a shared mainline. Standard practice adopts a development strategy of merging these changes several
+times a day. As such, the development of production-level compilers is fast paced, which can lead to signiﬁcant changes
+in resulting code as discussed further in Section 5.1. Standard ML-based autotuning efforts ﬁt the decision function
+
+5
+
+I. Colbert et al.: Generating GPU Compiler Heuristics using Reinforcement Learning
+
+Figure 3: RL-based GPU Compiler Autotuning Framework. Our RL-based compiler autotuning framework com-
+bines deep reinforcement learning (DRL) with continuous integration (CI) to deploy trained models as heuristics in
+production compilers.
+
+Algorithm 1: RL-based GPU Compiler Autotuning
+Result: π(N )
+Randomly initialize πθ;
+Initialize an empty Q-table;
+while i < numIterations do
+
+β
+
+Copy learned parameters of πθ to π(i)
+β (Section 4.1);
+Integrate πβ into the latest compiler (Section 4.1.1);
+Get states and performance measurements over A (Section 4.2);
+Update (or expand) the Q-table based on the observed performance measurements (Section 4.3.1);
+Convert the empirical Q-table to probabilities π∗(s, a) (Section 4.3.1);
+Train πθ(a|s) to approximate π∗(s, a) (Section 4.3.2);
+
+end
+
+6
+
+I. Colbert et al.: Generating GPU Compiler Heuristics using Reinforcement Learning
+
+Figure 4: Machine Learning Compiler Phase. The behavior policy (πβ) is deployed as a compiler heuristic to be
+applied directly to the IR. The state (s) is derived directly from the incoming IR to be analyzed by πβ. The model
+output is then used to determine the compiler action (a).
+
+to a frozen snapshot in time. However, the possibility of freezing a production compiler is precluded by the team of
+engineers dedicated to improving it through continuous updates. In Section 4.3.1, we discuss how we account for CI
+throughout training.
+
+4.1.1 Inference Engine
+
+Figure 4 depicts the compiler inference engine, where the behavior policy (πβ) is deployed as a compiler heuristic to be
+applied directly to the IR, before any machine-dependent optimizations. The state is derived from the incoming IR
+(see Section 4.2) to be analyzed by πβ where the model output is then used to determine which heuristic setting can be
+optimally applied. Using continuous integration (CI) ensures πβ is always integrated into the latest compiler for each
+performance run. As shown in Figure 3, each trial-and-error loop collects the derived static features and the applied
+compiler heuristic settings (a) for every shader as well as the observed frame rates (r) of every graphics application in
+our benchmark suite (A). These static features are derived from the incoming IR before the neural network forward
+pass and used to build each state (s).
+
+4.1.2 Robust Reward Signals
+
+The success of learning a stable policy that generalizes well to real-world data is dependent on an informative reward
+signal that reinforces desired behavior. Under a multi-threaded execution model, speeding up one shader can sometimes
+lead to signiﬁcant performance degradation in another when co-executing programs compete for shared resources.
+Because our objective is to maximize the frame rate of graphics applications rather than reducing shader execution time,
+we deﬁne our reward signal (r) as the normalized change in frame rate observed when compared to the global default
+compiler actions. Given a baseline frame rate of F0 and an observed frame rate of F , the reward function becomes the
+relative speed-up given by F
+. However, as compilers evolve, previously collected performance measurements become
+F0
+stale. We further discuss this in Section 4.3.1.
+
+4.2 Data Collection
+
+Approaches to representing source code for machine learning models can be split into static and dynamic techniques.
+Dynamic techniques rely on performance counters which offer a condensed summary of the program’s behavior at
+runtime and have been empirically shown to outperform methods relying strictly on static features alone [5, 7]. However,
+dynamic performance counter information is expensive to collect and unrealistic in production compilers that do not
+have that information available at compile time. Alternatively, static techniques aim to form a representation directly
+from the source code itself. Recent works have drawn from the ﬁeld of natural language processing to learn distributed
+representations of instructions for automated feature extraction [8, 10, 27, 28, 29, 30]. While effective, these approaches
+can consume large chunks of memory and require more compute resources than are available in practice. To operate
+within the compute and memory constraints of production compilers, we capture fast, machine-independent features
+such as total instructions, number of basic blocks, and memory operations directly from the compiler IR at compile
+time. By doing so, we tightly represent the compiler IR of each shader as a ﬁxed-length feature vector at compile
+time using only 44 input features. When running the model at 32-bit ﬂoating point precision, this only consumes 176
+bytes. Table 1 provides a high-level summary of the categories of attributes used, each of which can be determined
+independently of target hardware.
+
+7
+
+Machine Learning Compiler Phase Derived StateInferenceExecutionCompilerActionIncomingIRResultingIRI. Colbert et al.: Generating GPU Compiler Heuristics using Reinforcement Learning
+
+# of basic blocks
+# of vector instructions
+# of scalar instructions
+# of memory instructions
+# of compute instructions
+# of control ﬂow instructions
+# of registers used
+# of work groups
+The shader hardware stage
+
+Table 1: Summary of Static Feature Categories Considered. Here, we provide a summary of the categories of static
+features considered when representing the incoming IR as a ﬁxed-length feature vector.
+
+4.3 Model Training
+
+Unlike on-policy DRL algorithms, which require πθ = πβ, off-policy algorithms can learn from previously collected
+data independent of the behavior policy πβ such that πθ (cid:54)= πβ. This allows data to be collected asynchronously and
+re-used throughout training iterations. In production systems, this is important since data collection does not bottleneck
+training and a decision policy can learn over historical revisions. However, as further discussed in Section 4.1, even
+mature production compilers are constantly changing. To deploy stable heuristics robust to changes in the compiler IR,
+we implement a DRL strategy based on Q-learning.
+
+4.3.1 Q-Learning for GPU Compiler Autotuning
+
+Here, we formalize Q-tables for RL-based GPU compiler autotuning. Let P (a|s; A) denote the probability that applying
+a heuristic setting (a) to a shader given its state (s) will maximize the expected frame rate over a set of applications
+(A). The optimal heuristic setting (a∗) is then the action that maximizes this conditional probability, as shown in Eq. 2.
+Given that we have deﬁned each trajectory as a single time-step MDP, the Q-table (see Eq. 1) under this formulation is
+independent of future sequences of states and actions. As shown in Eq. 3, the resulting value of each state-action pair
+can be simpliﬁed to its expected reward over A. The optimal decision policy π∗(s, a) can then greedily follow this
+Q-table to maximize the expected reward. Alternatively, the joint probability distribution π∗(s, a) can be derived from
+Q(s, a) using the standard Boltzmann softmax operator, as given by Eq. 4, where ρ is a temperature parameter such
+that ρ ∈ (0, ∞). As ρ increases, the derived policy moves towards a uniform distribution. As ρ decreases, it moves
+closer towards the greedy policy given by Eq. 2.
+
+a∗ = arg max
+
+P (a|s; A)
+
+a
+
+Q(s, a) = E[r|s, a; A]
+
+π∗(a|s) =
+
+eQ(s,a)/ρ
+
+(cid:80)
+
+aj
+
+eQ(s,aj )/ρ
+
+(2)
+
+(3)
+
+(4)
+
+As the compiler updates, performance measurements become stale. To account for this throughout training, we apply a
+discount (ω) based on the change in time (∆t) as measured in code check-ins. As data is collected from the nth iteration,
+the Q-table values are updated using Eq. 5 if the state already exists in the data structure such that s ≡ sn and a ≡ an.
+Qn(s, a) = (1 − α) · ω∆t · Qn−1(s, a) + α · rn
+
+(5)
+
+If the state has yet to be seen, it is initialized to the observed reward (rn). Here, α is learning rate and ∆t is dependent
+on the rate of code check-ins over a given measurement of time. Note that α and ω are tuneable hyperparameters.
+
+4.3.2 Approximating the Optimal Policy
+
+Compiler updates lead to changes in the IR which creates a non-stationary environment (E). Because the shader state
+(s) is derived from the compiler IR, these changes produce more states, creating a dynamic Q-table in response to the
+non-stationary E. As the compiler is updated, this Q-table would be too big to use as it expands with new state-action
+pairs. Additionally, a Q-table does not easily generalize to new states since it is a ﬁnite-state look-up table. As shown
+
+8
+
+I. Colbert et al.: Generating GPU Compiler Heuristics using Reinforcement Learning
+
+Figure 5: Shader Wavefront Size Selection - AMD Radeon™ 6800 XT. We provide a histogram of the observed change in frame
+rate when enabling the RL-based compiler heuristic to select shader wavefront size within the production AMD Radeon™ Software
+graphics compiler across the suite of graphics applications executed on the AMD Radeon™ 6800 XT.
+
+Figure 6: Average Change in IR Counters over Time. Over time, code changes to the compiler signiﬁcantly impact the state
+space of the of the shader IR. Even the total number of IR instructions in mature production compilers can vary as much as 50% over
+the course of a year.
+
+in Algorithm 1 and depicted in Figure 3, we train πθ to approximate the empirically optimal decision policy π∗(s, a)
+by minimizing the Kullback-Leibler divergence as given in Eq. 6. Note that π∗(s, a) is derived from the empirically
+estimated Q-table using Eq. 4, where the temperature parameter ρ can be decreased throughout training as the table
+converges to Q(s, a). The learned parameters of πθ are periodically deployed as the behavior policy πβ to collect
+performance measurements and update the empirical Q-table using the DRL trial-and-error feedback loop.
+
+L = DKL (πθ||π∗)
+
+(6)
+
+5 Experimental Results
+
+Performance gains seen on graphics applications from production compilers are typically the combination of smaller
+gains aggregated over several tuned heuristic optimizations. To realize these performance gains, expert-driven autotuning
+efforts often greedily focus resources on highly impactful shaders. However, this approach tends to only account for
+the top percentage of shaders in a graphics benchmark. Our framework for RL-based autotuning provides a means
+of automatically exploring more of the optimization space across all shaders in a benchmark application. We applied
+our RL-based autotuning framework to a compiler optimization and two GPUs to learn, integrate, and deploy stable
+heuristics in the production AMD Radeon™ Software graphics compiler.
+
+5.1 Adapting to Production Compiler Development
+
+The development of production-level compilers can lead to signiﬁcant changes in generated code, resulting in a dynamic,
+non-stationary environment. As described in Section 3, we deﬁne our non-stationary environment as the target hardware
+and continuously updated production compiler. As shown Figure 6, the absolute percentage change in IR instructions
+
+9
+
+I. Colbert et al.: Generating GPU Compiler Heuristics using Reinforcement Learning
+
+Figure 7: Relative Increase in Q-table Size. The rapid pace of software development signiﬁcantly impacts the state space over
+time. Updates to the production compiler throughout the DRL trial-and-error loop can cause the Q-table to grow when new states are
+derived from changes to compiler IR. Because the Q-table requires so much memory, we train πθ to approximate the optimal policy
+π∗(s, a) to be periodically deployed as πβ (see Section 4.1).
+
+for a given shader can vary as much as 50% over the course of a year’s worth of compiler updates. This frequent change
+in IR results in a shift in the derived state (s) which incrementally increases the size of the Q-table. Figure 7 shows how
+the Q-table grows over a year’s worth of compiler updates. To avoid this overhead, we approximate the optimal policy
+(π∗) with a DNN decision policy (πθ) using the techniques discussed in Section 4.3.2.
+
+5.2 Shader Wavefront Size Selection
+
+The AMD RDNA™ graphics architecture supports wavefronts of either 32 or 64 work-items. The beneﬁts of these two
+execution modes, which are intuitively referred to as wave32 and wave64, are dependent on dynamic properties of the
+shader such as divergence and memory access order. Running shaders concurrently further complicates optimizing
+a decision function. Taking bandwidth as an example, a wider wavefront can result in better performance if there is
+sufﬁcient bandwidth to support memory accesses without cache misses. Narrower wavefronts can reduce the strain on
+bandwidth as the two memory accesses can be separated in time. However, system bandwidth is a dynamic resource
+consumed by shaders running concurrently. Thus, the optimal wavefront size choice is dependent on the dynamic
+environment of shaders executing concurrently throughout the course of a graphics application.
+
+A compiler has no awareness of this dynamic information at compile time and is forced to make decisions off of
+static information alone. We applied our RL-based autotuning framework to improve the frame rate over a set of
+graphics applications by accurately selecting the optimal wavefront size for each shader at compile time. As described
+in Section 4.2, we represent shader state (s) as a ﬁxed-length vector of static features derived from the compiler IR.
+For wavefront size selection, we constrain a to a binary action space such that a ∈ {wave32, wave64}. As described
+in Section 4.1.2, the reward signal r is derived from the observed change in frame rate with respect to the default
+behavior. The decision policy πθ is a resource-efﬁcient, 3-layer feed-forward classiﬁer with less than 20 KB of learnable
+parameters. As discussed in Section 3, the learned parameters are periodically integrated into the compiler as the
+behavior policy (πβ).
+
+Applying our RL-based GPU compiler autotuning framework to optimizing shader wavefront size selection for AMD’s
+Radeon™ 6800 XT, the learned compiler heuristic matches or surpasses the frame rates in 98% of graphics benchmarks
+with increases of up to 15.8% and an average of 1.6%. The model converged in only 45 iterations through each of the
+benchmarks in the application suite. All experiments are run in a production AMD GPU graphics compiler using a
+benchmark suite of over 150 graphics benchmarks with an average of 230 unique shaders per benchmark. Figure 5
+gives a histogram of the results.
+
+5.3 Stability in Production Compilers
+
+With the frequent changes to compiler IR, a model needs to be able to generalize to new generated code. A successfully
+trained model can be deployed without having to frequently update the learned parameters. We use the inverse of the
+rate of statistically signiﬁcant regressions as a metric for the stability of our pre-trained networks when deployed as a
+heuristic in production compilers. We determine statistical signiﬁcance using a 1-tailed t-test assuming a p-value of 5%.
+
+10
+
+I. Colbert et al.: Generating GPU Compiler Heuristics using Reinforcement Learning
+
+Figure 8: Shader Wavefront Size Selection - AMD Radeon™ RX 5700 XT. We provide a histogram of the observed change in
+frame rate when enabling the RL-based compiler heuristic to select shader wavefront size within the production AMD Radeon™ Soft-
+ware graphics compiler across the suite of graphics applications executed on the AMD Radeon™ RX 5700 XT.
+
+Figure 9: Stability in Production Compilers. We use the inverse of the rate of statistically signiﬁcant regressions as a metric for
+the stability of our pre-trained networks when deployed as a heuristic in production compilers, where a value of 100% indicates no
+statistically signiﬁcant regressions. We track this metric over a year of production compiler updates without retraining the deployed
+model.
+
+Here, 100% network stability indicates that no benchmarks saw a signiﬁcant regression when using the DNN as the
+wave size selection heuristic as compared to the default compiler behavior. Figure 9 shows how this stability metric
+changes over a year of production compiler updates without retraining the deployed model.
+
+5.4 Generalizing Across Target Hardware
+
+We use transfer learning to optimize wavefront execution mode selection for another GPU in the AMD Radeon™ family
+- the AMD Radeon™ RX 5700 XT. Rather than starting from a random initialization point, we use the ﬁnal Q-table and
+accompanying behavior policy (πβ) from the previous experiment as the initialization point. In only 10 iterations over
+our set of graphics benchmarks, the learned compiler heuristic matches or surpasses the observed frame rates in 94.4%
+of graphics benchmarks with increases of up to 10.3% and an average of 1.5%. Figure 8 gives a histogram of the results.
+All experiments are run in our AMD production graphics compiler over 270 graphics benchmarks with an average of
+230 unique shaders per benchmark.
+
+6 Discussion
+
+As discussed in Section 2.1, production compilers impose many constraints on ML-based solutions to code optimization
+problems. To operate within the limitations of compute and memory resources, we tightly represent the compiler IR of
+each shader as a feature vector using only 176 bytes and generate RL-based compiler heuristics using a DNN with less
+than 20KB of learnable parameters. As shown in Section 5, our RL-based GPU compiler autotuning framework is able
+
+11
+
+I. Colbert et al.: Generating GPU Compiler Heuristics using Reinforcement Learning
+
+to learn stable heuristics that are not only resilient to constantly evolving production software but also generalize well
+across both graphics benchmarks and GPU targets.
+
+While the average performance uplift on both hardware targets is modest, the results are non-trivial as maximum
+performance uplift is determined by: (1) the performance of the baseline, (2) the impact of the compiler optimization
+in question, and (3) the prevalence of the shader under consideration. In our experiments, we use the fully tuned
+production driver as a baseline of comparison, which is optimized by teams of experts and often leaves little room for
+further optimization. Furthermore, the theoretical maximum speedup is constrained under Amdahl’s Law. As discussed
+in Section 2.1, modern graphics applications use concurrently executing pipelines of dedicated shaders to render each
+frame. Let p denote the percentage of total execution time accounted for by a given pipeline of shaders such that
+p ∈ [0, 1]. Let s denote the estimated speedup when applying a set of compiler optimizations to that pipeline of shaders
+such that s ≥ 0, where 0 ≤ s < 1 is a performance degradation. It follows that applying those compiler optimizations
+to the given pipeline of shaders results in a global speedup of 1/(1 − p + p
+s ) over the entire graphics application. Due
+to the constraints of the compiler, we act on each shader in isolation, oblivious to concurrently executing pipelines
+and even other shaders staged in the same pipeline. It’s often the case in modern graphics applications that individual
+shaders account for small percentages of the total execution time. Furthermore, individual compiler optimizations do
+not impact all shaders equally. In fact, the back-end compiler is responsible for optimizing the byte code from many
+different front-end compilers, each of which may have unique or contradicting opportunities for optimization.
+As such, we conjecture that the optimal decision function (π∗) may be intimately tied to the target set of applications
+(A). This is contrary to the concept of overﬁtting, in which a model is too tightly ﬁt to a training set such that it
+negatively impacts generalization to a validation set. In such a scenario, the distribution of training and validation data
+is assumed to be independent and identically distributed (IID). Because the computational and bandwidth requirements
+of a graphics application can vary signiﬁcantly depending on the behavior of shaders and the properties of a scene, we
+conjecture that shifting A can lead to drastic shifts in the data distribution that may introduce conﬂicting opportunities
+for optimization and may void the IID assumption. In future work, we aim to explore this relationship further using
+techniques from out-of-distribution learning for the purpose of uncovering and appropriately handling conﬂicting
+opportunities for optimization.
+
+7 Related Works
+
+Previous works have begun to explore the use of reinforcement learning for compiler optimization [18, 19, 20, 21, 31, 32].
+Huang et al. [19] optimize compiler HLS phase ordering using cycle count reduction as a reward signal to guide
+learning using a framework they call AutoPhase. McGovern et al. [20] use a temporal difference reinforcement
+learning algorithm to optimize the scheduling of straight-line code. Mirhoseini et al. [32] use on-policy reinforcement
+learning to optimize device placements for graph partitioning of deep neural networks. Mendis et al. [31] use imitation
+learning to learn how to best convert scalar code into vector code (a process known as vectorization) by mimicking
+a state-of-the-art solution. Haj-Ali et al. [18], drive the vectorization pass with pragma directives to inform a LLVM
+compiler heuristic and build an automated feature extraction framework to represent source code using a framework
+they call NeuroVectorizer. Troﬁn et al. [21] formulates the inlining-for-size problem as a MDP, using native size
+reduction as a reward signal to guide an agent to learn the optimal policy for a production LLVM compiler, using a
+framework they call MLGO. Aside from [31], which uses imitation learning, each of these previous works use an
+on-policy reinforcement learning strategy. While they each yield impressive results on their respective tasks, our
+solution is an off-policy DRL algorithm based on Q-learning that accounts for the unique problems that arise from
+autotuning production GPU compilers using a time decay with each update step.
+
+8 Conclusion and Future Work
+
+We developed and implemented a GPU compiler autotuning framework that uses off-policy deep reinforcement
+learning to generate heuristics that improve the frame rates of graphics applications. Our framework combines
+continuous integration (CI) with Q-learning to learn the optimal heuristic settings that maximize the expected frame rate
+improvements across a set of graphics benchmarks. By accounting for the the rapid changes in software development,
+we show that we are able deploy these trained models as stable heuristics in constantly evolving production compilers.
+Furthermore, we show that this framework provides generalized performance gains across a large suite of graphics
+benchmarks across GPUs. In future work, we aim to explore the relationship between our set of static counters and the
+dynamic properties the neural network has learned to account for. Additionally, we aim to extend this framework across
+domains with continuous action spaces using techniques from deep Q-learning.
+
+12
+
+I. Colbert et al.: Generating GPU Compiler Heuristics using Reinforcement Learning
+
+Acknowledgements
+
+We would like to thank Mike Bedy, Robert Gottlieb, Chris Reeve, Andrew Dupont, Karen Dintino, Peter Scannell and
+the rest of the AMD GPU compiler team for insightful discussions and infrastructure support.
+
+© 2021 Advanced Micro Devices, Inc. All rights reserved. AMD, the AMD Arrow logo, Radeon, and combinations
+thereof are trademarks of Advanced Micro Devices, Inc. Other product names used in this publication are for
+identiﬁcation purposes only and may be trademarks of their respective companies.
+
+References
+
+[1] F. Bodin, T. Kisuki, P. Knijnenburg, M. O’Boyle, and E. Rohou, “Iterative compilation in a non-linear optimisation
+
+space,” 1998.
+
+[2] H. Leather and C. Cummins, “Machine learning in compilers: Past, present and future,” in 2020 Forum for
+
+Speciﬁcation and Design Languages (FDL), pp. 1–8, IEEE, 2020.
+
+[3] M. Stephenson, R. Rangan, and S. Keckler, “Cooperative proﬁle guided optimizations,” High Performance
+
+Graphics, 2021.
+
+[4] A. H. Ashouri, W. Killian, J. Cavazos, G. Palermo, and C. Silvano, “A survey on compiler autotuning using
+
+machine learning,” ACM Computing Surveys (CSUR), vol. 51, no. 5, pp. 1–42, 2018.
+
+[5] A. H. Ashouri, G. Mariani, G. Palermo, and C. Silvano, “A bayesian network approach for compiler auto-tuning
+for embedded processors,” in 2014 IEEE 12th Symposium on Embedded Systems for Real-time Multimedia
+(ESTIMedia), pp. 90–97, IEEE, 2014.
+
+[6] J. Bergstra, N. Pinto, and D. Cox, “Machine learning for predictive auto-tuning with boosted regression trees,” in
+
+2012 Innovative Parallel Computing (InPar), pp. 1–9, IEEE, 2012.
+
+[7] J. Cavazos, G. Fursin, F. Agakov, E. Bonilla, M. F. O’Boyle, and O. Temam, “Rapidly selecting good compiler
+optimizations using performance counters,” in International Symposium on Code Generation and Optimization
+(CGO’07), pp. 185–197, IEEE, 2007.
+
+[8] C. Cummins, P. Petoumenos, Z. Wang, and H. Leather, “End-to-end deep learning of optimization heuristics,” in
+2017 26th International Conference on Parallel Architectures and Compilation Techniques (PACT), pp. 219–232,
+IEEE, 2017.
+
+[9] G. Fursin, Y. Kashnikov, A. W. Memon, Z. Chamski, O. Temam, M. Namolaru, E. Yom-Tov, B. Mendelson,
+A. Zaks, E. Courtois, et al., “Milepost gcc: Machine learning enabled self-tuning compiler,” International journal
+of parallel programming, vol. 39, no. 3, pp. 296–327, 2011.
+
+[10] H. Leather, E. Bonilla, and M. O’boyle, “Automatic feature generation for machine learning–based optimising
+compilation,” ACM Transactions on Architecture and Code Optimization (TACO), vol. 11, no. 1, pp. 1–32, 2014.
+[11] A. Monsifrot, F. Bodin, and R. Quiniou, “A machine learning approach to automatic production of compiler
+heuristics,” in International conference on artiﬁcial intelligence: methodology, systems, and applications, pp. 41–
+50, Springer, 2002.
+
+[12] H. Song, M. Kim, D. Park, and J.-G. Lee, “Learning from noisy labels with deep neural networks: A survey,”
+
+arXiv preprint arXiv:2007.08199, 2020.
+
+[13] C. Zhang, S. Bengio, M. Hardt, B. Recht, and O. Vinyals, “Understanding deep learning requires rethinking
+
+generalization,” arXiv preprint arXiv:1611.03530, 2016.
+
+[14] X. Zhu and X. Wu, “Class noise vs. attribute noise: A quantitative study,” Artiﬁcial intelligence review, vol. 22,
+
+no. 3, pp. 177–210, 2004.
+
+[15] L. Graesser and W. L. Keng, Foundations of Deep Reinforcement Learning: Theory and Practice in Python.
+
+Addison-Wesley Professional, 2019.
+
+[16] E. Lin, Q. Chen, and X. Qi, “Deep reinforcement learning for imbalanced classiﬁcation,” Applied Intelligence,
+
+pp. 1–15, 2020.
+
+[17] D. Zhao, Y. Chen, and L. Lv, “Deep reinforcement learning with visual attention for vehicle classiﬁcation,” IEEE
+
+Transactions on Cognitive and Developmental Systems, vol. 9, no. 4, pp. 356–367, 2016.
+
+[18] A. Haj-Ali, N. K. Ahmed, T. Willke, Y. S. Shao, K. Asanovic, and I. Stoica, “Neurovectorizer: end-to-end
+vectorization with deep reinforcement learning,” in Proceedings of the 18th ACM/IEEE International Symposium
+on Code Generation and Optimization, pp. 242–255, 2020.
+
+13
+
+I. Colbert et al.: Generating GPU Compiler Heuristics using Reinforcement Learning
+
+[19] Q. Huang, A. Haj-Ali, W. Moses, J. Xiang, I. Stoica, K. Asanovic, and J. Wawrzynek, “Autophase: Compiler
+phase-ordering for hls with deep reinforcement learning,” in 2019 IEEE 27th Annual International Symposium on
+Field-Programmable Custom Computing Machines (FCCM), pp. 308–308, IEEE, 2019.
+
+[20] A. McGovern, E. Moss, and A. G. Barto, “Building a basic block instruction scheduler with reinforcement learning
+
+and rollouts,” Machine learning, vol. 49, no. 2-3, pp. 141–160, 2002.
+
+[21] M. Troﬁn, Y. Qian, E. Brevdo, Z. Lin, K. Choromanski, and D. Li, “Mlgo: a machine learning guided compiler
+
+optimizations framework,” arXiv preprint arXiv:2101.04808, 2021.
+
+[22] C. J. Watkins and P. Dayan, “Q-learning,” Machine learning, vol. 8, no. 3-4, pp. 279–292, 1992.
+[23] V. Mnih, K. Kavukcuoglu, D. Silver, A. Graves, I. Antonoglou, D. Wierstra, and M. Riedmiller, “Playing atari
+
+with deep reinforcement learning,” arXiv preprint arXiv:1312.5602, 2013.
+
+[24] A. Kumar, A. Zhou, G. Tucker, and S. Levine, “Conservative q-learning for ofﬂine reinforcement learning,” arXiv
+
+preprint arXiv:2006.04779, 2020.
+
+[25] J. Gleeson, M. Gabel, G. Pekhimenko, E. de Lara, S. Krishnan, and V. Janapa Reddi, “Rl-scope: Cross-stack
+proﬁling for deep reinforcement learning workloads,” Proceedings of Machine Learning and Systems, vol. 3, 2021.
+[26] A. Kumar, A. Gupta, and S. Levine, “Discor: Corrective feedback in reinforcement learning via distribution
+
+correction,” arXiv preprint arXiv:2003.07305, 2020.
+
+[27] U. Alon, M. Zilberstein, O. Levy, and E. Yahav, “code2vec: Learning distributed representations of code,”
+
+Proceedings of the ACM on Programming Languages, vol. 3, no. POPL, pp. 1–29, 2019.
+
+[28] T. Ben-Nun, A. S. Jakobovits, and T. Hoeﬂer, “Neural code comprehension: A learnable representation of code
+
+semantics,” arXiv preprint arXiv:1806.07336, 2018.
+
+[29] C. Cummins, Z. V. Fisches, T. Ben-Nun, T. Hoeﬂer, and H. Leather, “Programl: Graph-based deep learning for
+
+program optimization and analysis,” arXiv preprint arXiv:2003.10536, 2020.
+
+[30] S. VenkataKeerthy, R. Aggarwal, S. Jain, M. S. Desarkar, R. Upadrasta, and Y. Srikant, “Ir2vec: Llvm ir based
+scalable program embeddings,” ACM Transactions on Architecture and Code Optimization (TACO), vol. 17, no. 4,
+pp. 1–27, 2020.
+
+[31] C. Mendis, C. Yang, Y. Pu, S. Amarasinghe, and M. Carbin, “Compiler auto-vectorization with imitation learning,”
+
+2019.
+
+[32] A. Mirhoseini, H. Pham, Q. V. Le, B. Steiner, R. Larsen, Y. Zhou, N. Kumar, M. Norouzi, S. Bengio, and J. Dean,
+“Device placement optimization with reinforcement learning,” in International Conference on Machine Learning,
+pp. 2430–2439, PMLR, 2017.
+
+14
+
+

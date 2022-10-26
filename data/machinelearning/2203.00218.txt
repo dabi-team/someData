@@ -1,0 +1,2596 @@
+Specialized Accelerators and Compiler Flows:
+Replacing Accelerator APIs with a Formal
+Software/Hardware Interface
+Steven Lyubomirsky∗
+University of Washington
+
+Bo-Yuan Huang∗
+Princeton University
+
+Yi Li
+Princeton University
+
+2
+2
+0
+2
+
+r
+a
+
+M
+1
+
+]
+
+R
+A
+.
+s
+c
+[
+
+1
+v
+8
+1
+2
+0
+0
+.
+3
+0
+2
+2
+:
+v
+i
+X
+r
+a
+
+Mike He
+University of Washington
+
+Thierry Tambe
+Harvard University
+
+Gus Henry Smith
+University of Washington
+
+Akash Gaonkar
+Princeton University
+
+Aarti Gupta
+Princeton University
+
+Vishal Canumalla
+University of Washington
+
+Zachary Tatlock
+University of Washington
+
+Gu-Yeon Wei
+Harvard University
+
+Sharad Malik
+Princeton University
+
+Abstract
+Specialized accelerators are increasingly used to meet the
+power-performance goals of emerging applications such as
+machine learning, image processing, and graph analysis. Ex-
+isting accelerator programming methodologies using APIs
+have several limitations: (1) The application code lacks porta-
+bility to other platforms and compiler frameworks; (2) the
+lack of integration of accelerator code in the compiler limits
+useful optimizations such as instruction selection and oper-
+ator fusion; and (3) the opacity of the accelerator function
+semantics limits the ability to check the final code for cor-
+rectness. The root of these limitations is the lack of a formal
+software/hardware interface specification for accelerators.
+
+In this paper we use the recently developed Instruction-
+Level Abstraction (ILA) for accelerators to serve this pur-
+pose, similar to how the Instruction Set Architecture (ISA)
+has been used as the software/hardware interface for pro-
+cessors. We propose a compiler flow termed D2A using the
+ILA and present a prototype that demonstrates this flow for
+deep learning (DL) applications. This prototype compiles
+programs from high-level domain-specific languages, e.g.,
+PyTorch and MxNet, to multiple target accelerators with no
+target-specific extensions to the application or compiler —
+thus demonstrating application portability. It includes com-
+piler optimizations through instruction selection using equal-
+ity saturation-based flexible matching. Finally, we demon-
+strate checking the correctness of the resulting code through
+both formal verification of individual matched operations, as
+well as fully automated simulation-based validation of com-
+plete applications. The evaluation of the prototype compiler
+is based on six different DL applications and three different
+accelerators. Overall, this methodology lays the foundation
+
+∗Equal contribution
+
+arXiv, 2022, USA
+2022.
+
+1
+
+for integrating accelerators in compiler flows using a formal
+software/hardware interface.
+
+Keywords: DSL, Compiler, Accelerator
+
+1 Introduction
+Hardware specialization is the main technique for improving
+power-performance efficiency in emerging compute plat-
+forms. By customizing compute engines, memory hierar-
+chies, and data representations [12, 21, 43], hardware accel-
+erators provide efficient computation in various application
+domains like artificial intelligence, image processing, and
+graph analysis [15, 28–30, 61, 87]. At the same time, there is a
+growing trend in using domain-specific languages (DSLs) for
+boosting development productivity, e.g., TensorFlow for deep
+learning [1], Halide for image processing [59], and GraphIt
+for graph applications [88]. However, there are critical gaps
+in bridging these two distinct system trends in the current
+compilation flows that start from high-level DSLs and target
+accelerator-rich platforms.1
+
+Large industrial teams invest substantial resources to ad-
+dress DSL-to-accelerator mapping challenges via bespoke
+infrastructure [38, 39]. For smaller teams, like in the aca-
+demic research community, these gaps make end-to-end
+evaluation of new accelerator designs prohibitively difficult;
+many recent papers on accelerator designs only evaluate
+on small application snippets, e.g., individual layers of deep
+neural networks [9, 23–25, 37, 56, 63, 64, 66, 71, 80, 81]. Un-
+fortunately, an accelerator’s results for application snippets
+are often not predictive of its influence on overall system
+behavior, e.g., due to cumulative effects of custom numer-
+ical representations — engineers need the ability to easily
+
+1Note that there are two different compilation problems that DSL compilers
+tackle: (1) adding compiler support for a given custom accelerator, and
+(2) generating the accelerator design to be implemented on an FPGA as part
+of the compilation [11, 32, 42, 55, 67, 79]. This paper deals with the former.
+
+ 
+ 
+ 
+ 
+ 
+ 
+arXiv, 2022, USA
+
+B.-Y. Huang et al.
+
+1
+2
+3
+4
+5
+6
+7
+8
+9
+10
+11
+12
+13
+14
+15
+16
+17
+18
+19
+20
+21
+22
+23
+24
+25
+26
+27
+28
+
+#define HWREG(addr) (*((volatile uint128_t*)(addr)))
+union buffer128 {
+uint128_t v128;
+int64x2_t v64;
+} buf;
+
+// FlexASR API: Layer Recude (max/min/mean pooling)
+bool FlexAsrLayerReduce(uint64_t* arg1, /* ... */) {
+// set up inputs and arguments
+buf.v64[0] = 0xC9A8070100CA8801;
+buf.v64[1] = 0x09D1008100810000;
+HWREG(0xA0500000) = buf.v128; // internal buffer[0]
+// ...
+// configure and invoke operation
+buf.v64[0] = 0x0101000000010001;
+buf.v64[1] = 0x0000000200000001;
+HWREG(0xA0700010) = buf.v128; // global buffer control
+buf.v64[0] = 0x0000000000000001;
+buf.v64[1] = 0x0000000000000000;
+HWREG(0xA0400010) = buf.v128; // memory manager config
+buf.v64[0] = 0x0000000000000000;
+buf.v64[1] = 0x0000000000000000;
+HWREG(0xA0000010) = buf.v128; // invoke operation
+// wait and retrieve results from the buffer
+sleep(5);
+buf.v128 = HWREG(0xA0500000);
+// ...
+}
+
+Figure 1. Snippet of the FlexASR device driver [71]. Through
+MMIO commands, the driver first stores input arguments,
+e.g., weights, in the accelerator’s internal buffer (lines 10
+to 13). It then sets up the configuration such as tensor dimen-
+sion and vector size (lines 15 to 20). Finally, it triggers the
+operation (line 23) and retrieves the result (starting line 26).
+
+validate complete applications compiled onto accelerator
+platforms. This is lacking in current prevalent practice.
+
+1.1 Prevalent Practice: Accelerator Drivers/APIs
+
+Effective accelerator utilization requires offloading applica-
+tion computations to those supported by accelerators. In
+current practice, this is generally accomplished by manu-
+ally crafting device drivers to provide “hardware function
+calls” for specific operations. This essentially provides an
+application programming interface (API) for accelerators,
+where each hardware function call consists of low-level ac-
+celerator invocation commands that configure, initiate, and
+check/return the results. Figure 1 shows an example hard-
+ware function call, in which a layer reduction operation is
+implemented by a sequence of memory-mapped input/out-
+put (MMIO) loads/stores from the host processor to invoke
+the FlexASR accelerator [71]. This MMIO-based API is the
+prevalent mechanism for accelerator invocation.
+
+Generally, hardware function calls are manually added
+by application programmers, or they can be added by com-
+pilers via handcrafted accelerator-specific extensions. Such
+bespoke compiler extensions demand tedious effort and deep
+
+2
+
+expertise in the hardware and the compilation stack.In prac-
+tice, this limits end-to-end deployment of DSLs to accelerator-
+rich platforms within reach for only a few — large enterprises
+that can afford teams of hardware, software, and system ex-
+perts for high-value applications [10, 22, 39]. Further, this
+API-based approach has three critical gaps in mapping ap-
+plications from DSLs to accelerator-rich platforms:
+
+G1 Lack of portability. Hardware function calls imple-
+mented in device drivers contain MMIO loads/stores for
+accelerator invocation, but these low-level commands
+work only for a specific processing platform. When these
+calls are manually added by an application programmer,
+the application is not portable to new accelerator plat-
+forms. When these are added by a compiler through be-
+spoke extensions, this task requires significant accelerator-
+specific restructuring of the compiler. This is challenging
+due to: (1) the mismatch between fine-grained compiler
+intermediate representation (IR) intrinsics and coarse–
+grained accelerator operations (that are often used to
+deliver power-performance efficiency), and (2) the lack
+of a formal software/hardware interface specification for
+the accelerator that can be leveraged to automate this
+matching. This limits portability across both compiler
+frameworks and hardware platforms.
+
+G2 Lack of integration into standard compiler flows.
+Unlike general-purpose processors which have the ISA
+as the software/hardware interface, accelerators lack a
+formal software/hardware interface specification which
+makes the accelerator APIs opaque to the compiler stack.
+This makes it challenging to integrate them in standard
+compiler flows. For example, standard techniques for in-
+struction selection [7] become challenging with a “black-
+box” API, which provides little flexibility in selecting
+and reusing parts of these APIs. The fixed API also lim-
+its automation in exposing potential optimizations, e.g.,
+operator fusion that may minimize data transfers.
+G3 Lack of ability to validate compilation results. Ac-
+celerators often incorporate novel techniques such as
+custom memory management schemes and numeric rep-
+resentations (referred to as numerics) to improve com-
+putational efficiency. However, existing compiler plat-
+forms do not readily support these unconventional fea-
+tures, which can lead to the generation of inefficient or
+even incorrect code. Unfortunately, the lack of a formal
+software/hardware interface specification of accelerator
+operations makes it very difficult to validate compila-
+tion results. In current practice, this is done using soft-
+ware/hardware co-simulation with an FPGA emulation
+of the accelerator or with a low-level register-transfer
+level (RTL) model for the accelerator. The former incurs
+significant engineering overhead, and the latter is very
+slow, making validation for full applications unrealistic.
+
+Specialized Accelerators and Compiler Flows
+
+arXiv, 2022, USA
+
+In practice, validation using RTL co-simulation is per-
+formed only for individual accelerator-supported opera-
+tions. This is insufficient to determine if small deviations
+at the operation level (e.g., due to different numerics)
+lead to acceptable results at the application level. Fur-
+ther, the need for a fully functional RTL model limits
+early stage software/hardware co-design, i.e., software
+development before the hardware is implemented.
+
+The lack of a formal software/hardware interface specifi-
+cation that provides the semantics of individual accelerator
+operations is the root inadequacy across the three gaps. In
+this work, we propose the D2A (short for “DSLs to Accel-
+erators”) methodology which addresses these gaps via the
+use of an ISA-like formal model for accelerators, instead of
+using API-supported hardware function calls. The formal
+semantics of the accelerator operations are provided through
+an accelerator instruction set. This formal model and the finer-
+grained, instruction-level control it provides (in contrast to
+API calls) facilitates standard compiling techniques (e.g., in-
+struction selection and optimization), facilitates portability,
+and enables validation of compilation results.
+
+1.2 D2A Methodology: Key Ideas
+
+Identifying the computation in the application that can be
+offloaded to the accelerators is effectively seeking mappings
+between compiler IR intrinsics and the accelerator opera-
+tions such that they are functionally equivalent and lead
+to performant code. (Note that in certain domains like ma-
+chine learning, small numerical differences may not affect the
+application-level results, such as a classification category, so
+notions of “equivalence” should reflect this property.) While
+the semantics of the accelerator operations is available in the
+hardware RTL model, this is too low-level for the compiler to
+target directly and thus not an option. In the D2A methodol-
+ogy, we use the Instruction-Level Abstraction (ILA) [36], for
+this purpose. The ILA, like the ISA for processors, provides
+a software/hardware interface specification for accelerators.
+It bridges the gap between the compiler IR intrinsics on one
+hand and the accelerator operations on the other — providing
+the basis for specifying IR-accelerator mappings.
+
+Compiler IR-Accelerator Mappings using ILAs. The ILA
+model of an accelerator provides formal semantics at its
+software/hardware interface through a lifting of the accel-
+erator operations in the form of a set of instructions, each
+of which reads/updates the accelerator architectural state.
+Similarly, the IR intrinsics can be defined as instructions that
+update program state. This provides a uniform model on
+both sides — the IR side and the accelerator side — in the
+form of instructions. We specify the mappings as pairs of
+program fragments, where a program fragment comprises
+a sequence of instructions. Unlike API calls or RTL models,
+program fragments using accelerator ILA instructions cap-
+ture the underlying accelerator operation semantics while
+
+3
+
+abstracting out low-level hardware implementation details.
+Further, these program fragments provide the flexibility to
+specify mappings at different levels of granularity — this helps
+bridge the granularity mismatch which may exist between
+IR intrinsics and coarse-grained accelerator operations.
+
+Instruction Selection and Optimization. With the instruc-
+tion semantics specified by an ILA, the D2A methodology
+facilitates standard instruction selection and optimization
+techniques in compilers. In this work, we use term rewriting
+for instruction selection, i.e., using compiler IR-accelerator
+rewrites to map IR intrinsics to accelerator instructions [3,
+7, 20]. Specifically, we utilize equality saturation to opti-
+mally match equivalent rewrites of the program and there-
+fore reduce the need for manual program restructuring (ad-
+dressing gaps G1 and G2) [69, 74]. Further, the compiler
+IR-accelerator mappings have finer-grained knowledge and
+control of accelerator operations through the instruction-
+level interface provided by ILAs. This enables optimizations
+that require understanding of accelerator behavior, e.g., oper-
+ator fusion for reducing data movement (addressing gap G2).
+
+ILA-based Compilation-Results Validation. We use the
+term compilation-results validation for checking that the
+results of the compilation are correct, i.e., functionally equiv-
+alent or with acceptable deviation when there are differ-
+ences in numerics. This may be done at the level of a single
+accelerator-supported operation, i.e., checking the correct-
+ness of compiler IR-accelerator mappings, or for the entire
+application. The formal semantics of the ILA instructions
+provides the foundation for proof-based formal verification
+or simulation-based validation. This enables systematic end-
+to-end compilation-results validation as well as early-stage
+software/hardware co-design (addressing gap G3).
+
+D2A Compilation Flow. The overall compilation flow us-
+ing the D2A methodology is shown in Figure 2. We first trans-
+late the application program, provided in a high-level DSL,
+into the compiler IR. Next, we perform equality saturation to
+search a large space of equivalent programs given the com-
+piler IR-accelerator mappings (along with general-purpose
+rewrite rules). Based on a given cost function, we then extract
+the lowest-cost program and pass it on for code generation,
+where each accelerator instruction is subsequently lowered
+to the corresponding MMIO load/store command. This gen-
+erated program executes on the host processor and invokes
+accelerator operations through MMIO commands. (Note that
+the ILA modeling and the validation of the IR-accelerator
+mappings are omitted from this figure.)
+
+1.3 Prototype Implementation and Case Studies
+
+As a demonstration of the D2A methodology, we have im-
+plemented an end-to-end compilation flow for deep learning
+(DL) applications by integrating it with an existing compiler
+flow. Specifically, our prototype compiler utilizes the DSL
+
+arXiv, 2022, USA
+
+B.-Y. Huang et al.
+
+Figure 2. D2A compilation flow overview.
+
+front-end and the code-generation capability provided by
+the TVM framework [14]. For instruction selection, it lever-
+ages the rewrite rules and the equality saturation engine
+provided by Glenside and egg [68, 83]. The ILA-models of
+accelerators, the validation of IR-accelerator mappings, and
+compilation-results validation at the application level are
+powered by ILA-based methods in ILAng [35].
+
+We show the generality of the D2A methodology through
+multiple case studies. At the front-end, we consider six DL
+applications for language processing and image recognition,
+e.g., Transformer [77] and ResNet [31]. For the target accel-
+erators, we add support for three custom accelerators that
+provide hardware operations at different levels of granular-
+ity: VTA [50] is a fine-grained accelerator for general tensor
+operations; HLSCNN [81] is a coarse-grained accelerator
+providing 2D convolutions; FlexASR [71] is an accelerator
+for speech recognition, specializing in coarse-grained opera-
+tions such as a long short-term memory (LSTM) layer.
+
+We added support for the three accelerators — developed
+their ILA models, provided compiler IR-accelerator mappings
+for operations supported by them, and validated all the map-
+pings. Note that this work for supporting a new accelerator
+is a one-time effort that can be reused across different appli-
+cations. Our prototype compiler successfully compiled all
+six DL applications (developed by different teams and pro-
+grammed in different DSLs) for exploiting the three custom
+accelerators. Our prototype and case studies demonstrate the
+key ideas in the D2A methodology for end-to-end compila-
+tion with validated results. We do not claim this work provides
+a complete, fully optimized compiler for custom accelerators;
+rather, it establishes the foundations for validated compilation
+for such targets through the use of a formal instruction-level
+software/hardware interface for accelerators.
+
+1.4 Contributions
+
+Overall this paper makes the following contributions:
+• We present the D2A methodology that uses an instruction-
+level formal software/hardware interface specification for
+an accelerator, which abstracts away low-level implemen-
+tation details while providing a formal hardware semantics
+with the following capabilities:
+– It bridges the granularity gap between compiler IR in-
+trinsics and accelerator operations with flexible map-
+pings between instruction-level program fragments.
+– It enables integration into standard compiler flows and
+the application of standard techniques like instruction
+selection and optimization.
+
+– It provides for end-to-end validation of compilation-
+
+results for accelerator-extensible compilers.
+
+• We describe a prototype2 that implements the D2A com-
+pilation flow on top of open-source frameworks TVM,
+Glenside, egg, and ILAng.
+
+• We provide a set of case studies that demonstrate:
+
+– portability: through compiling six DL applications (pro-
+
+grammed by different teams in different DSLs)
+
+– extensibility: through adding support for three custom
+accelerators which provide operations at different levels
+of granularity.
+
+– compilation-results validation: for both IR-accelerator
+mappings, and at the application-level. The latter demon-
+strates how this methodology exposed several accuracy
+issues due to custom numerics.
+
+This article is organized as follows. In Sections 2 and 3, we
+explain the D2A methodology and our compiler prototype,
+respectively. We then describe the case studies and evalu-
+ation results in Section 4. Future work, related work, and
+conclusions are discussed in Sections 5, 6, and 7, respectively.
+
+2Our prototype will be released under a permissive open-source license.
+
+4
+
+Flexible matchingusing equality saturation; Host CPU instructionsCMPr0, r1SUBGTr0, r0, r1BNEloop; Invoke accel. (MMIO)STRr2, 0xffff0000STRr3, 0xffff0100LDRr4, 0xffff0010; Host CPU instructionsMOVr3, r2SUBGTr0, r0, r1BlrCodegenerationApplication program(translated to compiler IR)ProgramextractionAll possible (equivalent)program rewritesBest rewritten program(w.r.t.the cost function)Compiled program(executable binary)2.IR-Accelerator rewrites1.Compiler IR rewritesCompiler IR patternAccelerator ILA program fragmentRewrite rulesCompiler IR patternCompiler IR patternSpecialized Accelerators and Compiler Flows
+
+arXiv, 2022, USA
+
+2 D2A Methodology
+In this section, we explain three key aspects of the D2A
+methodology: (1) adding accelerator support by specifying
+mappings between compiler IR intrinsics and accelerator
+operations, (2) compiling applications by searching within
+input programs for computations supported by accelerators,
+and (3) ensuring compilation-result validation and support-
+ing early-stage software/hardware co-design.
+
+2.1 Specifying IR-Accelerator Mappings using ILAs
+
+The ILA is an ISA-like formal model for specifying the func-
+tional behavior of accelerators. It generalizes the notion of
+instructions to accelerators and provides a modular func-
+tional specification as a set of instructions. Like processor
+ISAs, it does so by specifying how each instruction updates
+software-visible (viz., architectural) state while abstracting
+out implementation details.
+
+2.1.1 Accelerator ILA. We develop the ILA formal model
+for an accelerator by following the methodology proposed
+in prior work [36]. Each instruction of an accelerator ILA
+corresponds to a command at the accelerator interface, i.e.,
+an MMIO load or store command. The ILA captures formal
+semantics of accelerator behavior by specifying how each
+instruction reads/updates the architectural state variables.
+Essentially, the ILA is a modular (per-instruction) opera-
+tional specification of an accelerator. Figure 6 in Appendix C
+provides an accelerator ILA example.
+
+2.1.2 Compiler IR ILA. While the ILA is primarily in-
+tended to serve as the formal model for accelerators, it is
+convenient to also use it to formally model compiler IR in-
+trinsics. We develop the compiler IR ILA by following the
+approach used in prior work for the NVidia parallel execution
+thread (PTX) programming model [86]. Each instruction of a
+compiler IR ILA corresponds to an IR intrinsic and specifies
+its operational behavior in terms of how it updates program
+state. Modeling both the compiler IR and accelerators using
+ILAs provides a uniform model on both sides, and enables
+the use of the ILAng toolkit for their verification/validation.
+
+2.1.3 IR-Accelerator Mappings. Due to the granularity
+gap between the IR instrinsics and the accelerator operations,
+it is often not possible to construct a one-to-one mapping
+between the compiler IR and the accelerator operations. In-
+stead, on each side (the compiler IR and the accelerator), we
+consider a program fragment that comprises a sequence of
+instructions defined by the associated ILA model. The pro-
+gram fragments provide a basis for many-to-many instruction
+mappings between the two sides, providing flexibility that is
+key to addressing the granularity mismatch challenge.
+
+The specification of the mappings starts from the accel-
+erators — based on the given accelerator, we provide an
+IR-accelerator mapping for each accelerator operation. This
+bottom-up approach is a one-time effort for each accelerator,
+
+Figure 3. Verification tasks and the IR-accelerator mapping
+for a linear-layer operation supported by FlexASR [71]. (The
+mapping is simplified for a clearer presentation. See Figure 5
+in the Appendix for the complete mapping.)
+
+requires no knowledge of the input program, and is the key
+for modular and extensible compilation.
+
+Figure 3 shows an example of an IR-accelerator mapping
+for a linear layer operation for the FlexASR accelerator [71].
+The program fragments of the compiler IR and the accelerator
+are shown in parts (b) and (c), respectively. As discussed,
+each instruction of the compiler IR ILA corresponds to one
+IR intrinsic, which is reflected in parts (a) and (b). Similarly,
+each instruction of the accelerator ILA corresponds to one
+command at its MMIO interface, as shown in parts (c) and (d).
+
+2.2 Flexible Matching using Equality Saturation
+
+Given the IR-accelerator mappings and an input program,
+the next step in the D2A methodology is to identify computa-
+tions in the input program that can be offloaded to equivalent
+accelerator operations. We approach this task by utilizing
+term rewriting techniques — given a set of syntactic rewrite
+rules (ℓ → 𝑟 ), rewrite instances of pattern ℓ in the input
+program with pattern 𝑟 where applicable [3, 7, 20, 69, 74]. In
+term rewriting systems, the application of rewrite rules is
+
+5
+
+// (a) Compiler IR pattern%1 = nn_dense(%2, %3)%4 = bias_add(%1, %5)// (d) Accelerator invocations (MMIOs)WR0xA1040010, 0x0100102040001001WR0xA1040020, 0xFFFF49DE5F5C0010WR0xA1080010, 0x010210403301FFFFWR0xA0040010, 0x0000000102040001WR0xA0070010, 0x004008101000000AWR0xA0000010, 0x0000000000000001// (b) Compiler IR ILA program fragmentcomILA.nn_dense %arg1 %arg2 %arg3comILA.bias_add %arg4 %arg1 %arg5// (c) Accelerator ILA program fragmentaccILA.cfgPELayDims%dim1  %dim2accILA.cfgPEManager %addr1 %addr2accILA.cfgPEActions%addr3 %addr4accILA.cfgGBMemIdxs %midx1 %midx2accILA.cfgGBControl %opcodeaccILA.triggerStartVerification task 1 (VT1)•Compiler IR ILA  vs. compiler implementation•Modular, per-instruction checkVerification task 2 (VT2)•Program fragments equivalence checking•Sequence to sequence checkingVerification task 3 (VT3)•Accelerator ILA vs. RTL implementation•Modular, per-instruction checkarXiv, 2022, USA
+
+B.-Y. Huang et al.
+
+correct by construction as long as the rules preserve seman-
+tic equality. This provides for modular correctness checking
+through checking the individual rewrite rules.
+
+Classic term rewriting systems often suffer from the phase
+ordering problem (i.e., the order in which rewrites are applied
+affects final performance) and thus require careful order-
+ing [82]. In D2A, we utilize the equality saturation technique
+to mitigate phase ordering problems [69, 74].
+Equality Saturation. Given an input program 𝑝, equality
+saturation repeatedly applies the given rewrite rules to ex-
+plore all equivalent ways to express 𝑝 (with respect to the
+rules). It utilizes the e-graph data structure to efficiently
+represent an exponentially large set of equivalent program
+expressions [52, 53]. Upon reaching a fixed point, i.e., when
+no application of any rewrite rule can introduce a new pro-
+gram expression, it extracts the optimal rewritten program
+according to a given cost function. This provides for search-
+ing over the space of all possible rewrites and finding the
+representative most suitable for the given purpose without
+sophisticated ordering considerations.
+
+2.2.1 IR-Accelerator Rewrites. Based on the provided
+IR-accelerator mappings, we derive a set of rewrite rules
+where the left-hand side of the rule is the compiler IR pat-
+tern and the right-hand side is the corresponding acceler-
+ator instructions. Applying these rules, which we call the
+IR-accelerator rewrites, allows replacing the computations
+that are exact syntactic matches to the compiler IR pattern
+specified in the mappings by the corresponding accelerator
+operations. We call this exact matching.
+
+2.2.2 Flexible Matching and Compiler IR Rewrites.
+Exact matching provides a baseline matching capability but
+may be limited in practice because there is often no canonical
+IR expression to represent a program. Therefore, the input
+program can have constructs that are syntactically different
+from the left-hand side of the IR-accelerator rewrites but are
+semantically equivalent to the pattern. For example, in the
+IR-accelerator mapping shown in Figure 3, we specify the
+compiler IR pattern for a linear layer (as an S-expression):
+(bias_add (nn_dense %a %b) %c).
+
+However, a linear layer can be equivalently expressed as
+
+(add (reshape (nn_dense %a %b) %s) %c)
+
+when %c is a vector, for certain shapes %s. This prevents exact
+matching from identifying potential accelerator calls.
+
+Rather than enumerating various semantically equivalent
+IR-accelerator mappings, we include another set of rewrite
+rules that we call compiler IR rewrites. Each compiler IR
+rewrite transforms an IR pattern into another IR pattern,
+e.g., from the second to the first linear-layer IR pattern above,
+without replacement by accelerator instructions. These general-
+purpose rewrite rules do not depend on the input program
+nor on the accelerator, but help expose more potential matches.
+
+6
+
+We refer to this as flexible matching, as it enables finding
+matches that may be missed by exact matching.
+
+2.3 ILA-Based Compilation-Results Validation
+
+The formal semantics of ILA instructions provides the foun-
+dation for validating compilation results. The D2A method-
+ology does compilation results validation at two levels.
+
+2.3.1 Checking IR-Accelerator Mappings. The use of
+term rewriting provides for modular validation — checking
+end-to-end compilation correctness by verifying individual
+rewrite rules. In D2A, we focus on the verification of IR-
+accelerator mappings from which IR-accelerator rewrites are
+derived. Checking and inferring rules between compiler IR
+patterns is not the focus of this paper [5, 48, 51].
+
+Verifying an IR-accelerator mapping consists of three ver-
+ification tasks, as illustrated in Figure 3, At the two ends, i.e.,
+the compiler IR and the accelerator end, we check the equiva-
+lence through VT1 and VT3, respectively. In the middle, VT2
+checks the equivalence between a compiler IR ILA program
+fragment and an accelerator ILA program fragment. This
+is an instruction-sequence-to-instruction-sequence verifica-
+tion, typically over short program fragments that correspond
+to operations instead of a whole application.
+
+Proof-Based Formal Verification. The formal semantics
+of ILA instructions allows for formally verifying the IR-
+accelerator mappings. For VT1, the equivalence between
+compiler IR intrinsics and compiler IR ILA instructions can
+be checked using software model checking tools (e.g., CBMC
+and SeaHorn [18, 27]) by translating ILA models into soft-
+ware models, as has been done in prior work [34]. For VT2,
+the two program fragments can be encoded into Satisfiabil-
+ity Modulo Theories (SMT) formulas (e.g., via unrolling the
+instructions) and their equivalence checked using an SMT
+solver such as Z3 [19]. For VT3, the refinement checking
+between the accelerator ILA (specification) and the acceler-
+ator RTL (implementation) has been shown successfully in
+prior work [36] that leverages processor verification tech-
+niques [8, 47]. We provide a case study for VT2 in Section 4
+that focuses on verifying equivalence of the operator defini-
+tions in the two program fragments over abstract data types,
+thus avoiding dealing with differences in numerics which
+are the focus of the simulation-based validation.
+
+Simulation-Based Validation. The D2A methodology also
+supports checking VT1-3 through simulation-based valida-
+tion. This is highly automated as the ILAng platform [35]
+can automatically generate an executable software model
+(in C++/SystemC) of a program of ILA instructions. These
+executable models capture the precise definitions of the nu-
+merics used by the accelerator. For VT1, the simulation of
+ILA instructions is checked against the execution of the cor-
+responding IR intrinsics (i.e., the original compiler generated
+
+Specialized Accelerators and Compiler Flows
+
+arXiv, 2022, USA
+
+code). For VT2, we compare the simulation of two ILA pro-
+gram fragments. For VT3, the ILA simulation can be checked
+against RTL simulation of the accelerator implementation.
+
+2.3.2 Application-Level Co-Simulation. Verification at
+the application-level, e.g., examining the final accuracy of
+an inference model instead of its individual layers, is espe-
+cially critical for exploiting accelerators that utilize custom
+data representations. While such accelerators gain power-
+performance efficiency by leveraging custom data types, they
+may introduce modest numerical mismatches at every op-
+eration. Thus, the IR-accelerator mapping validation for a
+pair of program fragments (§ 2.3.1) can at best check that
+the numerical differences for the computation in these frag-
+ments is within a certain range. Unfortunately, this provides
+no guarantee of the correctness at the application level and,
+therefore, requires the application-level co-simulation capa-
+bility enabled by the use of the ILA models.
+
+3 Prototype Implementation
+As a demonstration of the D2A methodology, we have im-
+plemented an end-to-end compilation flow for Deep Learn-
+ing (DL) applications by integrating with existing compiler
+frameworks. Figure 4 shows the workflow of our prototype.
+
+DSL Front-End. TVM is a compiler framework for DL appli-
+cations that provides various capabilities for expressing and
+optimizing DL applications [14]. Here, we make use of TVM’s
+model importer as the front-end for DSL programs. The im-
+porter supports taking programs written in mainstream DL
+frameworks and interchange formats (e.g., ONNX [46], Py-
+Torch [57], and TensorFlow [1]) and translating them into
+Relay, the top-level IR used in TVM [62].
+
+Flexible Matching. We leverage the egg library for equality
+saturation in our prototype [83]. First, the input program
+is translated from Relay to Glenside, a pure (side effect–
+free) tensor program representation that supports specifying
+rewrite rules for tensor programs [68]. Next, with both the
+compiler IR rewrites and IR-accelerator rewrites provided in
+Glenside, the equality saturation engine explores the space
+of possible rewrites as discussed in § 2.2. Upon reaching a
+fixed point, an optimal rewritten program is extracted based
+on a given cost function. Here, as a proof of concept, we
+implemented a cost function that maximizes the number
+of accelerator operations; we leave cost functions that best
+correspond to measures of performance for future work.
+
+Code Generation. Once flexible matching completes, the ex-
+tracted rewritten program is translated back to Relay where
+accelerator instructions are specially annotated. In our pro-
+totype, we use TVM’s Bring Your Own Codegen (BYOC)
+interface to implement the generation of those accelerator
+instructions [16]. BYOC allows for invoking the target inter-
+face of a custom execution mechanism (e.g., an accelerator’s
+
+7
+
+MMIO loads/stores) by having TVM’s runtime defer execu-
+tion to a user-specified runtime when it reaches an annotated
+portion of the program. Here, we implemented a custom run-
+time that invokes the accelerator implemented on an FPGA
+(§ 4.3.2) as well as the ILAng-generated simulators (see be-
+low), producing the necessary ILA instructions at run time.
+Such a just-in-time approach helps prototyping as it allows
+for easily inspecting intermediate values in the program and
+simplifies the implementation, but introduces overhead from
+communication between the TVM runtime and our custom
+D2A runtime. In principle, this overhead can be eliminated
+by using BYOC’s ahead-of-time compilation mode.
+
+ILA Modeling and Correctness Verification. We utilize
+ILAng, an open-source platform for ILA-based modeling and
+verification, for developing the ILA models and perform-
+ing ILA-based verification/validation [35]. ILAng provides
+support for the following capabilities:
+
+1. (a) manually specifying and (b) semi-automatically
+
+synthesizing an ILA model [70].
+
+2. refinement checking between an ILA specification and
+
+an RTL implementation.
+
+3. automatic translation from semantics of ILA instruc-
+
+tions to SMT formulas.
+
+4. generating a sound executable simulator based on the
+operational semantics defined by the ILA model.
+
+We use 1(a), 3, and 4 in this work.
+
+4 Case Studies and Evaluation
+We show the generality of the D2A methodology through
+multiple case studies.
+
+4.1 Target Accelerators
+
+We added support for three accelerators specialized for DL
+applications that provide hardware operations at different
+levels of granularity:
+
+1. FlexASR is an accelerator optimized for speech and natu-
+ral language processing (NLP) tasks that supports various
+recurrent neural networks [71]. It uses a custom numeric
+datatype AdaptivFloat for boosting the accuracy of quan-
+tized computations [72].
+
+2. HLSCNN is an accelerator optimized for 2D convolu-
+tions [81]. HLSCNN is designed to operate on 8/16-bit
+fixed point data, and the feature map tensors are expressed
+in the NHWC layout format for providing better perfor-
+mance through parallelization.
+
+3. VTA is a parameterizable accelerator for tensor opera-
+tions featuring a processor-like design with an ISA and
+configurable parameters [50]. It provides efficient hard-
+ware implementations of element-wise arithmetic opera-
+tions as well as generalized matrix multiplication (GEMM).
+
+The ILAs for FlexASR, HLSCNN, and VTA are approximately
+5600, 1600, and 2100 lines of code, respectively — note that
+
+arXiv, 2022, USA
+
+B.-Y. Huang et al.
+
+Figure 4. Prototype implementation of the D2A compilation flow.
+
+Table 1. End-to-end compilation statistics.
+
+Application Statistics
+1 Application EfficientNet LSTM-WLM MobileNet-V2 ResMLP ResNet-20 Transformer
+PyTorch
+2
+872
+3
+
+PyTorch PyTorch
+343
+
+Source DSL
+#Relay Ops
+
+PyTorch
+578
+
+MxNet
+494
+
+MxNet
+232
+
+757
+
+Number of Static Accelerator Invocations using Exact Matching/Flexible Matching
+
+FlexASR
+4
+5 HLSCNN
+6 VTA
+
+0/35
+35/35
+0/35
+
+1/1
+0/0
+36/36
+
+0/41
+40/40
+1/41
+
+0/38
+0/0
+38/38
+
+2/22
+21/21
+2/22
+
+0/66
+0/0
+66/66
+
+these ILAs serve the dual purposes of enabling compilation
+via the D2A methodology as well as validating the RTL de-
+sign. Additionally, the BYOC-based code generators and run-
+times for these devices are approximately 450, 300, and 900
+lines of code, respectively. Please see Appendix A for a com-
+plete list of supported operations for the three accelerators.
+
+4.2 Target Applications
+
+For our experiments, we considered six DL applications cor-
+responding to common neural network models for language
+and vision tasks that contain operators supported by the
+three target accelerators. We selected applications with rea-
+sonable size for human inspection and in-depth analysis.
+
+1. EfficientNet is a recent convolutional neural network
+(CNN) designed for image classification that uniformly
+scales network width, depth, and resolution [73]. We chose
+it because it contains convolutions that could be acceler-
+ated by VTA and HLSCNN.
+
+2. LSTM-WLM is a simple text generation application [84]
+implemented using an LSTM recurrent neural network
+architecture [26]. We chose this model because it contains
+an LSTM layer that could be accelerated by FlexASR. As
+detailed in Appendix B, we made a small modification to
+the model after importing into Relay to match the seman-
+tics of our FlexASR LSTM code generator, namely by not
+returning the final hidden and cell states (unused in this
+application).
+
+8
+
+3. MobileNet-V2 is a commonly used CNN, designed for
+mobile and embedded vision applications, that uses depth-
+wise separable convolutions [33, 65]. We chose MobileNet
+due to its wide use, especially on embedded devices.
+4. ResMLP is a recent residual network, designed for image
+classification, comprised only of multi-layer perceptrons
+and no convolutional layers [75]. We chose this model
+because its preponderance of linear layers means it could
+be accelerated by VTA as well as by FlexASR (despite not
+being a language model).
+
+5. ResNet-20 is a CNN designed for image classification
+that applies identity mapping [31]. As with MobileNet,
+we chose ResNet for its common use in practice.
+
+6. Transformer is a language representation model com-
+prised primarily of attention mechanisms [77]. We chose
+Transformer as a representative of recent NLP models in
+common use.
+
+With the exception of the minor change for LSTM-WLM,
+all applications were mapped to accelerators without any
+manual modifications. Detailed parameters for these applica-
+tions are given in Appendix B.
+
+4.3 Evaluation: Compilation
+
+We examined the portability provided by D2A through end-
+to-end compilation using our compiler prototype. We took
+six DL applications, developed by different teams in different
+DSLs, and compiled them for the three target accelerators.
+Our compiler prototype successfully generated code that
+
+Relay programGlenside programFlexible matching(using eq. sat.)Rewritten Glenside programAnnotated Relay programCode-gen. (using BYOC)TranslateTranslateExtractFPGA emulationCompiler IR rewritesCompiler IR-acceleratorrewrites/mappingsPyTorchMxNetRelayApplications in DSLsTVMmodel importerSimulation-based validationProof-based formal verificationApplication-level simulationVTAHLSCNNFlexASRAcceleratorsGlenside/eggILAngTVMILA modelsSpecialized Accelerators and Compiler Flows
+
+arXiv, 2022, USA
+
+exploits the accelerators for supported computations. Fur-
+thermore, we demonstrate full-system deployment, running
+D2A-generated code on physical hardware through FPGA
+emulation.
+
+Table 2. Simulation-based validation results of check-
+ing IR-accelerator mappings (partial). The average rela-
+tive error (Avg. Err.) and the standard deviation (Std. Dev.) of
+the errors are measured for simulation over 100 test inputs.
+
+4.3.1 Portability and Flexible Matching. Table 1 shows
+the compilation statistics of using exact matching and flex-
+ible matching. It describes the source language in which
+the application is programmed (Row 2) and the program
+complexity using the number of Relay operators as a proxy
+(Row 3). It reports the number of invocations to FlexASR,
+HLSCNN, and VTA when using exact/flexible matching in
+Rows 4-6. Note that some invocations (IR-acclerator map-
+pings) correspond to multiple Relay operators; in particular,
+the 35-step FlexASR LSTM in LSTM-WLM is 566 operators
+and maps to one FlexASR LSTM instruction (a dramatic gran-
+ularity mismatch between DSL and accelerator operations).
+Our results demonstrate portability with the successful
+exploitation of accelerators for supported operations and
+provide evidence for the utility of flexible matching. For
+example, flexible matching revealed several offloads to Flex-
+ASR’s linear layer in MobileNet-V2 by rewriting nn.dense to
+nn.dense followed by an add of a zero tensor. Also note that
+certain Glenside rewrites [68] that implement the im2col op-
+timization [13] result in many more offloads to VTA in that
+table; this is due to 2D convolutions being rewritten into ma-
+trix multiplications. Hence, flexible matching allowed us to
+support 2D convolutions on VTA even though our prototype
+code generator did not explicitly implement 2D convolutions
+via VTA instructions. This is an example of emergent effects
+resulting from simple, reusable rewrite rules.
+
+4.3.2 System Deployment and FPGA Emulation. To
+demonstrate the D2A flow on a real hardware platform, we
+synthesized, placed-and-routed the FlexASR accelerator on
+a Xilinx Zynq ZCU102 FPGA, which consumed 86% of the
+available LUT resources.3 We utilized the Xilinx SDK [85] to
+pass the accelerator instructions (MMIO commands) to the
+accelerator interface for invoking the supported operations.
+Specifically, we compiled and executed synthetic applica-
+tion programs in which LSTM layers and linear layers are
+offloaded to the FlexASR accelerator. This case study demon-
+strates the applicability of D2A in actual system deployment
+on a commodity hardware platform. Further, it shows that
+in the absence of compilation-results validation enabled by
+the D2A methodology, the need for a fully functional RTL
+model and the significant engineering overhead indeed limit
+early-stage software/hardware co-design.
+
+4.4 Evaluation: Compilation-Results Validation
+
+We want to check that the compiled program, in which parts
+of the computation are offloaded to accelerators, retains the
+
+3Due to the significant engineering overhead of FPGA emulation, FlexASR
+is the only accelerator we deployed on an FPGA.
+
+Accelerator Operation
+
+1 VTA
+2 HLSCNN
+FlexASR
+3
+FlexASR
+4
+FlexASR
+5
+FlexASR
+6
+FlexASR
+7
+FlexASR
+8
+
+GEMM
+Conv2D
+LinearLayer
+LSTM
+LayerNorm
+MaxPool
+MeanPool
+Attention
+
+Avg. Err.
+0.00%
+1.78%
+0.84%
+1.21%
+0.27%
+0.00%
+1.79%
+4.22%
+
+Std. Dev.
+0.00%
+0.16%
+0.29%
+0.19%
+0.20%
+0.0%
+0.28%
+0.09%
+
+same functionality as intended with the IR semantics. Thus,
+we use the IR ILA specification as the reference for formal
+verification of the IR-accelerator mappings, and use an IR
+interpreter as the reference when running simulation at two
+levels: the operation level (for checking the IR-accelerator
+mappings) and the application level.
+
+4.4.1 Checking IR-Accelerator Mappings. Modern ac-
+celerators often adopt custom numerics for achieving better
+power-performance efficiency. For example, in our cases,
+FlexASR and HLSCNN use the AdaptivFloat and 8/16-bit
+fixed point data types, respectively. This means checking
+the IR-accelerator mappings must account for the numerical
+differences. To separate the effect of numerics and focus on
+the definition of operations, we use abstract data types to
+formally verify the equivalence (demonstrated through a
+proof-of-concept case study). In addition, to precisely cap-
+ture the numerical differences, we use simulation to compare
+accelerator executions (using an ILA simulator) against the
+IR semantics (using an IR interpreter).
+
+Simulation-Based Validation. For checking the mappings
+through simulation, we generated 100 random test inputs
+and compared the outputs of the accelerator ILA simulator
+and that of an IR interpreter. The accelerator ILA simula-
+tors precisely model the data types used by the accelerators.
+Specifically, VTA, HLSCNN, and FlexASR use 8-bit integer,
+8/16-bit fixed point, and AdaptiveFloat, respectively. For the
+IR interpreter, as a reference, we use 8-bit integer, 32-bit
+floating point, and 32-bit floating point when checking oper-
+ations of VTA, HLSCNN, and FlexASR, respectively. These
+are respectively the closest standard datatypes to those used
+by these accelerators. The relative errors are measured using
+the standard Frobenius Norm [2] for the tensors as follows:
+(cid:13)𝐹 /(cid:13)
+𝐸𝑟𝑟𝑜𝑟 = (cid:13)
+(cid:13)
+
+(cid:13)𝑂𝑢𝑡𝑟𝑒 𝑓 − 𝑂𝑢𝑡𝑎𝑐𝑐
+
+(cid:13)𝑂𝑢𝑡𝑟𝑒 𝑓
+
+(cid:13)
+(cid:13)𝐹 .
+
+Table 2 shows a selected subset of the validation results:
+four IR-accelerator mappings (Rows 1-4) that are used in
+the end-to-end compilation (Table 1) and four additional
+
+9
+
+arXiv, 2022, USA
+
+B.-Y. Huang et al.
+
+mappings for non-trivial operations (Rows 5-8). We omit val-
+idation results of other mappings, e.g., for trivial operations
+add and max. Columns 1 and 2 indicate the accelerator and
+the supported operation for each IR-accelerator mapping,
+respectively. Columns 3 and 4 provide the average relative
+error and the standard deviation, respectively, over the 100
+test inputs. For mappings that are not affected by numerical
+differences, e.g., the VTA-supported GEMM, we see exact
+matches in the results. For other mappings, we see devia-
+tions caused by the custom numerics, especially for complex
+operations such as the attention operation for FlexASR.
+
+Proof-Based Formal Verification. The key challenges in
+formally verifying mappings between fragments that repre-
+sent DL computations include: (1) handling nested loops, for
+both compiler side and accelerator side, that iterate through
+tensor elements, and (2) relating tensor variables between
+the two sides which may employ various tiling mechanisms.
+As a proof-of-concept study, we considered the Relay and
+FlexASR fragments for the FlexASR MaxPool IR-accelerator
+mapping. These fragments both have 3+ nested loops, and
+the relation between the two fragments must account for
+a special customized tiling provided by FlexASR [71]. For
+this study, we considered equivalence of the fragments over
+fixed-sized tensors with symbolic data,4 and implemented
+verification using two methods: (1) bounded model checking
+(BMC) [6], and (2) program verification using constrained
+Horn clauses (CHCs) [40]. The BMC-based method unrolls
+all the loops in both fragments, which is straightforward
+but may fail to scale for large-sized tensors. The CHC-based
+method is given a product program of the two fragments and
+uses relational loop invariants, i.e., formulas that relate the
+two fragments at intermediate loop boundaries (details are
+beyond the scope of this paper). This avoids loop unrolling
+and can handle large tensors. Both methods use Z3 [19] as
+the underlying SMT solver.
+
+While ILAng directly supports BMC, we manually created
+CHCs for the CHC-based method. We also supplied the rela-
+tional invariants that capture the customized tiling of Flex-
+ASR. In future work, we plan to automate CHC generation,
+which will allow formal verification of other IR-accelerator
+mappings used in this paper. Table 3 shows the results for
+this case study for various dimensions of the 2D input matrix
+(Column 1), with runtimes of the BMC-based and CHC-based
+verification methods in Columns 2 and 3, respectively. The
+BMC-based method was able to verify equivalence of map-
+pings with small-sized matrices, but timed out (with a 3-hour
+time limit) on the 16×64 matrix that was used for simulation-
+based validation. In contrast, the CHC-based method was
+faster than BMC and successfully verified mappings with
+larger matrices. These results are encouraging and demon-
+strate how the D2A methodology enables formal verification
+of key steps in the compilation flow.
+
+4Formally modeling custom numerics is left to future work.
+
+10
+
+Table 3. Formal verification case study: results for ver-
+ifying the IR-accelerator mapping for FlexASR Max-
+Pool. Experiments were run on an Intel Core i7-5500U CPU
+(two 2.40GHz cores) with 8 GB RAM.
+
+Matrix dim. BMC verif. time (s) CHC verif. time (s)
+2 × 16
+38
+4 × 16
+37
+4 × 32
+146
+8 × 64
+1831
+16 × 64
+5177
+
+443
+1976
+7954
+Timeout (>3 hrs)
+Timeout (>3 hrs)
+
+4.4.2 Application-Level Co-Simulation. With the vali-
+dated IR-accelerator mappings, we want to check if minor
+deviations at the operation level will influence application-
+level behavior. Therefore, we performed application-level
+co-simulation on several applications which offload various
+computations to FlexASR and HLSCNN, the two acceler-
+ators that utilize custom numerics. Specifically, we exam-
+ined LSTM-WLM and ResMLP, which offload to FlexASR
+the LSTM layer and linear layer operations, respectively. We
+also considered MobileNet and ResNet, which both offload
+2D convolution and linear layer operations to HLSCNN and
+FlexASR, respectively. (We compiled to two target acceler-
+ators by including the IR-accelerator rewrite rules for both
+accelerators.)
+
+We trained and validated the LSTM-WLM model using
+the WikiText-2 dataset [49]. The image classification models
+(MobileNet-V2, ResMLP, and ResNet-20) were trained and
+validated using the CIFAR-10 dataset [17]. Table 4 shows
+the application-level co-simulation results. Columns 1 and 2
+describe the application and the target processing platform
+under evaluation, respectively. We provide a reference result
+(perplexity for the text-generation task and inference accu-
+racy for vision tasks) in Column 3 by running the application
+on the host processor, i.e., not offloading to accelerators. The
+validation result using original accelerator designs, labeled
+“Original Result,” is provided in Column 4. For cases where
+the “Original Result” was significantly poorer than the ref-
+erence result, we reported it to the accelerator developers
+for their further investigation. When they provided an ac-
+celerator design modification to address this, we provide an
+updated result, using this modified accelerator, in Column 5.
+The average simulation time is reported in Column 6.
+
+Case Study: ResNet-20 and MobileNet-V2. We reported
+the original validation results of ResNet-20, which were far
+from the 91.55% reference result, to the accelerator devel-
+opers. We also provided statistics for each accelerator in-
+vocation (e.g., error accumulation, input and output ranges,
+etc.), gathered by our compiler prototype and ILA simulators.
+With the information, the accelerator developers were able
+to identify the root cause: weight data values in HLSCNN’s
+2D convolutional layers were heavily quantized by its 8-bit
+
+Specialized Accelerators and Compiler Flows
+
+arXiv, 2022, USA
+
+Table 4. Application-Level Co-Simulation Results. In each validation, we evaluated 2000 images (for vision tasks) or 100
+sentences (for text generation) that were evenly sampled from the corresponding dataset. The original result is measured using
+original accelerator designs. The updated result is measured using modified designs provided by the accelerator developers.
+
+Application
+LSTM-WLM
+ResMLP
+ResNet-20
+MobileNet-V2
+
+Processing Platform Reference Result∗
+122.15 (perplexity)
+69.65% (accuracy)
+FlexASR & HLSCNN 91.55% (accuracy)
+FlexASR & HLSCNN 92.40% (accuracy)
+
+FlexASR
+FlexASR
+
+Original Result
+257.39 (perplexity)
+10.65% (accuracy)
+29.15% (accuracy)
+10.35% (accuracy)
+
+Updated Result
+Reported
+Reported
+91.85% (accuracy)
+91.20% (accuracy)
+
+Avg. Sim. Time†
+1min 10s
+19min 15s
+14min 23s
+42min 26s
+
+∗ The reference result does not represent the best achievable accuracy/perplexity of the model on the given dataset. This
+table is intended for comparing the application-level results on different processing platforms.
+† Average simulation time of running one data point (e.g., an image or a sentence) on a 2.4GHz AMD EPYC 7532 core.
+
+fixed point data type due to a narrower value range. After
+updating the design by expanding the original 8-bit represen-
+tation to 16 bits, the application-level result matched up to
+the reference result. The same tuning approach also resulted
+in improved accuracy for MobileNet-V2.
+
+The results in Table 4 reaffirm the need for application-
+level validation, especially for accelerators utilizing custom
+numerics. However, without a portable end-to-end compila-
+tion flow, such application-level validation is prohibitively
+difficult for new accelerators. Through our case studies, we
+demonstrate how D2A provides systematic and automatic
+compilation-results validation at the application level and
+also show its usefulness in software/hardware co-design.
+Specifically, with the ILA, D2A provides quick design space
+exploration and numerics tuning without hardware engi-
+neering overhead (e.g., deploying to FPGA) in each hardware
+design iteration. Further, it provides handy debugging in-
+formation and efficient simulation. (For FlexASR, we see a
+30× speedup on average with the ILA simulator compared
+to RTL simulation using a commercial Verilog simulator.)
+
+5 Discussion and Future Work
+The D2A methodology establishes a foundation for an end-
+to-end, validatable compilation flow for accelerator-rich plat-
+forms. Our prototype not only provides a working imple-
+mentation, but also an experimental framework for future
+research in this area. Thus far, we have demonstrated how
+flexible matching, mapping validation, and application-level
+co-simulation are enabled by D2A. Below we discuss two
+example near-term extensions ripe for further exploration
+and inclusion in D2A-based frameworks.
+
+5.1 Optimizing Data Transfers
+
+As a motivating example, we consider an image processing
+application with a 2D max-pooling layer that we would like
+to offload to FlexASR. Suppose that the max-pooling layer
+uses a window with shape (4, 4) and stride (2, 2) and is used
+to downsample a 128 × 128 matrix into a 64 × 64 matrix.
+However, FlexASR does not directly support this window
+or stride size. Instead, it supports a related operation called
+
+11
+
+temporal max-pooling, which corresponds to 2D max-pool
+with a fixed window of shape (2, 1) and stride (2, 1). The
+following IR-accelerator rewrite rule represents an offload-
+ing of the temporal max-pooling operation, where the IR
+fragment is shown on the left of the arrow, and the FlexASR
+fragment on the right (?T in the pattern denotes the input
+matrix; fragments are shown as S-expressions).
+
+1
+2
+3
+
+; Rewrite rule for IR-accelerator mapping
+(map reduceMax (windows (2, 1) (2, 1) ?T)) ->
+(fasrMaxpLoad (fasrMaxpool (fasrMaxpStore ?T)))
+
+By using flexible matching, our prototype found the follow-
+ing rewritten IR program for the 2D max-pooling layer:
+
+1
+2
+3
+4
+5
+6
+7
+8
+9
+
+; Rewritten IR program for window (4, 4), stride (2, 2)
+; T denotes the input to the 2D max-pooling layer
+; S is the shape of the output of the 2D max-pooling layer
+(reshape (map reduceMax (windows (2, 1) (2, 1)
+(map reduceMax (windows (2, 1) (2, 1)
+(map reduceMax (windows (2, 1) (2, 1)
+(map reduceMax (windows (2, 1) (2, 1)
+(map flatten (windows (4, 4) (2, 2) T))
+)))))))) S)
+
+Then the IR-accelerator rules above rewrite each of these
+four map reduceMax instances to the FlexASR fragment. The
+listings for this example are in Figure 7 of Appendix C, with
+the result of applying the IR-accelerator mapping in part (d).
+Note that each of the map reduceMax instances in the re-
+written IR program is mapped to a composition of three
+FlexASR instructions (as shown in the IR-accelerator map-
+ping rewrite rule), where fasrMaxpStore stores the input data
+into FlexASR, fasrMaxPool performs the maxpool computa-
+tion in FlexASR, and fasrMaxpLoad loads the output result
+from FlexASR. When four of these instances are composed,
+the initial store and the final load are needed to communi-
+cate with FlexASR; however, the other intermediate transfers
+can be eliminated, since the output of one instance serves
+as input of another. We plan to enhance our prototype to
+cancel such redundant transfers, with the final optimized
+result shown in part (f) of Figure 7 in Appendix C.
+
+This example illustrates the importance of minimizing
+data transfers while offloading operations to accelerators.
+Note that a fixed set of accelerator APIs may not allow such
+
+arXiv, 2022, USA
+
+B.-Y. Huang et al.
+
+optimizations, whereas D2A provides this flexibility through
+individual accelerator instructions. In future work, we would
+like to consider more general optimizations on the acceler-
+ator side that account for memory organization and data
+movement, potentially leveraging standard register alloca-
+tion as well as recent DL operator fusion techniques [54].
+
+5.2 Extending Formal Verification of Mappings
+
+In our study (§ 4.4.1), we explored CHC-based verification
+of IR-accelerator mappings for fixed-size tensors (with sym-
+bolic data) and supplied relational loop invariants to the
+verifier. In future work, we would like to add support for
+symbolic-sized tensors and automatic inference of relational
+loop invariants. Additionally, our simulation validation re-
+veals that custom numerics can significantly impact model
+accuracy. We would like to extend our verification to account
+for custom numerics and check or derive error bounds.
+
+6 Related Work
+The key insight of the D2A methodology is using the ILA
+as a formal software/hardware interface for mapping DSL
+applications to specialized accelerators. Below we survey
+past work on different aspects of D2A’s features.
+
+6.1 Software/Hardware Co-design
+
+Recent work on accelerator generation and integration [4,
+76] has explored adding support in the Halide [59] compiler
+flow for specialized Coarse-Grained Reconfigurable Array
+(CGRA) accelerators. That work composes an impressive ar-
+ray of custom tools to generate and verify specialized CGRA
+accelerators and also map Halide program fragments down
+to accelerator invocations. HeteroCL [42] also provides a
+similar custom flow. In contrast, the D2A methodology is
+designed to support software/hardware co-design by miti-
+gating impedance mismatches between the granularity of in-
+dependently developed DSLs and near-arbitrary accelerators;
+because of the flexibility of the ILA, the D2A methodology is
+applicable to a broader class of compilers and accelerators.
+
+6.2 Pattern Matching Accelerator Calls
+
+In principle, many DSLs allow for supporting custom acceler-
+ators via bespoke translations from DSL operators to specific
+accelerator APIs, e.g., as in the original TVM [14] support
+for VTA [50]. TVM’s BYOC [16] interface eases incorpo-
+rating custom accelerators by performing syntactic pattern
+matching to offload computations via user-provided code
+generators. However, BYOC leaves all matters of code genera-
+tion, e.g., MMIO invocations, to the user, while D2A provides
+more structure to code generation via the ILA. In particular,
+the ILA provides useful simulation and verification capabili-
+ties. Additionally, BYOC’s pattern matching cannot search
+the space of programs equivalent to the input, limiting the
+
+12
+
+number of potential accelerator invocations compared to
+flexible matching in our D2A prototype.
+
+The MLIR framework [44] provides a rich metalanguage
+and numerous tools for developing, optimizing, and translat-
+ing between custom compiler IRs, but does not inherently
+provide direct support for D2A’s features. It would be possi-
+ble to realize the D2A methodology within an MLIR-based
+ecosystem; we implemented our DL-focused prototype using
+TVM since it allowed leveraging more DL infrastructure.
+
+Past work has also explored rewrite-based techniques for
+automatically inferring instruction selection passes between
+ISAs [60]. Rewriting in D2A instead operates on a high-
+level DSL to expose opportunities to invoke code generators,
+rather than performing low-level code generation directly.
+
+6.3 Validating and Verifying Accelerator Calls
+
+Tools like Verilator [78] and Cuttlesim [58] enable efficient
+RTL-level simulation, but do not provide reusable interfaces
+or flexible matching to incorporate custom accelerators into
+existing compiler flows. Formally verified compilers such as
+CompCert [45] and CakeML [41] can rigorously establish
+end-to-end equivalence from high-level source code down to
+assembly for various CPU back-ends via machine-checkable
+proofs, but currently do not provide a general approach for
+integrating new accelerator support and provide no support
+for custom numerics. In contrast, D2A enables validating
+accelerator mappings via end-to-end simulation handling
+custom numerics and formally verifying individual rewrite
+rules from compiler IR patterns to accelerator invocations.
+
+7 Conclusions
+In this work we address key gaps preventing effective accel-
+erator utilization under the prevalent API-based approach.
+Specifically, we highlight the lack of portability, the inability
+to integrate accelerators into optimizing compilers, and the
+inability to validate generated code. We show that the root of
+these gaps is the lack of a formal software/hardware interface
+for accelerators, and use the recently developed ILA specifi-
+cation for this purpose in our proposed D2A methodology.
+We describe a D2A prototype for DL applications using the
+TVM and ILAng frameworks. We evaluate the capabilities of
+this prototype through the fully automated compilation of
+six applications on three different accelerator platforms. We
+show the convenience of equality saturation–based flexible
+matching by mapping of a larger set of accelerator-supported
+operations in DSL applications than is possible using exact
+matching. We also discuss case studies that highlight the
+ability to (a) formally verify the equivalence of compiler IR
+to accelerator mappings of individual accelerator operations
+(using abstract data types) and (b) do automated application-
+level simulation-based validation using the accelerator nu-
+merics to check the acceptability of application-level results
+even with deviations at the operation level due to numerics.
+
+Specialized Accelerators and Compiler Flows
+
+arXiv, 2022, USA
+
+The latter exposed precision issues in various case studies
+which required modification of the accelerator numerics,
+demonstrating its use in software/hardware co-design. Other
+than the device ILAs, integration into the compiler required
+only a small number of Glenside rewrite rules and a small
+code generator mapping matched patterns to ILA instruc-
+tions. We believe this is the first compiler framework that
+addresses the multiple issues in effective accelerator utiliza-
+tion and establishes a foundation that can democratize the
+end-to-end mapping of applications in DSLs to accelerator-rich
+platforms, no longer limiting it to large enterprises that can
+afford teams of hardware, software, and system experts.
+
+Acknowledgments
+This work was supported in part by the Applications Driving
+Architectures (ADA) Research Center, a JUMP Center co-
+sponsored by SRC and DARPA.
+
+References
+[1] Martín Abadi, Paul Barham, Jianmin Chen, Zhifeng Chen, Andy Davis,
+Jeffrey Dean, Matthieu Devin, Sanjay Ghemawat, Geoffrey Irving,
+Michael Isard, Manjunath Kudlur, Josh Levenberg, Rajat Monga, Sherry
+Moore, Derek G. Murray, Benoit Steiner, Paul Tucker, Vijay Vasude-
+van, Pete Warden, Martin Wicke, Yuan Yu, and Xiaoqiang Zheng. 2016.
+TensorFlow: A System for Large-Scale Machine Learning. In Proceed-
+ings of the 12th USENIX Conference on Operating Systems Design and
+Implementation (Savannah, GA, USA) (OSDI ’16). USENIX Association,
+USA, 265–283. https://www.usenix.org/conference/osdi16/technical-
+sessions/presentation/abadi
+
+[2] E. Anderson, Z. Bai, C. Bischof, L. S. Blackford, J. Demmel, Jack J.
+Dongarra, J. Du Croz, S. Hammarling, A. Greenbaum, A. McKenney,
+and D. Sorensen. 1999. LAPACK Users’ Guide (Third Ed.). Society for
+Industrial and Applied Mathematics, USA.
+
+[3] Franz Baader and Tobias Nipkow. 1998. Term Rewriting and All That.
+
+Cambridge University Press, USA.
+
+[4] Rick Bahr, Clark Barrett, Nikhil Bhagdikar, Alex Carsello, Ross Daly,
+Caleb Donovick, David Durst, Kayvon Fatahalian, Kathleen Feng, Pat
+Hanrahan, Teguh Hofstee, Mark Horowitz, Dillon Huff, Fredrik Kjol-
+stad, Taeyoung Kong, Qiaoyi Liu, Makai Mann, Jackson Melchert,
+Ankita Nayak, Aina Niemetz, Gedeon Nyengele, Priyanka Raina,
+Stephen Richardson, Raj Setaluri, Jeff Setter, Kavya Sreedhar, Maxwell
+Strange, James Thomas, Christopher Torng, Leonard Truong, Nestan
+Tsiskaridze, and Keyi Zhang. 2020. Creating an Agile Hardware Design
+Flow. In Proceedings of the 57th ACM/EDAC/IEEE Design Automation
+Conference (Virtual Event, USA) (DAC ’20). IEEE Press, New York, NY,
+USA, Article 142, 6 pages. https://doi.org/10.1109/DAC18072.2020.
+9218553
+
+[5] Sorav Bansal and Alex Aiken. 2006. Automatic Generation of Peephole
+Superoptimizers. In Proceedings of the 12th International Conference
+on Architectural Support for Programming Languages and Operating
+Systems (San Jose, California, USA) (ASPLOS XII). Association for
+Computing Machinery, New York, NY, USA, 394–403. https://doi.org/
+10.1145/1168857.1168906
+
+[6] Armin Biere, Alessandro Cimatti, Edmund M. Clarke, Ofer Strichman,
+and Yunshan Zhu. 2003. Bounded model checking. Adv. Comput. 58
+(2003), 117–148. https://doi.org/10.1016/S0065-2458(03)58003-2
+[7] Gabriel Hjort Blindell. 2016. Instruction Selection - Principles, Methods,
+and Applications. Springer, Berlin, Heidelberg. https://doi.org/10.
+1007/978-3-319-34019-7
+
+13
+
+[8] Jerry R. Burch and David L. Dill. 1994. Automatic Verification of
+Pipelined Microprocessor Control. In Proceedings of the 6th Interna-
+tional Conference on Computer Aided Verification (CAV ’94). Springer-
+Verlag, Berlin, Heidelberg, 68–80. https://dl.acm.org/citation.cfm?id=
+735662
+
+[9] Ningyuan Cao, Baibhab Chatterjee, Minxiang Gong, Muya Chang,
+Shreyas Sen, and Arijit Raychowdhury. 2020. A 65nm Image Processing
+SoC Supporting Multiple DNN Models and Real-Time Computation-
+Communication Trade-Off Via Actor-Critical Neuro-Controller. In
+Proceedings of the 2020 IEEE Symposium on VLSI Circuits (Honolulu,
+HI, USA). IEEE, New York, NY, USA, 1–2. https://doi.org/10.1109/
+VLSICircuits18222.2020.9162878
+
+[10] Adrian M. Caulfield, Eric S. Chung, Andrew Putnam, Hari Angepat,
+Jeremy Fowers, Michael Haselman, Stephen Heil, Matt Humphrey,
+Puneet Kaur, Joo-Young Kim, Daniel Lo, Todd Massengill, Kalin
+Ovtcharov, Michael Papamichael, Lisa Woods, Sitaram Lanka, Derek
+Chiou, and Doug Burger. 2016. A Cloud-Scale Acceleration Archi-
+tecture. In Proceedings of the 49th Annual IEEE/ACM International
+Symposium on Microarchitecture (Taipei, Taiwan) (MICRO-49). IEEE
+Press, New York, NY, USA, Article 7, 13 pages. https://doi.org/10.1109/
+MICRO.2016.7783710
+
+[11] Google LLC n. d.. The CFU Playground: Accelerate ML models on FPGAs.
+Google LLC. Retrieved Oct. 9, 2021 from https://cfu-playground.
+readthedocs.io
+
+[12] Wei-Ting Jonas Chan, Andrew B. Kahng, Siddhartha Nath, and Ichiro
+Yamamoto. 2014. The ITRS MPU and SOC system drivers: Calibration
+and implications for design-based equivalent scaling in the roadmap.
+In Proceedings of the 32nd IEEE International Conference on Computer
+Design (Seoul, South Korea) (ICCD ’14). IEEE Computer Society, New
+York, NY, USA, 153–160. https://doi.org/10.1109/ICCD.2014.6974675
+[13] Kumar Chellapilla, Sidd Puri, and Patrice Simard. 2006. High Perfor-
+mance Convolutional Neural Networks for Document Processing. In
+Proceedings of the Tenth International Workshop on Frontiers in Hand-
+writing Recognition, Guy Lorette (Ed.). Université de Rennes 1, La Baule
+(France), 6 pages. https://hal.inria.fr/inria-00112631
+
+[14] Tianqi Chen, Thierry Moreau, Ziheng Jiang, Lianmin Zheng, Eddie
+Yan, Meghan Cowan, Haichen Shen, Leyuan Wang, Yuwei Hu, Luis
+Ceze, Carlos Guestrin, and Arvind Krishnamurthy. 2018. TVM: An
+Automated End-to-End Optimizing Compiler for Deep Learning. In
+Proceedings of the 13th USENIX Conference on Operating Systems Design
+and Implementation (Carlsbad, CA, USA) (OSDI ’18), Andrea C. Arpaci-
+Dusseau and Geoff Voelker (Eds.). USENIX Association, USA, 579–594.
+https://www.usenix.org/conference/osdi18/presentation/chen
+[15] Yu-Hsin Chen, Tushar Krishna, Joel S. Emer, and Vivienne Sze. 2017.
+Eyeriss: An Energy-Efficient Reconfigurable Accelerator for Deep
+IEEE J. Solid State Circuits 52, 1
+Convolutional Neural Networks.
+(2017), 127–138. https://doi.org/10.1109/JSSC.2016.2616357
+
+[16] Zhi Chen, Cody Hao Yu, Trevor Morris, Jorn Tuyls, Yi-Hsiang Lai, Jared
+Roesch, Elliott Delaye, Vin Sharma, and Yida Wang. 2021. Bring Your
+Own Codegen to Deep Learning Compiler. arXiv:2105.03215 [cs.LG]
+[17] Canadian Institute for Advanced Research 2009. The CIFAR-10 dataset.
+Canadian Institute for Advanced Research. Retrieved Nov. 15, 2021
+from http://www.cs.toronto.edu/~kriz/cifar.html
+
+[18] Edmund M. Clarke, Daniel Kroening, and Flavio Lerda. 2004. A Tool
+for Checking ANSI-C Programs. In Proceedings of the 10th International
+Conference on Tools and Algorithms for the Construction and Analysis
+of Systems (TACAS 2004) (Barcelona, Spain) (Lecture Notes in Computer
+Science, Vol. 2988), Kurt Jensen and Andreas Podelski (Eds.). Springer,
+Berlin, Heidelberg, 168–176. https://doi.org/10.1007/978-3-540-24730-
+2_15
+
+[19] Leonardo Mendonça de Moura and Nikolaj Bjørner. 2008. Z3: An
+Efficient SMT Solver. In Proceedings of the 14th International Conference
+on Tools and Algorithms for the Construction and Analysis of Systems
+(TACAS 2008) (Budapest, Hungary) (Lecture Notes in Computer Science,
+
+arXiv, 2022, USA
+
+B.-Y. Huang et al.
+
+Vol. 4963), C. R. Ramakrishnan and Jakob Rehof (Eds.). Springer, Berlin,
+Heidelberg, 337–340. https://doi.org/10.1007/978-3-540-78800-3_24
+[20] Nachum Dershowitz. 1993. A Taste of Rewrite Systems. In Functional
+Programming, Concurrency, Simulation and Automated Reasoning (Lec-
+ture Notes in Computer Science, Vol. 693), Peter E. Lauer (Ed.). Springer,
+Berlin, Heidelberg, 199–228. https://doi.org/10.1007/3-540-56883-2_11
+[21] Zhenman Fang, Farnoosh Javadi, Jason Cong, and Glenn Reinman.
+2019. Understanding Performance Gains of Accelerator-Rich Archi-
+tectures. In Proceedings of the 30th IEEE International Conference on
+Application-specific Systems, Architectures and Processors (New York,
+NY, USA) (ASAP ’19). IEEE, New York, NY, USA, 239–246. https:
+//doi.org/10.1109/ASAP.2019.00013
+
+[22] Jeremy Fowers, Kalin Ovtcharov, Michael Papamichael, Todd Mas-
+sengill, Ming Liu, Daniel Lo, Shlomi Alkalay, Michael Haselman,
+Logan Adams, Mahdi Ghandi, Stephen Heil, Prerak Patel, Adam
+Sapek, Gabriel Weisz, Lisa Woods, Sitaram Lanka, Steven K. Reinhardt,
+Adrian M. Caulfield, Eric S. Chung, and Doug Burger. 2018. A Config-
+urable Cloud-Scale DNN Processor for Real-Time AI. In Proceedings
+of the 45th Annual International Symposium on Computer Architecture
+(Los Angeles, California) (ISCA ’18). IEEE Press, New York, NY, USA,
+1–14. https://doi.org/10.1109/ISCA.2018.00012
+
+[23] Taro Fujii, Takao Toi, Teruhito Tanaka, Katsumi Togawa, Toshiro
+Kitaoka, Kengo Nishino, Noritsugu Nakamura, Hiroki Nakahara, and
+Masato Motomura. 2018. New Generation Dynamically Reconfigurable
+Processor Technology for Accelerating Embedded AI Applications. In
+Proceedings of the 2018 IEEE Symposium on VLSI Circuits (Honolulu,
+HI, USA). IEEE, New York, NY, USA, 41–42. https://doi.org/10.1109/
+VLSIC.2018.8502438
+
+[24] Angelo Garofalo, Gianmarco Ottavi, Alfio Di Mauro, Francesco Conti,
+Giuseppe Tagliavini, Luca Benini, and Davide Rossi. 2021. A 1.15
+TOPS/W, 16-Cores Parallel Ultra-Low Power Cluster with 2b-to-32b
+Fully Flexible Bit-Precision and Vector Lockstep Execution Mode.
+In Proceedings of the 47th European Solid State Circuits Conference
+(Grenoble, France) (ESSCIR 2021). IEEE, New York, NY, USA, 267–270.
+https://doi.org/10.1109/ESSCIRC53450.2021.9567767
+
+[25] Massimo Giordano, Kartik Prabhu, Kalhan Koul, Robert Radway, Albert
+Gural, Rohan Doshi, Zainab F. Khan, John W. Kustin, Timothy Liu,
+Gregorio B. Lopes, Victor Turbiner, Win-San Khwa, Yu-Der Chih,
+Meng-Fan Chang, Guénolé Lallement, Boris Murmann, Subhasish
+Mitra, and Priyanka Raina. 2021. CHIMERA: A 0.92 TOPS, 2.2 TOPS/W
+Edge AI Accelerator with 2 MByte On-Chip Foundry Resistive RAM for
+Efficient Training and Inference. In Proceedings of the 2021 Symposium
+on VLSI Circuits (Kyoto, Japan). IEEE, New York, NY, USA, 1–2. https:
+//doi.org/10.23919/VLSICircuits52068.2021.9492347
+
+[26] Alex Graves and Navdeep Jaitly. 2014. Towards End-To-End Speech
+Recognition with Recurrent Neural Networks. In Proceedings of the 31st
+International Conference on Machine Learning (Proceedings of Machine
+Learning Research, Vol. 32), Eric P. Xing and Tony Jebara (Eds.). PMLR,
+Bejing, China, 1764–1772. https://proceedings.mlr.press/v32/graves14.
+html
+
+[27] Arie Gurfinkel, Temesghen Kahsai, Anvesh Komuravelli, and Jorge A.
+Navas. 2015. The SeaHorn Verification Framework. In Proceedings of
+the 27th International Conference on Computer Aided Verification (CAV
+2015) (San Francisco, CA, USA) (Lecture Notes in Computer Science,
+Vol. 9206), Daniel Kroening and Corina S. Pasareanu (Eds.). Springer,
+Berlin, Heidelberg, 343–361. https://doi.org/10.1007/978-3-319-21690-
+4_20
+
+[28] Tae Jun Ham, Lisa Wu, Narayanan Sundaram, Nadathur Satish, and
+Margaret Martonosi. 2016. Graphicionado: A High-Performance and
+Energy-Efficient Accelerator for Graph Analytics. In Proceedings of the
+49th Annual IEEE/ACM International Symposium on Microarchitecture
+(Taipei, Taiwan) (MICRO-49). IEEE Press, New York, NY, USA, Article
+56, 13 pages.
+
+[29] Rehan Hameed, Wajahat Qadeer, Megan Wachs, Omid Azizi, Alex Solo-
+matnikov, Benjamin C. Lee, Stephen Richardson, Christos Kozyrakis,
+and Mark Horowitz. 2010. Understanding Sources of Inefficiency in
+General-Purpose Chips. In Proceedings of the 37th Annual International
+Symposium on Computer Architecture (Saint-Malo, France) (ISCA ’10).
+Association for Computing Machinery, New York, NY, USA, 37–47.
+https://doi.org/10.1145/1815961.1815968
+
+[30] Song Han, Xingyu Liu, Huizi Mao, Jing Pu, Ardavan Pedram, Mark A.
+Horowitz, and William J. Dally. 2016. EIE: Efficient Inference En-
+gine on Compressed Deep Neural Network. In Proceedings of the
+43rd International Symposium on Computer Architecture (Seoul, Re-
+public of Korea) (ISCA ’16). IEEE Press, New York, NY, USA, 243–254.
+https://doi.org/10.1109/ISCA.2016.30
+
+[31] Kaiming He, Xiangyu Zhang, Shaoqing Ren, and Jian Sun. 2016. Deep
+Residual Learning for Image Recognition. In Proceedings of the 2016
+IEEE Conference on Computer Vision and Pattern Recognition (Las Vegas,
+NV, USA) (CVPR). IEEE Computer Society, New York, NY, USA, 770–
+778. https://doi.org/10.1109/CVPR.2016.90
+
+[32] James Hegarty, John Brunhaver, Zachary DeVito, Jonathan Ragan-
+Kelley, Noy Cohen, Steven Bell, Artem Vasilyev, Mark Horowitz, and
+Pat Hanrahan. 2014. Darkroom: Compiling High-Level Image Process-
+ing Code into Hardware Pipelines. ACM Trans. Graph. 33, 4, Article
+144 (July 2014), 11 pages. https://doi.org/10.1145/2601097.2601174
+
+[33] Andrew G. Howard, Menglong Zhu, Bo Chen, Dmitry Kalenichenko,
+Weijun Wang, Tobias Weyand, Marco Andreetto, and Hartwig Adam.
+2017. MobileNets: Efficient Convolutional Neural Networks for Mobile
+Vision Applications. arXiv:1704.04861 [cs.CV] http://arxiv.org/abs/
+1704.04861
+
+[34] Bo-Yuan Huang, Sayak Ray, Aarti Gupta, Jason M. Fung, and Sharad
+Malik. 2018. Formal Security Verification of Concurrent Firmware in
+SoCs Using Instruction-Level Abstraction for Hardware. In Proceedings
+of the 55th Annual Design Automation Conference (San Francisco, Cali-
+fornia) (DAC ’18). Association for Computing Machinery, New York,
+NY, USA, Article 91, 6 pages. https://doi.org/10.1145/3195970.3196055
+[35] Bo-Yuan Huang, Hongce Zhang, Aarti Gupta, and Sharad Malik.
+2019. ILAng: A Modeling and Verification Platform for SoCs Using
+Instruction-Level Abstractions. In Proceedings of the 25th International
+Conference on Tools and Algorithms for the Construction and Analysis
+of Systems (TACAS 2019) (Prague, Czech Republic) (Lecture Notes in
+Computer Science, Vol. 11427), Tomás Vojnar and Lijun Zhang (Eds.).
+Springer, Berlin, Heidelberg, 351–357. https://doi.org/10.1007/978-3-
+030-17462-0_21
+
+[36] Bo-Yuan Huang, Hongce Zhang, Pramod Subramanyan, Yakir Vizel,
+Aarti Gupta, and Sharad Malik. 2018. Instruction-Level Abstraction
+(ILA): A Uniform Specification for System-on-Chip (SoC) Verification.
+ACM Trans. Des. Autom. Electron. Syst. 24, 1, Article 10 (Dec. 2018),
+24 pages. https://doi.org/10.1145/3282444
+
+[37] Tianyu Jia, Yuhao Ju, and Jie Gu. 2020. 31.3 A Compute-Adaptive
+Elastic Clock-Chain Technique with Dynamic Timing Enhancement
+for 2D PE-Array-Based Accelerators. In Proceedings of the 2020 IEEE
+International Solid- State Circuits Conference (San Francisco, CA, USA)
+(ISSCC 2020). IEEE, New York, NY, USA, 482–484. https://doi.org/10.
+1109/ISSCC19947.2020.9063062
+
+[38] Norman P. Jouppi, Doe Hyun Yoon, George Kurian, Sheng Li, Nishant
+Patil, James Laudon, Cliff Young, and David Patterson. 2020. A Domain-
+Specific Supercomputer for Training Deep Neural Networks. Commun.
+ACM 63, 7 (jun 2020), 67–78. https://doi.org/10.1145/3360307
+[39] Norman P. Jouppi, Cliff Young, Nishant Patil, David Patterson, Gau-
+rav Agrawal, Raminder Bajwa, Sarah Bates, Suresh Bhatia, Nan Bo-
+den, Al Borchers, Rick Boyle, Pierre-luc Cantin, Clifford Chao, Chris
+Clark, Jeremy Coriell, Mike Daley, Matt Dau, Jeffrey Dean, Ben
+Gelb, Tara Vazir Ghaemmaghami, Rajendra Gottipati, William Gul-
+land, Robert Hagmann, C. Richard Ho, Doug Hogberg, John Hu,
+Robert Hundt, Dan Hurt, Julian Ibarz, Aaron Jaffey, Alek Jaworski,
+
+14
+
+Specialized Accelerators and Compiler Flows
+
+arXiv, 2022, USA
+
+Alexander Kaplan, Harshit Khaitan, Daniel Killebrew, Andy Koch,
+Naveen Kumar, Steve Lacy, James Laudon, James Law, Diemthu Le,
+Chris Leary, Zhuyuan Liu, Kyle Lucke, Alan Lundin, Gordon MacK-
+ean, Adriana Maggiore, Maire Mahony, Kieran Miller, Rahul Nagara-
+jan, Ravi Narayanaswami, Ray Ni, Kathy Nix, Thomas Norrie, Mark
+Omernick, Narayana Penukonda, Andy Phelps, Jonathan Ross, Matt
+Ross, Amir Salek, Emad Samadiani, Chris Severn, Gregory Sizikov,
+Matthew Snelham, Jed Souter, Dan Steinberg, Andy Swing, Mercedes
+Tan, Gregory Thorson, Bo Tian, Horia Toma, Erick Tuttle, Vijay Va-
+sudevan, Richard Walter, Walter Wang, Eric Wilcox, and Doe Hyun
+In-Datacenter Performance Analysis of a Tensor Pro-
+Yoon. 2017.
+cessing Unit. In Proceedings of the 44th Annual International Sym-
+posium on Computer Architecture (Toronto, ON, Canada) (ISCA ’17).
+Association for Computing Machinery, New York, NY, USA, 1–12.
+https://doi.org/10.1145/3079856.3080246
+
+[40] Anvesh Komuravelli, Arie Gurfinkel, and Sagar Chaki. 2016. SMT-
+based model checking for recursive programs. Formal Methods Syst.
+Des. 48, 3 (2016), 175–205. https://doi.org/10.1007/s10703-016-0249-4
+[41] Ramana Kumar, Magnus O. Myreen, Michael Norrish, and Scott Owens.
+2014. CakeML: A Verified Implementation of ML. In Proceedings of the
+41st ACM SIGPLAN-SIGACT Symposium on Principles of Programming
+Languages (San Diego, California, USA) (POPL ’14). Association for
+Computing Machinery, New York, NY, USA, 179–191. https://doi.org/
+10.1145/2535838.2535841
+
+[42] Yi-Hsiang Lai, Yuze Chi, Yuwei Hu, Jie Wang, Cody Hao Yu, Yuan Zhou,
+Jason Cong, and Zhiru Zhang. 2019. HeteroCL: A Multi-Paradigm Pro-
+gramming Infrastructure for Software-Defined Reconfigurable Com-
+puting. In Proceedings of the 2019 ACM/SIGDA International Symposium
+on Field-Programmable Gate Arrays (Seaside, CA, USA) (FPGA ’19). As-
+sociation for Computing Machinery, New York, NY, USA, 242–251.
+https://doi.org/10.1145/3289602.3293910
+
+[43] Yi-Hsiang Lai, Ecenur Ustun, Shaojie Xiang, Zhenman Fang, Hongbo
+Rong, and Zhiru Zhang. 2021. Programming and Synthesis for
+Software-Defined FPGA Acceleration: Status and Future Prospects.
+ACM Trans. Reconfigurable Technol. Syst. 14, 4, Article 17 (Sept. 2021),
+39 pages. https://doi.org/10.1145/3469660
+
+[44] Chris Lattner, Mehdi Amini, Uday Bondhugula, Albert Cohen, Andy
+Davis, Jacques A. Pienaar, River Riddle, Tatiana Shpeisman, Nico-
+las Vasilache, and Oleksandr Zinenko. 2021. MLIR: Scaling Com-
+piler Infrastructure for Domain Specific Computation. In Proceedings
+of the IEEE/ACM International Symposium on Code Generation and
+Optimization (Seoul, South Korea) (CGO ’21), Jae W. Lee, Mary Lou
+Soffa, and Ayal Zaks (Eds.). IEEE, New York, NY, USA, 2–14. https:
+//doi.org/10.1109/CGO51591.2021.9370308
+
+[45] Xavier Leroy. 2006. Formal Certification of a Compiler Back-End
+or: Programming a Compiler with a Proof Assistant. In Conference
+Record of the 33rd ACM SIGPLAN-SIGACT Symposium on Principles of
+Programming Languages (Charleston, South Carolina, USA) (POPL ’06).
+Association for Computing Machinery, New York, NY, USA, 42–54.
+https://doi.org/10.1145/1111037.1111042
+
+[46] The Linux Foundation 2019. ONNX: Open Neural Network Exchange.
+The Linux Foundation. Retrieved Apr. 21, 2021 from https://onnx.ai/
+[47] Panagiotis Manolios and Sudarshan K. Srinivasan. 2008. A Refinement-
+Based Compositional Reasoning Framework for Pipelined Machine
+Verification.
+IEEE Trans. Very Large Scale Integr. Syst. 16, 4 (2008),
+353–364. https://doi.org/10.1109/TVLSI.2008.918120
+
+[48] David Menendez and Santosh Nagarakatte. 2017. Alive-Infer: Data-
+Driven Precondition Inference for Peephole Optimizations in LLVM.
+In Proceedings of the 38th ACM SIGPLAN Conference on Programming
+Language Design and Implementation (Barcelona, Spain) (PLDI 2017).
+Association for Computing Machinery, New York, NY, USA, 49–63.
+https://doi.org/10.1145/3062341.3062372
+
+[49] Stephen Merity, Caiming Xiong, James Bradbury, and Richard Socher.
+2016. Pointer Sentinel Mixture Models. arXiv:1609.07843 [cs.CL]
+
+15
+
+[50] Thierry Moreau, Tianqi Chen, Luis Vega, Jared Roesch, Eddie Q. Yan,
+Lianmin Zheng, Josh Fromm, Ziheng Jiang, Luis Ceze, Carlos Guestrin,
+and Arvind Krishnamurthy. 2019. A Hardware-Software Blueprint for
+Flexible Deep Learning Specialization. IEEE Micro 39, 5 (2019), 8–16.
+https://doi.org/10.1109/MM.2019.2928962
+
+[51] Chandrakana Nandi, Max Willsey, Amy Zhu, Yisu Remy Wang, Brett
+Saiki, Adam Anderson, Adriana Schulz, Dan Grossman, and Zachary
+Tatlock. 2021. Rewrite Rule Inference Using Equality Saturation. Proc.
+ACM Program. Lang. 5, OOPSLA, Article 119 (oct 2021), 28 pages.
+https://doi.org/10.1145/3485496
+
+[52] Greg Nelson and Derek C. Oppen. 1980. Fast Decision Procedures
+Based on Congruence Closure. J. ACM 27, 2 (April 1980), 356–364.
+https://doi.org/10.1145/322186.322198
+
+[53] Robert Nieuwenhuis and Albert Oliveras. 2005. Proof-Producing Con-
+gruence Closure. In Proceedings of the 16th International Conference
+on Term Rewriting and Applications (RTA 2005) (Nara, Japan) (Lecture
+Notes in Computer Science, Vol. 3467), Jürgen Giesl (Ed.). Springer, Berlin,
+Heidelberg, 453–468. https://doi.org/10.1007/978-3-540-32033-3_33
+[54] Wei Niu, Jiexiong Guan, Yanzhi Wang, Gagan Agrawal, and Bin
+Ren. 2021. DNNFusion: Accelerating Deep Neural Networks Exe-
+cution with Advanced Operator Fusion. In Proceedings of the 42nd
+ACM SIGPLAN International Conference on Programming Language
+Design and Implementation (Virtual, Canada) (PLDI 2021). Associa-
+tion for Computing Machinery, New York, NY, USA, 883–898. https:
+//doi.org/10.1145/3453483.3454083
+
+[55] Daniel H Noronha, Bahar Salehpour, and Steven JE Wilton. 2018.
+LeFlow: Enabling flexible FPGA high-level synthesis of tensorflow deep
+neural networks. In Proceedings of the Fifth International Workshop
+on FPGAs for Software Programmers (Dublin, Ireland) (FSP ’18). VDE,
+Berlin, Garmany, 1–8. https://ieeexplore.ieee.org/document/8470462
+[56] Jun-Seok Park, Jun-Woo Jang, Heonsoo Lee, Dongwoo Lee, Sehwan
+Lee, Hanwoong Jung, Seungwon Lee, Suknam Kwon, Kyung-Ah Jeong,
+Joon-Ho Song, SukHwan Lim, and Inyup Kang. 2021. 9.5 A 6K-MAC
+Feature-Map-Sparsity-Aware Neural Processing Unit in 5nm Flagship
+Mobile SoC. In Proceedings of the IEEE International Solid-State Circuits
+Conference (San Francisco, CA, USA) (ISSCC 2021). IEEE, New York,
+NY, USA, 152–154. https://doi.org/10.1109/ISSCC42613.2021.9365928
+[57] Adam Paszke, Sam Gross, Francisco Massa, Adam Lerer, James Brad-
+bury, Gregory Chanan, Trevor Killeen, Zeming Lin, Natalia Gimelshein,
+Luca Antiga, Alban Desmaison, Andreas Köpf, Edward Yang, Zachary
+DeVito, Martin Raison, Alykhan Tejani, Sasank Chilamkurthy, Benoit
+Steiner, Lu Fang, Junjie Bai, and Soumith Chintala. 2019. PyTorch:
+An Imperative Style, High-Performance Deep Learning Library. In
+Proceedings of the Annual Conference on Advances in Neural Infor-
+mation Processing Systems (Vancouver, BC, Canada) (NeurIPS ’19),
+Hanna M. Wallach, Hugo Larochelle, Alina Beygelzimer, Florence
+d’Alché Buc, Emily B. Fox, and Roman Garnett (Eds.). Curran Asso-
+ciates, Inc., USA, 8024–8035. https://proceedings.neurips.cc/paper/
+2019/hash/bdbca288fee7f92f2bfa9f7012727740-Abstract.html
+
+[58] Clément Pit-Claudel, Thomas Bourgeat, Stella Lau, Arvind, and Adam
+Chlipala. 2021. Effective Simulation and Debugging for a High-Level
+Hardware Language Using Software Compilers. In Proceedings of the
+26th ACM International Conference on Architectural Support for Pro-
+gramming Languages and Operating Systems (Virtual, USA) (ASPLOS
+2021). Association for Computing Machinery, New York, NY, USA,
+789–803. https://doi.org/10.1145/3445814.3446720
+
+[59] Jonathan Ragan-Kelley, Connelly Barnes, Andrew Adams, Sylvain
+Paris, Frédo Durand, and Saman Amarasinghe. 2013. Halide: A Lan-
+guage and Compiler for Optimizing Parallelism, Locality, and Re-
+computation in Image Processing Pipelines. In Proceedings of the
+34th ACM SIGPLAN Conference on Programming Language Design
+and Implementation (Seattle, Washington, USA) (PLDI ’13). Asso-
+ciation for Computing Machinery, New York, NY, USA, 519–530.
+https://doi.org/10.1145/2491956.2462176
+
+arXiv, 2022, USA
+
+B.-Y. Huang et al.
+
+[60] Norman Ramsey and João Dias. 2011. Resourceable, Retargetable,
+Modular Instruction Selection Using a Machine-Independent, Type-
+Based Tiling of Low-Level Intermediate Code. In Proceedings of the
+38th Annual ACM SIGPLAN-SIGACT Symposium on Principles of Pro-
+gramming Languages (Austin, Texas, USA) (POPL ’11). Association
+for Computing Machinery, New York, NY, USA, 575–586.
+https:
+//doi.org/10.1145/1926385.1926451
+
+[61] Brandon Reagen, Paul Whatmough, Robert Adolf, Saketh Rama,
+Hyunkwang Lee, Sae Kyu Lee, José Miguel Hernández-Lobato, Gu-
+Yeon Wei, and David Brooks. 2016. Minerva: Enabling Low-Power,
+Highly-Accurate Deep Neural Network Accelerators. In Proceedings
+of the 43rd International Symposium on Computer Architecture (Seoul,
+Republic of Korea) (ISCA ’16). IEEE Press, New York, NY, USA, 267–278.
+https://doi.org/10.1109/ISCA.2016.32
+
+[62] Jared Roesch, Steven Lyubomirsky, Marisa Kirisame, Logan Weber,
+Josh Pollock, Luis Vega, Ziheng Jiang, Tianqi Chen, Thierry Moreau,
+and Zachary Tatlock. 2019. Relay: A High-Level Compiler for Deep
+Learning. arXiv:1904.08368 [cs.LG]
+
+[63] Davide Rossi, Francesco Conti, Manuel Eggimann, Stefan Mach, Al-
+fio Di Mauro, Marco Guermandi, Giuseppe Tagliavini, Antonio Pullini,
+Igor Loi, Jie Chen, Eric Flamand, and Luca Benini. 2021. 4.4 A 1.3TOP-
+S/W @ 32GOPS Fully Integrated 10-Core SoC for IoT End-Nodes with
+1.7𝜇W Cognitive Wake-Up From MRAM-Based State-Retentive Sleep
+Mode. In Proceedings of the IEEE International Solid-State Circuits Con-
+ference (San Francisco, CA, USA) (ISSCC 2021). IEEE, New York, NY,
+USA, 60–62. https://doi.org/10.1109/ISSCC42613.2021.9365939
+[64] D. Saito, T. Kobayashi, Hiroki Koga, Nicolo Ronchi, K. Banerjee, Y.
+Shuto, Jun Okuno, K. Konishi, Luca Di Piazza, A. Mallik, Jan Van
+Houdt, M. Tsukamoto, K. Ohkuri, Taku Umebayashi, and Takayuki
+Ezaki. 2021. Analog In-memory Computing in FeFET-based 1T1R
+Array for Edge AI Applications. In Proceedings of the 2021 Symposium
+on VLSI Circuits (Kyoto, Japan). IEEE, New York, NY, USA, 1–2. https:
+//doi.org/10.23919/VLSICircuits52068.2021.9492479
+
+[65] Mark Sandler, Andrew Howard, Menglong Zhu, Andrey Zhmoginov,
+and Liang-Chieh Chen. 2019. MobileNetV2: Inverted Residuals and
+Linear Bottlenecks. arXiv:1801.04381 [cs.CV]
+
+[66] Colin Schmidt, John Charles Wright, Zhongkai Wang, Eric Chang,
+Albert J. Ou, Woo-Rham Bae, Sean Huang, Anita Flynn, Brian C.
+Richards, Krste Asanovic, Elad Alon, and Borivoje Nikolic. 2021. 4.3
+An Eight-Core 1.44GHz RISC-V Vector Machine in 16nm FinFET. In
+Proceedings of the IEEE International Solid-State Circuits Conference
+(San Francisco, CA, USA) (ISSCC 2021). IEEE, New York, NY, USA,
+58–60. https://doi.org/10.1109/ISSCC42613.2021.9365789
+
+[67] Sam Skalicky, Joshua S. Monson, Andrew G. Schmidt, and Matthew
+French. 2018. Hot & Spicy: Improving Productivity with Python and
+HLS for FPGAs. In Proceedings of the 26th IEEE Annual International
+Symposium on Field-Programmable Custom Computing Machines (Boul-
+der, CO, USA) (FCCM ’18). IEEE Computer Society, New York, NY, USA,
+85–92. https://doi.org/10.1109/FCCM.2018.00022
+
+[68] Gus Henry Smith, Andrew Liu, Steven Lyubomirsky, Scott Davidson,
+Joseph McMahan, Michael Taylor, Luis Ceze, and Zachary Tatlock.
+2021. Pure Tensor Program Rewriting via Access Patterns (Represen-
+tation Pearl). In Proceedings of the 5th ACM SIGPLAN International
+Symposium on Machine Programming (Virtual, Canada) (MAPS 2021).
+Association for Computing Machinery, New York, NY, USA, 21–31.
+https://doi.org/10.1145/3460945.3464953
+
+[69] Michael Stepp, Ross Tate, and Sorin Lerner. 2011. Equality-Based
+Translation Validator for LLVM. In Proceedings of the 23rd International
+Conference on Computer Aided Verification (CAV 2011) (Snowbird, UT,
+USA) (Lecture Notes in Computer Science, Vol. 6806), Ganesh Gopalakr-
+ishnan and Shaz Qadeer (Eds.). Springer, Berlin, Heidelberg, 737–742.
+https://doi.org/10.1007/978-3-642-22110-1_59
+
+[70] Pramod Subramanyan, Bo-Yuan Huang, Yakir Vizel, Aarti Gupta, and
+Sharad Malik. 2018. Template-Based Parameterized Synthesis of
+
+16
+
+Uniform Instruction-Level Abstractions for SoC Verification.
+IEEE
+Trans. Comput. Aided Des. Integr. Circuits Syst. 37, 8 (2018), 1692–1705.
+https://doi.org/10.1109/TCAD.2017.2764482
+
+[71] Thierry Tambe, En-Yu Yang, Glenn G. Ko, Yuji Chai, Coleman Hooper,
+Marco Donato, Paul N. Whatmough, Alexander M. Rush, David Brooks,
+and Gu-Yeon Wei. 2021. 9.8 A 25mm2 SoC for IoT Devices with 18ms
+Noise-Robust Speech-to-Text Latency via Bayesian Speech Denoising
+and Attention-Based Sequence-to-Sequence DNN Speech Recognition
+in 16nm FinFET. In Proceedings of the IEEE International Solid-State
+Circuits Conference (ISSCC ’21). IEEE, New York, NY, USA, 158–160.
+https://doi.org/10.1109/ISSCC42613.2021.9366062
+
+[72] Thierry Tambe, En-Yu Yang, Zishen Wan, Yuntian Deng, Vijay Janapa
+Reddi, Alexander Rush, David Brooks, and Gu-Yeon Wei. 2020.
+Algorithm-Hardware Co-Design of Adaptive Floating-Point Encod-
+ings for Resilient Deep Learning Inference. In Proceedings of the 57th
+ACM/EDAC/IEEE Design Automation Conference (Virtual Event, USA)
+(DAC ’20). IEEE Press, USA, Article 51, 6 pages.
+
+[73] Mingxing Tan and Quoc V. Le. 2019. EfficientNet: Rethinking Model
+Scaling for Convolutional Neural Networks. In Proceedings of the
+36th International Conference on Machine Learning (Long Beach, Cal-
+ifornia, USA) (ICML ’19, Vol. 97), Kamalika Chaudhuri and Ruslan
+Salakhutdinov (Eds.). PMLR, Atlanta, Georgia, USA, 6105–6114. http:
+//proceedings.mlr.press/v97/tan19a.html
+
+[74] Ross Tate, Michael Stepp, Zachary Tatlock, and Sorin Lerner. 2009.
+Equality Saturation: A New Approach to Optimization. In Proceedings
+of the 36th Annual ACM SIGPLAN-SIGACT Symposium on Principles of
+Programming Languages (Savannah, GA, USA) (POPL ’09). Association
+for Computing Machinery, New York, NY, USA, 264–276. https://doi.
+org/10.1145/1480881.1480915
+
+[75] Hugo Touvron, Piotr Bojanowski, Mathilde Caron, Matthieu Cord,
+Alaaeldin El-Nouby, Edouard Grave, Armand Joulin, Gabriel Syn-
+naeve, Jakob Verbeek, and Hervé Jégou. 2021. ResMLP: Feedfor-
+ward networks for image classification with data-efficient training.
+arXiv:2105.03404 [cs.CV] https://arxiv.org/abs/2105.03404
+
+[76] Lenny Truong, Steven Herbst, Rajsekhar Setaluri, Makai Mann, Ross G.
+Daly, Keyi Zhang, Caleb Donovick, Daniel Stanley, Mark Horowitz,
+Clark W. Barrett, and Pat Hanrahan. 2020. fault: A Python Embedded
+Domain-Specific Language for Metaprogramming Portable Hardware
+Verification Components. In Proceedings of the 32nd International Con-
+ference on Computer Aided Verification (CAV 2020) (Los Angeles, CA,
+USA) (Lecture Notes in Computer Science, Vol. 12224), Shuvendu K.
+Lahiri and Chao Wang (Eds.). Springer, Berlin, Heidelberg, 403–414.
+https://doi.org/10.1007/978-3-030-53288-8_19
+
+[77] Ashish Vaswani, Noam Shazeer, Niki Parmar, Jakob Uszkoreit, Llion
+Jones, Aidan N. Gomez, Lukasz Kaiser, and Illia Polosukhin. 2017.
+Attention Is All You Need. arXiv:1706.03762 [cs.CL]
+
+[78] Veripool n. d.. Verilator. Veripool. Retrieved Nov. 18, 2021 from
+
+https://www.veripool.org/verilator/
+
+[79] Jie Wang, Licheng Guo, and Jason Cong. 2021. AutoSA: A Polyhedral
+Compiler for High-Performance Systolic Arrays on FPGA. In The 2021
+ACM/SIGDA International Symposium on Field-Programmable Gate
+Arrays (Virtual Event, USA) (FPGA ’21). Association for Computing
+Machinery, New York, NY, USA, 93–104. https://doi.org/10.1145/
+3431920.3439292
+
+[80] Xuechao Wei, Yun Liang, and Jason Cong. 2019. Overcoming Data
+Transfer Bottlenecks in FPGA-Based DNN Accelerators via Layer Con-
+scious Memory Management. In Proceedings of the 56th Annual Design
+Automation Conference 2019 (Las Vegas, NV, USA) (DAC ’19). Asso-
+ciation for Computing Machinery, New York, NY, USA, Article 125,
+6 pages. https://doi.org/10.1145/3316781.3317875
+
+[81] Paul N. Whatmough, Sae Kyu Lee, Marco Donato, Hsea-Ching Hsueh,
+Sam Likun Xi, Udit Gupta, Lillian Pentecost, Glenn G. Ko, David M.
+Brooks, and Gu-Yeon Wei. 2019. A 16nm 25mm2 SoC with a 54.5x
+
+Specialized Accelerators and Compiler Flows
+
+arXiv, 2022, USA
+
+Flexibility-Efficiency Range from Dual-Core Arm Cortex-A53 to eF-
+PGA and Cache-Coherent Accelerators. In Proceedings of the 2019
+Symposium on VLSI Circuits (Kyoto, Japan). IEEE, New York, NY, USA,
+34. https://doi.org/10.23919/VLSIC.2019.8778002
+
+[82] Deborah L. Whitfield and Mary Lou Soffa. 1997. An Approach for
+Exploring Code Improving Transformations. ACM Trans. Program.
+Lang. Syst. 19, 6 (Nov. 1997), 1053–1084. https://doi.org/10.1145/267959.
+267960
+
+[83] Max Willsey, Chandrakana Nandi, Yisu Remy Wang, Oliver Flatt,
+Zachary Tatlock, and Pavel Panchekha. 2021. Egg: Fast and Extensible
+Equality Saturation. Proc. ACM Program. Lang. 5, POPL, Article 23
+(Jan. 2021), 29 pages. https://doi.org/10.1145/3434304
+
+[84] PyTorch Team 2020. Word-level language modeling RNN. PyTorch Team.
+Retrieved Nov. 18, 2021 from https://github.com/pytorch/examples/
+tree/master/word_language_model
+
+[85] Xilinx Inc. n. d.. The Xilinx Software Development Kit (XSDK). Xilinx Inc.
+Retrieved Apr. 24, 2021 from https://www.xilinx.com/products/design-
+tools/embedded-software/sdk.html
+
+[86] Yue Xing, Bo-Yuan Huang, Aarti Gupta, and Sharad Malik. 2018. A
+Formal Instruction-Level GPU Model for Scalable Verification. In
+Proceedings of the International Conference on Computer-Aided De-
+sign (San Diego, California) (ICCAD ’18). Association for Comput-
+ing Machinery, New York, NY, USA, Article 130, 8 pages.
+https:
+//doi.org/10.1145/3240765.3240771
+
+[87] Shijin Zhang, Zidong Du, Lei Zhang, Huiying Lan, Shaoli Liu, Ling Li,
+Qi Guo, Tianshi Chen, and Yunji Chen. 2016. Cambricon-x: An Accel-
+erator for Sparse Neural Networks. In Proceedings of the 49th Annual
+IEEE/ACM International Symposium on Microarchitecture (Taipei, Tai-
+wan) (MICRO-49). IEEE Press, New York, NY, USA, Article 20, 12 pages.
+https://doi.org/10.1109/MICRO.2016.7783723
+
+[88] Yunming Zhang, Mengjiao Yang, Riyadh Baghdadi, Shoaib Kamil,
+Julian Shun, and Saman Amarasinghe. 2018. GraphIt: A High-
+Performance Graph DSL. Proc. ACM Program. Lang. 2, OOPSLA, Article
+121 (Oct. 2018), 30 pages. https://doi.org/10.1145/3276491
+
+17
+
+arXiv, 2022, USA
+
+B.-Y. Huang et al.
+
+Appendix A Supported Accelerator
+
+Operations
+
+For each of the accelerators discussed in § 4.1, our prototype
+compiler supports specific operations through the compiler-
+IR accelerator mappings.
+
+FlexASR. The compiler supports two of FlexASR’s opera-
+tions: linear layers (illustrated in Figure 5) and LSTM layers.
+For simplicity, the pattern we match for the LSTM layer in
+exact matching is precisely the formulation of an LSTM pro-
+duced by TVM’s PyTorch importer, which is “unrolled” to
+the correct number of timesteps (35 in the case of our LSTM-
+WLM application). For flexible matching, we translate the
+“unrolled” LSTM in Relay into Glenside and also match it in
+the target Glenside program. In principle, it would be possi-
+ble to define a rewrite rule corresponding to a single LSTM
+timestep, and another rewrite to “fold” adjacent timesteps
+into a single FlexASR LSTM layer invocation (one ILA in-
+struction) with the total number of timesteps.
+
+HLSCNN. Our HLSCNN specification has only one opera-
+tion, a non-grouped 2D convolution. In Relay and Glenside,
+we map any non-grouped 2D convolution (nn.conv2d) to
+the HLSCNN convolution operation. Note that the Relay
+convolution operation allows for padding an input before
+convolving it; our implementation pads on the host before
+invoking the accelerator. In principle, it would be possible
+to rewrite a grouped convolution into a concatenation of
+non-grouped convolutions, but the number of groups in the
+models in § 4.2 tended to be large (960 groups in MobileNet),
+which would blow up the programs and be impractical to
+run on a single device.
+
+VTA. Unlike the above accelerators, VTA is a fine-grained
+programmable accelerator with a defined ISA. Hence, “op-
+erators” in VTA are really sequences of VTA instructions
+that implement the semantics of a tensor operator in Relay.
+TVM has a built-in bespoke code generator for VTA, which
+operates on TVM’s lower-level Halide-like DSL and directly
+implements arbitrary tensor operations for VTA. In princi-
+ple, it would be possible for us to adapt the existing VTA
+code generator to instead output VTA ILA instructions, re-
+sembling traditional instruction selection. For simplicity, our
+prototype implements matrix multiplication and addition as
+fixed sequences of VTA ILA instructions.
+
+Appendix B Application Parameters
+We provide further details for the applications listed in § 4.2.
+• EfficientNet: We used a publicly available implemen-
+tation of EfficientNet5 in MxNet, pretrained on Ima-
+geNet (image size 224 × 224, with 1000 classes). We
+imported it through TVM’s MxNet importer.
+
+5https://github.com/mnikitin/EfficientNet, accessed Nov. 18, 2021.
+
+18
+
+• LSTM-WLM: We used the LSTM model implementa-
+tion from the official PyTorch examples repository,6
+training on WikiText-2 with the provided script on
+the following settings: 40 epochs, a batch size of 20,
+sequence length of 35, and an initial learning rate of
+20, with a single layer for the LSTM. We imported
+it through TVM’s PyTorch importer with one simpli-
+fication in the importer: for simplicity, our FlexASR
+LSTM layer integration only returned the LSTM’s se-
+quence output but not the final hidden and cell states
+(even though the device itself supports this). In order to
+match the semantics between our integration and the
+LSTM, we modified the imported LSTM not to return
+the final hidden and cell states either. In future work, it
+would be feasible for us to support returning the final
+hidden and cell states and eliminate this simplification.
+• MobileNet V2: We used an open-source implemen-
+tation of MobileNetV27 in PyTorch and used the im-
+plementation’s provided script to train on CIFAR-10,
+training for 200 epochs with a learning rate of 0.01
+and a batch size of 128. We imported it using TVM’s
+PyTorch importer.
+
+• ResMLP: We used an open-source ResMLP implemen-
+tation8 in PyTorch. We used similar parameters as
+those reported in [75] for training on CIFAR: 384 fea-
+tures, 12 layers, and a patch size of 16. We trained it on
+CIFAR-10 for 100 epochs with a learning rate of 0.01,
+though in Table 4, we note that we obtained a lower
+reference accuracy on CIFAR-10 than that reported
+in [75]. We are not certain that we trained using all
+the same settings as in the original work and (in order
+to reduce the load on the simulator) we trained and
+evaluated on 32×32 images, whereas the original work
+scaled the images up to 256 × 256. We imported the
+model through TVM’s PyTorch importer.
+
+• ResNet-20: We used the Gluon Model Zoo’s imple-
+mentation of ResNet-20 in MxNet,9 pretrained on CIFAR-
+10. We imported it unmodified through TVM’s MxNet
+importer.
+
+• Transformer: We used the nn.Transformer imple-
+mentation from PyTorch, with 8 heads, 6 encoder lay-
+ers, 6 decoder layers, and 256 features (left untrained).
+These settings were based on a TVM PyTorch importer
+unit test.
+
+Appendix C Illustrative Code Fragments
+The figures below provide examples of ILA fragments and
+various rewrites at greater length.
+
+6https://github.com/pytorch/examples/tree/master/word_language_
+model, accessed Nov. 18, 2021.
+7https://github.com/kuangliu/pytorch-cifar, accessed Nov. 18, 2021.
+8https://github.com/lucidrains/res-mlp-pytorch, accessed Nov. 18, 2021.
+9https://cv.gluon.ai/api/model_zoo.html#gluoncv.model_zoo.cifar_
+resnet20_v1, accessed Nov. 18, 2021.
+
+Specialized Accelerators and Compiler Flows
+
+arXiv, 2022, USA
+
+1
+2
+
+ComILA.relay_nn_dense
+ComILA.relay_bias_add
+
+(a) Compiler IR instructions
+
+(b) Compiler IR ILA program fragment
+
+1
+2
+3
+4
+5
+6
+7
+8
+9
+10
+11
+12
+13
+14
+15
+
+1
+2
+3
+4
+5
+6
+7
+8
+9
+10
+11
+12
+13
+
+// 1. writing data into the accelerator memory
+FlexASR_ILA.write_v
+...
+// 2. configuring the accelerator for executing linear layer operation
+FlexASR_ILA.pe_cfg_rnn_layer_sizing
+FlexASR_ILA.pe_cfg_mngr
+FlexASR_ILA.pe_cfg_act_mngr
+FlexASR_ILA.pe_cfg_act_v
+FlexASR_ILA.gb_cfg_mmngr_gb_large
+FlexASR_ILA.gb_cfg_gb_control
+// 3. triggering the accelerator linear function
+FlexASR_ILA.fn_start
+// 4. reading data out from the accelerator memory (if needed)
+FlexASR_ILA.read_v
+...
+
+(c) FlexASR ILA program fragment
+
+// 1. writing data into the accelerator memory
+Write, addr=0xA4500000, data=0x0F0EFFBF8F746F9FB58D148E0EB7BFDAD
+...
+// 2. configurating the accelerator states for linear layer operation
+Write, addr=0xA4400010, data=0x0010101000001
+Write, addr=0xA4400020, data=0x0000000010000000102020200
+Write, addr=0xA4800010, data=0x0000000000102050001
+...
+// 3. triggering the accelerator function
+Write, addr=0xA3000010, data=0x1
+// 4. reading data out from the accelerator memory (if needed)
+Read, addr=0xA3500200, data=0x0
+...
+
+(d) FlexASR MMIO commands
+
+Figure 5. IR-accelerator mapping for the FlexASR LinearLayer operation. This shows a many-to-many mapping from
+Relay IR instrucions to a sequence of FlexASR MMIO commands. (a) LinearLayer in Relay consists of a linear transformation
+operation nn.dense, followed by a bias addition operation nn.bias_add. (b) The compiler IR ILA instruction has an one-to-
+one mapping to the compiler IR instruction. (c) The FlexASR ILA program fragment in its assembly format: It includes: (1)
+write instructions to transfer the data into FlexASR’s memory. (2) setting up FlexASR LinearLayer configuration states, for
+example, the instruction at line 5 sets the states of FlexASR layer sizing information. (3) instruction that triggers the FlexASR
+LinearLayer computation (5) read data out from FlexASR’s memory if needed. (d) The MMIO commands for FlexASR have a
+one-to-one mapping to its FlexASR ILA instructions.
+
+19
+
+arXiv, 2022, USA
+
+B.-Y. Huang et al.
+
+1
+2
+3
+4
+5
+6
+7
+8
+9
+10
+11
+12
+13
+14
+15
+16
+17
+18
+19
+20
+21
+22
+23
+24
+25
+26
+27
+28
+29
+30
+31
+32
+33
+34
+35
+36
+
+#include <ilang/ilang++.h>
+
+int main() {
+// declare an ILA model module
+auto m = ilang::Ila("flexasr-ila");
+
+// declare model interface input ports
+m.NewBvInput("top_if_wr", TOP_IF_WR_BITWIDTH);
+m.NewBvInput("top_if_rd", TOP_IF_RD_BITWIDTH);
+m.NewBvInput("top_addr_in", TOP_ADDR_IN_BITWIDTH);
+m.NewBvInput("top_data_in", TOP_DATA_IN_BITWIDTH);
+
+// declare architectural states
+m.NewBvState("pe_0_is_valid", PE_VALID_BITWIDTH);
+m.NewBvState("pe_0_is_bias", PE_IS_BIAS_BITWIDTH);
+...
+m.NewMemState("gb_large_buffer", TOP_ADDR_IN_BITWIDTH, TOP_DATA_IN_BITWIDTH);
+...
+// define ILA instructions
+{ // ILA instruction for configuring pe_cfg_mngr
+auto instr = m.NewInstr("pe_0_cfg_mngr");
+
+// define decode condition for this instruction
+auto is_write = (m.input("top_if_wr") == 1) & (m.input("top_if_rd") == 0);
+instr.SetDecode(is_write & (m.input("top_addr_in") == PE_0_CFG_MNGR_ADDR));
+
+// define state update functions for this instruction
+auto is_valid = ilang::SelectBit(m.input("top_data_in"), PE_IS_VALID_BIT_IDX);
+instr.SetUpdate(m.state("pe_0_is_valid"), is_valid);
+auto is_bias = ilang::SelectBit(m.input("top_data_in"), PE_IS_BIAS_BIT_IDX);
+instr.SetUpdate(m.state("pe_0_is_bias"), is_bias);
+...
+}
+// other ILA instructions
+...
+}
+
+Figure 6. FlexASR ILA model snippet. Lines 5-18 define the FlexASR ILA model, its input and architectural states variables.
+Lines 20-32 shows an example of an ILA instruction named “pe_0_cfg_mngr,” which corresponds to line 6 in Figure 5 (c). In
+each ILA instruction, we specify its decode condition and state update functions. For example, in this instruction, the decode
+condition (line 24-25) is when there is write instruction at the top interface to the address associated with the configuration of
+the PE’s management configuration. Lines 27-32 show this instruction’s state update functions for the architectural states.
+In this example, this ILA instruction models the behavior of storing the arguments from the input data at its interface into
+the FlexASR configuration registers. From this example, we can see that the ILA instructions provide an abstraction of the
+functionality of the accelerator corresponding to the MMIO instructions at its interface.
+
+20
+
+Specialized Accelerators and Compiler Flows
+
+arXiv, 2022, USA
+
+1
+2
+3
+4
+5
+6
+7
+8
+9
+10
+11
+12
+13
+14
+15
+16
+17
+18
+19
+20
+21
+22
+23
+24
+25
+26
+27
+28
+29
+30
+
+; (a) IR-accelerator rewrite rule for FlexASR's temporal max-pooling (which corresponds to
+; 2D max-pooling with window shape and stride (2, 1))
+(map reduceMax (windows (2, 1) (2, 1) ?T)) -> (fasrMaxpLoad (fasrMaxpool (fasrMaxpStore ?T)))
+
+; (b) Initial Glenside program for a 2D max-pooling layer with window shape (4, 4)
+; and stride (2, 2). We use T to denote the input of the 2D max-pooling layer.
+(map reduceMax (windows (4, 4) (2, 2) T))
+
+; (c) A rewritten IR program found via Glenside
+; T denotes the input of the 2D max-pooling layer, and S is the shape of the output of the 2D max-pooling layer
+(reshape (map reduceMax (windows (2, 1) (2, 1)
+(map reduceMax (windows (2, 1) (2, 1)
+(map reduceMax (windows (2, 1) (2, 1)
+(map reduceMax (windows (2, 1) (2, 1)
+(map flatten (windows (4, 4) (2, 2) T)) )))))))) S)
+
+; (d) 2D max-pooling using FlexASR
+(reshape (fasrMaxpLoad (fasrMaxpool (fasrMaxpStore
+(fasrMaxpLoad (fasrMaxpool (fasrMaxpStore
+(fasrMaxpLoad (fasrMaxpool (fasrMaxpStore
+(fasrMaxpLoad (fasrMaxpool (fasrMaxpStore
+(map flatten (windows (4, 4) (2, 2) T)) )))))))))))) S)
+
+; (e) IR-accelerator rewrite rule to remove redundant Store-Loads
+; Loading data out of the accelerator only to store it back to the same location is unnecessary
+(fasrMaxpStore (fasrMaxpLoad ?T) -> ?T
+
+; (f) Optimized 2D max-pooling using FlexASR
+(reshape (fasrMaxpLoad (fasrMaxpool (fasrMaxpool (fasrMaxpool (fasrMaxpool (fasrMaxpStore
+(map flatten (windows (4, 4) (2, 2) T)) )))))) S)
+
+Figure 7. How D2A offloads 2D max-pooling to FlexASR’s temporal max-pooling operation. (a) The IR-accelerator
+rewrite rule for FlexASR’s temporal max-pooling operation. (b) A Glenside program for a 2D max-pooling layer with window
+shape (4, 4) and stride (2, 2). Note that it does not contain a match for the left-hand side of the IR-accelerator rewrite rule.
+(c) An equivalent rewritten IR program found by flexible matching. It contains four instances of the left-hand side of the
+IR-accelerator rewrite rule. (d) A program offloading the 2D max-pooling layer to FlexASR produced by replacing each of the
+four instances with the right-hand side of the IR-accelerator rule. Note that in this program, the initial store and the final load
+are needed to communicate with FlexASR; however, the other intermediate loads/stores can be eliminated, since the output of
+one instance serves as input of another. (e) Another IR-accelerator rewrite rule that removes redundant Store-Loads. (f) An
+optimized program produced by applying the new rewrite rule. This program only performs a single (matrix) store at the start
+of the operation and a single (matrix) load to read the output at the end of the operation. In future, we hope to generalize this
+example and consider memory organization in accelerators and data-movement for optimizing data transfers.
+
+21
+
+

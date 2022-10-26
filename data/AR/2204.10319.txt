@@ -1,0 +1,1440 @@
+2
+2
+0
+2
+
+r
+p
+A
+1
+2
+
+]
+
+G
+L
+.
+s
+c
+[
+
+1
+v
+9
+1
+3
+0
+1
+.
+4
+0
+2
+2
+:
+v
+i
+X
+r
+a
+
+TORCHSPARSE: EFFICIENT POINT CLOUD INFERENCE ENGINE
+
+Haotian Tang * 1 Zhijian Liu * 1 Xiuyu Li * 2 Yujun Lin 1 Song Han 1
+
+https://torchsparse.mit.edu
+
+ABSTRACT
+Deep learning on point clouds has received increased attention thanks to its wide applications in AR/VR and
+autonomous driving. These applications require low latency and high accuracy to provide real-time user experience
+and ensure user safety. Unlike conventional dense workloads, the sparse and irregular nature of point clouds poses
+severe challenges to running sparse CNNs efﬁciently on the general-purpose hardware. Furthermore, existing
+sparse acceleration techniques for 2D images do not translate to 3D point clouds. In this paper, we introduce
+TorchSparse, a high-performance point cloud inference engine that accelerates the sparse convolution computation
+on GPUs. TorchSparse directly optimizes the two bottlenecks of sparse convolution: irregular computation and
+data movement. It applies adaptive matrix multiplication grouping to trade computation for better regularity,
+achieving 1.4-1.5× speedup for matrix multiplication. It also optimizes the data movement by adopting vectorized,
+quantized and fused locality-aware memory access, reducing the memory movement cost by 2.7×. Evaluated on
+seven representative models across three benchmark datasets, TorchSparse achieves 1.6× and 1.5× measured
+end-to-end speedup over the state-of-the-art MinkowskiEngine and SpConv, respectively.
+
+1
+
+INTRODUCTION
+
+3D point cloud becomes increasingly accessible over the
+past few years thanks to the widely available 3D sensors,
+such as LiDAR scanners (on the self-driving vehicles and,
+more recently, even the mobile phones) and depth cameras
+(on the AR/VR headsets). Compared with 2D RGB images,
+3D point clouds provide much more accurate spatial/depth
+information and are usually more robust to different lighting
+conditions. Therefore, 3D point cloud processing becomes
+the key component of many real-world AI applications: e.g.,
+to understand the indoor scene layout for AR/VR, and to
+parse the driveable regions for autonomous driving.
+
+A 3D point cloud is an unordered set of 3D points. Unlike
+2D image pixels, this data representation is highly sparse
+and irregular. Researchers have explored to rasterize the 3D
+data into dense volumetric representation (Qi et al., 2016)
+or directly process it in the point cloud representation (Qi
+et al., 2017b; Li et al., 2018). However, both of them are not
+scalable to large indoor/outdoor scenes (Liu et al., 2019). Al-
+ternatively, researchers have also investigated to ﬂatten 3D
+
+*Equal contribution 1Massachusetts Institute of Technology
+2Cornell University. Correspondence to: Song Han <song-
+han@mit.edu>.
+
+Proceedings of the 5 th MLSys Conference, Santa Clara, CA, USA,
+2022. Copyright 2022 by the author(s).
+
+Figure 1: Widely available 3D sensors (left) have enabled
+more and more real-world AI applications to perceive the
+world using 3D point clouds (middle). However, processing
+3D point cloud requires sparse computation that is not fa-
+vored by general-purpose hardware. TorchSparse reduces
+the irregular computation and optimizes the data movement,
+achieving 1.7× to 2× measured speedup (right).
+
+point clouds into dense 2D representations using spherical
+projection and bird’s-eye view (BEV) projection. However,
+their accuracy is much lower due to the physical dimension
+distortion and height information loss.
+
+Recently, state-of-the-art 3D point cloud neural networks
+tend to rely largely or fully on sparse convolutions (Graham
+et al., 2018), making it an important workload for machine
+learning system: all top 5 segmentation submissions on Se-
+manticKITTI (Behley et al., 2019) are based on SparseConv,
+
+Real-World Perception TasksTorchSparse Optimizations3D Sensors02550751000255075100Data OrchestrationMatMulMappingConv2D / NMSMisc2  faster×1.7  faster×Before
+(Seg)After
+(Seg)Before
+(Det)After
+(Det)3D Object Detection (Waymo)3D Semantic Segmentation 
+(SemanticKITTI)Self-driving carsAR/VR glassesiPhone13ProLiDAR 
+ 
+ 
+ 
+ 
+ 
+TorchSparse: Efﬁcient Point Cloud Inference Engine
+
+9 of top 10 submissions on nuScenes (Caesar et al., 2020)
+and top 2 winning solutions on Waymo (Sun et al., 2020)
+have exploited SparseConv-based detectors (Yin et al., 2021;
+Ge et al., 2021). Given the wide applicability and dominat-
+ing performance of SparseConv-based point cloud neural
+networks, it is crucial to provide efﬁcient system support for
+sparse convolution on the general-purpose hardware.
+
+Unlike conventional dense computation, sparse convolution
+is not supported by existing inference libraries (such as Ten-
+sorRT and TVM), which is why most industrial solutions
+still prefer 2D projection-based models despite their lower
+accuracy. It is urgent to better support the sparse workload,
+which was not favored by modern high-parallelism hard-
+ware. On the one hand, the sparse nature of point clouds
+leads to irregular computation workloads: i.e., different ker-
+nel offsets might correspond to drastically different numbers
+of matched input/output pairs. Hence, existing sparse infer-
+ence engines (Yan et al., 2018; Choy et al., 2019) usually
+execute the matrix multiplication for each kernel offset sep-
+arately, which cannot fully utilize the parallelism of modern
+GPUs. On the other hand, neighboring points do not lie
+contiguously in the sparse point cloud representation. Ex-
+plicitly gathering input features and scattering output results
+can be very expensive, taking up to 50% of the total runtime.
+Due to the irregular computation workload and expensive
+data movement cost, SparseConv-based neural networks
+can hardly be run in real time: the latest sparse convolution
+library can only run MinkowskiNet at 8FPS on an NVIDIA
+GTX 1080Ti GPU, let alone other low-power edge devices.
+
+In this paper, we introduce TorchSparse, a high-performance
+inference engine tailored for sparse point cloud computation.
+TorchSparse is optimized based upon two principles: (1)
+improving the computation regularity and (2) reducing the
+memory footprint. First, we propose the adaptive matrix
+multiplication grouping to batch the computation workloads
+from different kernel offsets together, trading #FLOPs for
+regularity. Then, we adopt quantization and vectorized mem-
+ory transactions to reduce memory movement. Finally, we
+gather and scatter features in locality-aware memory access
+order to maximize the data reduce. Evaluated on seven
+models across three datasets, TorchSparse achieves 1.6×
+and 1.5× speedup over state-of-the-art MinkowskiEngine
+and SpConv, paving the way for deploying 3D point cloud
+neural networks in real-world applications.
+
+2 BACKGROUND
+
+The point cloud can be formulated as an unordered set of
+points paired with features: {(pj, xj)}, where xj ∈ RC
+is a C-dimensional feature vector for point pj ∈ ZD in
+a D-dimensional space. For a convolution of kernel size
+K, let W ∈ RKD×Cin×Cout
+be its weights and ∆D(K)
+be its kernel offsets (e.g., ∆2(5) = {−2, −1, 0, 1, 2}2 and
+
+∆3(3) = {−1, 0, 1}3). The weights W can be broken down
+into K D matrices of shape C in × C out, denoted as Wδ for
+δ ∈ ∆D(K). With these notations, the convolution with
+stride s can be represented as
+
+xout
+
+k =
+
+(cid:88)
+
+(cid:88)
+
+δ∈∆D(K)
+
+j
+
+1[pj = sqk + δ] (xin
+
+j · Wδ),
+
+(1)
+
+where pj ∈ P in, qk ∈ P out, and 1[·] is the binary indicator.
+
+For dense convolution (Figure 3a), each nonzero input is
+multiplied with all nonzero weights, leading to rapidly grow-
+ing nonzeros (P in ⊂ P out). On the other hand, the compu-
+tation of sparse convolution (Figure 3b) is determined by
+maps M = {(pj, qk, Wδ)} in Equation 1 (also written as
+{(pj, qk, Wn)}, where n is the weight index) and keeps the
+sparsity pattern unchanged (P in = P out). It iterates over all
+maps and performs xout
+
+k = xout
+
+k + xin
+
+j · Wδ.
+
+2.1 Mapping Operations
+
+Mapping is a step to construct the input-output maps M =
+{(pj, qk, Wδ)} for sparse convolution. Here, j is the index
+of input point p in P in, k is the index of output point q
+in P out, and Wδ is the weight matrix for kernel offset δ.
+Generating maps typically requires two steps: calculating
+the output coordinates P out, and searching maps M. These
+operations only take coordinates as input.
+
+2.1.1 Output Coordinates Calculation
+
+When the convolution stride is 1, the output coordinates are
+exactly the same as the input coordinates, i.e., P out = P in.
+
+When the convolution stride is larger than 1, the nonzero
+input coordinates will ﬁrst be dilated for each kernel offset
+(i.e., p − δ). After that, only these points on the strided grids
+within boundaries will become outputs q, where s·q = p−δ.
+Take the input coordinate (3, 5) as an example (with stride
+of 2). For offset δ = (1, 1), the output coordinate will be
+((3, 5) − (1, 1)) /2 = (1, 2), while for offset δ = (0, 0),
+there is no valid output coordinate since ((3, 5) − (0, 0))
+is not a multiple of stride s = 2. We refer the readers to
+Appendix A for more details.
+
+2.1.2 Map Search
+
+As in Algorithm 1, map search requires iterating over all
+possible input coordinates for each output coordinate. A
+map is generated only when the input is nonzero.
+
+To efﬁciently examine whether the possible input qj + δ is
+nonzero, a common implementation is to record the coor-
+dinates of nonzero inputs with a hash table. The key-value
+pairs are (key=input coordinates, value=input index), i.e.,
+(key = pj, value = j). The hash function can simply be
+ﬂattening the coordinate of each dimension into an integer.
+
+TorchSparse: Efﬁcient Point Cloud Inference Engine
+
+Figure 2: TorchSparse aims at accelerating Sparse Convolution, which consists of four stages: mapping, gather, matmul and
+scatter-accumulate. Our optimization follows two principles: 1 improve the regularity of sparse workload 2 reduce the
+memory footprint. To achieve that, TorchSparse exploits adaptively batched matmul (Principle 1 , Section 4.2); quantized,
+vectorized, locality-aware scatter/gather (Principle 2 , Section 4.3); and mapping kernel fusion (Principle 2 , Section 4.4).
+
+Algorithm 1 Map Search
+Input: input coordinates P in, output coordinates P out
+
+kernel size K, stride s
+
+Output: maps M
+
+N ← ∆D(K).size
+M ← {∅} × N
+for k, qk in enumerate(P out) do
+
+# Traverse the neighbors of an output point.
+for n, δ in enumerate(∆D(K)) do
+# Calculate input coordinates.
+r ← s · qk + δ
+# Add new map if input exists.
+if P in.contain(r) then
+
+j ← P in.getIndex(r)
+M[Wδ] ← M[Wδ] ∪ {(pj, qk, Wδ)}
+
+end if
+end for
+
+end for
+
+Algorithm 2 Gather-MatMul-Scatter
+Input: input features X in, weights W , maps M
+Output: output features X out
+
+X out ← 0
+# Separately perform gather-matmul-scatter for each weight.
+for δ in ∆D(K) do
+
+F ← ∅
+# Gather features for wn.
+for m, (pj, qk, Wδ) in enumerate(M[Wδ]) do
+
+F [m] ← X in[j]
+
+end for
+# Matrix-matrix multiplication.
+F ← F · Wδ
+# Scatter partial sums to X out.
+for m, (pj, qk, Wδ) in enumerate(M[Wδ]) do
+
+X out[qk] ← X out[qk] + F [m]
+
+end for
+
+end for
+
+Figure 3: Sparse convolution (b) does not multiply each
+nonzero input with all nonzero weights as conventional
+convolution (a) does.
+
+2.2 Data Orchestration and Matrix Multiplication
+
+After maps are generated, sparse convolution will multiply
+the input feature vector xin
+j with corresponding weight ma-
+trix Wδ and accumulate to the corresponding output feature
+vector xout
+k , following the map {(pj, qk, Wδ)}.
+The utilization of matrix-vector multiplication is rather low
+on GPU. Therefore, most existing implementations follow
+the gather-matmul-scatter computation ﬂow in Algorithm 2.
+First, all input feature vectors associated with the same
+weight matrix are gathered and concatenated into a contigu-
+ous matrix. Then, matrix-matrix multiplication between
+feature matrix and weight matrix is conducted to obtain the
+partial sums. Finally, these partial sums are scattered and
+accumulated to the corresponding output feature vectors.
+
+2.3 Difference from Other Tasks
+
+vs. conventional convolution with sparsity. The sparsity
+in conventional convolution comes from the ReLU activa-
+tion function or weight pruning. Since there is no hard con-
+straint on the output sparsity pattern, each nonzero input is
+multiplied with every nonzero weight, so the nonzeros will
+
+Matrix Multiplication (Sec 4.2)X0X1X2X3X4Input FeaturesX0X1X2X3X4P0P1P2P3P4Q0Q1Q2Q3Q4Input CoordsOutput Coordsw-1,-1w-1,0w-1,1w0,-1w0,0w0,1w1,-1w1,0w1,1Kernel OffsetKeyValue(coords)(index)1,102,212,423,234,34(P0, Q0, W0,0)(P1, Q1, W0,0)(P2, Q2, W0,0)(P3, Q3, W0,0)(P4, Q4, W0,0)Maps (In, Out, Wgt)Gather Build Hash TableQuery Possible Input CandidatesQuery HitAdaptive GroupingLocality-Aware AccessScatter Gather (Sec 4.3)  Scatter-Add (Sec 4.3) Locality-Aware AccessOutput FeaturesMapping (Sec 4.4)GenerateX0X1X2X3X4PSUM 0PSUM 1PSUM 2PSUM 3PSUM 4W0,0×=X0X3X1padPSUM 1PSUM 4PSUM 3W-1,-1W-1,0××==X3padX1X4PSUM 1PSUM 0PSUM 3W1,0W1,1××==Apply BMMApply MMSymmetry-Aware ConstructionCompute from  Hash TableInferred from symmetry(P0, Q1, W-1,-1)(P3, Q4, W-1,-1)(P1, Q3, W-1,0)(P3, Q1, W1,0)(P1, Q0, W1,1)(P4, Q3, W1,1)(b) Sparse Convolution (Sparse computation determined by maps)Q1,1Q2,2Q2,4Q3,2Q4,3P1,1P2,2P2,4P3,2P4,3InputsWeightsW-1,-1W-1,0W-1,1W0,-1W0,0W0,1W1,-1W1,0W1,1OutputsINP1,1P3,2P2,2P1,1P2,2…P3,2P2,2P4,3WGTW-1,-1W-1,-1W-1,0W0,0W0,0…W1,0W1,1W1,1OUTQ2,2Q4,3Q3,2Q1,1Q2,2…Q2,2Q1,1Q3,2Map(a) Conventional Convolution (each nonzero input is multiplied with  all nonzero weights)Q0,0Q0,1Q0,2Q1,0Q1,1Q1,2Q1,3Q1,4Q2,0Q2,1Q2,2Q2,3Q2,4Q3,1Q3,2Q3,3Q3,4Q4,1Q4,2Q4,3Q4,4P1,1P2,2P2,4P3,2P4,3InputsWeightsW-1,-1W-1,0W-1,1W0,-1W0,0W0,1W1,-1W1,0W1,1OutputsTorchSparse: Efﬁcient Point Cloud Inference Engine
+
+plication computation from data movement so that we can
+use well-optimized libraries (such as cuDNN) to calculate
+X out ← X in·Wδ. However, the computation workloads are
+very non-uniform due to the irregular nature of point clouds
+(detailed in Figure 12, where map sizes for different weights
+can differ by an order of magnitude, and most map sizes are
+small). As a result, the matrix multiplication in MinkUNet
+(0.5× width) runs at 8.1 TFLOP/s on RTX 2080 Ti with
+FP16 quantization, achieving only 30% device utilization.
+Therefore, improving the regularity of matrix multiplication
+will potentially be helpful: we boost the utilization to 44.2%
+after optimization (detailed in Table 2).
+
+Principle II. Reduce Memory Footprint Data move-
+ment is the largest bottleneck in sparse CNNs, which takes
+up 40%-50% of total runtime on average. This is because
+scatter-gather operations are bottlenecked by GPU mem-
+ory bandwidth (limited) rather than computation resources
+(abundant). Worse still, the dataﬂow in Algorithm 2 com-
+pletely separates scatter-gather operations for different ker-
+nel offsets. This further ruins the possibility of any reuse
+in the data movement, which will be detailed in Figure 9.
+It is also noteworthy that the large mapping latency in the
+CenterPoint detector (Figure 4b) also stems from memory
+overhead: hashmap construction and output coordinate cal-
+culation both require multiple DRAM accesses. Thus, re-
+ducing memory footprint is at the heart of data movement
+and mapping optimization.
+
+4 SYSTEM DESIGN AND OPTIMIZATION
+
+This section unfolds our TorchSparse as follows: Section 4.1
+provides an overview and API design for TorchSparse, Sec-
+tion 4.2 introduces improvements on matrix multiplication
+operations, Section 4.3 elaborates the optimizations for data
+movement operations (scatter/gather), and Section 4.4 ana-
+lyzes the opportunities to speed up mapping operations.
+
+4.1 System Overview
+
+Figure 5 provides an overview of our TorchSparse. At the
+top level, users deﬁne their sparse CNNs using TorchSparse
+APIs, which have minimal differences with native PyTorch
+APIs. Also, TorchSparse does not require users to add ad-
+ditional ﬁelds such as indice key and spatial shape in
+SpConv (Yan et al., 2018), and coordinate manager in
+MinkowskiEngine (Choy et al., 2019) when deﬁning mod-
+ules and tensors. TorchSparse converts the high-level mod-
+ules to primitive operations: e.g., Conv3d is decomposed to
+output construction, mapping operations and gather-matmul-
+scatter. For each part, Python APIs interact with backend
+CUDA implementations via pybind. Note that TorchSparse
+also provides support for CPU inference and multi-GPU
+training, but this paper will focus on the GPU inference.
+
+Figure 4: Data movement and GEMM constitute a signiﬁ-
+cant proportion of the runtime of sparse CNNs.
+
+dilate during the inference, i.e., P in ⊂ P out (see Figure 3a).
+The existing sparse computation libraries leverage such com-
+putation pattern by travelling all nonzero inputs with all
+nonzero weights to accelerate the conventional convolution.
+On the contrary, sparse convolution requires P in = P out,
+and thus the relationship among inputs, weights and outputs
+requires to be explicitly searched with mapping operations,
+which makes it a hassle for previous sparse libraries.
+
+vs. graph convolution.
+In graph convolution, the relation-
+ship between inputs and outputs are provided in the adja-
+cency matrix which stays constant across layers. Contrarily,
+sparse convolution has to search maps for every downsam-
+pling block. Furthermore, graph convolution shares the
+same weight matrix for different neighbors, i.e. all Wδ are
+the same. Hence, graph convolution only needs either one
+gather or one scatter of features: 1) ﬁrst gather input features
+associated with the same output vertex, and then multiply
+them with shared weights and reduce to the output feature
+vector; or 2) ﬁrst multiply all input features with shared
+weights, and then scatter-accumulate the partial sums to the
+corresponding output feature vector. However, sparse con-
+volution uses different weight matrices for different kernel
+offset δ and thus needs both gather and scatter during the
+computation. Consequently, existing SpMV/SpDMM sys-
+tems for graph convolution accleration (Wang et al., 2019a;
+Hu et al., 2020) are not applicable to sparse convolution.
+
+3 ANALYSIS
+
+We systematically proﬁle the runtime of different compo-
+nents in two representative sparse CNNs: one for segmenta-
+tion (Figure 4a) and one for detection (Figure 4b). Based on
+observations in Figure 4, we summarize two principles for
+sparse convolution optimization which lays the foundation
+for our system design in Section 4.
+
+Principle I. Improve Regularity in Computation Ma-
+trix multiplication is the core computation in sparse con-
+volution and takes up a large proportion of total execution
+time (20%-50%). Algorithm 2 decouples the matrix multi-
+
+5%4%44%47%7%12%15%23%43%Data Mov.GEMMMapping2D/NMSMisc.(a) Segmentation(b) DetectionTorchSparse: Efﬁcient Point Cloud Inference Engine
+
+Figure 5: System overview for TorchSparse: our TorchSparse provides handy Python APIs similar to PyTorch and applies
+low-level optimizations to data movement, matrix multiplication and mapping operations in sparse convolution.
+
+(a) Dense Computation
+
+(b) Separate MatMul
+
+(c) Fixed Grouping
+
+(d) Adaptive Grouping
+
+Figure 6: Different matrix multiplication grouping strate-
+gies: (a) dense computation suffers from large FLOPs over-
+head; (b) separate matrix multiplication suffers from low de-
+vice utilization and excessive kernel calls; (c) ﬁxed grouping
+trades FLOPs for regularity; (d) adaptive grouping searches
+for the best balance point.
+
+4.2 Matrix Multiplication Optimization
+
+Matrix multiplication is the core computation in sparse con-
+volution. Due to the irregularity of point clouds, existing
+implementations rely on cuDNN to perform many small ma-
+trix multiplications on different weights (Figure 6b), which
+usually do not saturate the utilization of GPUs. In order to
+increase the utilization, we propose to trade computation for
+regularity (Principle I) by grouping matrix multiplication for
+different weights together. We ﬁnd it helpful to introduce
+redundant computation but group more computation in a
+single kernel. In Figure 12, we collect the real workload for
+MinkUNet (Choy et al., 2019) on SemanticKITTI (Behley
+
+Figure 7: Trading FLOPs for computation regularity via
+batched matrix multiplication brings 1.5× speedup.
+
+et al., 2019) and analyze the efﬁciency of matrix multiplica-
+tion in the ﬁrst sparse convolution layer with respect to the
+group size. It turns out that batched matrix multiplication
+can be signiﬁcantly faster than sequentially performing the
+computation along the batch dimension, thanks to the better
+regularity. This motivates us to explore the opportunity of
+grouping in the matrix multiplication computation.
+
+4.2.1
+
+Symmetric Grouping
+
+With sparse workloads, the map sizes for different weights
+within one sparse convolution layer are usually different.
+Fortunately, for sparse convolutions with odd kernel size and
+stride of 1, the maps corresponding to kernel offset (a, b, c)
+will always have the same size as the maps corresponding to
+the symmetric kernel offset (−a, −b, −c). For a map entry
+(pj, qk, Wa,b,c), we have qk = pj + (a, b, c). Then, pj =
+qk +(−a, −b, −c), which implies that (qk, pj, W−a,−b,−c)
+is also a valid map entry. As such, we can establish an one-
+to-one correspondence between maps for weights ±(a, b, c).
+Therefore, we are able to group the workload for symmetric
+kernel offsets together and naturally have a batch size of 2.
+Note that the workload corresponding to the kernel offset
+(0, 0, 0) is processed separately since it does not require
+any explicit data movement. From Figure 7, the symmetric
+grouping (13 groups) can already be up to 1.2× faster than
+the separate matrix multiplication.
+
+import torchsparse.nn as spnn class SparseConvBlock(nn.Sequential):     def __init__(self,                  in_channels: int,                  out_channels: int,                  kernel_size: Union[int, list, tuple],                  stride: Union[int, list, tuple] = 1,                  dilation: int = 1) -> None:         super().__init__(             spnn.Conv3d(in_channels,                         out_channels,                         kernel_size,                         stride=stride,                         dilation=dilation),             spnn.BatchNorm(out_channels),             spnn.ReLU(True)         )import torch.nn as nn class ConvBlock(nn.Sequential):     def __init__(self,                  in_channels: int,                  out_channels: int,                  kernel_size: Union[int, list, tuple],                  stride: Union[int, list, tuple] = 1,                  dilation: int = 1) -> None:         super().__init__(             nn.Conv2d(in_channels,                         out_channels,                         kernel_size,                         stride=stride,                         dilation=dilation),             nn.BatchNorm2d(out_channels),             nn.ReLU(True)         )TorchSparse APIs are very close to PyTorch native APIs. SparseConvNets: MinkUNet, CenterPoint, …TorchSparse APIs:  spnn.Conv3d, spF.conv3d…Output Coord. Construction (4.4)Map Search (4.4)PyTorch CUDA ExtensionFused Locality-Aware Scatter/Gather (4.3)Adaptively  Grouped MatMul (4.2)BMM (batch=7)MMMMMMMMMMMMMMMMBMM (batch=4)BMM (batch=2)Extra computation = 2 / 28 (Small overhead)MMBMM (batch=4)BMM (batch=2)Extra computation = 10 / 24 (Large overhead)MMBMM (batch=6)Extra computation = 6 / 42 (Slightly large overhead, but better regularity)MMMMBMM (batch=2)MMBMM (batch=2)Adaptively choosing MM / BMM in each group based on runtime statistics.00.40.81.21.6Speedup Over BaselineNumber of GroupsIncreasing regularity helps improve latencyPadding overhead hurts latency1 group3 groups6 groups13 groups26 groups(=, assume oﬀset=(0,0,0) separately computed.)33−126242220181614121086420TorchSparse: Efﬁcient Point Cloud Inference Engine
+
+4.2.2 Fixed Grouping
+
+Though symmetric grouping works well for sparse convo-
+lutions with the stride of 1, it falls short in generalizing to
+downsampling layers. Also, it cannot push the batch size to
+> 2, which means that we still have a large gap towards the
+best GPU utilization in Figure 7. Nevertheless, we ﬁnd that
+clear pattern exists in the map size statistics (Figure 12): for
+submanifold layers, the maps corresponding to W0 to W3
+tend to have similar sizes and the rest of the weights other
+than the middle one have similar sizes; for downsampling
+layers, the maps for all offsets have similar sizes. Conse-
+quently, we can batch the computation into three groups
+accordingly. Within each group, we pad all features to the
+maximum size (Figure 6c). Fixed grouping generally works
+well when all features within the same group have similar
+sizes (Figure 6c left), and this usually happens in downsam-
+pling layers. For submanifold layers (Figure 6c right), the
+padding overhead can sometimes be large despite the better
+regularity, resulting in wasted computation.
+
+4.2.3 Adaptive Grouping
+
+The major drawback of ﬁxed grouping is that it does not
+adapt to individual samples. This can be problematic since
+workload size distributions can vary greatly across different
+datasets (Figure 12). It is also very labor-intensive to design
+different grouping strategies for different layers, different
+networks on a diverse set of datasets and hardware. To this
+end, we design an adaptive grouping algorithm (Figure 6d)
+that automatically determines the input-adaptive grouping
+strategy for a given layer on arbitrary workload.
+
+Actual FLOPs
+
+The adaptive grouping algorithm builds upon two auto-tuned
+parameters (cid:15) and S, where (cid:15) indicates our tolerance of redun-
+dant computation, and S is the workload threshold. Given
+(cid:15), we scan over sizes of all maps in the current workload
+for W0 to WK−1 (where K is the kernel volume) and dy-
+namically maintain two pointers indicating the start and end
+of the current group. We initiate a new group whenever the
+redundant computation ratio (1 − Theoretical FLOPs
+) exceeds
+(cid:15). Then, given S, we inspect the maximum workload size
+within each group. Each group performs bmm if the workload
+size is smaller than S and performs mm otherwise. This is
+because bmm can improve device utilization for small work-
+loads but has little beneﬁt for large workloads. We refer the
+readers to Appendix B for more details of this algorithm.
+Note that even if (cid:15) and S are ﬁxed, the generated strategy it-
+self is still input-adaptive. Since different input point clouds
+have different map sizes, even the same (cid:15) can potentially
+generate different group partition strategies for different
+samples. The ((cid:15), S) parameter space is simple but diverse
+enough to cover dense computation ((cid:15) = 1; S = +∞), sep-
+arate computation (S = 0) as well as symmetric grouping
+((cid:15) = 0; S = +∞) as its special cases.
+
+Figure 8: TorchSparse applies vectorized and quantized
+scatter-gather to greatly reduce the data movement latency.
+
+Figure 9: TorchSparse proposes cache-friendly locality-
+aware and memory access pattern. In contrary, baseline
+implementation (a) cannot exploit cache reuse due to unique-
+ness in input/output indices for each weight.
+
+For a given sparse CNN, we determine ((cid:15), S) for each layer
+on the target dataset and hardware platform via exhaustive
+grid search on a small subset (usually 100 samples) of the
+training set. We formalize this process in Appendix B. The
+search is inference-only. It explores a space of around 1,000
+conﬁgurations and requires less than 10 minutes of search
+time on a desktop GPU. The strategy derived on the small
+subset can be directly applied and does not require any
+parameter optimization during the inference time.
+
+4.3 Data Movement Optimization
+
+From Section 3, data movement usually takes up 40-50% of
+the total runtime. Thus, optimizing data movement will be
+of high priority as well (Principle II). Intuitively, it is most
+effective to reduce data movement cost by reducing the total
+amount of DRAM access and exploiting the data reuse.
+
+4.3.1 Quantized and Vectorized Memory Access
+
+FP16 quantization brings 2× theoretical DRAM access sav-
+ing compared with the FP32 baseline. However, as in Fig-
+ure 8, this reduction cannot be translated into real speedup
+without vectorized scatter/gather.
+
+c0c1…c30c31c32c33…c62c63……c255Warp #0Warp #1Warp #7c0-1c2 -3…c60-61c62-63c64 -65c66 -67…c124 -125c126 -127……c254 -255Warp #0Warp #1Warp #3(a) FP32, Scalar Scatter-Gather; 4B/channel (c0-c255), 128B/warp(b) FP16, Vectorized Scatter-Gather; 2B/channel (c0-c255), 128B/warpUnique input / output indices for each weight(a) Weight-Stationary Memory AccessCache Hit(b) Locality-Aware Memory AccessCache MissP0P95077…P1W-1,-1,-1W-1,1,0W1,0,1W1,0,1W1,1,1W-1,-1,-1W-1,-1,0…P95133W-1,-1,0W1,1,1…P95229W1,1,0Input-stationary gatherQ95077…Q1W-1,0,-1W1,-1,0W1,1,1W-1,-1,-1W1,1,1W1,1,0W1,1,1…Q95133W-1,-1,-1W1,1,0…Q95229W-1,-1,0Output-stationary scatterQ0100% hit after first miss…W-1,-1,-1W-1,-1,0W1,1,1(P0, Q1)(P95029, Q95133)(P3, Q4)…(P95077, Q95181)…W1,1,0(P3, Q1)(P95077, Q95180)(P4, Q8)…(P95133, Q95229)(P1, Q3)(P95180, Q95077)(P8, Q4)…(P95229, Q95133)(P1, Q0)(P95133, Q95029)(P4, Q3)…(P95181, Q95077)TorchSparse: Efﬁcient Point Cloud Inference Engine
+
+NVIDIA GPUs group memory access requests into trans-
+actions, whose largest size is 128 bytes. Considering the
+typical memory access pattern in scatter/gather, where a
+warp (32 threads) issues contiguous FP32 (4 bytes) memory
+access instructions simultaneously, the 128-byte transaction
+is fully utilized. However, when each thread in the warp
+issues an FP16 memory request, the memory transaction
+has only 64/128=50% utilization, and the total number of
+memory transactions are essentially unchanged. As a result,
+we observe far smaller speedup (1.3×) compared to the the-
+oretical value (2×) on scatter/gather if scalar scatter/gather
+(Figure 8a) is performed.
+
+Contrarily, vectorized scatter-gather Figure 8b doubles the
+workload of each thread, making the total work of each warp
+still 128 bytes, equivalent to a full FP32 memory transac-
+tion. Meanwhile, the total number of memory transactions
+is halved while the work for each memory transaction is
+unchanged, and we observe 1.9× speedup over FP32 data
+movement on various GPU platforms. This closely aligns
+with the theoretical reduction in DRAM access.
+
+Further quantizing the features to INT8 offers diminishing
+return, as the multi-way reduction in the scatter operation
+requires more than 8-bit for the ﬁnal result. In this case, all
+scatter operations are still in 16 bits since CUDA requires
+aligned memory access. Thus, scattering (which takes 60%
+of the data movement time) cannot not accelerated with the
+INT8 quantization, leading to limited overall speedup.
+
+4.3.2 Fused and Locality-Aware Memory Access
+
+Despite the limitation of aggressive feature quantization,
+it is still possible to achieve faster scatter/gather by ex-
+ploiting locality. Intuitively, for a sparse convolution layer,
+the total amount of gather read and scatter write is N1 =
+|M|(Cin +Cout), where M is the map for this layer (deﬁned
+in Section 2.1), and Cin and Cout correspond to input and
+output channel numbers. However, the total feature size
+of this layer is N2 = NinCin + NoutCout. Empirically, the
+feature of each point is repetitively accessed for at least 4
+times (N1 ≥ 4N2). Based on this, we can ideally have 1.6×
+more DRAM access saving for scatter/gather (the amount
+of gather write and scatter read is also N1 and cannot be
+saved).
+
+As shown in Algorithm 2 and Figure 9a, the current imple-
+mentation completely separates gather/scatter for different
+weights. When we perform gather operation for Wk+1, the
+GPU cache is ﬁlled with scatter buffer features for Wk as
+long as the GPU cache size is much smaller than N1 (typ-
+ically > 40MB, much larger than the 5.5MB L2 cache of
+NVIDIA RTX 2080 Ti). Intuitively, for gather operation on
+Wk+1, we hope that the cache is ﬁlled with gather buffer
+features from Wk. This suggests us to ﬁrst fuse all gather
+operations before matrix multiplication, and fuse all scatter
+
+Figure 10: TorchSparse reduces mapping DRAM access
+and improves mapping latency via kernel fusion.
+
+operations afterwards. As such, the GPU cache will always
+hold data from the same type of buffer.
+
+Moreover, the memory access order matters. In the weight-
+stationary order (Figure 9a), all map entries for weight Wk
+are unique, so there is no chance of feature reuse, and each
+gather/scatter leads to a cache miss. As in Figure 9b, we
+instead take a locality-aware memory access order. We
+gather the input features in the input-stationary order and
+scatter the partial sums in the output-stationary order.
+
+Without loss of generality, we will focus on the implementa-
+tion of input-stationary gather. We ﬁrst maintain a neighbor
+set Nj for each input point pj: i.e., for the ith map entry
+(pj, qk, Wn), we insert (Wn, i) into Nj. Then, we iterate
+over every input point pj, fetch its feature vector X in
+j into
+the register, and write it to the corresponding DRAM lo-
+cation (cid:80)n−1
+k=0 |M[Wk]| + i for each (Wn, i) ∈ Nj. Here,
+M[Wk] is the map for weight Wk. Note that each X in
+j is
+read from DRAM only once and held in the register. Hence,
+this algorithm achieves the optimal reuse for gather. Similar
+technique can be applied to scatter, where we read neighbors’
+partial sums for each output point from DRAM, perform
+reduction in the register, and write the result back only once.
+This optimization alone leads to 1.3-1.4× speedup in data
+movement on real-world point cloud datasets.
+
+4.4 Mapping Optimization
+
+From Figure 4, mapping operations in our baseline imple-
+mentation take up a signiﬁcant amount of time (15%) in
+detectors on the Waymo (Sun et al., 2020) dataset. It is
+important to reduce the mapping overhead in sparse CNNs.
+
+We ﬁrst choose the map search strategy for each layer from
+[grid, hashmap] in a similar manner to the adaptive group-
+ing. Here, grid corresponds to a naive collision-free grid-
+based hashmap: it takes larger memory space, but hashmap
+construction/query requires exactly one DRAM access per-
+entry, which is much smaller than conventional hashmaps.
+We then perform kernel fusion (Figure 10) on output coor-
+dinates computation for downsampling. The downsample
+operation applies a sliding window around each point. It 1
+calculates candidate activated points with broadcast add,
+2 performs modular check, 3 performs boundary check
+and generates a mask on whether each point is kept, 4 con-
+verts the remaining candidate point coordinates to 1D values,
+
+Candidate CalculationModular  CheckBoundary CheckDRAMDRAMnD1D  Coord. Conversion→DRAMDRAMUnique FilteringDRAMDRAMDRAMUnique FilteringCandidate CalculationReg.Modular  CheckReg.Boundary CheckReg.Coord.  ConversionSingle Fused Kernel: No intermediate DRAM accessDRAMDRAMTorchSparse: Efﬁcient Point Cloud Inference Engine
+
+Figure 11: TorchSparse consistently outperforms state-of-the-art inference engines in both detection and segmentation
+benchmarks and achieves up to 1.5-1.6× geomean speedup, 2.3× single model speedup over MinkowskiEngine and SpConv.
+
+and 5 performs unique operation to keep ﬁnal output coor-
+dinates (detailed in Appendix A). There are DRAM accesses
+between every two of the ﬁve stages, making downsampling
+kernels memory-bounded. We therefore fuse stages 1 to
+4 into a single kernel and use registers to store intermedi-
+ate results, which eliminates all intermediate DRAM write.
+For the fused kernel, we further perform control logic sim-
+pliﬁcation, full loop unrolling and utilize the symmetry of
+submanifold maps. Overall, the mapping operations are
+accelerated by 4.6× on detection tasks with our optimiza-
+tions.
+
+5 EVALUATION
+
+5.1 Setup
+
+TorchSparse is implemented in CUDA and provides easy-
+to-use PyTorch-like interfaces (described in Section 4.1).
+We build TorchSparse based on PyTorch 1.9.1 with CUDA
+10.2/11.1 and cuDNN 7.6.5. Our system is evaluated against
+a baseline FP32 design without optimizations in Section 4
+and the latest versions of two state-of-the-art sparse convo-
+lution libraries MinkowskiEngine v0.5.4 (Choy et al., 2019)
+and SpConv v1.2.1 (Yan et al., 2018) on three generations
+of NVIDIA GPUs: GTX 1080Ti, RTX 2080Ti and RTX
+3090. Necessary changes are made to MinkowskiEngine to
+correctly support downsample operations in detectors and
+to SpConv to avoid OOM in large-scale scenes.
+
+All systems are evaluated on seven top-performing sparse
+CNNs on large-scale datasets: MinkUNet (Choy et al., 2019)
+(0.5×/1× width) on SemanticKITTI (Behley et al., 2019),
+MinkUNet (1/3 frames) on nuScenes-LiDARSeg (Caesar
+et al., 2020), CenterPoint (Yin et al., 2021) (10 frames) on
+nuScenes detection and CenterPoint (1/3 frames) on Waymo
+Open Dataset (Sun et al., 2020). We report the normalized
+
+(a) Map size on SemanticKITTI
+
+(b) Map size on nuScenes
+
+Figure 12: Grouping strategy on different datasets. Maps
+on nuScenes are much smaller than on SemanticKITTI for
+MinkUNet. Thus, to fully utilize GPU, the grouping strategy
+is more aggressive on nuScenes (8 groups vs. 10 groups).
+
+FPS for all systems (with TorchSparse to be 1).
+
+5.2 Evaluation Results
+
+Our TorchSparse achieves the best performance compared
+with the baseline design, MinkowskiEngine and SpConv.
+
+From Figure 11, TorchSparse achieves up to 2.16× speedup
+on segmentation models and 1.6-2× speedup on detection
+models over MinkowskiEngine on RTX 3090. We achieve
+a smaller speedup for the 1-frame MinkUNet on nuScenes-
+LiDARSeg because MinkowskiEngine applies specialized
+optimizations to small models by using the fetch-on-demand
+dataﬂow (Lin et al., 2021) instead of the gather-matmul-
+scatter dataﬂow.
+
+TorchSparse also demonstrates a 1.2× faster inference speed
+compared with the FP16 version of SpConv for detectors
+on RTX3090 thanks to our fused and locality-aware ac-
+cess pattern and almost perfect speedup from vectorized
+data movement. Note that we report end-to-end speedup in
+Figure 11. However, 10% of total total runtime in Center-
+Point (Yin et al., 2021) is not related to point cloud computa-
+
+SK-MinkUNet (1.0x)SK-MinkUNet (0.5x)NS-MinkUNet (3f)NS-MinkUNet (1f)NS-CenterPoint (10f)WM-CenterPoint (3f)WM-CenterPoint (1f)Geomean1.001.001.001.001.001.001.001.000.650.830.850.810.570.550.520.530.590.690.700.780.550.510.500.440.650.540.540.651.060.730.670.470.650.620.600.750.670.650.660.58Baseline ImplementationMinkowskiEngineSPConv (FP32)SPConv (FP16)TorchSparseSK-MinkUNet (1.0x)SK-MinkUNet (0.5x)NS-MinkUNet (3f)NS-MinkUNet (1f)NS-CenterPoint (10f)WM-CenterPoint (3f)WM-CenterPoint (1f)Geomean1.001.001.001.001.001.001.001.000.770.880.910.890.700.680.670.690.590.620.610.750.600.530.560.470.610.520.510.640.920.680.660.460.610.550.500.680.750.680.650.52SK-MinkUNet (1.0x)SK-MinkUNet (0.5x)NS-MinkUNet (3f)NS-MinkUNet (1f)NS-CenterPoint (10f)WM-CenterPoint (3f)WM-CenterPoint (1f)Geomean1.001.001.001.001.001.001.001.000.830.980.980.930.640.690.820.850.690.720.690.760.680.670.700.640.680.560.540.601.080.770.740.610.690.590.540.670.900.810.740.68RTX 3090RTX 2080TiGTX 1080TiWeight Index10010001000010000014710131619222527Map Size10210310410510010001000010000014710131619222527Weight Index102103104105TorchSparse: Efﬁcient Point Cloud Inference Engine
+
+tion (image convolution and non-maximum suppression, as
+in Figure 4). Therefore, our speedup ratio on sparse convo-
+lution is 10% more for CenterPoint. The performance gain
+over SpConv (FP16) is even larger on segmentation models
+on various hardware platforms thanks to the effectiveness of
+adaptively batched matrix multiplication, which will be dis-
+cussed in Section 6.1. GPUs are usually more under-utilized
+for segmentation models as they usually have smaller work-
+load compared with detectors, making it necessary to apply
+batching strategies to improve the device utilization.
+
+TorchSparse achieves consistent speedup over other systems
+on GTX 1080Ti, which has no FP16 tensor cores. Compared
+with the baseline design, our TorchSparse still achieves a
+1.5× speedup, only 11% less than the speedup we achieved
+on RTX 2080Ti with tensor cores. This validates that the
+native tensor-core speedup only constitutes a very minor
+proportion of our performance gain.
+
+Our TorchSparse runs MinkUNet (1.0× on SemanticKITTI)
+at 36, 26 and 13 FPS on RTX 3090, RTX 2080Ti, GTX
+1080Ti, respectively, all satisfying the real-time requirement
+(≥ 10 FPS). For the 3-frame model on nuScenes-LiDARSeg,
+TorchSparse achieves 45, 40 and 25 FPS throughput on the
+three devices, at least 2× faster than the LiDAR frequency.
+Even for the heaviest 3-frame CenterPoint model on Waymo,
+our TorchSparse is still able to achieve the real-time infer-
+ence on GTX 1080Ti. As such, our system paves the way
+for real-time LiDAR perception on self-driving cars.
+
+6 ABLATION STUDY
+
+6.1 Matrix Multiplication Optimizations
+
+We ﬁrst examine the performance of different grouping
+strategies on SemanticKITTI with MinkUNet (0.5×) and
+on nuScenes with MinkUNet (3 frames). From Figure 6,
+our adaptive grouping strategy outperforms all handcrafted,
+ﬁxed strategy and achieves 1.4-1.5× over no grouping base-
+line. Table 2 also suggests that manually-designed strat-
+egy cannot generalize to all datasets: ﬁxed 3-batch group-
+ing achieves large speedup (1.5×) on nuScenes, but is
+13% slower than the separate computation baseline on Se-
+manticKITTI. Note that although this strategy has the best
+device utilization (largest TFLOP/s) on nuScenes, it does
+not bring greater latency reduction than adaptive grouping
+due to much more extra computation, indicating the impor-
+tance of (cid:15) in our adaptive grouping algorithm. We also show
+the effectiveness of grouping strategy specialization for dif-
+ferent datasets, model and hardware in Table 1. In Table 1a,
+we found that the same model (1-frame MinkUNet) on the
+same hardware platform beneﬁts more from the dataset-
+specialized strategy. This is because map size distributions
+(which decides the workload of matrix multiplication) sig-
+niﬁcantly differ between SemanticKITTI and nuScenes, as
+
+Specialization
+for Different
+Datasets
+
+Optimized for
+
+SemanticKITTI
+
+nuScenes
+
+Execute
+on
+
+SemanticKITTI
+
+nuScenes
+
+10.11
+
+5.30
+
+10.87
+
+4.67
+
+(a) Specialization for Datasets (MinkUNet, 2080Ti)
+
+Specialization
+for Different
+Models
+
+Optimized for
+
+MinkUNet (1.0×) MinkUNet (0.5×)
+
+Execute
+on
+
+MinkUNet (1.0×)
+
+MinkUNet (0.5×)
+
+10.11
+
+5.37
+
+10.70
+
+4.72
+
+(b) Specialization for Model (SemanticKITTI, 2080Ti)
+
+Specialization
+for Different
+Hardware
+
+Optimized for
+
+RTX2080Ti
+
+GTX1080Ti
+
+Execute
+on
+
+RTX2080Ti
+
+GTX1080Ti
+
+4.67
+
+14.95
+
+4.80
+
+14.01
+
+(c) Specialization for Hardware (nuScenes, MinkUNet)
+
+Table 1: Specializing adaptive batching strategies for differ-
+ent datasets, models and hardware platforms helps improve
+efﬁciency (TFLOP/s) by up to 13.5%.
+
+Grouping Method MatMul speedup (SK) MatMul Speedup (NS)
+
+Separate
+Symmetric
+Fixed
+Adaptive
+
+8.1 TFLOP/s (1.00×)
+8.2 TFLOP/s (1.02×)
+8.7 TFLOP/s (0.87×)
+11.9 TFLOP/s (1.39×)
+
+10.4 TFLOP/s (1.00×)
+14.6 TFLOP/s (1.39×)
+21.1 TFLOP/s (1.50×)
+16.9 TFLOP/s (1.54×)
+
+Table 2: Ablation analysis on matrix multiplication: adap-
+tive batching consistently outperforms all other strategies
+in latency and brings about 1.4×-1.5× speedup for matmul
+(SK=SemanticKITTI, NS=nuScenes). As we trade FLOPs
+for regularity, TFLOP/s and speedup are non-proportional.
+
+shown in Figure 12. The maps on nuScenes are much
+smaller than those on SemanticKITTI. As a result, if we
+directly transfer SemanticKITTI strategy to nuScenes, the
+groups will not be large enough to fully utilize hardware
+resources. On the other hand, if the nuScenes strategy is
+transferred to SemanticKITTI, the efﬁciency will be bottle-
+necked by computation overhead. We notice similar effect
+for model and hardware specialization in Table 1b and Ta-
+ble 1c, where specialized strategies always outperform the
+transferred ones.
+
+6.2 Data Movement Optimizations
+
+We then perform ablation analysis on MinkUNet (Choy
+et al., 2019) (1.0×) on the SemanticKITTI dataset (Behley
+et al., 2019). As in Table 3, naively quantizing features to
+
+TorchSparse: Efﬁcient Point Cloud Inference Engine
+
+FP16 Vec. Fused Loc.-Aware Speedup (G) Speedup (S) Speedup (SG)
+
+(cid:55)
+(cid:51)
+(cid:51)
+(cid:51)
+(cid:51)
+
+(cid:55)
+(cid:55)
+(cid:51)
+(cid:51)
+(cid:51)
+
+(cid:55)
+(cid:55)
+(cid:55)
+(cid:51)
+(cid:51)
+
+(cid:55)
+(cid:55)
+(cid:55)
+(cid:55)
+(cid:51)
+
+1.00
+1.17
+1.91
+1.91
+2.86
+
+1.00
+1.48
+1.95
+2.12
+2.61
+
+1.00
+1.32
+1.93
+2.02
+2.72
+
+Table 3: Speedup breakdown of different optimizations to
+reduce data movement. Feature quantization, vectorized
+memory access, and fused and locality-aware access bring
+1.3×, 1.5× and 1.4× speedup, respectively. Here, G and S
+denote gather and scatter.
+
+Figure 13: Speedup breakdown of mapping optimizations.
+Grid-based hashmap, fused kernel, simpliﬁed control logic
+and symmetry bring 1.6×, 1.5×, 1.8× and 1.1× measured
+speedup, respectively.
+
+16-bit will not provide signiﬁcant speedup for scatter/gather:
+especially for gather, the speedup ratio is only 1.17×, far
+less than the theoretical value (2×). Instead, quantized and
+vectorized scatter/gather improves the latency of scatter-
+gather by 1.93×, which closely matches the DRAM ac-
+cess reduction and veriﬁes our analysis in Section 4.3 on
+memory transactions. We further observe that fusing gath-
+er/scatter itself will not provide substantial speedup, as the
+weight-stationary access pattern cannot provide good cache
+locality due to the uniqueness of maps for each weight.
+However, when combined with locality-aware access, we
+achieve 2.86× speedup on gathering, 2.61× speedup on
+scattering and 2.72× overall speedup against FP32. This
+demonstrates the fact that all techniques in Section 4.3 are
+crucial in improving the efﬁciency of data movement.
+
+6.3 Mapping Optimizations
+
+We ﬁnally present analysis on optimizing mapping oper-
+ations in 3-frame CenterPoint (Yin et al., 2021) detector
+on Waymo (Sun et al., 2020). Grid-based map search is
+2.7× faster than a general hashmap-based solution thanks
+to its no-collision property, resulting in a 1.6× end-to-end
+speedup for mapping. Fusing four small kernels accelerates
+output construction by 2.1× and brings 1.5× further end-to-
+end mapping speedup. Finally, simplifying the control logic,
+loop unrolling and utilizing the symmetry of maps substan-
+tially accelerates map search by another 4× and pushes the
+ﬁnal end-to-end mapping speedup to 4.6×.
+
+7 RELATED WORK
+
+Deep Learning on Point Clouds. Early methods (Chang
+et al., 2015; Qi et al., 2016; Cicek et al., 2016) ﬁrst con-
+vert point clouds to the dense volumetric representation and
+apply dense CNNs to extract features. Another line of re-
+search (Qi et al., 2017a;b; Li et al., 2018; Wu et al., 2019;
+Thomas et al., 2019; Wang et al., 2019b) directly performs
+convolution on the k-nearest neighbor or spherical nearest
+neighbor of each point. Both streams of methods struggle
+to scale up to large scenes due to large or irregular memory
+footprint (Liu et al., 2019; 2021). Recent state-of-the-art
+deep learning methods on point cloud segmentation / de-
+tection (Graham et al., 2018; Choy et al., 2019; Tang et al.,
+2020; Shi et al., 2020; 2021; Yin et al., 2021) are usually
+based on sparse convolution, which is empirically proven
+to be able to scale up to large scenes and is the target for
+acceleration in this paper.
+
+Point Cloud Inference Engines. Researchers have exten-
+sively developed efﬁcient inference engines for sparse con-
+volution inference. SpConv (Yan et al., 2018) proposes grid-
+based map search and the gather-matmul-scatter dataﬂow.
+SparseConvNet (Graham et al., 2018) proposes hashmap-
+based map search and is later signiﬁcantly improved (in
+latency) by MinkowskiEngine, which also introduces a new
+fetch-on-demand dataﬂow that excels at small workloads
+and allows generalized sparse convolution on >3D point
+clouds and on arbitrary coordinates.
+
+8 CONCLUSION
+
+We present TorchSparse, an open-source inference engine
+for efﬁcient point cloud neural networks. Guided by two
+general principles: trade computation for regularity and re-
+duce memory footprint, we optimize matrix multiplication,
+data movement and mapping operations in sparse convolu-
+tions, achieving up to 1.5×, 2.7× and 4.6× speedup on these
+three components, and up to 1.5-1.6× end-to-end speedup
+over previous state-of-the-art point cloud inference engines
+on both segmentation and detection tasks. We hope that
+our in-depth analysis on the efﬁciency bottlenecks and opti-
+mization recipes for sparse convolution can inspire future
+research on point cloud inference engine design.
+
+ACKNOWLEDGMENTS
+
+We would like to thank Hanrui Wang and Ligeng Zhu for
+their feedback on the artifact evaluation. This research
+was supported by NSF CAREER Award #1943349, Ford
+and Hyundai. Zhijian Liu and Yujun Lin were partially
+supported by the Qualcomm Innovation Fellowship.
+
+Baseline+ Grid HM.+ Fused Kernel+ Simplify Ctl.+ SymmetryOutput ConstructionMap Search1.6×1.5×1.8×1.1×TorchSparse: Efﬁcient Point Cloud Inference Engine
+
+REFERENCES
+
+Behley, J., Garbade, M., Milioto, A., Quenzel, J., Behnke, S.,
+Stachniss, C., and Gall, J. SemanticKITTI: A Dataset for
+Semantic Scene Understanding of LiDAR Sequences. In
+IEEE/CVF International Conference on Computer Vision
+(ICCV), 2019.
+
+Caesar, H., Bankiti, V., Lang, A. H., Vora, S., Liong, V. E.,
+Xu, Q., Krishnan, A., Pan, Y., Baldan, G., and Beijbom,
+O. nuScenes: A Multimodal Dataset for Autonomous
+Driving. In IEEE/CVF Conference on Computer Vision
+and Pattern Recognition (CVPR), 2020.
+
+Chang, A. X., Funkhouser, T., Guibas, L., Hanrahan, P.,
+Huang, Q., Li, Z., Savarese, S., Savva, M., Song, S., Su,
+H., Xiao, J., Yi, L., and Yu, F. ShapeNet: An Information-
+Rich 3D Model Repository. arXiv, 2015.
+
+Choy, C., Gwak, J., and Savarese, S. 4D Spatio-Temporal
+ConvNets: Minkowski Convolutional Neural Networks.
+In IEEE/CVF Conference on Computer Vision and Pat-
+tern Recognition (CVPR), 2019.
+
+Cicek, O., Abdulkadir, A., Lienkamp, S. S., Brox, T., and
+Ronneberger, O. 3D U-Net: Learning Dense Volumetric
+Segmentation from Sparse Annotation. In Proc. Medical
+Image Computing and Computer Assisted Intervention
+(MICCAI), 2016.
+
+Ge, R., Ding, Z., Hu, Y., Shao, W., Huang, L., Li, K., and
+Liu, Q. 1st Place Solutions to the Real-time 3D Detection
+and the Most Efﬁcient Model of the Waymo Open Dataset
+Challenge 2021. In IEEE/CVF Conference on Computer
+Vision and Pattern Recognition Workshops (CVPRW),
+2021.
+
+Graham, B., Engelcke, M., and van der Maaten, L. 3D Se-
+mantic Segmentation With Submanifold Sparse Convolu-
+tional Networks. In IEEE/CVF Conference on Computer
+Vision and Pattern Recognition (CVPR), 2018.
+
+Hu, Y., Ye, Z., Wang, M., Yu, J., Zheng, D., Li, M., Zhang,
+Z., Zhang, Z., and Wang, Y. FeatGraph: A Flexible and
+Efﬁcient Backend for Graph Neural Network Systems. In
+International Conference for High Performance Comput-
+ing, Networking, Storage and Analysis (SC), 2020.
+
+Li, Y., Bu, R., Sun, M., Wu, W., Di, X., and Chen,
+B. PointCNN: Convolution on X -Transformed Points.
+In Advances in Neural Information Processing Systems
+(NeurIPS), 2018.
+
+Lin, Y., Zhang, Z., Tang, H., Wang, H., and Han, S.
+In 54th
+PointAcc: Efﬁcient Point Cloud Accelerator.
+Annual IEEE/ACM International Symposium on Microar-
+chitecture (MICRO), 2021.
+
+Liu, Z., Tang, H., Lin, Y., and Han, S. Point-Voxel CNN
+for Efﬁcient 3D Deep Learning. In Advances in Neural
+Information Processing Systems (NeurIPS), 2019.
+
+Liu, Z., Tang, H., Zhao, S., Shao, K., and Han, S. PV-
+NAS: 3D Neural Architecture Search with Point-Voxel
+Convolution. IEEE Transactions on Pattern Analysis and
+Machine Intelligence (TPAMI), 2021.
+
+Qi, C. R., Su, H., Niessner, M., Dai, A., Yan, M., and
+Guibas, L. J. Volumetric and Multi-View CNNs for Ob-
+ject Classiﬁcation on 3D Data. In IEEE/CVF Conference
+on Computer Vision and Pattern Recognition (CVPR),
+2016.
+
+Qi, C. R., Su, H., Mo, K., and Guibas, L. J. PointNet:
+Deep Learning on Point Sets for 3D Classiﬁcation and
+Segmentation. In IEEE/CVF Conference on Computer
+Vision and Pattern Recognition (CVPR), 2017a.
+
+Qi, C. R., Yi, L., Su, H., and Guibas, L. J. PointNet++: Deep
+Hierarchical Feature Learning on Point Sets in a Metric
+Space. In Advances in Neural Information Processing
+Systems (NeurIPS), 2017b.
+
+Shi, S., Guo, C., Jiang, L., Wang, Z., Shi, J., Wang, X., and
+Li, H. PV-RCNN: Point-Voxel Feature Set Abstraction
+for 3D Object Detection. In IEEE/CVF Conference on
+Computer Vision and Pattern Recognition (CVPR), 2020.
+
+Shi, S., Jiang, L., Deng, J., Wang, Z., Guo, C., Shi, J.,
+Wang, X., and Li, H. PV-RCNN++: Point-Voxel Feature
+Set Abstraction With Local Vector Representation for
+3D Object Detection. arXiv preprint arXiv:2102.00463,
+2021.
+
+Sun, P., Kretzschmar, H., Dotiwalla, X., Chouard, A., Pat-
+naik, V., Tsui, P., Guo, J., Zhou, Y., Chai, Y., Caine, B.,
+Vasudevan, V., Han, W., Ngiam, J., Zhao, H., Timofeev,
+A., Ettinger, S., Krivokon, M., Gao, A., Joshi, A., Zhang,
+Y., Shlens, J., Chen, Z., and Anguelov, D. Scalability
+in Perception for Autonomous Driving: Waymo Open
+Dataset. In IEEE/CVF Conference on Computer Vision
+and Pattern Recognition (CVPR), 2020.
+
+Tang, H., Liu, Z., Zhao, S., Lin, Y., Lin, J., Wang, H., and
+Han, S. Searching Efﬁcient 3D Architectures with Sparse
+Point-Voxel Convolution. In European Conference on
+Computer Vision (ECCV), 2020.
+
+Thomas, H., Qi, C. R., Deschaud, J.-E., Marcotegui, B.,
+Goulette, F., and Guibas, L. J. KPConv: Flexible and
+Deformable Convolution for Point Clouds. In IEEE/CVF
+International Conference on Computer Vision (ICCV),
+2019.
+
+TorchSparse: Efﬁcient Point Cloud Inference Engine
+
+Wang, M., Zheng, D., Ye, Z., Gan, Q., Li, M., Song, X.,
+Zhou, J., Ma, C., Yu, L., Gai, Y., Xiao, T., He, T., Karypis,
+G., Lin, J., and Zhang, Z. Deep Graph Library: A Graph-
+Centric, Highly-Performant Package for Graph Neural
+Networks. arXiv preprint arXiv:1909.01315, 2019a.
+
+Wang, Y., Sun, Y., Liu, Z., Sarma, S. E., Bronstein, M. M.,
+and Solomon, J. M. Dynamic Graph CNN for Learning
+on Point Clouds. In ACM SIGGRAPH, 2019b.
+
+Wu, W., Qi, Z., and Fuxin, L. PointConv: Deep Convo-
+lutional Networks on 3D Point Clouds. In IEEE/CVF
+Conference on Computer Vision and Pattern Recognition
+(CVPR), 2019.
+
+Yan, Y., Mao, Y., and Li, B. SECOND: Sparsely Embedded
+
+Convolutional Detection. Sensors, 2018.
+
+Yin, T., Zhou, X., and Kr¨ahenb¨uhl, P. Center-based 3D
+Object Detection and Tracking. In IEEE/CVF Conference
+on Computer Vision and Pattern Recognition (CVPR),
+2021.
+
+TorchSparse: Efﬁcient Point Cloud Inference Engine
+
+A OUTPUT COORDINATES CALCULATION
+
+Here, we illustrate the output coordinates calculation algo-
+rithm for s > 1 in sparse convolution. We apply a sliding
+window on each input point and check whether each can-
+didate output point within the window passes modular and
+boundary check. If both checks are passed, we add the can-
+didate output point to P out. We ﬁnally ﬁlter out duplicate
+coordinates in P out.
+
+Algorithm 3 Output Coordinates Calculation
+Input: kernel size K, stride s, input coordinates P in,
+
+output coordinates boundary b
+
+Output: output coordinates P out
+
+if s = 1 then
+P out ← P in
+
+else
+
+P out ← ∅
+for p in P in do
+
+# Traverse the neighbors of an input point.
+for δ in ∆D(K) do
+
+# Calculate the candidate coordinates.
+u ← p − δ
+# Add output if it passes modular and boundary check.
+if u % s == 0 and u < s · b then
+
+P out ← P out ∪ {u/s}
+
+end if
+end for
+
+end for
+# Filter out duplicate coordinates.
+P out ← Unique(P out)
+
+end if
+
+Algorithm 4 Grouped Matrix Multiplication
+Input: input features X in, weights W , maps M,
+redundant computation tolerance (cid:15),
+mm/bmm threshold S
+
+Output: output features X out
+
+G ← ∅
+i ← 0
+# Traverse each weight index with unique number of inputs.
+while i < range((cid:98)∆D(K).size/2(cid:99)) do
+nmin ← 0; nmax ← len(M[Wi])
+# Always push the ﬁrst index to the current group.
+g ← {i}; i ← i + 1
+for j in range(i, (cid:98)∆D(K).size/2(cid:99)) do
+
+n ← len(M[Wj])
+nmin ← min{n, nmin}, nmax ← max{n, nmax}
+# Push the index to the group if the ratio no larger than (cid:15).
+if 1 − nmin/nmax ≤ (cid:15) then
+
+g ← g ∪ {j}
+
+else
+
+# Otherwise return and start a new group.
+break
+
+end if
+end for
+# Push the returned group to the groups list.
+G ← G ∪ {g}
+
+B ADAPTIVE GROUPING ALGORITHM
+
+end while
+for g in G do
+
+nmax ← max{len(M[Wi]) for i in g}
+# Pad inputs and apply bmm when workload smaller than S.
+if nmax < S then
+
+gather input feature matrices Fi with X in and M[Wi]
+for i ∈ g; pad zeros to each Fi to become length nmax;
+perform batched matrix multiplication between Fi∈g and
+Wi∈g and then scatter results to corresponding X out
+
+else
+
+# Otherwise apply mm.
+perform Algorithm 2 in main paper with X in
+get X out
+
+i for i ∈ g to
+
+end if
+end for
+
+Here, we provide detailed illustration for the adaptive group-
+ing algorithm. The algorithm is divided into two parts:
+grouped matrix multiplication (Algorithm 4) and adaptive
+group search (Algorithm 5).
+
+B.1 Group Matrix Multiplication
+
+We describe the process of applying the adaptive grouping
+strategies for each layer in Algorithm 4, which is performed
+via two steps. First, we maintain two pointers to track the
+start and the end of the current group. Once 1 − nmin/nmax
+updated by the end pointer exceeds the tolerance of redun-
+dant computation (cid:15), we return the working group to the
+groups list and move pointers to start a new group. Sec-
+ond, for each group, we determine if batched matmul is
+performed on it based on the value of S.
+
+B.2 Adaptive Strategy Search
+
+For each layer, we search for a speciﬁc conﬁguration to con-
+duct adaptive grouping (i.e. auto-tune (cid:15) and S). The tuning
+
+TorchSparse: Efﬁcient Point Cloud Inference Engine
+
+Figure 14: TorchSparse evaluation results in absolute values.
+
+algorithm is shown in Algorithm 5, where we enumerate
+(cid:15), S in a predeﬁned search space (usually < 1000 conﬁgura-
+tions), use Algorithm 4 to perform the matrix multiplication
+for the target layer, and select the (cid:15), S pair which leads to
+the smallest average latency.
+
+Algorithm 5 Adaptive Group Search
+Input: sampled inputs subset D, weights W , maps M,
+
+redundant computation tolerance search space Sa,
+mm/bmm threshold search space Sb
+
+Output: selected redundant computation tolerance (cid:15)∗,
+
+mm/bmm threshold S∗
+
+f ← cost function to compute elapsed time on hardware
+cmin ← 0
+for (cid:15) in Sa do
+
+for S in Sb do
+
+c ← 0
+for X in in D do
+
+c ← c+f (run Algorithm 4 with X in, W , M, (cid:15), S)
+
+end for
+# Update selected conﬁg to {(cid:15), S} for smaller latency.
+if cmin = 0 or c < cmin then
+
+cmin ← c
+(cid:15)∗ ← (cid:15), S∗ ← S
+
+end if
+end for
+
+end for
+
+C RESULTS DETAIL
+
+We show TorchSparse evaluation results in absolute FPS in
+Figure 14. TorchSparse is able to run all models in real-time
+(> 10 FPS) on all hardware platforms.
+
+SK-MinkUNet (1.0x)SK-MinkUNet (0.5x)NS-MinkUNet (3f)NS-MinkUNet (1f)NS-CenterPoint (10f)WM-CenterPoint (3f)WM-CenterPoint (1f)28.323.728.444.844.542.335.523.420.222.925.524.622.218.819.616.722.124.522.821.215.815.212.818.547.632.628.416.817.714.321.330.229.128.120.7Baseline ImplementationMinkowskiEngineSPConv (FP32)SPConv (FP16)TorchSparseSK-MinkUNet (1.0x)SK-MinkUNet (0.5x)NS-MinkUNet (3f)NS-MinkUNet (1f)NS-CenterPoint (10f)WM-CenterPoint (3f)WM-CenterPoint (1f)23.419.625.942.439.636.326.020.717.823.129.927.024.218.114.612.019.525.420.920.312.312.39.916.738.926.824.112.012.89.817.731.926.923.713.6SK-MinkUNet (1.0x)SK-MinkUNet (0.5x)NS-MinkUNet (3f)NS-MinkUNet (1f)NS-CenterPoint (10f)WM-CenterPoint (3f)WM-CenterPoint (1f)12.310.318.331.725.022.312.912.110.116.920.417.118.411.08.87.213.921.616.715.68.36.95.611.034.319.416.67.97.35.612.228.420.216.48.8RTX 3090RTX 2080TiGTX 1080Ti

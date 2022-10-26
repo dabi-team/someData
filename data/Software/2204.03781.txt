@@ -1,0 +1,1920 @@
+2
+2
+0
+2
+
+r
+p
+A
+8
+
+]
+
+R
+C
+.
+s
+c
+[
+
+1
+v
+1
+8
+7
+3
+0
+.
+4
+0
+2
+2
+:
+v
+i
+X
+r
+a
+
+Color My World: Deterministic Tagging for Memory Safety
+
+Hans Liljestrand
+Univresity of Waterloo, Canada
+hans@liljestrand.dev
+
+Carlos Chinea
+Huawei Technologies Oy, Finland
+carlos.chinea.perez@huawei.com
+
+Rémi Denis-Courmont
+Huawei Technologies Oy, Finland
+remi.denis.courmont@huawei.com
+
+Jan-Erik Ekberg
+Huawei Technologies Oy, Finland
+Aalto University, Finland
+jan.erik.ekberg@huawei.com
+
+N. Asokan
+University of Waterloo, Canada
+Aalto University, Finland
+asokan@acm.org
+
+Abstract
+Hardware-assisted memory protection features are increas-
+ingly being deployed in COTS processors. ARMv8.5 Memory
+Tagging Extensions (MTE) is a recent example, which has
+been used to provide probabilistic checks for memory safety.
+This use of MTE is not secure against the standard adversary
+with arbitrary read/write access to memory. Consequently
+MTE is used as a software development tool. In this paper we
+present the ﬁrst design for deterministic memory protection
+using MTE that can resist the standard adversary, and hence
+is suitable for post-deployment memory safety. We describe
+our compiler extensions for LLVM Clang implementing static
+analysis and subsequent MTE instrumentation. Via a compre-
+hensive evaluation we show that our scheme is effective.
+
+1 Introduction
+
+Hardware-assisted memory tagging, originally introduced
+in early computer architectures [22] but largely abandoned
+shortly thereafter, has resurfaced in recent processor architec-
+tures such as lowRISC [3], SPARC M7 [31], and ARMv8.5-
+A [2, 8]. It is a powerful technique that allows detection of
+memory errors using a lock-and-key mechanism where both
+pointers and memory allocations are associated with tags; a
+pointer is allowed to access a chunk of memory if and only if
+both the pointer and the memory allocation have matching tag
+values (“colors”). Tools like hardware-assisted AddressSani-
+tizer (HWASAN) [4] use a randomized tagging scheme to tag
+each memory allocation (and corresponding pointers) with
+a random tag. They can then efﬁciently detect many spatial
+and temporal memory access violations. Since the tags are
+randomly assigned, these tools can only provide a probab-
+listic guarantee of correctness. Furthermore, the guarantee
+is limited because the tags are short (a few bits long). How-
+ever, these tools are typically used for testing in the software
+development phase. In such benign, non-adversarial settings,
+limited correctness guarantees are sufﬁcient.
+
+A natural question is whether and how hardware-assisted
+memory tagging can be used for ensuring run-time memory
+
+safety after deployment. Unlike the software development
+phase, post-deployment is a potentially adversarial environ-
+ment: detecting memory-safety violations after deployment
+therefore must be robust in the presence of an intelligent ad-
+versary. The standard adversary model used in memory safety
+literature assumes an adversary that can exploit a memory vul-
+nerability to read from or write to arbitrary memory locations.
+Memory tagging schemes that use randomized tag assignment
+cannot withstand such an adversary that can (a) learn tag val-
+ues and subsequently inject bogus pointers with correct tags,
+or (b) repeat an attack until injected pointer tags match by
+chance. Therefore, existing memory tagging schemes, with
+their limited probabilistic guarantees, cannot be used directly
+to ensure post-deployment memory safety.
+
+In this paper, we describe the ﬁrst hardware-assisted mem-
+ory tagging approach that enforce post-deployment run-time
+memory protection even in the presence of the standard
+(strong but realistic) adversary that can forge tags and re-
+peat an attack indeﬁnitely. Unlike prior schemes, we target
+deterministic memory protection without using probabilistic
+random tagging. To achieve this, we ﬁrst use static analysis
+to classify memory allocations into different classes based
+on their level of operational safety. But because the mem-
+ory tag of a pointer is embedded within the pointer itself,
+the adversary can overwrite it freely. Consequently, we use a
+tag forgery prevention scheme to prevent attacker-controlled
+pointers from accessing safe allocations. Speciﬁcally, we can
+guarantee the integrity of provably safe allocations even in the
+presence of memory errors that affect the less secure classes.
+Furthermore, our static analysis is memory-tagging aware: it
+can detect allocations that are safe only when coupled with
+our tagging scheme or other similar run-time enforcement.
+
+We realize our scheme using ARMv8.5 Memory Tagging
+Extension (MTE) [2] which is slated to be deployed soon [29].
+Our implementation is based on the LLVM compiler frame-
+work and covers both our static analysis and instrumentation.
+
+We claim the following contributions:
+
+1
+
+ 
+ 
+ 
+ 
+ 
+ 
+• The ﬁrst design for deterministic memory protection
+using hardware-assisted memory tagging, guarantee-
+ing data integrity for safe classes, even against the stan-
+dard adversary that can break prior memory-tagging
+schemes. Our scheme can thus be used to ensure post-
+deployment integrity of protected data. (Section 5)
+• A complete ARMv8.5-A MTE based implementation of
+our design built on the LLVM 12 compiler framework,
+including augmented stack safety analysis (Section 6),
+and compiler back-end modiﬁcations (Section 7). We
+plan to our implementation available as open source.
+• A comprehensive evaluation including security analysis
+(Section 8.1), functional evaluation using QEMU with
+MTE support (Section 8.2), and performance analysis
+using SPEC CPU 2017 (Section 8.3), showing the effec-
+tiveness of our scheme.
+
+2 Background
+
+2.1 ARMv8.5-A Memory Tagging Extension
+
+The ARMv8.5 instruction set architecture (ISA) introduces
+the Memory Tagging Extension (MTE) feature, a hardware
+primitive for memory tagging (colloquially referred to as mem-
+ory coloring) [2, 8]. MTE allows 4-bit tags to be assigned to
+each memory allocation and address (at 16-byte granularity).
+These are referred to as allocation tags and address tags re-
+spectively. An allocation tag is a 4-bit value associated with
+every memory granule (a 16-byte region of memory). Allo-
+cation tags are stored in hardware-protected tag memory. An
+address tag is a 4-bit value stored within the highest-order
+byte of a pointer. ARM-A processors have a top-byte ignore
+(TBI) feature to instruct the memory management hardware to
+ignore the topmost byte during address translation. In conjunc-
+tion, MTE uses the lower half to store the tag value. Allocation
+tags are tracked by the hardware. During any memory access,
+the allocation tag of the accessed memory is compared to the
+address tag of the pointer attempting access (Figure 1). Mem-
+ory accesses that use incorrect tags will trap to the operating
+system, allowing it to choose a course of action.
+
+MTE requires programs to be instrumented with explicit
+MTE-speciﬁc instructions that tag memory and associated
+pointers according to the tagging strategy. To this end, MTE
+provides instructions for writing and reading allocation tags in
+memory, as well as for efﬁciently manipulating the address tag
+bits of a pointer in a register. The addg and subg instructions
+allow a pointer in a register and its tag to be generated based
+on a reference pointer (and tag). stg tags a granule of memory,
+and ldg allows reading the tag of a speciﬁc memory location.
+In total, MTE adds 15 new instructions for operating on the
+MTE tagging framework.
+
+To facilitate efﬁcient operation, MTE also allows
+unchecked accesses in some cases. First, no accesses via the
+stack pointer, or the stack pointer with an immediate offset,
+
+Figure 1: MTE supports “coloring” memory and pointers with
+allocation and address tags, respectively. Memory accesses
+must then use a pointer with the address tag matching the
+allocation tag of the accessed memory. In this example, ptr2
+is denied access to Y because its address tag does not match
+the allocation tag of the addressed memory.
+
+are checked. This allows compiler-generated code that modi-
+ﬁes the stack—e.g., to store local variables in memory—to
+avoid tag checks. MTE also supports unchecked access using
+a wildcard tag. For user space, the wildcard tag is 0b0000 and
+is enabled via the tcr_elx.tcma conﬁguration register. If
+enabled, any pointer with the tag 0b0000 will be designated
+as an unchecked tag and not undergo any tag checks.
+
+MTE can be used in two modes: a synchronous mode
+where mismatching tags immediately trap, or an asynchronous
+mode that only sets a ﬂag to indicate that a mismatch has
+been encountered at some point during execution. The former
+allows for precise error handling, whereas the latter is more
+performant but does not facilitate precise debugging.
+
+Memory tagging can be used to detect spatial and temporal
+memory errors. For example, use-after-free errors for heap
+allocations (or use-after-return for stack allocations) can be
+protected against by assigning random tags to newly allocated
+memory regions and clearing the tags on freeing memory [31].
+Re-allocated memory will, with probability 15
+16 , be assigned
+a different tag, which prevents access by any remaining dan-
+gling pointers. However, because the address tag is stored
+within the pointer itself, such solutions do not lend them-
+selves for post-deployment run-time protection against an
+adversary that can overwrite pointers and their address tags.
+
+2.2 LLVM memory tagging on ARM
+
+At the time of writing LLVM provides two sanitizers that uti-
+lize ARM MTE: the Clang HWASAN [4] and LLVM Mem-
+TagSanitizer [18]. The former, on ARM architectures, uses
+the TBI feature to reserve the most-signiﬁcant byte of pointers
+for a software-deﬁned tag that is also enforced by software-
+only instrumentation that largely targets testing use cases.
+In contrast, MemTagSanitizer is designed to use MTE for
+protecting programs both during testing as well for during
+post-deployment run-time protection. On function entry, it
+selects a random tag for the ﬁrst tagged frame slot, and then
+tags subsequent slots with incrementing tags. This provides
+probabilistic detection of arbitrary memory errors, and can
+
+2
+
+Normal Memory0xF00032345Tagmemoryptr2:0010&YY:ptr1:0011&Y0011Pointersprevent some, but not all, linear buffer overﬂows. Neither
+HWASAN or MemTagSanitizer considers and adversary that
+has arbitrary memory-read access, and therefore, can reliably
+forge tags. In this work, we use the standard adversary model
+typically used in memory protection [35], and speciﬁcally
+consider an adversary that has these abilities.
+
+2.3 LLVM StackSafetyAnalysis
+
+LLVM StackSafetyAnalysis [20] detects stack-based vari-
+ables that are “safe”, i.e., cannot cause memory errors through
+their use. It was originally introduced to support the Clang
+SafeStack [5] used for code-pointer integrity [12], but can
+also be used to optimize approaches such as HWASAN. For
+each stack-based allocation, the analysis indicates the small-
+est memory region that contains all accesses by any direct or
+derived pointer based on the allocation. If the analysis is in-
+conclusive, it indicates that the full memory range is accessed.
+Moreover, StackSafetyAnalysis does not track pointers
+written to memory, and instead assumes such pointers can be
+corrupted or otherwise misused. Without full memory safety
+or fault isolation, this is the only safe assumption.
+
+The StackSafetyAnalysis implementation is split into
+two passes. The ﬁrst intra-procedural pass analyzes the use of
+stack-based allocations and pointer-type function arguments
+within the scope of one function. The access range is always
+relative to the base pointer, i.e., the start of the allocation or
+the initial value of a function argument pointer. A second inter-
+procedural analysis combines the local analysis to facilitate
+tracking of pointers passed between functions. When pointers
+are passed as arguments, the offset to the base pointer is used
+to adjust the argument access range before the ranges are
+merged. As noted above, pointer tracking is not done through
+memory and will conservatively mark untracked pointers as
+accessing the full set of memory addresses.
+
+succeeds. We assume A can repeatedly relaunch and retry an
+attack.
+
+4 Goals and Requirements
+
+Our goal is to partition memory allocations into different pro-
+tection domains based on their memory-safety properties, use
+memory tagging to enforce domain separation, and where
+possible, enforce in-domain memory integrity (e.g., by pre-
+venting overﬂows). The former is similar to the safe stack
+employed by Kuznetsov et al. [12] that aims to isolate prov-
+ably memory-safe data from other data (such as buffers that
+might overﬂow). In particular, we use the notion of memory-
+safe allocations. Informally, a memory-safe allocation is one
+where all pointers based on the allocation are safe, and cannot
+cause overﬂows or other memory errors. See Section 5 for a
+more detailed deﬁnition.
+
+We deﬁne the following requirements for our solution:
+
+R1 Isolate safe allocations: Allow access to a safe allocation
+
+only through legitimate pointers to it.
+
+R2 Isolate unsafe allocations: Prevent unsafe memory ac-
+cesses from compromising data in safe allocations.
+
+R3 Resist address tag forgery: Prevent A from accessing
+
+safe allocations using forged pointers.
+
+R4 Resist buffer overﬂow: Prevent A from exploiting linear
+
+overﬂows to violate allocation bounds.
+
+R5 Resist memory disclosure: Remain effective if A can
+read the entire process address space, including tags.
+
+R6 Be compatible: Be applicable to typical C code, without
+
+source code modiﬁcations.
+
+R7 Be efﬁcient: Impose only minimal run-time performance
+
+and memory overhead, while meeting R2–R6.
+
+3 Adversary Model
+
+5 Design
+
+In this work, we consider a powerful adversary, A, that can
+exploit a memory vulnerability to overwrite program data,
+including pointers and their address tags. We assume that the
+memory is protected with a W⊕X policy. Thus, A can neither
+modify program code nor execute data (e.g., inject and run
+code on the program stack), but can read all process memory,
+including the allocations tags used by MTE. For user-space
+protection, we assume that the operating system is trusted,
+and that A cannot modify MTE conﬁguration. This adversary
+model is consistent with prior work on memory safety [35].
+The ability to read arbitrary memory allows A to determine
+all memory tags used by the process. This renders probabilis-
+tic tagging schemes ineffective against A that can also inject
+arbitrary pointers and tags. However, even without read ac-
+cess to allocation tags, given the limited range from which
+tag values are drawn, A could simply repeat the attack until it
+
+Our design utilizes memory tagging without relying on ran-
+dom or hidden tags (R5), instead we: 1) isolate memory allo-
+cations into distinct protection domains (R1, R2), 2) alternate
+memory tags to prevent linear overﬂows (R4), and 3) prevent
+address tag forgery by explicitly setting tag bits of pointers
+that could be controlled by A (R3). We leverage an MTE-
+aware static analysis (Section 6) to classify memory alloca-
+tions into two distinct protection domains based on whether
+we can guarantee the allocations are memory safe.
+
+We deﬁne an allocation as memory safe if all dereferences
+of pointers based on the allocation are either safe, or cause
+the program to terminate. Our deﬁnition of memory-safe
+allocations is based on Kuznetsov et al., who deﬁne a safe
+dereference as one that only accesses the memory object that
+the pointer is based on, and based on as: “a pointer is based
+on a target object X iff the pointer is obtained at runtime by
+
+3
+
+g_ptr = alloca (64);
+
+1 void func (unsigned end ) {
+char buf_bad [32];
+2
+char buf_lin [32];
+3
+4
+5
+6
+7
+8
+9
+10
+11
+12
+
+buf_bad [ end ] = 0;
+
+buf_lin [i] = i;
+
+// ...
+
+for (unsigned i = 0; i < end ; ++ i)
+
+Figure 2: We tag allocations based on their safety class. Linear
+overﬂows are thwarted by adjusting allocation layout and by
+adding tagged memory guards. The stack frame in the ﬁgure
+corresponds to the example in Listing 1.
+
+(i) allocating X on the heap, (ii) explicitly taking the address
+of X, if X is allocated statically, such as a local or global
+variable, or is a control ﬂow target (including return locations,
+whose addresses are implicitly taken and stored on the stack
+when calling a function), (iii) taking the address of a sub-
+object y of X (e.g., a ﬁeld in the X struct), or (iv) computing a
+pointer expression (e.g., pointer arithmetic, array indexing, or
+simply copying a pointer) involving operands that are either
+themselves based on object X or are not pointers [12].” For
+brevity, we will use safe and unsafe as shorthand to refer to
+memory safe and memory unsafe, respectively.
+
+If all pointer dereferences in a program are safe, then the
+program as a whole is memory safe and each allocation will
+only be modiﬁed by pointers that are based on it. Note that
+without program-wide memory safety, a safe allocation can
+still be corrupted by unsafe pointer dereferences; either using
+pointers based on unsafe allocations or pointers injected by
+A. However, using our MTE tagging scheme and tag forgery
+prevention (explained in Section 5.1), we can prevent such
+corruption (R3) and protect safe allocations without requiring
+full memory safety.
+
+We divide safe allocations into three types: 1) implicit-
+ly-safe allocations that are only dereferenced by compiler–
+generated code and are thus always safe, 2) provably-safe
+allocations for which our analysis can conclusively prove that
+all dereferences of pointers based on the allocation are safe,
+and 3) guarded allocations that cannot be proven safe, but for
+which we can prove that all unsafe dereferences of pointers
+based on the allocation are prevented by our instrumentation.
+Our approaches to protect safe allocations is thus three-fold:
+1) we use static analysis (Section 6) to identify provably-safe
+and guarded allocations by verifying that all dereferences of
+pointers based on those allocations are safe or can be guarded;
+
+4
+
+Listing 1: An example to illustrate the safety categories as-
+signed to allocations. buf_lin belongs to the guarded cate-
+gory, as it is only used in a loop with a known starting point
+and indexing step (Line 9). buf_bad is unsafe because the
+index end is unknown at Line 7. The alloca on Line 5 leaks
+the pointer to a global variable, and so, is treated as unknown.
+
+2) we use MTE to prevent unsafe dereferences using pointers
+based on guarded allocations (Section 5.2) from corrupting
+other allocations; and 3) we apply MTE to isolate unsafe allo-
+cations and tag forgery prevention (Section 5.1) to ensure that
+neither corrupted pointers nor attacker-injected pointers can
+dereference safe allocations. Figure 2 and Listing 1 illustrate
+the different types of allocations and will be used as a running
+example to explain our approach.
+
+To maximize the set of safe allocations we also track point-
+ers when they are stored in memory. Our intent is to guarantee
+that pointers based on safe allocations cannot be corrupted in
+memory or be used in unsafe dereferences. Consequently, if a
+such a pointer is ever stored in a non-safe allocation, we also
+mark the allocation it is based on as unsafe. All other pointers
+stored to or loaded from memory are assumed to be corrupted
+or used unsafely. Because our deﬁnition of memory safety is
+allocation-based we must separately address the problem of
+narrowing [7] with respect to pointers. Consequently, we also
+verify that pointers stored in compound structures—e.g., ptr
+in Listing 2—cannot be corrupted, or else we use tag forgery
+prevention to ensure that such pointers always point to unsafe
+allocations.
+
+5.1
+
+Isolating unsafe allocations and pointers
+
+We isolate unsafe allocations using ARM MTE (Section 2.1).
+At run-time, all unsafe allocations ((cid:193) and (cid:195) in Figure 2), and
+pointers based on them, are tagged as unsafe by clearing the
+topmost tag bit; resulting in a tag of form 0b0xxx. We use
+the default tag, 0b1100, for safe allocations and unallocated
+memory that is initially automatically tagged by the kernel.
+The guarded allocations are similarly tagged as safe, but are
+surrounded by differently tagged guards—either a dedicated
+“red zone” or an unsafe allocation—to prevent unsafe derefer-
+
+return addressframe pointersafestack  framechar buf_bad[32]corruptiblechar buf_lin[32]safe (protected)alloca(64)corruptible②③④①ences. All unsafe allocations and pointers are tagged with the
+unsafe tag, 0b0xxx, tag to isolate them from the memory-safe
+allocations.
+
+If A overwrites a pointer, it might not only point to an arbi-
+trary address, but also have an arbitrary tag value, including
+the safe tag 0b1100. To prevent the use of such pointers, we
+implement tag forgery prevention by clearing the topmost tag
+bit of a loaded pointer, unless it was loaded from a pointer-
+safe allocation (Section 5.3). The address tag could also be
+corrupted by large-enough indexing errors or pointer arith-
+metic that affects the high-order address bits of the pointer.
+To prevent such pointer operations from changing address
+tags, our tag forgery prevention stores the address tag before
+arithmetic operations, and then afterwards writes it back to
+the pointer. In short, where a pointer’s address tag can be
+corrupted or a new pointer injected, such pointers will be
+re-tagged as unsafe before use (R3).
+
+5.2 Realizing guarded allocations
+
+Buffer overﬂows are a common memory error that can be
+completely prevented with MTE. As long as the overﬂow is
+contiguous we can tag adjoining memory with a different tag
+to prevent the overﬂow (e.g., an overﬂow from (cid:194) to (cid:193) in Fig-
+ure 2). For the purpose of our work, we consider an overﬂow
+linear if it is an under- or overﬂow such that its iteration step—
+e.g., how much an iterator is incremented on each loop—and
+element size guarantees that the overﬂow cannot “hop” over
+the adjoining memory granule and avoid detection. We deem
+an allocation as guarded if it is not provably-safe, but can be
+shown to only allow linear overﬂows. The adjoining memory
+can be either another allocation, e.g., a local variable, or a
+compiler-inserted guard zone. We conservatively only assume
+that the adjoining 16-byte MTE granule is tagged differently.
+The stack layout can be optimized to avoid dedicated guards
+when stack variables can be reordered (Section 7.2).
+
+5.3 Detecting safely stored pointers
+
+Implicit compiler-generated allocations are always safe as
+they are exclusively used by the compiler and not exposed
+to the programmer. For instance, the return address ((cid:192) in
+Figure 2) is stored in memory, but never directly accessed
+by program code. Another example are stack slots for local
+variables that are not explicitly referenced by the programmer
+(i.e., that do not “have their address taken”) or “register spills”
+generated by the compiler to temporarily free registers. Such
+implicitly-safe allocations do not require analysis, and will
+use the default safe tag.
+
+In other cases, we must either assume that a pointer stored
+in memory is unsafe, or be able to exhaustively prove that
+the storage location is a safe allocation and that we can deter-
+mine where it is subsequently loaded from memory. However,
+when considering the safety of pointers in memory, memory-
+
+1
+
+struct s { int * ptr ; char buff [ SIZE ]; }
+
+Listing 2: If a variable of type struct s is memory safe, its
+use is guaranteed to never corrupt memory outside its bounds
+or after its lifetime. However, we must additionally verify that
+s.ptr cannot be corrupted by an overﬂow of s.buff without
+violating the memory safety of struct s.
+
+safety as deﬁned above is insufﬁcient. We must also consider
+whether intra-object overﬂows could corrupt a pointer without
+violating the allocation boundaries of the storage location. For
+instance, an array in a data structure can potentially overﬂow
+and corrupt pointers in the structure without violating the
+safety of the allocation as a whole (Listing 2). In addition to
+safety, we thus also consider the pointer-safety of an alloca-
+tion and deem an allocation to be pointer-safe only if it is both
+safe and that pointers stored within it are safe from corrup-
+tion. Otherwise, we say the allocation is pointer-unsafe, and
+assume that any pointers stored within it might be corrupted
+even if the allocation as a whole is safe.
+
+5.4 Compartmentalization
+
+All memory within the program is assigned to different safety
+types as shown in Table 1. We assign tags to allocation classes
+so that we can isolate unsafe allocations, but also to facilitate
+tag forgery prevention at runtime. Speciﬁcally, whenever a
+pointer is loaded from a memory address, we can use the
+tag of the address to determine whether the loaded pointer
+is unsafe (shown in the ptr. load column of Table 1). Any
+pointer loaded from memory not tagged as pointer-safe, is
+tagged as unsafe, and so can only access unsafe memory. Note
+that pointer-safe allocations may contain unsafe pointers, but
+because the location is pointer-safe, we do not need to perform
+tag forgery prevention when loading it.
+
+6 Memory Safety Analysis
+
+We implement our memory safety analysis as two LLVM inter-
+mediate representation (IR) passes extending the functionality
+of the existing stack safety analysis (Section 2.3). It analyzes
+the use of stack allocation represented as alloca instructions
+in the IR. Recall that implicitly-safe allocations—i.e., those
+that are not represented by alloca instructions—are always
+safe and are not analyzed. For all other stack allocations, the
+analysis indicates whether it can prove the allocation to be
+either safe (or guarded), or whether it must be assumed to be
+unsafe. The analysis assumes instrumentation that enforces
+isolation (Section 5.1) and prevents linear overﬂows (Sec-
+tion 5.2). Given such instrumentation, we can use an analysis
+to ﬁnd allocations that:
+1) are memory safe;
+
+5
+
+Safety class/type
+Safe
+implicit
+provable
+provable
+guarded
+guarded
+no
+
+Ptr. safe
+yes
+yes
+no
+yes
+no
+no
+
+Instrumentation
+guarded
+
+ptr. load
+
+tag
+
+0b1100
+0b1100
+0b10xx
+0b1100
+0b10xx
+0b0xxx
+
+—
+—
+—
+guarded
+guarded
+—
+
+—
+—
+unsafe
+—
+unsafe
+unsafe
+
+Table 1: The safety classes and types with corresponding
+run-time instrumentation. The tag column indicates the tag
+set on allocation, and the guarded column indicates whether
+the allocation is surrounded by guards. The ptr. load column
+indicates whether pointers loaded from the allocation are
+unsafe and need tag forgery prevention. Note that the tag is
+statically assigned to the pointer at allocation and then allows
+us to determine the ptr. load action at run-time.
+
+2) can be guarded such that their safety can be guaranteed
+
+at run-time; and,
+
+3) are pointer-safe such that pointers within them are safe,
+and the safety of all pointers loaded from it can be veri-
+ﬁed.
+
+Programmatic analysis of any non-trivial program proper-
+ties is undecidable [28]. Consequently, most static analyses,
+including ours, are approximate. To maintain security, the
+analysis must be conservative and only over-approximate the
+unsafe set of allocations. Moreover, our goal is to not fully
+analyze all memory use, but to maximize the set of allocations
+that can be proven memory safe (Section 5). In this work, we
+present an example analysis building upon the stack safety
+analysis by [12], but our instrumentation strategy is not tied
+to this speciﬁc analysis.
+
+local
+
+Our analysis
+
+consists of a
+
+intra-procedural
+FunctionPass and a later inter-procedural ModulePass
+that collects and merges the local results. While the goal
+is to analyze allocations, the FunctionPass tracks three
+types of pointers: 1) pointers to local allocations, 2) function
+arguments that are pointers, and 3) pointers loaded from
+memory. We call these such pointers base pointers. For each
+base pointer our analysis follows the use of that pointer and
+stores the information in a UseInfo container object. We
+reuse the UseInfo from StackSafetyAnalysis but extend
+it with information needed to support our analysis. When a
+pointer is derived from the base pointer of a UseInfo, we
+refer to it as being based on the UseInfo.
+
+The FunctionPass does not track pointers passed to called
+functions or stored in memory, instead it only records such
+events in the corresponding UseInfo. For each UseInfo U,
+the later ModulePass then either ﬁnds and merge the corre-
+sponding UseInfo for the calls, stores, and loads; or marks
+U as unsafe. We stop processing a UseInfo if it is shown to
+be unsafe. The ModulePass is iterative and continues until
+
+6
+
+Algorithm 1 For each analyzed pointer, the FunctionPass
+creates a UseInfo. It then uses the def-use chain to ﬁnd all
+uses of the allocation and update UseInfo accordingly.
+
+UseIn f o ← new UseInfo(base_pointer)
+WorkList ← base_pointer
+while !WorkList.EMPTY() do
+Ptr ← WorkList.POP()
+for all Use ∈ Ptr.USES() do
+
+if Use.DEFINESNEWPOINTER() then
+
+WorkList ← Use
+else if Use ∈ CallInst then
+UseIn f o.calls ← Ptr
+else if Use ∈ LoadInst then
+
+(cid:46) add ptr to list
+
+UseIn f o.range ← GETRANGE(Use)
+UseIn f o.Dere f edBy ← GETLOADINFO(Use)
+
+else if Use ∈ StoreInst then
+
+if Use.ISPOINTEROP(Ptr) then
+
+(cid:46) ptr used
+
+UseIn f o.range ← GETRANGE(Use)
+
+else
+
+(cid:46) otherwise, ptr itself is stored
+
+UseIn f o.StoredIn ← PtrOp
+
+end if
+
+else
+
+UseIn f o.SETTOUNSAFE
+
+end if
+
+end for
+end while
+
+no further updates take place. To handle cyclic function calls
+and to limit analysis complexity, the analysis depth is limited
+such that any UseInfo reaching the limit is marked as unsafe.
+
+6.1 Detecting safe allocations
+
+The local analysis starts by generating a UseInfo for 1) all
+pointers to local allocations (deﬁned by alloca instructions),
+2) all pointer arguments to the function (as deﬁned by the
+function deﬁnition), and 3) any pointer loaded from mem-
+ory (any load instruction). The UseInfo is used to store
+information on all uses of the base pointer or pointer’s based
+on it. As the LLVM IR is structured in static single assign-
+ment (SSA) form, we can use the base pointer’s deﬁnition-
+use chain—which links variables to any instruction that uses
+them—to track its use throughout the function, as shown
+in Algorithm 1. When a pointer is used to access memory,
+the range of that access is added to the UseInfo. When a
+pointer is passed to another function, the called function and
+offset to the base pointer is recorded in the UseInfo. When
+a new pointer is derived (for instance when incrementing
+an iterator), the new pointer is stored for subsequent analy-
+sis. Finally, to support tracking pointers in memory, we also
+record any pointer loads in the UseInfo.DerefedBy list and
+pointer stores in the UseInfo.StoredIn list. If the analysis
+trivially recognizes pointer uses that are not analyzable by
+
+int A , B;
+int * ptr ;
+// Safe assignment to A
+A = 0;
+// Create pointer to B
+ptr = &B;
+func_2 (& ptr ); // Pass pointer to ptr
+func_2 ( arg );
+
+1 void func_1 (int ** arg ) {
+2
+3
+4
+5
+6
+7
+8 }
+9 void func_2 (int ** ptr ) {
+10
+11
+12 }
+
+for (int i = 0; i
+
+(* ptr )[ i] = 0;
+
+< 10; ++ i)
+
+Listing 3: A function containing three local variables A, B, and
+the pointer ptr. The safety of A can be locally determined.
+However, a pointer to B is passed via ptr into func_2(),
+and so, its safety depends on the safety of the corresponding
+argument of func_2() and how it is used when loaded from.
+
+our algorithm, it will immediately mark the corresponding
+UseInfo as unsafe and avoid further analysis (for instance,
+if an array is indexed using an arbitrary input variable of un-
+known size). As the FunctionPass is local, it cannot resolve
+how pointers passed to called functions are used and instead
+only stores information on the call for later analysis. We also
+defer resolving the use of pointers stored in memory to the
+ModulePass.
+
+Listing 3 shows an example of two functions that can only
+be partially resolved locally. During the FunctionPass, only
+A in func_1 can be determined to be safe, as no references to
+it are passed outside the local scope or written to memory. In
+contrast, a reference to B is stored in memory and then passed
+to the called function, so its safety cannot be determined
+before the ModulePass. When analyzing func_2, the ptr
+argument can be fully analyzed because it is not written to
+memory or used outside the local scope.
+
+The ModulePass resolves any calls or stores of potentially
+safe allocations until each allocation is either exhaustively an-
+alyzed and proven safe, or assumed to be unsafe. It works by
+adding all functions to a work list and then processing the list
+one function at a time, as shown in Algorithm 2. Within a func-
+tion, every UseInfo U is then processed. For each function
+call in U.calls, we query the analysis results for the corre-
+sponding argument UseInfo in the called function and merge
+it to U. For each memory store in U.StoredIn, we query the
+UseInfo.DerefedBy list (populated by Algorithm 1) of that
+storage location and merge these to U. If a pointer is stored
+or loaded in an unsafe location, or if we cannot ﬁnd UseInfo
+for all possible store or load locations of U, then U is marked
+unsafe.
+
+When merging a UseInfo to U, we add the memory access
+ranges, the calls, StoredIn, and DerefedBy lists to U. If the
+processing of a function causes changes in any of its UseInfo
+then all of its callers are re-inserted on the top of the work list.
+
+7
+
+The ModulePass only works with UseInfo objects and does
+not need to process the LLVM IR again.
+
+Algorithm 2 The ModulePass processes functions one at a
+time by updating their contained UseInfo objects.
+
+function RUNMODULEPASS(CallersMap,WorkList)
+
+while !WorkList.ISEMPTY() do
+
+F ← WorkList.POP()
+if F.!INCIFLESSTHAN(LIMIT ) then
+
+F.SETALLTOUNSAFE(U)
+
+else
+
+for all UseInfo U ∈ F do
+
+OriginalU ← U
+for all C ∈ UseIn f o.Calls do
+
+U.MERGECALLEEUSEINFO(C)
+
+end for
+for all C ∈ UseIn f o.StoredIn do
+for all L ∈ C.dere f edBy do
+
+U.MERGELOADUSEINFO(L)
+
+end for
+
+end for
+if (OriginalU (cid:54)= U) then
+
+WorkList.PUSHALL(Callers[F])
+
+end if
+
+end for
+
+end if
+end while
+end function
+
+For example, in Listing 3, the ModulePass will update
+func_1 by going through its set of UseInfo. As ptr has
+func_2 in its calls set, the UseInfo of the corresponding ar-
+gument of func_2 is merged to it. The merge includes not
+only the immediate access range of ptr, but also the addi-
+tional information pertaining to function calls and memory
+stores/loads; in this case, from the UseInfo for the pointer
+dereference at Line 11. Consequently, subsequent updates
+will further propagate this update to the UseInfo of B as well.
+During the analysis, the pointed-to memory location of
+a pointer is typically unknown. In particular, during the
+FunctionPass, pointer arguments passed to the function re-
+main unknown and may point to different memory depending
+on execution / caller context. To accommodate this, all ranges
+are treated as offsets to the value of the base pointer of the
+UseInfo. When merging two UseInfos we then apply the
+offset to the added range before applying it to the destination
+UseInfo. For instance, if a pointer to the 10th element of an
+array is passed to a function, then the resulting range is off-
+set by 10 when merging the UseInfo of the argument to the
+caller’s corresponding UseInfo. At any point, if an offset or
+range cannot be statically determined, the UseInfo is marked
+as unsafe. Consequently, at the end of analysis, the UseInfo
+of each stack allocation either ends up being marked as un-
+safe, or alternatively it can be used to retrieve the memory
+
+Figure 3: The static safety analysis is extended to also track
+the linear access range and maximum index step. These allow
+us to determine when overﬂow protection is needed, and when
+an overﬂow is guaranteed to hit our guard page.
+
+access range to verify that any use of a pointer based on the
+allocation remains within the bounds of the allocation size.
+
+6.2 Detecting linear-overﬂows
+
+In addition to provably memory-safe allocations, our anal-
+ysis also recognizes guarded allocations that can be instru-
+mented to be effectively memory safe or crash at run-time
+(Section 5). For this, we extend UseInfo to separately track
+the arbitrary access ranges and the linear access range (Fig-
+ure 3). To determine whether linear overﬂows can be pre-
+vented using MTE, we also store the information necessary to
+determine 1) whether the linear access starts within bounds,
+and 2) whether the increment / decrement size is less than
+the used MTE memory-tag granule size used by the instru-
+mentation. For example, in Listing 1, buf_lin is always ﬁrst
+accessed within bounds, and guaranteed to hit a different MTE
+memory tag because a single loop iteration increments the
+address by sizeof(unsigned) bytes which is smaller than
+the MTE tagging granule of 16 bytes.
+
+We adapt the memory access range analysis based on
+LLVM’s scalar evolution framework to also determine linear
+access behavior. For instance, in a loop over an array, the
+scalar-evolution indicates the ﬁrst element accessed and how
+the index changes—or, evolves—on each iteration of the loop.
+If the start and indexing steps are known and bounded, we
+treat the access as linear and update the linear access range,
+start range, and indexing step in UseInfo. Otherwise, we
+treat the access as non-linear and only update the arbitrary
+access range. The linear access information is updated along
+with other ranges, as speciﬁed in Algorithms 1 and 2. Con-
+sequently, as long as the arbitrary access range and linear
+access start range of a UseInfo remain within the bounds of
+the allocation, and the indexing step remains bounded, we
+can designate an allocation to be guarded, even if it would
+not otherwise be memory safe.
+
+the general case we need a full program analysis to reason
+about memory safety, the isolation guarantees allow for a
+more lightweight local analysis. As shown in Algorithm 1,
+when our FunctionPass encounters a pointer is stored in
+memory, we either mark the UseInfo unsafe or are able to
+determine a set of UseInfo that includes all possible storage
+locations; which we then store in the UseInfo.StoredIn set.
+Speciﬁcally, we look at the StoreInst and use the use-def
+chain of the pointer operand to determine where the pointer
+might be stored in. We mark the UseInfo unsafe if the use-
+def traversal encounters non-local memory; for instance, if the
+pointer operand is a global variable. Consequently, either each
+possible storage location for a pointer based on an analyzed
+UseInfo U has a corresponding UseInfo in the U.StoredIn
+set, or otherwise, U is marked unsafe. By constraining this
+analysis to local scope, we efﬁciently reach sound results
+without the need for complex full-program safety analysis.
+
+For pointers stored within compound structures the mea-
+sures listed earlier do not provide safety guarantees. As shown
+in Listing 2, such pointers might be corruptible without vi-
+olating the allocations bounds. We address this problem by
+approximating pointer-safety as typed use. The analysis we
+have implemented so far uses a less precise (but still conser-
+vative) approximation that assumes that only allocations of
+pointer-type are pointer-safe. However, we plan to extend our
+implementation based on the following algorithm that utilizes
+type information: We assume that an allocation is pointer-
+safe if we can determine that pointer ﬁelds in a compound
+structure are always used in a typed manner and that any other
+use of the structure cannot overﬂow to those pointer ﬁelds.
+For example, considering an allocation of type struct s in
+Listing 2, our algorithm veriﬁes that all pointers based on
+the base pointer retain the type of the pointer constituents of
+the structure. For instance, if a pointer to struct s is cast
+to a plain char *, we lose the type of the contained pointer
+s.ptr and mark the UseInfo it is based on as pointer unsafe.
+For each memory access, we can then verify that either it is a
+typed use of the pointer, or if not, whether the merged access
+range is guaranteed to not modify pointers within the struc-
+ture. For instance, if s.buff is used, and we cannot prove
+it will not overﬂow, we mark the UseInfo it is based on as
+pointer unsafe. In both cases, pointer-safety always depends
+on the allocation being memory safe to begin with. This
+conservative approach allows us to locally over-approximate
+pointer-safety violations during our FunctionPass, and then,
+in the ModulePass, propagate the pointer-safety state along
+with other UseInfo state.
+
+6.3 Tracking pointers stored in memory
+
+Our safety analysis can also reason about pointers stored in
+memory when the strong isolation provided by MTE can
+guarantee that such pointers remain uncorrupted. Where in
+
+6.4 Analysis results and use
+
+Our instrumentation uses the analysis results to assign each
+stack allocation deﬁned by an alloca to one of the safety
+and pointer-safety types shown in Table 1. All implicitly safe
+allocations will be materialized when the compiler lowers the
+
+8
+
+Allocatedbufferbaselinear access rangestartmax. indexing steptag. The default tag is conﬁgured by the kernel and is on main-
+line Linux set to 0 [6]. We modify the kernel to instead use
+0b1100 as the default tag, which avoids the need for special
+handling of NULL pointers that would otherwise uninten-
+dendly have the safe tag. A second IR pass, MTStackLoad,
+then instruments unsafe pointer operations and loads to realize
+tag forgery prevention (Section 7.1.2).
+
+7.1.1 Tagging
+
+The MTStack pass initially instruments the IR with intrinsics
+to tag stack allocations, which are realized as alloca calls
+in the IR. For each stack allocation MTStack checks if it is
+unsafe, and if so, inserts a llvm.aarch64.settag intrinsic
+to tag the allocation before its use. Compiler intrinsics are
+compiler-deﬁned functions that are lowered to architecture-
+speciﬁc code during machine code generation. Consequently,
+the compiler can optimize the use of intrinsics based on their
+high-level semantics while deferring the detailed machine
+code generation to later. Moreover, we minimize register pres-
+sure when lowering the IR by marking the addg and subg
+instructions that generate tagged pointers as re-materializable;
+i.e., such that tagged pointers can be re-created instead of
+needing to be stored.
+
+To prevent temporal memory errors, MTStack resets the
+tags of all unsafe allocations when the stack frame is released
+on function return. This prevents the use of dangling pointers
+to dead stack frames. For instance, in Listing 1, a pointer to
+the stack allocation on Line 5 is stored in the global variable
+g_ptr, and could be used after the function returns. More-
+over, resetting tags also ensures that unallocated memory is
+returned to its default state. Recall that safe allocations use
+the default tag. Therefore, it and need not be explicitly tagged
+by MTStack.
+
+In most cases, the stack-size, and hence our tagging strat-
+egy, is static. However, MTStack must also tag variable-length
+arrays (VLAs) and memory allocated using the C alloca
+function. We use the same settag intrinsic, but modify the
+instruction selection by extending SelectionDAG to lower it
+to our new pseudo-instruction STGLoopGeneric when either
+the size is unknown or multiple 16-byte granule tag writes
+are needed. Eventually, the AArch64ExpandPseudo then ex-
+pands the pseudo-instruction to the machine code shown in
+Listing 4. This code is currently inlined, but to minimize code
+size, we plan to add a generic function to the C runtime for
+this purpose.
+
+The C alloca poses another challenge because the al-
+located memory is only freed at function exit. Because an
+alloca can be anywhere in the function—including in condi-
+tional blocks—it might not dominate the function return, and
+therefore, not always be executed before return. Consequently,
+we do not a priori know if the corresponding memory needs to
+be re-tagged or not. To handle this case, MTStack marks such
+functions with a new reset-tags attribute. This attribute
+
+Figure 4: The analysis and instrumentation adds passes and
+functionality to both the IR optimizer and the architecture-
+speciﬁc backend. The stack safety analysis is replaced by
+our MTE-aware stack safety analysis (Section 6), and the
+instrumentation is split into a number of modiﬁed and new
+passes outlined in Section 7.
+
+IR into Machine IR; and as mentioned, need not be further an-
+alyzed. Our analysis results only apply to allocations, and do
+not pertain to the run-time safety of speciﬁc pointers; which
+might, at run-time, point to both safe and unsafe pointers at
+different times. Instead, the instrumentation utilizes the anal-
+ysis to assign tags at allocation-time such that the tag forgery
+prevention can ensure that only pointers legitimately based
+on safe allocations can be dereferenced to safe allocations.
+
+7 Instrumentation
+
+Our instrumentation is based on LLVM 12. Figure 4 shows
+an overview of the compiler pipeline and stages modiﬁed by
+our work: 1) the analysis passes described in Section 6 ((cid:182)),
+2) two new transformation passes ((cid:183), (cid:184)), and 3) changes
+to machine code generation ((cid:185)–(cid:188)). In addition to compiler
+changes, we also modify the libc runtime library to enable
+MTE at the start of the process.
+
+7.1 Protecting safe allocations
+
+Our new IR pass, MTStack, is responsible for tagging both
+pointers and memory allocations (Section 7.1.1). It runs our
+memory safety analysis and uses the analysis results to guide
+which allocations to tag (Sections 5.1 and 6.1). We use the
+default tag for safe allocations. Consequently, MTStack only
+needs to tag unsafe allocations and pointers based on them,
+whereas the kernel will initially tag the stack with the default
+
+9
+
+Code generationoptfrontendClang/LLVMselectionDAGAArch64MemoryGuard passNew componentLLVM internal changesTransformationsPrologEpilogInserter(PEI)AArch64ExpandPseudoAnalysislocalinter-proceduralMTStackLoadMTStacktbz
+1
+stg
+2
+sub
+3
+4 . sizecheck :
+cbz
+5
+6 . loop :
+7
+8
+9
+
+st2g
+sub
+cbnz
+
+x10 , #4 , . sizecheck
+x9 , [ x9 ], #16
+x10 , x10 , #16
+
+; range start
+; range size
+
+x10 , . done
+
+x9 , [ x9 ], #32
+x10 , x10 , #32
+x10 , . loop
+
+Listing 4: The expanded AArch64 machine code for the
+STGLoopGeneric pseudo-instruction used to dynamically tag
+memory ranges. We use both the stg and st2g instructions
+to minimize the number of separate tag memory writes.
+
+is used during the function epilogue construction by the
+PrologEpilogInserter (PEI) to insert a STGLoopGeneric
+call that re-tags the whole stack frame to the default tag value
+on return.
+
+Our VLA and C alloca instrumentation also prevents at-
+tacks where such allocations overﬂow the whole stack in order
+to access the heap. Such overﬂows are commonly mitigated
+by following the stack memory with an unmapped memory
+page that causes a fault if written to. Because this only hap-
+pens on write, not allocation, an attacker can avoid this by
+not writing to the unmapped page. In contrast, our instru-
+mentation prevents this attack altogether as a fault would be
+triggered when the memory is initially tagged.
+
+Finally, recall, that on ARMv8.5 MTE the granule size
+is 16 bytes (Section 2.1). Therefore, the instrumentation
+must pad and align all tagged allocations to the granule size.
+For alignment, MTStack uses the existing align attribute
+to set the alignment of allocations in the IR. To avoid un-
+necessary transformation of the IR, we do not add padding
+in MTStack. Instead, allocations that must be padded are
+marked with our new tagged attribute. We then extend the
+MachineFrameInfo to resize the marked stack slots based
+on the tagged attribute
+
+7.1.2 Tag forgery prevention
+
+As described in Section 5.1, we must prevent an attacker
+exploiting unsafe allocations, pointer casts, or pointer arith-
+metic to forge tagged pointers to safe memory allocations.
+MTStackLoad ensures that all corrupted pointer are tagged as
+unsafe, and that pointer arithmetic cannot be used to modify
+address tags. If the pointer was loaded from unsafe memory,
+MTStackLoad clears the topmost bit in the address tag of
+the loaded pointer. As a result, either the loaded pointer was
+stored in safe memory and its address tag remains unchanged;
+or it was loaded from unsafe memory and the topmost tag bit
+will be unset.
+
+As future work, MTStackLoad could optimize tag forgery
+prevention use by omitting instrumentation where safety can
+
+be statically determined. When an allocation is known to
+be unsafe, topmost tag bit can be unconditionally set on any
+pointer loaded from it. Conversely, when an allocation is
+known to be pointer-safe, we need not instrument loads from
+it. Such optimizations cannot be done if the safety of the
+pointer depends on execution context.
+
+MTStackLoad prevents tag forgery realized by ex-
+ploiting (overﬂowing) pointer arithmetic. To do so,
+MTStackLoad instruments the architecture independent
+LLVM getelementptr (GEP) instructions used to represent
+pointer arithmetic in the IR. We add tag forgery prevention
+to any unsafe GEP to prevent it from inadvertently tagging
+pointers as safe.
+
+A special case that avoids the GEP tag forgery prevention
+is casting a pointer to an integer before manipulating it, and
+subsequently casting it back to a pointer. Such casting of
+integer-typed pointers are handled by treating any pointers
+deﬁned by casts from non-pointer types as unsafe, and un-
+conditionally setting the topmost tag bit to zero after the cast.
+Correspondingly, whenever the analysis encounters a pointer
+being cast to an integer, it will mark the allocation it is based
+on as unsafe.
+
+7.2 Preventing linear overﬂows
+
+To realize the guarded safety type, MTStack inserts memory
+guards around guarded allocations (Sections 5.2 and 6.2).
+The tags of a memory guard and its guarded allocation are
+different. The guard can be either explicitly added, otherwise
+unused memory, or it can be an existing allocation with a
+different tag (see Figure 2).
+
+We insert memory-guard allocations and mark them as
+such using our llvm.aarch64.memoryguard intrinsic that
+prevents other passes from removing them because they ap-
+pear unused. During machine code generation, the intrinsic
+is used to identify the stack slot and to mark it as a memory
+guard through an added interface in the MachineFrameInfo
+class. Later, the AArch64MemoryGuard pass will remove re-
+dundant memory guards, for example, if there is already a
+differently tagged unsafe allocations adjoining a guarded al-
+location, then an explicit guard is not needed between them.
+As future work we plan to further optimize stack memory
+consumption by reordering allocations to minimize the need
+for explicit memory guards.
+
+7.3 Pointer-safe tagging
+
+Recall that safe allocations could still allow inter-object cor-
+ruption unless it is also pointer-safe (Sections 5.3 and 6.3).
+To distinguish such safe, but pointer-unsafe allocations, we
+tag them using the 0b1100. Consequently, we can at run-time
+distinguish pointers loaded from pointer-safe allocations, and
+apply tag forgery prevention to all other loaded pointers.
+
+10
+
+8 Evaluation
+
+We evaluate our design and implementation described in Sec-
+tions 5 to 7 in terms of security, functionality, and performance
+with respect to the requirements deﬁned in Section 4.
+
+8.1 Security evaluation
+
+To show that allocations in the safe domain cannot be cor-
+rupted (R1), we start by showing that pointers based on unsafe
+allocations cannot corrupt it (R2) and that the attacker cannot
+forge pointers to the safe domain (R3).
+
+Our memory safety analysis is designed to be conservative
+(Section 6), but not necessarily complete. Hence, it might not
+ﬁnd all safe and pointer-safe allocations, but should guarantee
+that those found are, in fact, safe. To do so, an allocation is
+marked as unsafe if any pointer based on it cannot be tracked,
+cannot be proven to be used safely, or is stored unsafely (Al-
+gorithms 1 and 2). We then rely on MTE to isolate safe alloca-
+tions by exclusively using the safe tags, 0b1100 and 0b1100,
+only for safe allocations. A pointer based on a safe allocation
+cannot, by deﬁnition, corrupt or overﬂow other allocations
+(Section 5), and only safe pointers can are tagged as such
+(Section 6.1). Thus, a safe allocation can only be accessed
+through pointers legitimately based on it (R2).
+
+Signal-handlers can break the typical control-ﬂow of pro-
+gram. However, they will be analyzed and instrumented simi-
+lar to all other functions. Consequently, all pointers used by
+them are local to the control-ﬂow starting from the handler
+entry-point; or they are pointers to unsafe allocations passed
+to the handler via globally-accessible variables.
+
+In order to realize memory storage (and tracking) of point-
+ers based on safe allocations we rely on our pointer-safe
+analysis (Sections 5.3 and 6.3). Pointer-safe allocations are
+a subset of safe allocations that can be proven to not corrupt
+pointers within them and to not allow the loading of arbitrary
+pointers. Consequently, if a pointer is stored in any allocation
+not pointer-safe, we mark it unsafe. On load, we then apply
+tag forgery prevention to any pointer loaded from either un-
+safe allocations or safe, but pointer-unsafe, allocations. This
+prevents A from using any forged pointer that they may have
+injected into pointer-unsafe allocations.
+
+The tag forgery prevention feature of our MTE instrumen-
+tation prevents an attacker introducing other new pointers
+with safe tags via pointer corruption or injection (Sections 5.1
+and 7.1.2). Pointers could be introduced when: 1) casting a
+non-pointer to pointer, or 2) performing unsafe pointer arith-
+metic, or 3) loading a pointer from unsafe memory. When
+casting any non-pointer value to a pointer, the ﬁrst bit of the
+tag is always cleared. Conversely, our analysis also marks an
+allocation as unsafe if any pointers based on it are cast to non-
+pointer values (Section 6.1). This prevents an attacker from
+introducing safe tags by corrupting non-pointer data before
+it is cast to a pointer. To prevent an attacker from exploit-
+
+ing pointer arithmetic to change tags, tag forgery prevention
+copies the tag of a source pointer before pointer arithmetic,
+and then afterwards writes the same tag back. An attacker also
+cannot exploit pointer unsafe allocations to inject pointers to
+the safe domain because any such pointers are subject to tag
+forgery prevention that unconditionally unsets the ﬁrst tag-bit
+on load. Therefore, our tag forgery prevention exhaustively
+prevents forged pointers from accessing safe allocations (R3).
+We use alternating tag values to prevent buffer overﬂows.
+Speciﬁcally, we tag adjacent allocations to realize the guarded
+subset of the safe domain (Section 7.2). Our analysis veri-
+ﬁes that any such guarded overﬂow cannot “jump” past the
+alternating tags by incrementing the pointer more than the
+16-byte memory granule (Section 6.2). Consequently, such
+allocations can be safely added to the safe domain (Item R4).
+We do not rely on random or hidden tags, hence our MTE
+instrumentation is not affected by memory disclosures that
+leak memory tags (R5).
+
+8.2 Functional veriﬁcation
+
+For function testing, we use QEMU 6.0.0, which has support
+for MTE [25]. The emulator replicates MTE functionality on
+architectural level, and so, can be used to test compatibility
+between our instrumentation, MTE, and existing source code.
+We compiled fully instrumented variants of the evaluated
+SPEC CPU 2017 Integer base benchmarks [34] and executed
+them on QEMU 6.0.0. Unfortunately, we were unable to com-
+plete functional evaluation of some benchmarks, and have
+therefore excluded them from our evaluation (See Table 2).
+Inspecting the compatibility issues, our conjuncture is that
+these are caused by the code in the offending benchmarks not
+complying to the C standard [11] or using constructs that can
+lead to undeﬁned behavior; for instance, gcc and perlbench
+benchmarks perform various optimizations by manipulating
+pointers as integers. Difﬁculties in using the 2017 version
+of the SPEC CPU benchmarks have been previously docu-
+mented in [24, 16]. Nonetheless, since the SPEC CPU 2017
+benchmark suite consists of real-world programs, the eval-
+uated tests are a strong indication that our instrumentation
+strategy is widely applicable (R6).
+
+8.3 Performance evaluation
+
+Our performance evaluation covers three aspects of our MTE
+instrumentation overhead: 1) the increase in code size due to
+added instrumentation code, 2) the increase in stack use due
+to the need to align and pad memory, and 3) the increase in ex-
+ecution time due to changes by instrumentation and checks by
+the MTE hardware. For benchmarking, we used the SPECrate
+Integer base benchmarks of the SPEC CPU 2017 [34].
+
+We estimated code and stack size using fully instrumented
+binaries. The code size is estimated by comparing the .text
+section size of non-instrumented and fully instrumented
+
+11
+
+benchmark binaries. As the stack grows and shrinks during
+execution, maximum run-time stack use is not necessarily a
+useful metric. Instead, we gather compile-time statistics and
+measure the average function stack-frame increase through-
+out the whole program. Both the stack-frame size and .text
+size is determined based on fully MTE-instrumented binaries.
+The execution-time overhead cannot be directly measured
+without MTE hardware or cycle-accurate emulators; neither
+is publicly available yet. Therefore, we instrument the bench-
+marks with emulated MTE overhead analogues (Section 8.3.1)
+and run them on a TaiShan 2280 Balanced Model [10] with
+a Kunpeng 920 CPU [37], an ARMv8 class-A CPU without
+MTE support. We measured the run time of each benchmark
+using the GNU/Linux time utility over 10 runs each.
+
+8.3.1 Emulating MTE-instruction overhead
+
+The performance overhead in terms of execution time consist
+of four components: 1) changes in code or memory layout,
+2) address tagging, 3) memory tagging, and 4) tag checks on
+memory access. To measure the instrumentation overhead, we
+ensure that each component is measurable as-is, or by using
+an MTE overhead analogue to estimate an upper bound. We
+now describe our MTE overhead analogue we use for each of
+these four categories.
+
+Code and memory layout changes are caused by the need
+to align allocations to the MTE granule of 16-bytes, increased
+register pressure, and other changes needed to accommodate
+the added code. Where possible, we convert each MTE in-
+struction to an equivalent generic instruction with the same
+arguments. Doing so minimizes code layout changes caused
+by the overhead emulation. In some cases, such as st2g,
+we need multiple general-purpose instructions to achieve to
+emulate a single MTE instruction. However, this does not
+invalidate our upper bound as code layout changes always
+increase code size, never decrease it.
+
+Address tagging is emulated using regular bit manipula-
+tions to modify the address bit of a pointer. The specialized
+MTE instructions are expected to be at least as fast as the
+corresponding bit-manipulation realized with general purpose
+instructions. Similar to any MTE instrumentation, we then
+enable the TBI feature (Section 2.1) to ignore tag bits during
+address translation.
+
+Memory tagging overhead is challenging to estimate with-
+out access to actual tag-memory implementations. However,
+as these operations are specialized to modify tag memory
+(Section 2.1) we can assume that they are optimized to take
+advantage of locality and the CPU caches. Therefore, we use
+regular stores to represent an upper bound on the cost of writ-
+ing to the specialized tag memory. Speciﬁcally, we convert
+all memory tag writes to regular memory writes. For instance,
+when tagging a newly created stack slot, we simulate the mem-
+ory tag write by writing the used pointer into the stack slot
+itself. One special case is the st2g instruction that is used to
+
+write a memory tag to two adjacent 16-byte granules. In some
+cases, the two 4-bit tag writes of st2g could happen on a
+cache-line boundary. To ensure our upper bound accounts for
+this, we continue to use a single write, but shift the address
+by 12-bytes to ensure the emulated MTE overhead causes
+multiple cache-line updates at least as often as st2g would
+have.
+
+Tag checks implemented in hardware are likely to have
+minimal overhead. We cannot simulate the overhead with-
+out substantially inﬂating the estimate. Instead, we use an
+estimate reported for a prior SPARC-based tagging architec-
+ture [32] by adding 1% to the reported measurements.
+
+8.3.2 Results
+
+Benchmark results and statistics on instrumentation are sum-
+marized in Table 2. The geometric mean of the execution-time
+overhead is 16.8%. The worst-case, 531.deepsjeng_r bench-
+mark exercises an alpha-beta tree search, suggesting that the
+overhead is caused by the frequent non-safe memory-accesses
+and pointer manipulations while traversing the tree. Compar-
+ing this to the estimated 7% tag-checking overhead reported
+by [15], suggests that the tag forgery prevention instrumen-
+tation is a not insigniﬁcant contributor to this overhead. We
+expect that the tag forgery prevention overhead can be lowered
+by optimizing it to avoid redundant tag checking. Nonethe-
+less, even it only reaches an overhead of 24.4%, indicating
+that our MTE instrumentation performance overhead is ac-
+ceptable even in worst-case scenarios (R7). In particular, we
+expect that this overhead would be further decreased by more
+accurate analysis and by optimizing the use of stack guards.
+For the binary .text segment size, we see an increase of
+22.1%, geometric mean (geo. mean). The increased size con-
+sists of additional code to tag stack slots, and to perform tag
+forgery prevention. We observe a stack-size increase of 25.2%
+(geo. mean), excluding the tag memory. This overhead is due
+to the need to pad and align tagged allocations to 16-bytes,
+and because guarded allocations must be interleaved such
+that the stack frame is split into disjoint sections with differ-
+ent tags. The memory use overhead, largely depends on how
+stack memory is used; frequent small allocations quickly ac-
+cumulate overhead due to the alignment requirements. Indeed,
+based on our results we see that this widely varies depending
+on the benchmark; from a negligeable 2% increase to a 100%
+increase in average stack size for 557.xz_r.
+
+9 Related Work
+
+Tagged computer architectures emerged in the 1970s to pro-
+vide data typing and data isolation. For instance, the Bur-
+roughs B6700 used memory tags to realize typed mem-
+ory [13]. In these hardware architectures, type and data were
+co-located in registers and often also in memory. Although
+this form of ﬁne-grained memory typing disappeared from
+
+12
+
+Benchmark
+
+505.mcf_r
+520.omnetpp_r
+525.x264_r
+531.deepsjeng_r
+557.xz_r
+geo.mean
+
+Baseline
+time (std.dev)
+650.13 (±8.89)
+775.16 (±7.87)
+151.62 (±0.79)
+383.74 (±0.32)
+157.69 (±1.06)
+
+Instrumented
+time (std.dev)
+736.1 (±0.79)
+854.72 (±8.3)
+176.48 (±0.43)
+473.41 (±2.48)
+182.54 (±0.4)
+
+Safe
+
+time
+4.326% 1.142
+57.75% 1.113
+40.778% 1.174
+21.381% 1.244
+21.794% 1.168
+1.167
+
+Overhead
+stack
+1.015
+1.264
+1.127
+1.061
+2.008
+1.252
+
+.text
+
+1.215
+1.281
+1.261
+1.177
+1.174
+1.221
+
+Table 2: Benchmark results using SPEC CPU 2017 benchmarks and the ref workloads. The % safe indicates how much of
+the stack has been assigned as safe. Results are normalized to a non-instrumented baseline, and overheads are reported as the
+geometric mean. The stack size estimate is based on summing up the static stack size of all functions in the binary. We estimate
+the binary size increase due to instrumentation by measuring the .text section of the resulting binaries.
+
+commercial computing for 50 years, coarse-grained hardware-
+assisted memory tagging has recently re-emerged in contem-
+porary processor designs such as lowRISC [3], SPARC pro-
+cessors with the Application Data Integrity feature [27], and
+AArch64 MTE used by this paper [2]. The CHERI capability
+architecture also uses memory tagging, but only to protect
+the integrity of the capabilities that then include metadata for
+checking validity of memory accesses [36].
+
+Today, Clang HWASAN [32] uses memory tagging to im-
+prove performance of AddressSanitizer (ASAN) [30]. As
+discussed in Section 2.2, HWASAN does not use MTE, but
+rather enables the use of software-deﬁned tagging with the
+TBI feature. HWASAN relies on a purely probabilistic tag-
+ging scheme for detection of memory errors. Given the risk of
+tag forgery, the limited tag size, and the probabilistic approach
+to tag allocation, HWASAN is mainly used as a testing tool,
+rather than as a run-time protection scheme.
+
+In contrast, LLVM’s MemTagSanitizer [18] targets post-
+deployment run-time protection. Currently, it only supports
+stack protection, although heap-protection is planned via the
+Scudo hardened allocator [19]. While MemTagSanitizer is
+nominally intended to provide run-time protection, it is not
+designed for the standard adversary model (Section 3) for
+memory safety. Speciﬁcally, it cannot withstand an adversary
+that can read tags, and subsequently, inject correctly-tagged
+pointers. Moreover, while it prevents most overﬂows, it relies
+on random tagging to detect arbitrary writes and use-after-free
+type errors. In contrast, we target the standard, more powerful,
+adversary model. Nonetheless, MemTagSanitizer could be
+combined with our work to mitigate errors between unsafe
+allocations, while using our instrumentation and tag forgery
+prevention to guarantee the integrity of safe allocations.
+
+The recent HAKC uses both ARM Pointer Authentication
+(PA) and MTE to realize compartmentalization within the
+kernel [23]. PA also covers the MTE bits in a pointer, and
+HAKC relies on it for tag integrity. It requires the developer
+to deﬁne compartmentalization policies for the kernel and to
+explicitly deﬁne data-ownership transfers between different
+modules. Consequently, the overhead also heavily depends on
+
+the compartmentalization strategy, ranging from 2%-%4 in
+a single-compartment case, to a linear increase of 14%-19%
+percent per compartment.
+
+We build upon the SafeStackAnalysis introduced by [12].
+In their work, safe allocations are protected by moving them
+to a Safe Stack at a randomized location. It relies on address-
+space layout randomization (ASLR) which is not resistant
+to the standard adversary model that includes full memory
+disclosure [32]. Relying on shadow stacks also changes the
+system application binary interface (ABI), making integration
+with legacy code difﬁcult.
+
+The more recent Data Guard [9] introduces an improved
+static analysis scheme that, similar to our work, can recognize
+pointers that are safely stored. While their analysis accuracy
+is impressive, Data Guard uses Safe Stack for protection, with
+the shortcomings listed above.
+
+WIT is a data-ﬂow integrity (DFI) scheme that uses
+software-based memory tagging to restrict data-writes to only
+allowed objects based on a data-ﬂow graph [1]. It uses a sep-
+arate metadata table to store tags and static run-time checks
+to verify that written memory is tagged with one of the ex-
+pected values. Because WIT uses static checks, it cannot, at
+run-time, distinguish between different valid pointers that can
+be differentiated by MTE address tags. HDFI [33] describes
+RISC-V support for tagging, and similarly to WIT, uses it for
+DFI,shows its applicability to coarse-grained isolation, and as
+a building-block for memory safety solutions such as shadow
+stacks. HDFI reports very low overhead (< 2%), but uses only
+a single tag bit, and requires static checks using speciﬁc load
+and store instructions.
+
+10 Conclusions and Future Work
+
+The ﬁrst processors with MTE was announced very re-
+cently [29]. It is reasonable to expect other ARM processor
+manufacturers to follow suit. Therefore, our work exploring
+novel ways of using MTE is timely. A clear direction for
+future implementors of memory tagging schemes like ARM
+MTE is to incorporate support for our tag forgery prevention
+
+13
+
+into their hardware design which can substantially reduce the
+performance overhead. Languages such as Rust [21] can often
+be combined with unsafe code, weakening the memory-safety
+guarantees provided by the language. Previous work has ad-
+dressed this with coarse-grained fault-isolation [14], more
+ﬁne-grained solutions could offer better performance and ﬂex-
+ibility. Such language front-ends already use powerful safety
+analysis for “safe” code and can provide this information to
+the compiler-back end via IR safety hint attributes. To this
+end, our implementation of MTStack adheres to allocation
+safety hints by ignoring our IR-based analysis and treating
+such allocations as safe, and thus preventing unsafe alloca-
+tions from corrupting allocations deemed safe by the language
+front-end. In ongoing parallel work, we have prototyped this
+feature with the LLVM Rustc compiler, and consider this to
+be a promising direction in general.
+
+While our current work is focused on stack-protection, our
+work is compatible with complimentary tagging techniques
+that mitigate errors on the heap. We also plan to evaluate our
+analysis and instrumentation strategy for heap-based alloca-
+tions and global variables.
+
+Our current work only reasons about pointers in memory to
+a limited degree, thus limiting the pointers we can assume are
+safe, and consequently increasing instrumentation overhead.
+While more accurate static analysis can improve the situation,
+not all pointers will be proven safe. The recently introduced
+ARM PA extension could alleviate this by providing prob-
+abilistic integrity guarantees for pointers stored in memory
+even if they cannot be proven pointer-safe [26, 16, 17]. As PA
+also protects address tags, this could allow the software-based
+tag forgery prevention to be dropped, consequently offsetting
+the overhead cause by the PA instrumentation. Similarly, the
+memory consumption due to introduced guard pages can be
+efﬁciently optimized in the compiler by allocation placement
+so that adjoining allocations in the stack carry different tags—
+this also enables support for larger guard areas, allowing cases
+with more linear overﬂow to be awarded guarded allocation
+status.
+
+In this paper we presented a MTE-based compartmentaliza-
+tion design, that fully protects the stack control-ﬂow data and
+data that can be proven safe. We claim this is the ﬁrst attempt
+towards achieving deterministic memory protection using
+hardware memory tagging; particularly in a strong adversary
+model that does not rely on any secret run-time information.
+Acknowledgements. This work is supported in part by Nat-
+ural Sciences and Engineering Research Council of Canada
+(RGPIN-2020-04744) and Intel Labs via the Private-AI con-
+sortium.
+
+References
+
+[1] Periklis Akritidis et al. “Preventing Memory Error Ex-
+ploits with WIT”. In: Proceedings of the 2008 IEEE
+
+Symposium on Security and Privacy (SP ’08) (SP ’08).
+SP ’08. Oakland, CA, USA, 2008, pp. 263–277.
+
+[2] ARM Ltd. Armv8.5-A Memory Tagging Extension.
+
+Whitepaper. 2019.
+
+[3] Alex Bradbury, Gavin Ferris, and Robert Mullins.
+Tagged Memory and Minion Cores in the lowRISC SoC.
+lowRISC-MEMO 2014-001. University of Cambridge,
+2014.
+
+[4] Clang team. Hardware-Assisted AddressSanitizer
+Design Documentation — Clang 11 Documentation.
+Clang 11 documentation. 2020. URL: https : / /
+releases.llvm.org/11.0.0/tools/clang/docs/
+.
+HardwareAssistedAddressSanitizerDesign
+html (visited on 11/25/2020).
+
+[5] Clang team. SafeStack — Clang 11 Documentation.
+Clang 11 documentation. 2020. URL: https : / /
+releases.llvm.org/11.0.0/tools/clang/docs/
+SafeStack.html (visited on 11/25/2020).
+
+[6] Vincenzo Frascino and Catalin Marinas. Memory Tag-
+ging Extension (MTE) in AArch64 Linux. The Linux
+Kernel documentation. 2020. URL: https : / / www .
+kernel.org/doc/html/latest/arm64/memory-
+tagging-extension.html (visited on 02/02/2022).
+
+[7] Ronald Gil, Hamed Okhravi, and Howard Shrobe.
+“There’s a Hole in the Bottom of the C: On the Ef-
+fectiveness of Allocation Protection”. In: Proceedings
+of the 2018 IEEE Cybersecurity Development. SecDev
+’18. Cambridge, MA, USA, 2018, pp. 102–109.
+
+[8] Matthew Gretton-Dann. Arm A-proﬁle Architecture
+Developments 2018: Armv8.5-A. 2018. URL: https:
+//community.arm.com/developer/ip-products/
+processors/b/processors-ip-blog/posts/arm-
+a- profile- architecture- 2018- developments-
+armv85a (visited on 05/27/2020).
+
+[9] Kaiming Huang et al. “The Taming of the Stack: Isolat-
+ing Stack Data from Memory Errors”. In: Proceedings
+of the Network and Distributed Systems Security Sym-
+posium 2022. NDSS ’22. San Diego, CA, USA, 2022,
+p. 17.
+
+[10] Huawei. TaiShan Server Data Sheet. Huawei En-
+terprise. 2020. URL: https : / / e . huawei .
+com / en / material / datacenter / server /
+7a0b8b0f056f479f909220ac21915999 (visited on
+01/25/2022).
+
+[11]
+
+ISO/IEC. ISO/IEC 9899:2018 - Information Technol-
+ogy — Programming Languages — C. ISO. URL:
+https : / / www . iso . org / standard / 74528 . html
+(visited on 03/07/2022).
+
+14
+
+[12] Volodymyr Kuznetsov, László Szekeres, and Mathias
+Payer. “Code-Pointer Integrity”. In: Proceedings of
+the 11th USENIX Symposium on Operating Systems
+Design and Implementation. OSDI ’14. Broomﬁeld,
+CO, USA, 2014, pp. 147–163.
+
+[13] C. A. Lakos. “Implementing BCPL on the Burroughs
+B6700”. In: Software: Practice and Experience 10.8
+(1980), pp. 673–683.
+
+[14] Benjamin Lamowski et al. “Sandcrust: Automatic
+Sandboxing of Unsafe Components in Rust”. In: Pro-
+ceedings of the 9th Workshop on Programming Lan-
+guages and Operating Systems. PLOS’17. Shanghai,
+China, 2017, pp. 51–57.
+
+[15] Michael LeMay et al. “Cryptographic Capability Com-
+puting”. In: MICRO-54: 54th Annual IEEE/ACM In-
+ternational Symposium on Microarchitecture. MICRO
+’21. New York, NY, USA, 2021, pp. 253–267.
+
+[16] Hans Liljestrand et al. “PAC It up: Towards Pointer
+Integrity Using ARM Pointer Authentication”. In: Pro-
+ceedings of the 28th USENIX Security Symposium
+(USENIX Security ’19). USENIX Security ’19. Santa
+Clara, CA, USA, 2019, pp. 177–194.
+
+[17] Hans Liljestrand et al. “PACStack: An Authenticated
+Call Stack”. In: Proceedings of the 30th USENIX Secu-
+rity Symposium (USENIX Security ’21). Virtual, 2021,
+pp. 357–374.
+
+[18] LLVM. MemTagSanitizer — LLVM 11 Documenta-
+tion. LLVM 11 documentation. 2020. URL: https :
+/ / releases . llvm . org / 11 . 0 . 0 / docs /
+MemTagSanitizer.html (visited on 11/25/2020).
+
+[19] LLVM. Scudo Hardened Allocator — LLVM 11 Doc-
+umentation. LLVM 11 documentation. 2020. URL:
+https : / / releases . llvm . org / 11 . 0 . 0 /
+docs/ScudoHardenedAllocator.html (visited on
+11/26/2020).
+
+[20] LLVM. Stack Safety Analysis — LLVM 11 Docu-
+mentation. LLVM 11 documentation. 2020. URL:
+https : / / releases . llvm . org / 11 . 0 . 0 /
+docs / StackSafetyAnalysis . html (visited on
+11/25/2020).
+
+[21] Nicholas D Matsakis and Felix S Klock II. “The Rust
+Language”. In: Proceedings of the 2014 ACM SIGAda
+Annual Conference on High Integrity Language Tech-
+nology. Vol. 34. HILT ’14. Portland, OR, USA, 2014,
+pp. 103–104.
+
+[22] Alastair J. W. Mayer. “The Architecture of the Bur-
+roughs B5000: 20 Years Later and Still Ahead of the
+Times?” In: ACM SIGARCH Computer Architecture
+News 10.4 (1982), pp. 3–10.
+
+[23] Derrick McKee et al. “Preventing Kernel Hacks with
+HAKC”. In: Proceedings 2022 Network and Dis-
+tributed System Security Symposium. NDSS ’22. San
+Diego, CA, USA, 2022, pp. 1–17.
+
+[24] Reena Panda et al. “Wait of a Decade: Did SPEC CPU
+2017 Broaden the Performance Horizon?” In: 2018
+IEEE International Symposium on High Performance
+Computer Architecture. HPCA ’18. 2018, pp. 271–282.
+
+[25] QEMU Team. QEMU. URL: https : / / www . qemu .
+
+org/ (visited on 11/07/2021).
+
+[26] Qualcomm. Pointer Authentication on ARMv8.3: De-
+sign and Analysis of the New Software Security Instruc-
+tions. 2017.
+
+[27]
+
+Ivo Raisr. “Application Data Integrity”. Presented at
+the UK Oracle User Group Technology Conference &
+Exhibition 2016. 2016.
+
+[28] H. G. Rice. “Classes of Recursively Enumerable Sets
+and Their Decision Problems”. In: Transactions of the
+American Mathematical Society 74.2 (1953), pp. 358–
+366.
+
+[29] Samsung. Samsung Introduces Game Changing
+Exynos 2200 Processor with Xclipse GPU Powered
+by AMD RDNA 2 Architecture. Samsung Newsroom.
+2022. URL: https : / / news . samsung . com /
+global / samsung - introduces - game - changing -
+exynos - 2200 - processor - with - xclipse - gpu -
+powered-by-amd-rdna-2-architecture (visited
+on 02/01/2022).
+
+[30] Konstantin Serebryany et al. “AddressSanitizer: A Fast
+Address Sanity Checker”. In: Presented as Part of the
+2012 USENIX Annual Technical Conference. USENIX
+ATC ’12. Boston, MA, USA, 2012, pp. 309–318.
+
+[31] Kostya Serebryany. “ARM Memory Tagging Exten-
+sion and How It Improves C/C++ Memory Safety”. In:
+USENIX ;login: 44.2 (2019), pp. 12–16.
+
+[32] Kostya Serebryany et al. Memory Tagging and How
+It Improves C/C++ Memory Safety. 2018. URL: http:
+/ / arxiv . org / abs / 1802 . 09517 (visited on
+11/26/2020).
+
+[33] C. Song et al. “HDFI: Hardware-assisted Data-Flow
+Isolation”. In: Proceedings of the 2016 IEEE Sympo-
+sium on Security and Privacy. SP ’16. San Jose, CA,
+USA, 2016, pp. 1–17.
+
+[34] Standard Performance Evaluation Corporation. SPEC
+CPU® 2017. 2019. URL: https://www.spec.org/
+cpu2017/ (visited on 12/06/2020).
+
+[35] László Szekeres et al. “SoK: Eternal War in Memory”.
+In: Proceedings of the 2013 IEEE Symposium on Se-
+curity and Privacy. SP ’13. San Francisco, CA, USA,
+2013, pp. 48–62.
+
+15
+
+[36] Robert N.M. Watson et al. “CHERI: A Hybrid
+Capability-System Architecture for Scalable Software
+Compartmentalization”. In: Proceedings of the 2015
+IEEE Symposium on Security and Privacy. Vol. 2015-
+July. SP ’15. San Jose, CA, USA, 2015, pp. 20–37.
+
+[37]
+
+Jing Xia et al. “Kunpeng 920: The First 7-Nm Chiplet-
+Based 64-Core ARM SoC for Cloud Services”. In:
+IEEE Micro 41.5 (2021), pp. 67–75.
+
+16
+
+

@@ -1,0 +1,1505 @@
+9
+1
+0
+2
+
+n
+u
+J
+
+7
+
+]
+L
+M
+
+.
+t
+a
+t
+s
+[
+
+1
+v
+8
+2
+0
+3
+0
+.
+6
+0
+9
+1
+:
+v
+i
+X
+r
+a
+
+Automatic Reparameterisation of Probabilistic Programs
+
+Maria I. Gorinova ∗
+University of Edinburgh
+Edinburgh, UK
+m.gorinova@ed.ac.uk
+
+Dave Moore
+Google
+San Francisco, CA
+davmre@google.com
+
+Matthew D. Hoffman
+Google
+San Francisco, CA
+mhoffman@google.com
+
+Abstract
+
+Probabilistic programming has emerged as a powerful paradigm in statistics, ap-
+plied science, and machine learning: by decoupling modelling from inference, it
+promises to allow modellers to directly reason about the processes generating data.
+However, the performance of inference algorithms can be dramatically affected by
+the parameterisation used to express a model, requiring users to transform their
+programs in non-intuitive ways. We argue for automating these transformations,
+and demonstrate that mechanisms available in recent modeling frameworks can im-
+plement non-centring and related reparameterisations. This enables new inference
+algorithms, and we propose two: a simple approach using interleaved sampling and
+a novel variational formulation that searches over a continuous space of parameter-
+isations. We show that these approaches enable robust inference across a range of
+models, and can yield more efﬁcient samplers than the best ﬁxed parameterisation.
+
+1
+
+Introduction
+
+Reparameterising a probabilistic model means expressing it in terms of new variables deﬁned by a
+bijective transformation of the original variables of interest. The reparameterised model expresses
+the same statistical assumptions as the original, but can have drastically different posterior geometry,
+with signiﬁcant implications for both variational and sampling-based inference algorithms.
+
+Non-centring is a particularly common form of reparameterisation in Bayesian hierarchical models.
+Consider a random variable z ∼ N (µ, σ); we say this is in centred parameterisation (CP). If we
+instead work with an auxiliary, standard normal variable ˜z ∼ N (0, 1), and obtain z by applying
+the transformation z = µ + σ˜z, we say the variable ˜z is in its non-centred parameterisation (NCP).
+Although the centred parameterisation is often more intuitive, non-centring can dramatically improve
+the performance of inference (Betancourt and Girolami, 2015). Neal’s funnel (Figure 1a) provides a
+simple example: most Markov chain Monte Carlo (MCMC) algorithms have trouble sampling from
+the funnel due to the strong non-linear dependence between latent variables. Non-centring the model
+removes this dependence, converting the funnel into a spherical Gaussian distribution.
+
+Bayesian practitioners are often advised to manually non-centre their models (Stan Development
+Team et al., 2016); however, this breaks the separation between modelling and inference and requires
+expressing the model in a potentially less intuitive form. Moreover, it requires the user to understand
+the concept of non-centring and to know a priori where in the model it might be appropriate. Because
+the best parameterisation for a given model may vary across datasets, even experts may need to
+ﬁnd the optimal parameterisation by trial and error, burdening modellers and slowing the model
+development loop (Blei, 2014).
+
+We propose that non-centring and similar reparameterisations be handled automatically by probabilis-
+tic programming systems. We demonstrate how such program transformations may be implemented
+using the effect handling mechanisms present in several modern deep probabilistic programming
+
+∗Work done while interning at Google.
+
+Preprint. Under review.
+
+ 
+ 
+ 
+ 
+ 
+ 
+NealsFunnel(z, x) :
+
+z ∼ N (0, 3)
+x ∼ N (0, exp(z/2))
+
+z = 0
+lpz = log pN (z | 0, 3)
+x = 0
+lpx = log pN (x | 0, exp(z/2))
+
+(a) Centred (left) and non-centred
+(right) parameterisation.
+
+(b) Model that generates
+variables z and x.
+
+(c) The model in the context of
+log_prob_at_0.
+
+Figure 1: Neal’s funnel (Neal, 2003): z ∼ N (0, 3); x ∼ N (0, ez/2).
+
+frameworks, and consider two inference algorithms enabled by automatic reparameterisation: in-
+terleaved Hamiltonian Monte Carlo (iHMC), which alternates HMC steps between centred and
+non-centred parameterisations, and a novel algorithm we call Variationally Inferred Parameterisation
+(VIP), which searches over a continuous space of reparameterisations that includes non-centring as a
+special case.2 Experiments demonstrate that these strategies enable robust inference, performing
+at least as well as the best ﬁxed parameterisation across a range of models, and sometimes better,
+without requiring a priori knowledge of the optimal parameterisation.
+
+2 Related work
+
+The value of non-centring is well-known to MCMC practitioners and researchers (Stan Development
+Team et al., 2016; Betancourt and Girolami, 2015), and can also lead to better variational ﬁts in
+hierarchical models (Yao et al., 2018). However, the literature largely treats this as a modelling
+choice; Yao et al. (2018) propose that “there is no general rule to determine whether non-centred
+parameterisation is better than the centred one.” We are not aware of prior work that treats non-
+centring directly as a computational phenomenon to be exploited by inference systems.
+
+Non-centred parameterisation of probabilistic models can be seen as analogous to the reparameterisa-
+tion trick in stochastic optimisation (Kingma and Welling, 2013); both involve expressing a variable in
+terms of a diffeomorphic transformation from a "standardised" variable. In the context of probabilistic
+inference, these are complementary tools: the reparameterisation trick yields low-variance stochastic
+gradients of variational objectives, whereas non-centring changes the geometry of the posterior itself,
+leading to qualitatively different variational ﬁts and MCMC trajectories.
+
+In the context of Gibbs sampling, Papaspiliopoulos et al. (2007) introduce a family of partially
+non-centred parameterisations equivalent to those we use in VIP (described below) and show that it
+improves mixing in a spatial GLMM. Our current work can be viewed as an extension of this work
+that mechanically reparameterises user-provided models and automates the choice of parameterisation.
+Similarly, Yu and Meng (2011) proposed a Gibbs sampling scheme that interleaves steps in centered
+and non-centered parameterisations; our interleaved HMC algorithm can be viewed as an automated,
+gradient-based descendent of their scheme.
+
+Recently, there has been work on accelerating MCMC inference through learned reparameterisation:
+Parno and Marzouk (2018) and Hoffman et al. (2019) run samplers in the image of a bijective map
+ﬁtted to transform the target distribution approximately to an isotropic Gaussian. These may be viewed
+as ‘black-box’ methods that rely on learning the target geometry, potentially using highly expressive
+neural variational models, while we use probabilistic-program transformations to apply ‘white-box’
+reparameterisations similar to those a modeller could in principle implement themselves. Because
+they exploit model structure, white-box approaches can correct pathologies such as those of Neal’s
+funnel (Figure 1a) directly, reliably, and at much lower cost (in parameters and inference overhead)
+than black-box models. White- and black-box reparameterisations are not mutually exclusive, and
+may have complementary advantages; combining them is a likely fruitful direction for improving
+inference in structured models.
+
+2Code for these algorithms and experiments is available at https://github.com/mgorinova/
+
+autoreparam
+
+2
+
+θ
+
+µ
+
+θ
+
+˜µ
+
+yn
+
+yn
+
+n = 1, ..., N
+
+n = 1, ..., N
+
+(a) Centred.
+
+(b) Non-centred.
+
+(c) The condition number as a function of the data’s strength.
+
+Figure 2: Effects of reparameterising a simple model with known posterior.
+
+3 Understanding the effects of parameterisation
+
+Non-centring reparameterisation is not always optimal; its usefulness depends on properties of both
+the model and the observed data. In this section, we work with a simple hierarchical model for
+which we can derive the posterior analytically. Consider a simple realisation of a model discussed by
+Betancourt and Girolami (2015, (2)), where for a vector of N datapoints y, and some given constants
+σ and σµ, we have:
+
+θ ∼ N (0, 1)
+
+µ ∼ N (θ, σµ)
+
+yn ∼ N (µ, σ) for all n ∈ 1 . . . N
+
+In the non-centred model, y is deﬁned in terms of ˜µ and θ, where ˜µ is a standard Gaussian variable:
+
+θ ∼ N (0, 1)
+
+˜µ ∼ N (0, 1)
+
+yn ∼ N (θ + σµ ˜µ, σ) for all n ∈ 1 . . . N
+
+Figure 2a and Figure 2b show the graphical models for the two parameterisations. In the non-centred
+case, the direct dependency between θ and µ is substituted by a conditional dependency given the data
+y, which creates an “explaining away” effect. Intuitively, this means that the stronger the evidence y
+is (large N , and small variance), the stronger the dependency between θ and ˜µ becomes, creating a
+poorly-conditioned posterior that may slow inference.
+
+As the Gaussian distribution is self-conjugate, the posterior distribution in each case (centred or
+non-centred) is also a Gaussian distribution, and we can analytically inspect its covariance matrix
+V . To quantify the quality of the parameterisation in each case, we investigate the condition number
+κ of the posterior covariance matrix under the optimal diagonal preconditioner. This models the
+common practice (implemented as the default in tools such as PyMC3 and Stan and followed in our
+experiments) of sampling using a ﬁtted diagonal preconditioner.
+
+Figure 2c shows the condition numbers κCP and κNCP for each parameterisation as a function of
+q = N/σ2; the full derivation is in Appendix A. This ﬁgure conﬁrms the intuition that the non-
+centred parameterisation is better suited for situation when the evidence is weak, while strong
+evidence calls for centred parameterisation. In this example we can exactly determine the optimal
+parameterisation, since the model has only one variable that can be reparameterised and the posterior
+has a closed form. In more realistic settings, even experts cannot predict the optimal parameterisation
+for hierarchical models with many variables and groups of data, and the wrong choice can lead not
+just to poor conditioning but to heavy tails or other pathological geometry.
+
+4 Reparameterising probabilistic programs
+
+An advantage of probabilistic programming is that the program itself provides a structured model
+representation, and we can explore model reparameterisation through the lens of program transforma-
+tions. In this paper, we focus on transforming generative probabilistic programs where the program
+represents a sampling process describing how the data was generated from some unknown latent
+variables. Most probabilistic programming languages (PPLs) provide some mechanism for transform-
+ing a generative process into an inference program; our automatic reparameterisation approach is
+applicable to PPLs that transform generative programs using effect handling. This includes modern
+deep PPLs such as Pyro (Uber AI Labs, 2017) and Edward2 (Tran et al., 2018).
+
+3
+
+4.1 Effect handling-based probabilistic programming
+
+Consider a generative program, where running the program forward generates samples from the prior
+over latent variables and data. Effect handling-based PPLs treat generating a random variable within
+such a model as an effectful operation (an operation that is understood as having side effects) and
+provide ways for resolving this operation in the form of effect handlers, to allow for inference. For
+example, we often need to transform a statement that generates a random variable to a statement that
+evaluates some (log) density or mass function. We can implement this using an effect handler:
+log_prob_at_0 = handler {v ∼ D(a1, . . . , aN ) (cid:55)→ v = 0; lpv = log pD(v | a1, . . . , aN )}3
+The handler log_prob_at_0 handles statements of the form v ∼ D(a1, . . . , aN ). The meaning
+of such statements is normally “sample a random variable from the distribution D(a1, . . . , aN )
+and record its value in v”. However, when executed in the context of log_prob_at_0 (we write
+with log_prob_at_0 handle model), statements that contain random-variable constructions are
+handled by setting the value of the variable v to 0, then evaluating the log density (or mass) function
+of D(a1, . . . , aN ) at v = 0 and recording its value in a new (program) variable lpv.
+For example, consider the function implementing Neal’s funnel in Figure 1b. When executed
+without any context, this function generates two random variables, z and x. When executed in the
+context of the log_prob_at_0 handler, it does not generate random variables, but it instead evaluates
+log pN (z | 0, 3) and log pN (x | 0, exp(z/2)) (Figure 1c).
+
+This approach can be extended to produce a function that corresponds to the log joint density (or mass)
+function of the latent variables of the model. In §§ B.1, we give the pseudo-code implementation
+of a function make_log_joint, which takes a model M (z | x) — that generates latent variables z
+and generates and observes data x — and returns the function f (z) = log p(z, x). This is a core
+operation, as it transforms a generative model into a function proportional to the posterior distribution,
+which can be repeatedly evaluated and automatically differentiated to perform inference.
+
+More generally, effectful operations are operations that can have side effects, e.g. writing to a ﬁle.
+The programming languages literature formalises cases where impure behaviour arises from a set of
+effectful operations in terms of algebraic effects and their handlers (Plotkin and Power, 2001; Plotkin
+and Pretnar, 2009; Pretnar, 2015). A concrete implementation for an effectful operation is given in
+the form of effect handlers, which (similarly to exception handlers) are responsible for resolving the
+operation. Effect handlers can be used as a powerful abstraction in probabilistic programming, as
+discussed previously by Moore and Gorinova (2018), and shown by both Pyro and Edward2.
+
+4.2 Model reparameterisation using effect handlers
+
+Once equipped with an effect handling-based PPL, we can easily construct handlers to perform many
+model transformations, including model reparameterisation.
+
+ncp = handler {v ∼ N (µ, σ), v /∈ data (cid:55)→ ˜v ∼ N (0, 1); v = µ + σ˜v}
+
+Non-centring handler.
+A non-centring handler can be used to non-centre all standardisable 4 latent variables in a model.
+The handler simply applies to statements of the form v ∼ N (µ, σ), where v is not a data variable,
+and transforms them to ˜v ∼ N (0, 1), v = µ + σ˜v. When nested within a log_prob handler (like
+the one from §§ 4.1), log_prob handles the transformed standard normal statement ˜v ∼ N (0, 1).
+Thus, make_log_joint applied to a model in the ncp context returns the log joint function of the
+transformed variables ˜z rather than the original variables z.
+
+For example, make_log_joint(NealsFunnel(z, y)) corresponds to log p(z, x) = log N (z | 0, 3) +
+log N (y | 0, exp(z/2)). But, make_log_joint(with ncp handle NealsFunnel(z, y)) gives the func-
+tion log p(˜z, ˜x) = log N (˜z | 0, 1) + log N (˜x | 0, 1), where z = 3˜z and x = exp(z/2)˜x.
+
+This approach can easily be extended to other parameterisations, including partially centred pa-
+rameterisations (as shown later in §§ 5.2), non-centring and whitening multivariate Gaussians, and
+transforming constrained variables to have unbounded support.
+
+3Typically, algebraic effects and handlers involve passing a continuation explicitly within the handler. Here,
+
+we make the continuation implicit to stay close to Edward2’s implementation.
+
+4We focus on Gaussian variables, but non-centring is broadly applicable, e.g. to the location-scale family and
+random variables that can be expressed as a bijective transformation z = fθ(˜z) of a “standardised” variable ˜z.
+
+4
+
+Algorithm 1: Interleaved Hamiltonian Monte Carlo
+
+Algorithm 2: Variationally Inferred Parameterisation
+
+Arguments: data x; a centred model Mcp(z | x)
+Returns: S samples z(1), . . . z(S) from p(z | x)
+1: Mncp(˜z | x), f = make_ncp(Mcp(z | x))
+2: log pcp = make_log_joint(Mcp(z | x))
+3: log pncp = make_log_joint(Mncp(˜z | x))
+4:
+5: z0 = init()
+6: for s ∈ [1, . . . , S] do
+7:
+8:
+9:
+10: return z(1), . . . , z(S)
+
+z(cid:48) = hmc_step(log pcp, z(s−1))
+z(cid:48)(cid:48) = hmc_step(log pncp, f −1(z(cid:48)))
+z(s) = f (z(cid:48)(cid:48))
+
+Arguments: data x; a centred model Mcp(z | x)
+Returns: S samples z(1), . . . z(S) from p(z | x)
+1: Mvip(˜z | x; λ), f = make_vip(Mcp(z | x))
+2: log p(x, ˜z) = make_log_joint(Mvip(˜z | x; λ))
+3:
+4: Q(˜z; θ) = make_variational(Mvip(˜z | x; λ))
+5: log q(˜z; θ) = make_log_joint(q(˜z; θ))
+6:
+7: L(θ, λ) = Eq(log p(x, ˜z; λ)) − Eq(log q(˜z; θ))
+8: θ∗, λ∗ = argmax L(θ, λ)
+9: log p(x, ˜z) = make_log_joint(Mvip(˜z | x; λ∗))
+10: z(1), . . . , z(S) = hmc(log p)
+11: return f (z(1)), . . . , f (z(S))
+
+Edward2 implementation. We implement reparameterisation handlers in Edward2, a deep PPL
+embedded in Python and TensorFlow (Tran et al., 2018). A model in Edward2 is a Python func-
+tion that generates random variables. In the core of Edward2 is a special case of effect handling
+called interception. To obtain the joint density of a model, the language provides the function
+make_log_joint_fn(model), which uses a log_prob interceptor (handler) as previously described.
+
+We extend the usage of interception to treat sample statements in one parameterisation as sample
+statements in another parameterisation (similarly to the ncp handler above):
+
+def no nc en t r i ng _ i n te r c e pt or ( rv_constructor , ** rv_kwargs ):
+# Assumes rv_constructor is in the location - scale family
+name = rv_kwargs [ " name " ] + " _std "
+rv_std = ed . interceptable 5 ( rv_constructor )( loc =0 , scale =1)
+return rv_kwargs [ " loc " ] + rv_kwargs [ " scale " ] * rv_std
+
+We use the interceptor by executing a model of interest within the interceptor’s context (using Python’s
+context managers). This overrides each random variable’s constructor to construct a variable with
+location 0 and scale 1, and scale and shift that variable appropriately:
+
+with ed . interception ( n o nc en t ri ng _i n te rc ep t or ): neals_funnel ()
+
+We present and explain in more detail all interceptors used for this work in Appendix B.
+
+5 Automatic model reparameterisation
+
+We introduce two inference strategies that exploit automatic reparameterisation: interleaved Hamilto-
+nian Monte Carlo (iHMC), and the Variationally Inferred Parameterisation (VIP).
+
+5.1
+
+Interleaved Hamiltonian Monte Carlo
+
+Automatic reparameterisation opens up the possibility of algorithms that exploit multiple parame-
+terisations of a single model. We consider interleaved Hamiltonian Monte Carlo (iHMC), which
+uses two HMC steps to produce each sample from the target distribution: the ﬁrst step is made in CP,
+using the original model latent variables, while the second step is made in NCP, using the auxiliary
+standardised variables. Interleaving MCMC kernels across parameterisations has been explored in
+previous work on Gibbs sampling (Yu and Meng, 2011; Kastner and Frühwirth-Schnatter, 2014),
+which demonstrated that CP and NCP steps can be combined to achieve more robust and performant
+samplers. Our contribution is to make the interleaving automatic and model-agnostic: instead of
+requiring the user to write multiple versions of their model and a custom inference algorithm, we
+implement iHMC as a black-box inference algorithm for centred Edward2 models.
+
+Algorithm 1 outlines iHMC. It takes a single centred model Mcp(z | x) that deﬁnes latent variables z
+and generates data x. It uses the function make_ncp to automatically obtain a non-centred version of
+the model, Mncp(˜z | x), which deﬁnes auxiliary variables ˜z and function f , such that z = f (˜z).
+
+5Wrapping the constructor with ed.interceptable ensures that we can nest this interceptor in the context
+
+of other interceptors.
+
+5
+
+(a) Different parameterisations λ of the funnel, with mean-ﬁeld normal variational ﬁt q(˜z)(overlayed in white).
+
+(b) Alternative view as implicit variational distributions q∗
+
+λ(z) (overlayed in white) on the original space.
+
+Figure 3: Neal’s funnel: z ∼ N (0, 3); x ∼ N (0, ez/2), with mean-ﬁeld normal variational ﬁt overlayed.
+
+5.2 Variationally inferred parameterisation
+
+The best parameterisation for a given model may mix centred and non-centred representations
+for different variables. To efﬁciently search the space of reparameterisations, we propose the
+variationally inferred parameterisation (VIP) algorithm, which selects a parameterisation by gradient-
+based optimisation of a differentiable variational objective. VIP can be used as a pre-processing step
+to another inference algorithm; as it only changes the parameterisation of the model, MCMC methods
+applied to the learned parameterisation maintain their asymptotic guarantees.
+
+Consider a model with latent variables z. We introduce parameterisation parameters λ = (λi) ∈
+[0, 1] for each variable zi, and transform zi ∼ N (zi | µi, σi) by deﬁning ˜zi ∼ N (λiµi, σλi
+i ) and
+zi = µi + σ1−λi
+(˜zi − λiµi). This deﬁnes a continuous relaxation that includes NCP as the special
+case λ = 0 and CP as λ = 1. More generally, it supports a combinatorially large class of per-variable
+and partial centrings. We aim to choose the parameterisation λ under which the posterior p(˜z|x; λ)
+is “most like” an independent normal distribution.
+
+i
+
+A natural objective to minimise is KL(q(˜z; θ) || p(˜z | x; λ)), where q(˜z; θ) = N (˜z | µ, diag(σ)) is
+an independent normal model with variational parameters θ = (µ, σ). Minimising this divergence
+corresponds to maximising a variational lower bound, the ELBO (Bishop, 2006):
+L(θ, λ) = Eq(˜z;θ) (log p(x, ˜z; λ) − log q(˜z; θ)) ≤ log p(x).
+
+Note that the auxiliary parameters λ are not statistically identiﬁable:
+the marginal likelihood
+log p(x; λ) = log p(x) is constant with respect to λ. However, the computational properties of
+the reparameterised models differ, which is what the variational bound selects for. Our key hypothesis
+(which the results in Figure 5 seem to support) is that diagonal-normal approximability is a good
+proxy for MCMC sampling efﬁciency.
+
+To search for a good model reparameterisation, we optimise L(θ, λ) using stochastic gradients to
+simultaneously ﬁt the variational distribution q to the posterior p and optimise the shape of that
+posterior. Figure 3a provides a visual example: an independent normal variational distribution
+is a poor ﬁt to the pathological geometry of a centred Neal’s funnel, but non-centring leads to a
+well-conditioned posterior, where the variational distribution is a perfect ﬁt. In general settings where
+the reparameterised model is not exactly Gaussian, sampling-based inference can be used to reﬁne
+the posterior; we apply VIP as a preprocessing step for HMC (summarised in Algorithm 2). Both
+the reparameterisation and the construction of the variational model q are implemented as automatic
+program transformations using Edward2’s interceptors.
+
+An alternate interpretation of VIP is that it expands a variational family to a more expressive
+family capable of representing prior dependence. Letting ˜z = fλ(z) represent the partial centring
+transformation, an independent normal family q(˜z) on the transformed model corresponds to an
+
+6
+
+Figure 4: Effective sample size and 95% conﬁdence intervals for the radon model across US states.
+
+Figure 5: Effective sample size (w/ 95% intervals) and the optimised ELBO across several models.
+
+λ(z) = q (˜z = fλ(z)) |f (cid:48)
+
+implicit posterior q∗
+λ(z)|−1 on the original model variables. Under this
+interpretation, λ are variational parameters that serve to add freedom to the variational family,
+allowing it to interpolate from independent normal (at λi = 1, Figure 3b left) to a representation that
+captures the exact prior dependence structure of the model (at λi = 0, Figure 3b right).
+
+6 Experiments
+
+We evaluate our proposed approaches by using Hamiltonian Monte Carlo to sample from the posterior
+of hierarchical Bayesian models on several datasets:
+
+Eight schools (Rubin, 1981): estimating the treatment effects θi of a course taught at each of
+i = 1 . . . 8 schools, given test scores yi and standard errors σi:
+
+µ ∼ N (0, 5)
+
+log τ ∼ N (0, 5)
+
+θi ∼ N (µ, τ )
+
+yi ∼ N (θi, σi)
+
+Radon (Gelman and Hill, 2006): hierarchical linear regression, in which the radon level ri in a home
+i in county c is modelled as a function of the (unobserved) county-level effect mc, the county uranium
+reading uc, and xi, the number of ﬂoors in the home:
+
+µ, a, b ∼ N (0, 1)
+
+mc ∼ N (µ + auc, 1)
+
+log ri ∼ N (mc[i] + bxi, σ)
+
+German credit (Dua and Graff, 2017): logistic regression; hierarchical prior on coefﬁcient scales:
+
+log τ0 ∼ N (0, 10)
+
+log τi ∼ N (log τ0, 1)
+
+βi ∼ N (0, τi)
+
+y ∼ Bernoulli(σ(βX T ))
+
+Election ’88 (Gelman and Hill, 2006): logistic model of 1988 US presidential election outcomes by
+county, given demographic covariates xi and state-level effects αs:
+
+βd ∼ N (0, 100) µ ∼ N (0, 100)
+
+log τ ∼ N (0, 10) αs ∼ N (µ, τ ) yi ∼ Bernoulli(σ(αs[i]+βT xi))
+
+Electric Company (Gelman and Hill, 2006): paired causal analysis of the effect of viewing an
+educational TV show on each of 192 classforms over G = 4 grades. The classrooms were divided
+into P = 96 pairs, and one class in each pair was treated (xi = 1) at random:
+
+µg ∼ N (0, 1) ap ∼ N (µg[p], 1) bg ∼ N (0, 100)
+
+log σg ∼ N (0, 1) yi ∼ N (ap[i] + bg[i]xi, σg[i])
+
+6.1 Algorithms and experimental details
+
+For each model and dataset, we compare our methods, interleaved HMC (iHMC) and VIP-HMC,
+with baselines of running HMC on either fully centred (CP-HMC) or fully non-centred (NCP-HMC)
+models. We initialise each HMC chain with samples from an independent Gaussian variational
+posterior, and use the posterior scales as a diagonal preconditioner; for VIP-HMC this variational
+optimisation also includes the parameterisation parameters λ. All variational optimisations were
+
+7
+
+Figure 6: A heat map of VIP parameterisations. Light regions correspond to CP and dark regions to NCP.
+
+run for the same number of steps, so they were a ﬁxed cost across all methods except iHMC (which
+depends on preconditioners for both the centred and non-centred transition kernels). The HMC step
+size and number of leapfrog steps were tuned following the procedures described in Appendix C.
+
+We report the average effective sample size per 1000 gradient evaluations (ESS/∇), with standard
+errors computed from 200 chains. We use gradient evaluations, rather than wallclock time, as they
+are the dominant operation in both HMC and VI and are easier to measure reliably; in practice, the
+wallclock times we observed per gradient evaluation did not differ signiﬁcantly between methods.
+
+Full details on the set up of the experiments can be found in Appendix C.
+
+6.2 Results
+
+Figures 4 and 5 show the results of the experiments. In most cases, either the centred or non-centred
+parameterisation works well, while the other does not. An exception is the German credit dataset,
+where both CP-HMC and NCP-HMC give a small ESS: 1.2 ± 0.2 or 1.3 ± 0.2 ESS/∇ respectively.
+
+iHMC. Across the datasets in both ﬁgures, we see that iHMC is a robust alternative to CP-HMC and
+NCP-HMC. Its performance is always within a factor of two of the best of CP-HMC and NCP-HMC,
+and sometimes better. In addition to being robust, iHMC can sometimes navigate the posterior more
+efﬁciently than either of CP-HMC and NCP-HMC can: in the case of German credit, it performs
+better than both (3.0 ± 0.2 ESS/∇).
+
+VIP. Performance of VIP-HMC is typically as good as the better of CP-HMC and NCP-HMC,
+and sometimes better. On the German credit dataset, it achieves 5.6 ± 0.6 ESS/∇, more than three
+times the rate of CP-HMC and NCP-HMC, and signiﬁcantly better than iHMC. Figure 5 shows the
+correspondence between the optimised mean-ﬁeld ELBO and the effective sampling rate. This result
+supports the ELBO as a reasonable predictor of the conditioning of a model, and further conﬁrms
+the validity of VIP as a strategy for automatic reparameterisation. Finally, we show some of the
+parameterisations that VIP ﬁnds in Figure 6. VIP’s behaviour appears reasonable: for most datasets
+we looked at, VIP ﬁnds the “correct” global parameterisation: most parameterisation parameters
+are set to either 0 or 1 (Figure 6, left). In the cases where a global parameterisation is not optimal
+(e.g. radon MO, radon PA and, most notably, German credit), VIP ﬁnds a mixed parameterisation,
+combining centred, non-centred, and partially centred variables (Figure 6, centre and right).
+
+7 Discussion
+
+Our results demonstrate that automated reparameterisation of probabilistic models is practical, and
+enables inference algorithms that can in some cases ﬁnd parameterisations even better than those a
+human could realistically express. These techniques allow modellers to focus on expressing statistical
+assumptions, leaving computation to the computer. We view the methods in this paper as exciting
+proofs of concept, and hope that they will inspire additional work in this space.
+
+While we focus on reparameterising hierarchical models naturally written in centred form, the inverse
+transformation—detecting and exploiting implicit hierarchical structure in models expressed as
+algebraic equations—is an important area of future work. This may be compatible with recent trends
+exploring the use of symbolic algebra systems in PPL runtimes (Narayanan et al., 2016; Hoffman
+et al., 2018). We also see promise in automating reparameterisations of heavy-tailed and multivariate
+distributions, and in designing new inference algorithms to exploit these capabilities.
+
+8
+
+References
+
+Andrieu, C. and Thoms, J. (2008). A tutorial on adaptive MCMC. Statistics and computing,
+
+18(4):343–373.
+
+Betancourt, M. and Girolami, M. (2015). Hamiltonian Monte Carlo for hierarchical models. Current
+
+trends in Bayesian methodology with applications, 79:30.
+
+Bishop, C. M. (2006). Pattern recognition and machine learning. Springer.
+
+Blei, D. M. (2014). Build, compute, critique, repeat: Data analysis with latent variable models.
+
+Annual Review of Statistics and Its Application, 1:203–232.
+
+Dua, D. and Graff, C. (2017). UCI machine learning repository.
+
+Gelman, A. and Hill, J. (2006). Data analysis using regression and multilevel/hierarchical models.
+
+Cambridge university press.
+
+Hoffman, M., Sountsov, P., Dillon, J. V., Langmore, I., Tran, D., and Vasudevan, S. (2019).
+NeuTra-lizing bad geometry in Hamiltonian Monte Carlo using neural transport. arXiv preprint
+arXiv:1903.03704.
+
+Hoffman, M. D., Johnson, M., and Tran, D. (2018). Autoconj: Recognizing and exploiting conjugacy
+
+without a domain-speciﬁc language. In Neural Information Processing Systems.
+
+Kastner, G. and Frühwirth-Schnatter, S. (2014). Ancillarity-sufﬁciency interweaving strategy (ASIS)
+for boosting MCMC estimation of stochastic volatility models. Computational Statistics & Data
+Analysis, 76:408–423.
+
+Kingma, D. P. and Ba, J. (2014). Adam: A method for stochastic optimization. arXiv preprint
+
+arXiv:1412.6980.
+
+Kingma, D. P. and Welling, M. (2013). Auto-encoding variational Bayes.
+
+arXiv preprint
+
+arXiv:1312.6114.
+
+Moore, D. and Gorinova, M. I. (2018). Effect handling for composable program transformations in
+
+Edward2. International Conference on Probabilistic Programming.
+
+Narayanan, P., Carette, J., Romano, W., Shan, C., and Zinkov, R. (2016). Probabilistic inference by
+program transformation in Hakaru (system description). In International Symposium on Functional
+and Logic Programming - 13th International Symposium, FLOPS 2016, Kochi, Japan, March 4-6,
+2016, Proceedings, pages 62–79. Springer.
+
+Neal, R. M. (2003). Slice sampling. The Annals of Statistics, 31(3):705–741.
+
+Papaspiliopoulos, O., Roberts, G. O., and Sköld, M. (2007). A general framework for the parametriza-
+
+tion of hierarchical models. Statistical Science, pages 59–73.
+
+Parno, M. D. and Marzouk, Y. M. (2018). Transport map accelerated Markov chain Monte Carlo.
+
+SIAM/ASA Journal on Uncertainty Quantiﬁcation, 6(2):645–682.
+
+Plotkin, G. and Power, J. (2001). Adequacy for algebraic effects.
+
+In Honsell, F. and Miculan,
+M., editors, Foundations of Software Science and Computation Structures, pages 1–24, Berlin,
+Heidelberg. Springer Berlin Heidelberg.
+
+Plotkin, G. and Pretnar, M. (2009). Handlers of algebraic effects. In Castagna, G., editor, Program-
+
+ming Languages and Systems, pages 80–94, Berlin, Heidelberg. Springer Berlin Heidelberg.
+
+Pretnar, M. (2015). An introduction to algebraic effects and handlers. Invited tutorial paper. Electronic
+Notes in Theoretical Computer Science, 319:19 – 35. The 31st Conference on the Mathematical
+Foundations of Programming Semantics (MFPS XXXI).
+
+Rubin, D. B. (1981). Estimation in parallel randomized experiments. Journal of Educational Statistics,
+
+6(4):377–401.
+
+9
+
+Stan Development Team et al. (2016). Stan modelling language users guide and reference manual.
+
+Technical report. https://mc-stan.org/docs/2_19/stan-users-guide/.
+
+Tran, D., Hoffman, M. D., Vasudevan, S., Suter, C., Moore, D., Radul, A., Johnson, M., and Saurous,
+R. A. (2018). Simple, distributed, and accelerated probabilistic programming. Advances in Neural
+Information Processing Systems.
+
+Uber AI Labs (2017). Pyro: A deep probabilistic programming language. http://pyro.ai/.
+
+Yao, Y., Vehtari, A., Simpson, D., and Gelman, A. (2018). Yes, but did it work?: Evaluating
+
+variational inference. arXiv preprint arXiv:1802.02538.
+
+Yu, Y. and Meng, X.-L. (2011). To center or not to center: That is not the question—an ancillarity–
+sufﬁciency interweaving strategy (ASIS) for boosting MCMC efﬁciency. Journal of Computational
+and Graphical Statistics, 20(3):531–570.
+
+10
+
+A Derivation of the condition number of the posterior for a simple model
+
+Centred parameterisation
+
+θ ∼ N (0, 1)
+
+µ ∼ N (θ, σµ)
+
+yn ∼ N (µ, σ) for all n ∈ 1 . . . N
+
+Non-centred parameterisation
+
+θ ∼ N (0, 1)
+
+˜µ ∼ N (0, 1)
+
+yn ∼ N (θ + σµ ˜µ, σ) for all n ∈ 1 . . . N
+
+As the Gaussian distribution is self-conjugate, the posterior distribution (given x) in each case (centred
+or non-centred) is also a Gaussian distribution, whose shape is entirely speciﬁed by a covariance
+matrix V . To quantify the quality of each parameterisation, we investigate the condition number κ of
+the posterior covariance matrix in each case under the best diagonal preconditioner.
+
+We do this in three steps:
+
+1. We derive the covariance matrices VCP and VNCP, such that p(µ, θ | y) = N (µ, θ | mCP, VCP)
+
+and p(˜µ, θ | y) = N (˜µ, θ | mNCP, VNCP) (Equation 1 and Equation 2).
+
+2. We ﬁnd the best diagonal preconditioners D∗
+
+arg minD(λ(2)
+and Equation 4).
+
+P /λ(1)
+
+P ), where λ(1)
+
+P
+
+and λ(2)
+
+P
+
+CP and D∗
+
+P =
+are the eigenvalues of U = DT VPD (Equation 3
+
+NCP: for P = CP, NCP, that is D∗
+
+3. We compare the condition numbers κcp(q) = λ(2)
+λ(i)
+(n)cp are the eigenvalues of U ∗ = (D∗)T V D∗
+
+cp /λ(1)
+
+cp and κncp(q) = λ(2)
+
+ncp/λ(1)
+
+ncp, where
+
+A.1 Deriving VCP and VNCP: centred parameterisation
+
+p(µ, θ | y) ∝ p(µ, θ, y)
+
+∝ N (µ | θ, σµ)N (θ | 0, 1)
+
+N
+(cid:89)
+
+n=1
+
+N (yn | µ, σ)
+
+(cid:32)
+
+(cid:32)
+
+(cid:32)
+
+∝ exp
+
+−
+
+(cid:32)
+
+∝ exp
+
+−
+
+1
+2
+
+1
+2
+
+(µ − θ)2
+σ2
+µ
+(cid:18) 1
+σ2
+µ
+
+µ2
+
++ θ2 +
+
+(cid:33)(cid:33)
+
+N
+(cid:88)
+
+n=1
+
+(yn − µ)2
+σ2
+
++
+
+(cid:19)
+
+N
+σ2
+
++ θ2
+
+(cid:18) 1
+σ2
+µ
+
+(cid:19)
+
++ 1
+
+− 2µθ
+
+(cid:32)
+
++ µ
+
+(cid:19)
+
+(cid:18) 1
+σ2
+µ
+
+−2
+σ2
+
+N
+(cid:88)
+
+n=1
+
+yn
+
+(cid:33)(cid:33)(cid:33)
+
+At the same time, for A = V −1
+
+NCP , we have:
+
+N (µ, θ | mCP, VCP) ∝ exp
+
+−
+
+(cid:32)
+
+(cid:18)
+
+∝ exp
+
+−
+
+1
+2
+
+1
+2
+
+(cid:19)
+
+(cid:18)(cid:18)µ
+θ
+
+(cid:19)T
+
+− m
+
+A
+
+(cid:19)
+
+(cid:18)(cid:18)µ
+θ
+
+(cid:19)(cid:33)
+
+− m
+
+(cid:0)µ2A11 + θ2A22 + µθ(2A12) + µ(−2A11m1 − 2A12m2)+
+(cid:19)
+
+µ2A11θ(−2A22m2 − 2A12m1)(cid:1)
+
+Thus, for q = N/σ2, we get: A =
+
+(cid:32) 1
+σ2
+µ
+− 1
+σ2
+µ
+
++ q − 1
+σ2
+µ
++ 1
+
+(cid:33)
+
+1
+σ2
+µ
+(cid:18) 1 + σ2
+µ
+1
+
+And therefore:
+
+(cid:19)
+
+1
+qσ2
+µ + 1
+
+(1)
+
+VCP =
+
+1
+σ2
+µq + q + 1
+
+11
+
+A.2 Deriving VCP and VNCP: non-centred parameterisation
+
+Like in the previous subsection, we have:
+
+p((cid:15), θ | y) ∝ p((cid:15), θ, y)
+
+∝ N ((cid:15) | 0, 1)N (θ | 0, 1)
+
+N
+(cid:89)
+
+n=1
+
+N (yn | σµ(cid:15) + θ, σ)
+
+(cid:32)
+
+∝ exp
+
+−
+
+(cid:32)
+
+∝ exp
+
+−
+
+1
+2
+
+1
+2
+
+(cid:32)
+
+((cid:15)2 + θ2 +
+
+N
+(cid:88)
+
+(cid:33)(cid:33)
+
+(yn − σµ(cid:15) − θ)2
+σ2
+
+n=1
+(cid:33)
+
+(cid:32)
+
+(cid:32)
+
+(cid:15)2
+
+1 +
+
+N σ2
+µ
+σ2
+(cid:80) yn
+(cid:18) −2σµ
+σ2
+
+(cid:15)
+
++ θ2
+
+(cid:19)
+
++ θ
+
+(cid:18)
+
+1 +
+
+N
+σ2
+(cid:18) −2 (cid:80) yn
+σ2
+
+(cid:19)
+
++ (cid:15)θ
+
+(cid:19)
+
+(cid:18) 2N σµ
+σ2
+
++
+
+(cid:19)(cid:19)(cid:19)
+
+Similarly to before, we derive A =
+
+VNCP =
+
+(cid:18) σ2
+
+µq + 1
+σµq
+1
+σ2
+µq + q + 1
+
+(cid:19)
+
+σµq
+q + 1
+(cid:18) q + 1 −σµq
+−σµq σ2
+µq + 1
+
+, and therefore:
+
+(cid:19)
+
+(2)
+
+A.3 The best diagonal preconditioner
+
+Consider a diagonal preconditioner D =
+
+such that:
+
+(cid:18) d 0
+1
+0
+
+(cid:19)
+
+. The best diagonal preconditioner D∗ of V is
+
+D∗ = arg min
+
+D
+
+(λ2/λ1) where λ1, λ2 are the eigenvalues of U = DT V D
+
+Firstly, in terms of the covariance matrix in the centred case, we have:
+1
+qσ2
+µ + 1
+(cid:19)
+
+(cid:18) 1 + σ2
+µ
+1
+
+U = DT VCPD =
+
+(cid:18) d 0
+1
+0
+
+(cid:19) (cid:18)
+
+1
+σ2
+µq + q + 1
+(cid:18) (1 + σ2
+µ)d2
+d
+
+d
+qσ2
+µ + 1
+
+=
+
+1
+σ2
+µq + q + 1
+
+(cid:19)(cid:19) (cid:18) d 0
+1
+0
+
+(cid:19)
+
+The solutions of det(U − λI) = 0 are the solutions of:
+µ)d2 − λ(σ2
+
+((1 + σ2
+which, after simpliﬁcation, becomes:
+
+µq + q + 1))(qσ2
+
+µ + 1 − λ(σ2
+
+µq + q + 1)) − d2 = 0
+
+(σ2
+
+µq + q + 1)λ2 − (σ2
+
+µq + 1 + d2(σ2
+
+µ + 1))λ + d2σ2
+
+µ = 0
+
+We want to ﬁnd d that minimises λ2/λ1. Let u = d2. We are looking for u, such that ∂
+∂u
+order to ﬁnd d∗
+
+(λ2/λ1). By expanding and simplifying we get:
+
+CP = arg min
+
+(σ2
+
+µq + 1 + u(σ2
+
+µ + 1)) = (σ2
+
+µq + 1 + u(σ2
+
+µ + 1))/u
+
+d
+∂
+∂u
+
+2
+
+And thus:
+
+d∗
+CP =
+
+√
+
+u =
+
+We obtain the best diagonal preconditioner D∗
+
+NCP =
+
+(cid:115)
+
+σ2
+µq + 1
+σ2
+µ + 1
+(cid:18) d∗
+NCP
+0
+
+0
+1
+
+λ2
+λ1
+
+= 0, in
+
+(3)
+
+(cid:19)
+
+in a similar manner, ﬁnally getting:
+
+(4)
+
+d∗
+NCP =
+
+√
+
+u =
+
+(cid:115)
+
+σ2
+µq + 1
+q + 1
+
+12
+
+A.4 The condition numbers κCP and κNCP
+
+Finally, we substitute d∗
+number in each case:
+
+CP and d∗
+
+NCP in the respective eigenvalue equations to derive the condition
+
+κCP = λ(CP)
+
+2
+
+/λ(CP)
+
+1 =
+
+σ2
+µq + 1 +
+
+σ2
+µq + 1 −
+
+(cid:113)
+
+(cid:113)
+
+(σ2
+
+µq + 1)2 − σ2
+
+µ(σ2
+
+µq + q + 1)(σ2
+
+µq + 1)/(v + 1)
+
+(σ2
+
+µq + 1)2 − σ2
+
+µ(σ2
+
+µq + q + 1)(σ2
+
+µq + 1)/(v + 1)
+
+κNCP = λ(NCP)
+
+2
+
+/λ(NCP)
+1
+
+=
+
+σ2
+µq + 1 +
+
+σ2
+µq + 1 −
+
+B Interceptors
+
+(cid:113)
+
+(σ2
+
+µq + 1)2 − σ2
+
+µ(σ2
+
+µq + q + 1)(σ2
+
+µq + 1)/(q + 1)
+
+(cid:113)
+
+(σ2
+
+µq + 1)2 − σ2
+
+µ(σ2
+
+µq + q + 1)(σ2
+
+µq + 1)/(q + 1)
+
+(5)
+
+(6)
+
+Interceptors can be used as a powerful abstractions in a probabilistic programming systems, as
+discussed previously by Moore and Gorinova (2018), and shown by both Pyro and Edward2. In
+particular, we can use interceptors to automatically reparameterise a model, as well as to specify
+variational families. In this section, we show Edward2 pseudo-code for the interceptors used to
+implement iHMC and VIP-HMC.
+
+B.1 Make log joint
+
+The following code is an outline of Edward2’s impllementation of a function that evaluates the log
+density log p(x) at some given x:
+
+def make_log_joi nt_fn ( model ):
+def log_joint_fn (** kwargs ):
+
+log_prob = 0
+
+def l og _pr ob _int er ce pt or ( rv_constructor , ** rv_kwargs ):
+
+# Overrides a random variable ’s ‘ value ‘ and accumulates its log prob .
+rv_name = rv_kwargs . get ( " name " )
+rv_kwargs [ " value " ] = kwargs . get ( rv_name )
+
+rv = rv_constructor (** rv_kwargs )
+log_prob = log_prob + rv . distribution . log_prob ( rv . value )
+return rv
+
+with ed . interception ( l og_prob_interceptor ):
+
+model ()
+
+return log_prob
+
+return log_joint_fn
+
+By executing the model function in the context of log_prob_interceptor, we override each sample
+statement (a call to a random variable constructor rv_constructor), to generate a variable that takes
+on the value provided in the arguments of log_joint_fn. As a side effect, we also accumulate the
+result of evaluating each variable’s prior density at the provided value, which, by the chain rule, gives
+us the log joint density.
+
+B.2 Non-centred Parameterisation Interceptor
+
+By intercepting every construction of a normal variable (or, more generally, of location-scale family
+variables), we can create a standard normal variable instead, and scale and shift appropriately.
+
+def ncp_interceptor ( rv_constructor , ** rv_kwargs ):
+
+# Assumes rv_constructor is in the location - scale family
+name = rv_kwargs [ " name " ] + " _std "
+rv_std = ed . interceptable 6 ( rv_constructor )( loc =0 , scale =1)
+return rv_kwargs [ " loc " ] + rv_kwargs [ " scale " ] * rv_std
+
+13
+
+Running a model that declares the random variables θ in the context of ncp_interceptor will
+declare a new set of standard normal random variables θ(std). Nesting this in the context of the
+log_prob_interceptor from ?? will then evaluate the log joint density log p(θ(std)).
+
+For example, going back to Neal’s funnel, running
+
+with ed . interception ( log_prob_interceptor ):
+
+neals_funnel ()
+
+corresponds to evaluating log p(z, x) = log N (z | 0, 3) + log N (x | 0, ez/2), while running
+
+with ed . interception ( l og_prob_ interceptor ):
+
+with ed . interception ( ncp_interceptor ):
+
+neals_funnel ()
+
+corresponds to evaluating log p(z(std), x(std)) = log N (z(std) | 0, 1) + log N (x(std) | 0, 1).
+
+B.3 VIP Interceptor
+
+The VIP interceptor is similar to the NCP interceptor. The notable difference is that it creates new
+learnable Tensorﬂow variables, which correspond to the parameterisation parameters λ:
+
+def vip_interceptor ( rv_constructor , ** rv_kwargs ):
+
+name = rv_kwargs [ " name " ] + " _vip "
+rv_loc = rv_kwargs [ " loc " ]
+rv_scale = rv_kwargs [ " scale " ]
+
+a = tf . nn . sigmoid ( tf . get_variable (
+
+name + " _a_unconstrained " ,
+initializer = tf . zeros_like ( rv_loc ))
+
+rv_vip = ed . interceptable ( rv_constructor )(
+
+loc = a * rv_loc , scale = rv_scale ** a )
+return rv_loc + rv_scale ** (1 - a ) * ( rv_vip - a * rv_loc )
+
+B.4 Mean-ﬁeld Variational Model Interceptor
+
+Finally, we show a mean-ﬁeld variational familiy interceptor, which we use both to tune the step sizes
+for HMC (see Appendix C), and to make use of VIP automatically. The mfvi_interceptor simply
+substitutes each sample statement with sampling from a normal distribution with parameters speciﬁed
+by some fresh variational parameters µ and σ:
+
+def vip_interceptor ( rv_constructor , ** rv_kwargs ):
+
+name = rv_kwargs [ " name " ] + " _q "
+mu = tf . get_variable ( name + " _mu " )
+sigma = tf . nn . softmax ( tf . get_variable ( name + " _sigma " ))
+
+rv_q = ed . interceptable ( ed . Normal )(
+
+loc = mu , scale = sigma , name = name )
+
+return rv_q
+
+C Details of the experiments
+
+Algorithms.
+
+• CP-HMC: HMC run on a fully centred model.
+• NCP-HMC: HMC run on a fully non-centred model.
+• iHMC: interleaved HMC.
+
+6Wrapping the constructor in with ed.interceptable ensures that we can nest this interceptor in the
+
+context of other interceptors.
+
+14
+
+• VIP-HMC: HMC run on the a model reparameterised as given by VIP.
+
+Each run consists of VI pre-processing and HMC inference.
+
+Variational inference pre-processing. We use automatic differentiation to compute stochastic
+gradients of the ELBO with respect to λ, θ and perform the optimisation using Adam (Kingma
+and Ba, 2014). We implement the constraint λi ∈ [0, 1] using a sigmoid transformation; λi =
+1/
+
+(cid:17)
+1 + exp(− ˜λi)
+
+for ˜λi ∈ R.
+
+(cid:16)
+
+Prior to running HMC, we also run VI to approximate per-variable initial step sizes (equivalently, a
+diagonal preconditioning matrix), and to initialise the chains. For each of CP-HMC and NCP-HMC
+this is just mean-ﬁeld VI, and for VIP-HMC the VI procedure is VIP.
+
+Each VI method is run for 3000 optimisation steps, and the ELBO is approximated using 256 Monte
+Carlo samples. We use the Adam optimiser with initial learning rate α ∈ [0.02, 0.05, 0.1, 0.2, 0.4],
+decayed to α/5 after 1000 steps and α/20 after 2000 steps, and returned the result with the highest
+ELBO.
+
+In each case we run 200 chains for a warm-up period of
+Hamiltonian Monte Carlo inference.
+2000 steps, followed by 10000 steps each, and report the average effective sample size (ESS) per
+1000 gradient evaluations (ESS/∇). Since ESS is naturally estimated from scalar traces, we ﬁrst
+estimate per-variable effective sample sizes for each model variable, and take the overall ESS to be
+the minimum across all variables.
+
+The HMC step size st was adapted to target an acceptance probability of 0.75, following a simple
+update rule
+
+log st+1 = log st + 0.02 · (I[αt − 0.75] − I[0.75 − αt])
+where αt is the acceptance probability of the proposed state at step t (Andrieu and Thoms, 2008).
+The adaptation runs during the ﬁrst 1500 steps of the warm-up period, after which we allow the chain
+to mix towards a stationary distribution.
+
+The number of leapfrog steps is chosen using ‘oracle’ tuning: each sampler is run with logarithmically
+increasing number of leapfrog steps in {1, 2, 4, . . . , 128}, and we report the result that maximises
+ESS/∇. This is intended to decouple the problem of tuning the number of leapfrog steps from the
+issues of parameterisation consider in this paper, and ensure that each method is reasonably tuned.
+For iHMC, we tune a single number of leapfrog steps that is shared across both the CP and NCP
+substeps.
+
+15
+
+
